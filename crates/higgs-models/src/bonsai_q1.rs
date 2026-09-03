@@ -61,17 +61,45 @@ use crate::{
 /// the engine surface in `higgs-engine::model_loader` can route it through the
 /// same `EngineError::Model` path used by all other architectures.
 pub fn load_bonsai_q1<P: AsRef<Path>>(model_dir: P) -> Result<BonsaiQ1Gpu, ModelError> {
-    let engine = BonsaiQ1Engine::load(model_dir).map_err(ModelError::ShapeMismatch)?;
-    engine.to_gpu().map_err(ModelError::Mlx)
+    let model_dir = model_dir.as_ref();
+    load_bonsai_with_boundaries(model_dir, || BonsaiQ1Engine::load(model_dir))
 }
 
 pub(crate) fn load_bonsai_q1_with_config(
     model_dir: &Path,
     config: &serde_json::Value,
 ) -> Result<BonsaiQ1Gpu, ModelError> {
-    let engine =
-        BonsaiQ1Engine::load_with_config(model_dir, config).map_err(ModelError::ShapeMismatch)?;
-    engine.to_gpu().map_err(ModelError::Mlx)
+    load_bonsai_with_boundaries(model_dir, || {
+        BonsaiQ1Engine::load_with_config(model_dir, config)
+    })
+}
+
+fn load_bonsai_with_boundaries(
+    model_dir: &Path,
+    load: impl FnOnce() -> Result<BonsaiQ1Engine, String>,
+) -> Result<BonsaiQ1Gpu, ModelError> {
+    let bytes = std::fs::metadata(model_dir.join("model.safetensors"))?.len();
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::BeforeConversion {
+        index: 0,
+        bytes,
+        kind: crate::progress::ConversionKind::FullArtifact,
+    })?;
+    let engine = load().map_err(ModelError::ShapeMismatch)?;
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::AfterConversion {
+        index: 0,
+        kind: crate::progress::ConversionKind::FullArtifact,
+    })?;
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::BeforeConversion {
+        index: 1,
+        bytes,
+        kind: crate::progress::ConversionKind::QwenMaterialization,
+    })?;
+    let gpu = engine.to_gpu().map_err(ModelError::Mlx)?;
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::AfterConversion {
+        index: 1,
+        kind: crate::progress::ConversionKind::QwenMaterialization,
+    })?;
+    Ok(gpu)
 }
 
 pub const GROUP_SIZE: usize = 128;

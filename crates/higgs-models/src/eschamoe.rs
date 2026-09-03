@@ -784,20 +784,7 @@ impl EschaCheckpointLayout {
     /// Inspect the cheap safetensors index when available, falling back to
     /// tensor names from checkpoint shards for single-file exports.
     pub(crate) fn load(model_dir: &std::path::Path) -> Result<Self, ModelError> {
-        let index_path = model_dir.join("model.safetensors.index.json");
-        let names = if index_path.exists() {
-            let index: crate::WeightMapIndex =
-                serde_json::from_str(&std::fs::read_to_string(index_path)?)?;
-            index.weight_map.into_keys().collect()
-        } else {
-            let mut names = Vec::new();
-            for file in crate::collect_safetensors_files(model_dir)? {
-                let loaded = Array::load_safetensors(&file)
-                    .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
-                names.extend(loaded.into_keys());
-            }
-            names
-        };
+        let names = crate::checkpoint_weight_names(model_dir)?;
         Ok(Self::from_weight_names(names))
     }
 
@@ -1469,12 +1456,17 @@ fn convert_checkpoint_impl(
 
     let affine_target = conversion_target(model_dir)?;
     let mut raw: HashMap<String, Array> = HashMap::new();
-    for file in crate::collect_safetensors_files(model_dir)? {
+    for (index, file) in crate::collect_safetensors_files(model_dir)?
+        .iter()
+        .enumerate()
+    {
+        crate::progress::report_before_shard(index, file)?;
         let loaded = Array::load_safetensors(file.to_str().unwrap_or_default())
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
         for (key, value) in loaded {
             raw.insert(normalize_key(&key).into_owned(), value);
         }
+        crate::progress::report_after_shard(index)?;
     }
 
     // Group by projection so the six trellis tensors (or the two int8 ones)
@@ -1500,7 +1492,28 @@ fn convert_checkpoint_impl(
     // memory. `take` removes each source tensor when the code reads it, and
     // `eval` completes the MLX operations. MLX keeps the input of an
     // incomplete operation, so the `eval` call is necessary to free it.
-    for ((storage, prefix), keys) in &groups {
+    for (conversion_index, ((storage, prefix), keys)) in groups.iter().enumerate() {
+        let group_bytes = keys.iter().try_fold(0_usize, |total, key| {
+            raw.get(key)
+                .ok_or_else(|| ModelError::MissingWeight(key.clone()))
+                .and_then(|value| {
+                    total.checked_add(value.nbytes()).ok_or_else(|| {
+                        ModelError::LoadCapacity("Escha conversion group size overflow".to_owned())
+                    })
+                })
+        })?;
+        let conversion_kind = if native {
+            crate::progress::ConversionKind::NativeEscha
+        } else {
+            crate::progress::ConversionKind::AffineEscha
+        };
+        crate::progress::report_load_boundary(crate::progress::LoadBoundary::BeforeConversion {
+            index: conversion_index,
+            bytes: u64::try_from(group_bytes).map_err(|_| {
+                ModelError::LoadCapacity("Escha conversion group size overflow".to_owned())
+            })?,
+            kind: conversion_kind,
+        })?;
         let mut made: Vec<(String, Array)> = Vec::with_capacity(6);
         let mut take = |key: &str| -> Result<Array, ModelError> {
             raw.remove(key)
@@ -1608,6 +1621,12 @@ fn convert_checkpoint_impl(
                         &mut slots.1
                     };
                     *slot = Some(built);
+                    crate::progress::report_load_boundary(
+                        crate::progress::LoadBoundary::AfterConversion {
+                            index: conversion_index,
+                            kind: conversion_kind,
+                        },
+                    )?;
                     continue;
                 }
                 let targets = projection_targets(prefix, axis)?;
@@ -1626,6 +1645,10 @@ fn convert_checkpoint_impl(
             crate::mlx_exec::eval(made.iter().map(|(_, a)| a))?;
         }
         out.extend(made);
+        crate::progress::report_load_boundary(crate::progress::LoadBoundary::AfterConversion {
+            index: conversion_index,
+            kind: conversion_kind,
+        })?;
     }
 
     let mut natives: Vec<(usize, EschaSwitchMlp)> = Vec::with_capacity(native_map.len());
@@ -2379,6 +2402,44 @@ mod tests {
         assert_eq!(classify(norm), (Storage::Dense, norm));
         let gate = "model.layers.0.mlp.gate.weight";
         assert_eq!(classify(gate), (Storage::Dense, gate));
+    }
+
+    #[test]
+    fn native_conversion_stops_before_rejected_next_group() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let weights = std::collections::HashMap::from([
+            ("first".to_owned(), Array::from_slice(&[1_f32], &[1])),
+            ("second".to_owned(), Array::from_slice(&[2_f32], &[1])),
+        ]);
+        Array::save_safetensors(&weights, None, &dir.path().join("model.safetensors")).unwrap();
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&events);
+        let _guard = crate::progress::install_load_boundary_sink(Box::new(move |boundary| {
+            if let crate::progress::LoadBoundary::BeforeConversion { index, kind, .. } = boundary {
+                captured.borrow_mut().push((index, kind));
+                if index == 1 {
+                    return Err(ModelError::LoadCapacity("synthetic rejection".to_owned()));
+                }
+            }
+            Ok(())
+        }));
+
+        assert!(matches!(
+            convert_checkpoint_impl(dir.path(), None, true),
+            Err(ModelError::LoadCapacity(_))
+        ));
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                (0, crate::progress::ConversionKind::NativeEscha),
+                (1, crate::progress::ConversionKind::NativeEscha),
+            ]
+        );
     }
 
     #[test]

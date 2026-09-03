@@ -481,12 +481,29 @@ fn load_safetensor_weights(model_dir: &Path) -> Result<HashMap<String, Array>, M
         ));
     };
 
+    let workspace_bytes = files.iter().try_fold(0_u64, |total, path| {
+        let bytes = std::fs::metadata(path)?.len();
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| ModelError::LoadCapacity("LLaVA artifact workspace overflow".to_owned()))
+    })?;
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::BeforeConversion {
+        index: 0,
+        bytes: workspace_bytes,
+        kind: crate::progress::ConversionKind::FullArtifact,
+    })?;
     let mut all_weights = HashMap::new();
-    for path in &files {
+    for (index, path) in files.iter().enumerate() {
+        crate::progress::report_before_shard(index, path)?;
         let loaded = Array::load_safetensors(path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
         all_weights.extend(loaded);
+        crate::progress::report_after_shard(index)?;
     }
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::AfterConversion {
+        index: 0,
+        kind: crate::progress::ConversionKind::FullArtifact,
+    })?;
     Ok(all_weights)
 }
 

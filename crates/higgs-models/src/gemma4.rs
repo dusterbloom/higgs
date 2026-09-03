@@ -1840,28 +1840,73 @@ fn load_gemma4_moe_expert_weights(
     let mut params = model.parameters_mut().flatten();
     let mut remapped = 0usize;
 
-    for file_path in &files {
+    for (index, file_path) in files.iter().enumerate() {
+        crate::progress::report_before_shard(index, file_path)?;
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
 
         for (key, value) in loaded {
             if let Some(prefix) = key.strip_suffix(".experts.gate_up_proj") {
+                crate::progress::report_load_boundary(
+                    crate::progress::LoadBoundary::BeforeConversion {
+                        index: remapped,
+                        bytes: u64::try_from(value.nbytes()).map_err(|_| {
+                            ModelError::LoadCapacity(
+                                "Gemma expert reshape size overflow".to_owned(),
+                            )
+                        })?,
+                        kind: crate::progress::ConversionKind::GemmaExpertReshape,
+                    },
+                )?;
                 let (gate_key, up_key, gate_w, up_w) = split_fused_gate_up(prefix, &value)?;
                 assign_param(&mut params, &gate_key, gate_w)?;
                 assign_param(&mut params, &up_key, up_w)?;
                 remapped += 2;
+                crate::progress::report_load_boundary(
+                    crate::progress::LoadBoundary::AfterConversion {
+                        index: remapped - 2,
+                        kind: crate::progress::ConversionKind::GemmaExpertReshape,
+                    },
+                )?;
             } else if let Some(prefix) = key.strip_suffix(".experts.down_proj") {
+                crate::progress::report_load_boundary(
+                    crate::progress::LoadBoundary::BeforeConversion {
+                        index: remapped,
+                        bytes: u64::try_from(value.nbytes()).map_err(|_| {
+                            ModelError::LoadCapacity(
+                                "Gemma expert reshape size overflow".to_owned(),
+                            )
+                        })?,
+                        kind: crate::progress::ConversionKind::GemmaExpertReshape,
+                    },
+                )?;
                 let (down_key, down_w) = reshape_down(prefix, &value)?;
                 assign_param(&mut params, &down_key, down_w)?;
                 remapped += 1;
+                crate::progress::report_load_boundary(
+                    crate::progress::LoadBoundary::AfterConversion {
+                        index: remapped - 1,
+                        kind: crate::progress::ConversionKind::GemmaExpertReshape,
+                    },
+                )?;
             }
         }
+        crate::progress::report_after_shard(index)?;
     }
 
     drop(params);
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::BeforeConversion {
+        index: remapped,
+        bytes: 0,
+        kind: crate::progress::ConversionKind::FinalModelEval,
+    })?;
     model
         .eval()
         .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::AfterConversion {
+        index: remapped,
+        kind: crate::progress::ConversionKind::FinalModelEval,
+    })?;
     tracing::info!(remapped, "Remapped fused MoE expert weights");
     Ok(())
 }

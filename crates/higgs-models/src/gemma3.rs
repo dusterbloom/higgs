@@ -960,7 +960,7 @@ pub(crate) fn load_gemma3_model_with_args(
     // a separate (often separately-quantized) `lm_head` are untied. Honor the
     // checkpoint — reusing the tied embedding as the output projection corrupts
     // low-margin logits (e.g. the stop-token decision) and degrades generation.
-    if crate::checkpoint_has_key_suffix(model_path, "lm_head.weight") {
+    if crate::checkpoint_has_key_suffix(model_path, "lm_head.weight")? {
         args.tie_word_embeddings = false;
     }
 

@@ -8,12 +8,181 @@
 //! thread-local sink installed for the duration of one prefill is exact and
 //! invisible to every other code path.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::path::Path;
+
+use crate::error::ModelError;
 
 type Sink = Box<dyn FnMut(i32, i32)>;
+type LoadSink = Box<dyn FnMut(LoadBoundary) -> Result<(), ModelError>>;
+
+/// The kind of allocation-producing conversion about to run while loading.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConversionKind {
+    FinalModelEval,
+    QwenMaterialization,
+    NativeEscha,
+    AffineEscha,
+    GemmaExpertReshape,
+    FullArtifact,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OptionalModelKind {
+    DFlash,
+    PrefillDrafter,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OptionalModelDisposition {
+    Retained,
+    Discarded,
+}
+
+/// A capacity checkpoint at a concrete model-loader allocation boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoadBoundary {
+    BeforeShard {
+        index: usize,
+        bytes: u64,
+    },
+    AfterShard {
+        index: usize,
+    },
+    BeforeConversion {
+        index: usize,
+        bytes: u64,
+        kind: ConversionKind,
+    },
+    AfterConversion {
+        index: usize,
+        kind: ConversionKind,
+    },
+    BeforeOptionalModel {
+        artifact_bytes: u64,
+        workspace_bytes: u64,
+        kind: OptionalModelKind,
+    },
+    AfterOptionalModel {
+        artifact_bytes: u64,
+        kind: OptionalModelKind,
+        disposition: OptionalModelDisposition,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OptionalLoadPolicy {
+    Allow,
+    Suppress,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OptionalLoadOutcome {
+    pub dflash_loaded: bool,
+    pub prefill_drafter_loaded: bool,
+}
 
 thread_local! {
     static PREFILL_SINK: RefCell<Option<Sink>> = const { RefCell::new(None) };
+    static LOAD_SINK: RefCell<Option<LoadSink>> = const { RefCell::new(None) };
+    static OPTIONAL_LOAD_POLICY: Cell<OptionalLoadPolicy> = const { Cell::new(OptionalLoadPolicy::Allow) };
+    static OPTIONAL_LOAD_OUTCOME: Cell<OptionalLoadOutcome> = const { Cell::new(OptionalLoadOutcome { dflash_loaded: false, prefill_drafter_loaded: false }) };
+}
+
+pub struct OptionalLoadPolicyGuard {
+    previous: OptionalLoadPolicy,
+    previous_outcome: OptionalLoadOutcome,
+}
+
+impl Drop for OptionalLoadPolicyGuard {
+    fn drop(&mut self) {
+        OPTIONAL_LOAD_POLICY.with(|policy| policy.set(self.previous));
+        OPTIONAL_LOAD_OUTCOME.with(|outcome| outcome.set(self.previous_outcome));
+    }
+}
+
+pub fn install_optional_load_policy(policy: OptionalLoadPolicy) -> OptionalLoadPolicyGuard {
+    let previous = OPTIONAL_LOAD_POLICY.with(|current| current.replace(policy));
+    let previous_outcome =
+        OPTIONAL_LOAD_OUTCOME.with(|current| current.replace(OptionalLoadOutcome::default()));
+    OptionalLoadPolicyGuard {
+        previous,
+        previous_outcome,
+    }
+}
+
+pub fn optional_load_policy() -> OptionalLoadPolicy {
+    OPTIONAL_LOAD_POLICY.with(Cell::get)
+}
+
+pub fn suppress_optional_loads() {
+    OPTIONAL_LOAD_POLICY.with(|policy| policy.set(OptionalLoadPolicy::Suppress));
+}
+
+pub fn record_dflash_loaded() {
+    OPTIONAL_LOAD_OUTCOME.with(|outcome| {
+        let mut current = outcome.get();
+        current.dflash_loaded = true;
+        outcome.set(current);
+    });
+}
+
+pub fn record_prefill_drafter_loaded() {
+    OPTIONAL_LOAD_OUTCOME.with(|outcome| {
+        let mut current = outcome.get();
+        current.prefill_drafter_loaded = true;
+        outcome.set(current);
+    });
+}
+
+pub fn optional_load_outcome() -> OptionalLoadOutcome {
+    OPTIONAL_LOAD_OUTCOME.with(Cell::get)
+}
+
+/// Restores the thread's previous loader sink, including across unwind.
+pub struct LoadBoundarySinkGuard {
+    previous: Option<LoadSink>,
+}
+
+impl Drop for LoadBoundarySinkGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        LOAD_SINK.with(|sink| *sink.borrow_mut() = previous);
+    }
+}
+
+/// Install one typed capacity sink for the duration of a model load.
+pub fn install_load_boundary_sink(sink: LoadSink) -> LoadBoundarySinkGuard {
+    let previous = LOAD_SINK.with(|current| current.borrow_mut().replace(sink));
+    LoadBoundarySinkGuard { previous }
+}
+
+/// Report a loader boundary. The no-sink path is deliberately fallible-shaped
+/// so allocation loops can propagate policy rejection with `?`.
+pub fn report_load_boundary(boundary: LoadBoundary) -> Result<(), ModelError> {
+    LOAD_SINK.with(|sink| match sink.borrow_mut().as_mut() {
+        Some(sink) => sink(boundary),
+        None => Ok(()),
+    })
+}
+
+/// Report a file-backed shard before opening it. Metadata failure is load
+/// failure rather than a zero-byte estimate, because zero would bypass policy.
+pub fn report_before_shard(index: usize, path: &Path) -> Result<u64, ModelError> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(ModelError::Io(std::io::Error::other(format!(
+            "model shard is not a regular file: {}",
+            path.display()
+        ))));
+    }
+    let bytes = metadata.len();
+    report_load_boundary(LoadBoundary::BeforeShard { index, bytes })?;
+    Ok(bytes)
+}
+
+pub fn report_after_shard(index: usize) -> Result<(), ModelError> {
+    report_load_boundary(LoadBoundary::AfterShard { index })
 }
 
 /// RAII guard that removes the thread's prefill sink on drop, keeping
@@ -86,5 +255,93 @@ mod tests {
         // After the guard drops, reports are no-ops again.
         report_prefill_progress(3072, 4096);
         assert_eq!(*seen.borrow(), vec![(1024, 4096), (2048, 4096)]);
+    }
+
+    /// Removing the load-boundary reporter or failing to restore a nested sink
+    /// would either lose ordering or leak policy into the next model load.
+    #[test]
+    fn load_boundary_sink_is_typed_nested_and_restored() {
+        let outer = Rc::new(RefCell::new(Vec::new()));
+        let outer_seen = Rc::clone(&outer);
+        let _outer_guard = install_load_boundary_sink(Box::new(move |event| {
+            outer_seen.borrow_mut().push(event);
+            Ok(())
+        }));
+
+        report_load_boundary(LoadBoundary::BeforeShard {
+            index: 0,
+            bytes: 13,
+        })
+        .unwrap();
+        {
+            let inner = Rc::new(RefCell::new(Vec::new()));
+            let inner_seen = Rc::clone(&inner);
+            let _inner_guard = install_load_boundary_sink(Box::new(move |event| {
+                inner_seen.borrow_mut().push(event);
+                Err(crate::error::ModelError::LoadCapacity("stop".to_owned()))
+            }));
+            let error = report_load_boundary(LoadBoundary::BeforeConversion {
+                index: 1,
+                bytes: 29,
+                kind: ConversionKind::NativeEscha,
+            })
+            .unwrap_err();
+            assert!(
+                matches!(error, crate::error::ModelError::LoadCapacity(message) if message == "stop")
+            );
+            assert_eq!(inner.borrow().len(), 1);
+        }
+        report_load_boundary(LoadBoundary::AfterShard { index: 0 }).unwrap();
+        assert_eq!(
+            *outer.borrow(),
+            vec![
+                LoadBoundary::BeforeShard {
+                    index: 0,
+                    bytes: 13,
+                },
+                LoadBoundary::AfterShard { index: 0 },
+            ]
+        );
+    }
+
+    /// A panicking load must not leave its capacity callback installed on the
+    /// thread and poison a later independent load.
+    #[test]
+    fn load_boundary_sink_restores_after_unwind() {
+        let calls = Rc::new(RefCell::new(0usize));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let calls_for_sink = Rc::clone(&calls);
+            let _guard = install_load_boundary_sink(Box::new(move |_| {
+                *calls_for_sink.borrow_mut() += 1;
+                Ok(())
+            }));
+            report_load_boundary(LoadBoundary::AfterConversion {
+                index: 3,
+                kind: ConversionKind::FinalModelEval,
+            })
+            .unwrap();
+            panic!("synthetic loader panic");
+        }));
+        assert!(caught.is_err());
+        report_load_boundary(LoadBoundary::AfterConversion {
+            index: 4,
+            kind: ConversionKind::FinalModelEval,
+        })
+        .unwrap();
+        assert_eq!(*calls.borrow(), 1);
+    }
+
+    /// Warning-pressure policy is scoped to one load and cannot leak into the
+    /// next normal model load, including through panic unwind.
+    #[test]
+    fn optional_load_policy_is_scoped_and_restored() {
+        assert_eq!(optional_load_policy(), OptionalLoadPolicy::Allow);
+        let caught = std::panic::catch_unwind(|| {
+            let _guard = install_optional_load_policy(OptionalLoadPolicy::Suppress);
+            assert_eq!(optional_load_policy(), OptionalLoadPolicy::Suppress);
+            panic!("synthetic load panic");
+        });
+        assert!(caught.is_err());
+        assert_eq!(optional_load_policy(), OptionalLoadPolicy::Allow);
     }
 }

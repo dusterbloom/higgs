@@ -22,8 +22,9 @@ pub mod simple;
 pub mod tool_parser;
 
 pub use mlx_tuning::{
-    EngineCostDescription, MemoryPhase, MlxMemoryProbeError, MlxMemorySnapshot, ModelFootprint,
-    RequestMemoryHighWater, RequestMemorySampler, TransientPrefillEstimate,
+    EngineCostDescription, LoaderWorkspaceKind, MemoryPhase, MlxMemoryProbeError,
+    MlxMemorySnapshot, ModelFootprint, ModelLoadEstimate, ModelLoadEstimateError,
+    RequestMemoryHighWater, RequestMemorySampler, TransientPrefillEstimate, model_load_estimate,
 };
 pub use simple::CacheResidency;
 pub use tokenizers;

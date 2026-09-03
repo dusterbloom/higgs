@@ -25,8 +25,8 @@ use sha2::{Digest, Sha256};
 
 use crate::capacity::CapacityRegistry;
 use crate::capacity::{
-    CAPACITY_SCHEMA_VERSION, LearnedProfileKey, ModelCapacityFacts, ModelContentIdentity,
-    fingerprint_model_artifacts,
+    CAPACITY_SCHEMA_VERSION, LearnedProfileKey, LoadCapacitySnapshot, MemoryPressure,
+    ModelCapacityFacts, ModelContentIdentity, fingerprint_model_artifacts,
 };
 use crate::config::{
     HiggsConfig, LocalConfig, ModelConfig, PrefillCompressionMode, resolved_model_supports_batch,
@@ -1303,23 +1303,104 @@ pub fn build_engine_with_capacity(
     resolved: &Path,
     model_cfg: &ModelConfig,
     config: &HiggsConfig,
-    capacity: &CapacityRegistry,
+    capacity: &Arc<CapacityRegistry>,
 ) -> Result<(String, Engine, ModelCapacityFacts), String> {
+    let loader = higgs_engine::model_loader::ModelConfig::from_dir(resolved)
+        .map_err(|error| format!("failed to classify model loader: {error}"))?;
+    let estimate = higgs_engine::model_load_estimate(resolved, &loader.model_type)
+        .map_err(|error| format!("failed to estimate model load: {error}"))?;
+    let initial = capacity.load_snapshot().ok_or_else(|| {
+        "model load rejected by capacity policy: no safe process memory authority".to_owned()
+    })?;
+    enforce_preload_capacity(estimate, initial).map_err(|error| error.to_string())?;
+
+    let optional_sidecars_configured = model_cfg.draft_model.is_some()
+        || model_cfg.prefill_drafter.is_some()
+        || std::env::var_os("HIGGS_DFLASH_PATH").is_some();
+    let mut optional_suppression_warned = false;
+
     let identity = fingerprint_model_artifacts(resolved)
         .map_err(|error| format!("failed to fingerprint model artifacts: {error}"))?;
-    let (name, engine, before, after) = with_serialized_mlx_load(|| {
+    let load_capacity = Arc::clone(capacity);
+    let model_path = model_cfg.path.clone();
+    let (name, engine, before, after, optional_load_outcome) = with_serialized_mlx_load(|| {
+        let admitted = capacity.load_snapshot().ok_or_else(|| {
+            "model load rejected by capacity policy: no safe process memory authority".to_owned()
+        })?;
+        enforce_preload_capacity(estimate, admitted).map_err(|error| error.to_string())?;
+        let effective_model_cfg = effective_load_config(model_cfg, admitted.pressure);
+        if admitted.pressure == MemoryPressure::Constrained
+            && take_optional_suppression_notice(
+                optional_sidecars_configured,
+                &mut optional_suppression_warned,
+            )
+        {
+            tracing::warn!(
+                model = %model_cfg.path,
+                "memory pressure constrained: optional DFlash and prefill drafter loading disabled"
+            );
+        }
+        let initial_optional_policy = if admitted.pressure == MemoryPressure::Constrained {
+            higgs_models::progress::OptionalLoadPolicy::Suppress
+        } else {
+            higgs_models::progress::OptionalLoadPolicy::Allow
+        };
+        let _optional_load_policy_guard =
+            higgs_models::progress::install_optional_load_policy(initial_optional_policy);
         let before = higgs_engine::MlxMemorySnapshot::measure()
             .map_err(|error| format!("failed to measure MLX before model load: {error}"))?;
-        let (name, engine) = match build_engine(resolved, model_cfg, &config.local) {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                higgs_engine::simple::maybe_clear_mlx_cache(true, "failed model load");
-                if let Ok(memory) = higgs_engine::MlxMemorySnapshot::measure() {
-                    capacity.refresh_memory(memory);
+        let mut ledger = LoadCapacityLedger::new(estimate);
+        let _boundary_guard = higgs_models::progress::install_load_boundary_sink(Box::new(
+            move |boundary| {
+                let snapshot = load_capacity.load_snapshot().ok_or_else(|| {
+                    higgs_models::error::ModelError::LoadCapacity(
+                        "no safe process memory authority".to_owned(),
+                    )
+                })?;
+                if snapshot.pressure == MemoryPressure::Constrained {
+                    higgs_models::progress::suppress_optional_loads();
+                    if take_optional_suppression_notice(
+                        optional_sidecars_configured,
+                        &mut optional_suppression_warned,
+                    ) {
+                        tracing::warn!(
+                            model = %model_path,
+                            "memory pressure constrained: optional DFlash and prefill drafter loading disabled"
+                        );
+                    }
+                    let discarding_optional = matches!(
+                        boundary,
+                        higgs_models::progress::LoadBoundary::AfterOptionalModel {
+                            disposition:
+                                higgs_models::progress::OptionalModelDisposition::Discarded,
+                            ..
+                        }
+                    );
+                    if ledger.optional_model_active()
+                        && !matches!(
+                            boundary,
+                            higgs_models::progress::LoadBoundary::BeforeOptionalModel { .. }
+                        )
+                        && !discarding_optional
+                    {
+                        return Err(higgs_models::error::ModelError::OptionalLoadSuppressed);
+                    }
                 }
-                return Err(error);
-            }
-        };
+                ledger.enforce(snapshot, boundary)
+            },
+        ));
+        let (name, engine) = run_model_load_attempt(
+            || build_engine(resolved, &effective_model_cfg, &config.local),
+            || {
+                higgs_engine::simple::maybe_clear_mlx_cache(true, "failed model load");
+                let memory = higgs_engine::MlxMemorySnapshot::measure().map_err(|error| {
+                    format!("failed to remeasure MLX after model load failure: {error}")
+                })?;
+                capacity.refresh_memory(memory);
+                Ok(())
+            },
+        )?;
+        let optional_load_outcome = higgs_models::progress::optional_load_outcome();
         let after = match higgs_engine::MlxMemorySnapshot::measure() {
             Ok(memory) => memory,
             Err(error) => {
@@ -1327,17 +1408,24 @@ pub fn build_engine_with_capacity(
                     tracing::warn!(%shutdown_error, "failed to join engine after load measurement failure");
                 }
                 higgs_engine::simple::maybe_clear_mlx_cache(true, "failed model load measurement");
-                if let Ok(memory) = higgs_engine::MlxMemorySnapshot::measure() {
-                    capacity.refresh_memory(memory);
-                }
-                return Err(format!("failed to measure MLX after model load: {error}"));
+                let cleanup = higgs_engine::MlxMemorySnapshot::measure()
+                    .map(|memory| capacity.refresh_memory(memory))
+                    .map_err(|cleanup_error| {
+                        format!("failed to remeasure MLX after load measurement failure: {cleanup_error}")
+                    });
+                return match cleanup {
+                    Ok(_) => Err(format!("failed to measure MLX after model load: {error}")),
+                    Err(cleanup_error) => Err(format!(
+                        "failed to measure MLX after model load: {error}; {cleanup_error}"
+                    )),
+                };
             }
         };
         // Publish while the process GPU/load gate is still held. Lifecycle
         // commits may complete out of order, but can no longer regress the
         // allocator authority to an older per-load snapshot.
         capacity.refresh_memory(after);
-        Ok((name, engine, before, after))
+        Ok((name, engine, before, after, optional_load_outcome))
     })?;
     let cache_capabilities = engine.cache_capabilities();
     let facts = match build_capacity_facts_from_measurements(
@@ -1349,14 +1437,237 @@ pub fn build_engine_with_capacity(
         before,
         after,
         cache_capabilities,
+        optional_load_outcome,
     ) {
         Ok(facts) => facts,
         Err(error) => {
-            release_failed_engine(engine, capacity);
-            return Err(error);
+            let cleanup = release_failed_engine_final(engine, capacity, "failed model publication");
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(format!("{error}; cleanup failed: {cleanup_error}")),
+            };
         }
     };
     Ok((name, engine, facts))
+}
+
+fn enforce_preload_capacity(
+    estimate: higgs_engine::ModelLoadEstimate,
+    snapshot: LoadCapacitySnapshot,
+) -> Result<(), higgs_models::error::ModelError> {
+    if snapshot.pressure == MemoryPressure::Critical {
+        return Err(higgs_models::error::ModelError::LoadCapacity(
+            "critical memory pressure before model load".to_owned(),
+        ));
+    }
+    if estimate.required_process_bytes > snapshot.headroom_bytes {
+        return Err(higgs_models::error::ModelError::LoadCapacity(format!(
+            "insufficient_capacity: load requires {} bytes but only {} bytes are safe",
+            estimate.required_process_bytes, snapshot.headroom_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn effective_load_config(model_cfg: &ModelConfig, pressure: MemoryPressure) -> ModelConfig {
+    let mut effective = model_cfg.clone();
+    if pressure == MemoryPressure::Constrained {
+        effective.draft_model = None;
+        effective.prefill_drafter = None;
+    }
+    effective
+}
+
+fn take_optional_suppression_notice(configured: bool, warned: &mut bool) -> bool {
+    if configured && !*warned {
+        *warned = true;
+        true
+    } else {
+        false
+    }
+}
+
+fn run_model_load_attempt<T>(
+    load: impl FnOnce() -> Result<T, String>,
+    cleanup: impl FnOnce() -> Result<(), String>,
+) -> Result<T, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(load)) {
+        Ok(Ok(loaded)) => Ok(loaded),
+        Ok(Err(error)) => match cleanup() {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(format!("{error}; cleanup failed: {cleanup_error}")),
+        },
+        Err(_) => match cleanup() {
+            Ok(()) => Err("model load panicked after partial allocation".to_owned()),
+            Err(cleanup_error) => Err(format!(
+                "model load panicked after partial allocation; cleanup failed: {cleanup_error}"
+            )),
+        },
+    }
+}
+
+struct LoadCapacityLedger {
+    target: higgs_engine::ModelLoadEstimate,
+    retained_optional_resident_bytes: u64,
+    active_optional: Option<(higgs_models::progress::OptionalModelKind, u64, u64)>,
+    full_artifact_workspace_active: bool,
+}
+
+impl LoadCapacityLedger {
+    const fn new(estimate: higgs_engine::ModelLoadEstimate) -> Self {
+        Self {
+            target: estimate,
+            retained_optional_resident_bytes: 0,
+            active_optional: None,
+            full_artifact_workspace_active: false,
+        }
+    }
+
+    fn resident_and_workspace(&self) -> Result<(u64, u64), higgs_models::error::ModelError> {
+        let target_resident_bytes =
+            if self.active_optional.is_some() || self.retained_optional_resident_bytes != 0 {
+                self.target
+                    .artifact_bytes
+                    .max(self.target.workspace_upper_bound_bytes)
+            } else {
+                self.target.artifact_bytes
+            };
+        let resident = target_resident_bytes
+            .checked_add(self.retained_optional_resident_bytes)
+            .and_then(|bytes| {
+                self.active_optional
+                    .map_or(Some(bytes), |(_, artifact, _)| bytes.checked_add(artifact))
+            })
+            .ok_or_else(|| {
+                higgs_models::error::ModelError::LoadCapacity(
+                    "resident model byte ledger overflow".to_owned(),
+                )
+            })?;
+        let workspace = self.active_optional.map_or(
+            self.target.workspace_upper_bound_bytes,
+            |(_, _, workspace)| workspace,
+        );
+        Ok((resident, workspace))
+    }
+
+    const fn optional_model_active(&self) -> bool {
+        self.active_optional.is_some()
+    }
+
+    fn enforce(
+        &mut self,
+        snapshot: LoadCapacitySnapshot,
+        boundary: higgs_models::progress::LoadBoundary,
+    ) -> Result<(), higgs_models::error::ModelError> {
+        use higgs_models::progress::{ConversionKind, LoadBoundary, OptionalModelDisposition};
+
+        if snapshot.pressure == MemoryPressure::Critical {
+            return Err(higgs_models::error::ModelError::LoadCapacity(
+                "critical memory pressure at model allocation boundary".to_owned(),
+            ));
+        }
+        if let LoadBoundary::BeforeOptionalModel { .. } = boundary
+            && snapshot.pressure == MemoryPressure::Constrained
+        {
+            return Ok(());
+        }
+
+        let additional_bytes = match boundary {
+            LoadBoundary::BeforeOptionalModel {
+                artifact_bytes,
+                workspace_bytes,
+                kind,
+            } => {
+                if self.active_optional.is_some() {
+                    return Err(higgs_models::error::ModelError::LoadCapacity(
+                        "nested optional model load".to_owned(),
+                    ));
+                }
+                self.active_optional = Some((kind, artifact_bytes, workspace_bytes));
+                workspace_bytes
+            }
+            LoadBoundary::AfterOptionalModel {
+                artifact_bytes,
+                kind,
+                disposition,
+            } => {
+                let Some((active_kind, active_artifact, active_workspace)) =
+                    self.active_optional.take()
+                else {
+                    return Err(higgs_models::error::ModelError::LoadCapacity(
+                        "optional model end without start".to_owned(),
+                    ));
+                };
+                if active_kind != kind || active_artifact != artifact_bytes {
+                    return Err(higgs_models::error::ModelError::LoadCapacity(
+                        "optional model boundary identity mismatch".to_owned(),
+                    ));
+                }
+                if disposition == OptionalModelDisposition::Retained {
+                    self.retained_optional_resident_bytes = self
+                        .retained_optional_resident_bytes
+                        .checked_add(artifact_bytes.max(active_workspace))
+                        .ok_or_else(|| {
+                            higgs_models::error::ModelError::LoadCapacity(
+                                "optional model byte ledger overflow".to_owned(),
+                            )
+                        })?;
+                }
+                return Ok(());
+            }
+            LoadBoundary::BeforeShard { bytes, .. } => {
+                let (_, workspace) = self.resident_and_workspace()?;
+                if self.full_artifact_workspace_active
+                    || self.active_optional.is_some()
+                    || self.target.workspace_kind
+                        != higgs_engine::LoaderWorkspaceKind::StandardStream
+                {
+                    workspace.max(bytes)
+                } else {
+                    bytes
+                }
+            }
+            LoadBoundary::BeforeConversion { bytes, kind, .. } => {
+                let (_, workspace) = self.resident_and_workspace()?;
+                match kind {
+                    ConversionKind::FinalModelEval if bytes == 0 => workspace.max(bytes),
+                    ConversionKind::NativeEscha
+                    | ConversionKind::AffineEscha
+                    | ConversionKind::QwenMaterialization => workspace.max(bytes),
+                    ConversionKind::FullArtifact => {
+                        self.full_artifact_workspace_active = true;
+                        workspace.max(bytes)
+                    }
+                    _ => bytes,
+                }
+            }
+            LoadBoundary::AfterConversion {
+                kind: ConversionKind::FullArtifact,
+                ..
+            } => {
+                self.full_artifact_workspace_active = false;
+                return Ok(());
+            }
+            LoadBoundary::AfterShard { .. } | LoadBoundary::AfterConversion { .. } => {
+                return Ok(());
+            }
+        };
+        let (resident_bytes, _) = self.resident_and_workspace()?;
+        let required = resident_bytes
+            .checked_add(additional_bytes)
+            .ok_or_else(|| {
+                higgs_models::error::ModelError::LoadCapacity(
+                    "load-boundary byte ledger overflow".to_owned(),
+                )
+            })?;
+        if required > snapshot.headroom_bytes {
+            return Err(higgs_models::error::ModelError::LoadCapacity(format!(
+                "insufficient_capacity at load boundary: {required} bytes required, {} safe",
+                snapshot.headroom_bytes
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[doc(hidden)]
@@ -1366,12 +1677,30 @@ pub fn release_failed_engine(engine: Engine, capacity: &CapacityRegistry) {
         drop(engine);
         return;
     }
+    if let Err(error) = release_failed_engine_final(engine, capacity, "failed model publication") {
+        tracing::error!(%error, "failed engine cleanup was not measurable and final");
+    }
+}
+
+fn release_failed_engine_final(
+    engine: Engine,
+    capacity: &CapacityRegistry,
+    reason: &'static str,
+) -> Result<(), String> {
     with_serialized_mlx_load(|| {
-        if let Err(error) = engine.shutdown() {
-            tracing::warn!(%error, "failed to join engine during failed publication cleanup");
+        let shutdown_error = engine.shutdown().err();
+        higgs_engine::simple::maybe_clear_mlx_cache(true, reason);
+        let memory = higgs_engine::MlxMemorySnapshot::measure()
+            .map_err(|error| format!("failed to measure MLX after engine drop: {error}"))?;
+        capacity.refresh_memory(memory);
+        if let Some(error) = shutdown_error {
+            Err(format!(
+                "failed to join engine during failed publication cleanup: {error}"
+            ))
+        } else {
+            Ok(())
         }
-        refresh_after_engine_drop_locked(capacity, "failed model publication");
-    });
+    })
 }
 
 #[doc(hidden)]
@@ -1426,6 +1755,7 @@ fn build_capacity_facts_from_measurements(
     before: higgs_engine::MlxMemorySnapshot,
     after: higgs_engine::MlxMemorySnapshot,
     cache_capabilities: crate::capacity::CacheCapabilities,
+    optional_load_outcome: higgs_models::progress::OptionalLoadOutcome,
 ) -> Result<ModelCapacityFacts, String> {
     const MIB: u64 = 1024 * 1024;
     let footprint = ModelFootprint::from_load_measurements(resolved, before, after)
@@ -1494,12 +1824,20 @@ fn build_capacity_facts_from_measurements(
             model_cfg.kv_adaptive_dense_layers
         ),
     };
-    let prefill_model_identity = optional_artifact_identity(model_cfg.prefill_drafter.as_deref())?;
-    let effective_drafter_path = model_cfg
-        .draft_model
-        .clone()
-        .or_else(|| std::env::var("HIGGS_DFLASH_PATH").ok());
-    let drafter_identity = optional_artifact_identity(effective_drafter_path.as_deref())?;
+    let prefill_model_identity = optional_load_outcome
+        .prefill_drafter_loaded
+        .then(|| optional_artifact_identity(model_cfg.prefill_drafter.as_deref()))
+        .transpose()?
+        .flatten();
+    let drafter_identity = if optional_load_outcome.dflash_loaded {
+        let effective_drafter_path = model_cfg
+            .draft_model
+            .clone()
+            .or_else(|| std::env::var("HIGGS_DFLASH_PATH").ok());
+        optional_artifact_identity(effective_drafter_path.as_deref())?
+    } else {
+        None
+    };
     let startup_headroom_bytes = smaller_nonzero_memory_authority(before)
         .map_or(0, |authority| authority.saturating_sub(before.active_bytes));
     let learned_profile_key = learned_profile_key(
@@ -1873,6 +2211,215 @@ pub(crate) fn test_state_with_stub_engine(model: &str) -> SharedState {
 mod tests {
     use super::*;
 
+    /// A critical observation must stop the next allocation even when the
+    /// byte ledger itself would otherwise fit.
+    #[test]
+    fn load_boundary_policy_aborts_critical_before_allocation() {
+        let estimate = higgs_engine::ModelLoadEstimate {
+            artifact_bytes: 100,
+            largest_selected_shard_bytes: 40,
+            workspace_kind: higgs_engine::LoaderWorkspaceKind::StandardStream,
+            workspace_upper_bound_bytes: 40,
+            required_process_bytes: 140,
+        };
+        let snapshot = crate::capacity::LoadCapacitySnapshot {
+            pressure: crate::capacity::MemoryPressure::Critical,
+            headroom_bytes: 1_000,
+        };
+        let error = LoadCapacityLedger::new(estimate)
+            .enforce(
+                snapshot,
+                higgs_models::progress::LoadBoundary::BeforeShard {
+                    index: 0,
+                    bytes: 40,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            higgs_models::error::ModelError::LoadCapacity(_)
+        ));
+    }
+
+    #[test]
+    fn preload_policy_rejects_definite_overcommit_before_loader_entry() {
+        let estimate = higgs_engine::ModelLoadEstimate {
+            artifact_bytes: 100,
+            largest_selected_shard_bytes: 40,
+            workspace_kind: higgs_engine::LoaderWorkspaceKind::StandardStream,
+            workspace_upper_bound_bytes: 40,
+            required_process_bytes: 140,
+        };
+        let loader_entered = std::cell::Cell::new(false);
+        let result = enforce_preload_capacity(
+            estimate,
+            crate::capacity::LoadCapacitySnapshot {
+                pressure: crate::capacity::MemoryPressure::Normal,
+                headroom_bytes: 139,
+            },
+        );
+        if result.is_ok() {
+            loader_entered.set(true);
+        }
+        assert!(matches!(
+            result,
+            Err(higgs_models::error::ModelError::LoadCapacity(_))
+        ));
+        assert!(!loader_entered.get());
+    }
+
+    /// Native Escha retains the packed artifact while materializing one bounded
+    /// conversion group, so omitting either term undercounts the actual peak.
+    #[test]
+    fn load_boundary_policy_charges_native_raw_plus_current_group() {
+        let estimate = higgs_engine::ModelLoadEstimate {
+            artifact_bytes: 100,
+            largest_selected_shard_bytes: 60,
+            workspace_kind: higgs_engine::LoaderWorkspaceKind::NativeEscha,
+            workspace_upper_bound_bytes: 100,
+            required_process_bytes: 200,
+        };
+        let boundary = higgs_models::progress::LoadBoundary::BeforeConversion {
+            index: 2,
+            bytes: 31,
+            kind: higgs_models::progress::ConversionKind::NativeEscha,
+        };
+        assert!(
+            LoadCapacityLedger::new(estimate)
+                .enforce(
+                    crate::capacity::LoadCapacitySnapshot {
+                        pressure: crate::capacity::MemoryPressure::Normal,
+                        headroom_bytes: 199,
+                    },
+                    boundary,
+                )
+                .is_err()
+        );
+        assert!(
+            LoadCapacityLedger::new(estimate)
+                .enforce(
+                    crate::capacity::LoadCapacitySnapshot {
+                        pressure: crate::capacity::MemoryPressure::Normal,
+                        headroom_bytes: 200,
+                    },
+                    boundary,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn optional_load_preserves_affine_target_resident_upper_bound() {
+        let estimate = higgs_engine::ModelLoadEstimate {
+            artifact_bytes: 100,
+            largest_selected_shard_bytes: 60,
+            workspace_kind: higgs_engine::LoaderWorkspaceKind::AffineEscha,
+            workspace_upper_bound_bytes: 200,
+            required_process_bytes: 300,
+        };
+        let boundary = higgs_models::progress::LoadBoundary::BeforeOptionalModel {
+            artifact_bytes: 100,
+            workspace_bytes: 150,
+            kind: higgs_models::progress::OptionalModelKind::DFlash,
+        };
+        let error = LoadCapacityLedger::new(estimate)
+            .enforce(
+                crate::capacity::LoadCapacitySnapshot {
+                    pressure: crate::capacity::MemoryPressure::Normal,
+                    headroom_bytes: 400,
+                },
+                boundary,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            higgs_models::error::ModelError::LoadCapacity(_)
+        ));
+    }
+
+    /// Constrained pressure drops only optional load-time sidecars; accidentally
+    /// clearing the runtime prefill plan cache would change generation behavior.
+    #[test]
+    fn constrained_load_config_disables_optional_sidecars_only() {
+        let config = ModelConfig {
+            path: "model".to_owned(),
+            draft_model: Some("dflash".to_owned()),
+            prefill_drafter: Some("small-dense".to_owned()),
+            prefill_plan_cache: true,
+            ..ModelConfig::default()
+        };
+        let constrained = effective_load_config(&config, MemoryPressure::Constrained);
+        assert!(constrained.draft_model.is_none());
+        assert!(constrained.prefill_drafter.is_none());
+        assert!(constrained.prefill_plan_cache);
+        let normal = effective_load_config(&config, MemoryPressure::Normal);
+        assert_eq!(normal.draft_model.as_deref(), Some("dflash"));
+        assert_eq!(normal.prefill_drafter.as_deref(), Some("small-dense"));
+    }
+
+    #[test]
+    fn optional_sidecar_suppression_notice_fires_exactly_once() {
+        let mut warned = false;
+        assert!(take_optional_suppression_notice(true, &mut warned));
+        assert!(!take_optional_suppression_notice(true, &mut warned));
+        assert!(!take_optional_suppression_notice(false, &mut warned));
+    }
+
+    /// A loader panic must unwind and drop partial state before allocator cache
+    /// cleanup/remeasure runs, and the cleanup must run exactly once.
+    #[test]
+    fn loader_unwind_drops_partial_state_before_cleanup() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct Partial(Rc<RefCell<Vec<&'static str>>>);
+        impl Drop for Partial {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push("drop");
+            }
+        }
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let load_events = Rc::clone(&events);
+        let cleanup_events = Rc::clone(&events);
+        let capacity = CapacityRegistry::new(Vec::<String>::new());
+        let cleanup_capacity = Arc::clone(&capacity);
+        let outcome: Result<(), String> = run_model_load_attempt(
+            move || {
+                let _partial = Partial(load_events);
+                panic!("synthetic loader panic");
+            },
+            move || {
+                cleanup_events.borrow_mut().push("cache-clear");
+                cleanup_events.borrow_mut().push("measure");
+                let published = cleanup_capacity.refresh_memory(higgs_engine::MlxMemorySnapshot {
+                    active_bytes: 17,
+                    ..higgs_engine::MlxMemorySnapshot::default()
+                });
+                assert_eq!(published.revision(), 1);
+                cleanup_events.borrow_mut().push("publish");
+                Ok(())
+            },
+        );
+        assert!(outcome.unwrap_err().contains("panicked"));
+        assert_eq!(
+            *events.borrow(),
+            vec!["drop", "cache-clear", "measure", "publish"]
+        );
+    }
+
+    #[test]
+    fn loader_cleanup_failure_is_not_hidden_by_original_error() {
+        let outcome: Result<(), String> = run_model_load_attempt(
+            || Err("synthetic load failure".to_owned()),
+            || Err("synthetic remeasure failure".to_owned()),
+        );
+        assert_eq!(
+            outcome.unwrap_err(),
+            "synthetic load failure; cleanup failed: synthetic remeasure failure"
+        );
+    }
+
     #[test]
     fn exposed_model_name_is_identical_for_catalog_and_loaded_paths() {
         assert_eq!(
@@ -2131,6 +2678,7 @@ mod tests {
             before,
             after,
             crate::capacity::CacheCapabilities::SIMPLE,
+            higgs_models::progress::OptionalLoadOutcome::default(),
         )
         .unwrap();
 

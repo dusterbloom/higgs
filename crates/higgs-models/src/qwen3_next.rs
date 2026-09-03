@@ -8442,13 +8442,26 @@ impl Qwen3NextCausalLM {
         })
     }
 
-    fn promote_bonsai_dense_mlps_to_row4(&mut self) -> Result<BonsaiRow4Promotion, Exception> {
+    fn promote_bonsai_dense_mlps_to_row4(&mut self) -> Result<BonsaiRow4Promotion, ModelError> {
         let mut promoted = BonsaiRow4Promotion::default();
         for (layer_index, layer) in self.model.layers.iter_mut().enumerate() {
+            crate::progress::report_load_boundary(
+                crate::progress::LoadBoundary::BeforeConversion {
+                    index: layer_index,
+                    bytes: 0,
+                    kind: crate::progress::ConversionKind::QwenMaterialization,
+                },
+            )?;
             let layer = layer.mlp.promote_bonsai_row4(layer_index)?;
             promoted.layers = promoted.layers.saturating_add(layer.layers);
             promoted.projections = promoted.projections.saturating_add(layer.projections);
             promoted.bytes = promoted.bytes.saturating_add(layer.bytes);
+            crate::progress::report_load_boundary(
+                crate::progress::LoadBoundary::AfterConversion {
+                    index: layer_index,
+                    kind: crate::progress::ConversionKind::QwenMaterialization,
+                },
+            )?;
         }
         Ok(promoted)
     }
@@ -11127,15 +11140,11 @@ fn mtp_weight_layout_from_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> M
 
 fn checkpoint_mtp_weight_layout(model_path: &Path) -> Result<MtpWeightLayout, ModelError> {
     fn safetensors_file_mtp_weight_layout(file_path: &Path) -> Result<MtpWeightLayout, ModelError> {
-        let bytes = std::fs::read(file_path)?;
-        let metadata = safetensors::SafeTensors::deserialize(&bytes)
-            .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
         // Auxiliary sidecars may ship truly unprefixed keys (`fc.weight`,
         // `layers.0....`) — normalize so they classify as MTP keys.
-        let normalized: Vec<String> = metadata
-            .names()
+        let normalized: Vec<String> = crate::safetensor_weight_names(file_path)?
             .into_iter()
-            .map(|name| normalize_sidecar_mtp_key(file_path, name.to_owned()))
+            .map(|name| normalize_sidecar_mtp_key(file_path, name))
             .collect();
         Ok(mtp_weight_layout_from_keys(
             normalized.iter().map(String::as_str),
@@ -11762,6 +11771,7 @@ pub(crate) fn load_qwen3_5_moe_model_with_args(
 /// Returns the number of `QLinears` requantized.
 fn requant_dense_gdn_to_8bit(model: &mut Qwen3NextCausalLM) -> Result<usize, ModelError> {
     let mut count = 0usize;
+    let mut conversion_index = 0_usize;
     for layer in &mut model.model.layers {
         if let Some(ref mut gdn) = layer.linear_attn {
             // Handle separate projections (in_proj_a, in_proj_b)
@@ -11770,15 +11780,51 @@ fn requant_dense_gdn_to_8bit(model: &mut Qwen3NextCausalLM) -> Result<usize, Mod
                 .flatten()
             {
                 if ql.mode.is_dense() {
+                    crate::progress::report_load_boundary(
+                        crate::progress::LoadBoundary::BeforeConversion {
+                            index: conversion_index,
+                            bytes: u64::try_from(ql.weight.nbytes()).map_err(|_| {
+                                ModelError::LoadCapacity(
+                                    "Qwen GDN requantization size overflow".to_owned(),
+                                )
+                            })?,
+                            kind: crate::progress::ConversionKind::QwenMaterialization,
+                        },
+                    )?;
                     requant_one_to_8bit(ql)?;
+                    crate::progress::report_load_boundary(
+                        crate::progress::LoadBoundary::AfterConversion {
+                            index: conversion_index,
+                            kind: crate::progress::ConversionKind::QwenMaterialization,
+                        },
+                    )?;
                     count += 1;
+                    conversion_index += 1;
                 }
             }
             // Handle fused projection (in_proj_ba) — when GDN uses fused mode,
             // a+b are concatenated into a single QLinear.
             if gdn.in_proj_ba.mode.is_dense() {
+                crate::progress::report_load_boundary(
+                    crate::progress::LoadBoundary::BeforeConversion {
+                        index: conversion_index,
+                        bytes: u64::try_from(gdn.in_proj_ba.weight.nbytes()).map_err(|_| {
+                            ModelError::LoadCapacity(
+                                "Qwen GDN requantization size overflow".to_owned(),
+                            )
+                        })?,
+                        kind: crate::progress::ConversionKind::QwenMaterialization,
+                    },
+                )?;
                 requant_one_to_8bit(&mut gdn.in_proj_ba)?;
+                crate::progress::report_load_boundary(
+                    crate::progress::LoadBoundary::AfterConversion {
+                        index: conversion_index,
+                        kind: crate::progress::ConversionKind::QwenMaterialization,
+                    },
+                )?;
                 count += 1;
+                conversion_index += 1;
             }
         }
     }
@@ -12122,7 +12168,8 @@ fn load_qwen3_next_weights<M: mlx_rs::module::ModuleParametersExt>(
     let safetensors_files = crate::collect_safetensors_files(model_path)?;
     let mut params = model.parameters_mut().flatten();
 
-    for file_path in &safetensors_files {
+    for (index, file_path) in safetensors_files.iter().enumerate() {
+        crate::progress::report_before_shard(index, file_path)?;
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
         crate::validate_quantized_tensor_widths(
@@ -12140,6 +12187,7 @@ fn load_qwen3_next_weights<M: mlx_rs::module::ModuleParametersExt>(
             }
             tracing::warn!(key = %key, "Weight key not found in model parameters");
         }
+        crate::progress::report_after_shard(index)?;
     }
 
     // Chunked load-time eval. A single `model.eval()` materializes the whole
@@ -12154,14 +12202,42 @@ fn load_qwen3_next_weights<M: mlx_rs::module::ModuleParametersExt>(
         .map(|v| v != "0")
         .unwrap_or(true)
     {
-        for (_, param) in params.iter() {
+        for (index, (_, param)) in params.iter().enumerate() {
+            crate::progress::report_load_boundary(
+                crate::progress::LoadBoundary::BeforeConversion {
+                    index,
+                    bytes: u64::try_from((**param).nbytes()).map_err(|_| {
+                        crate::error::ModelError::LoadCapacity(
+                            "Qwen materialization size overflow".to_owned(),
+                        )
+                    })?,
+                    kind: crate::progress::ConversionKind::QwenMaterialization,
+                },
+            )?;
             (**param).eval().map_err(crate::error::ModelError::from)?;
+            crate::progress::report_load_boundary(
+                crate::progress::LoadBoundary::AfterConversion {
+                    index,
+                    kind: crate::progress::ConversionKind::QwenMaterialization,
+                },
+            )?;
         }
     }
 
+    let final_eval_index = params.len();
+    drop(params);
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::BeforeConversion {
+        index: final_eval_index,
+        bytes: 0,
+        kind: crate::progress::ConversionKind::FinalModelEval,
+    })?;
     model
         .eval()
         .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::AfterConversion {
+        index: final_eval_index,
+        kind: crate::progress::ConversionKind::FinalModelEval,
+    })?;
 
     Ok(())
 }
@@ -12182,7 +12258,8 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
     let mut matched = 0usize;
     let mut unmatched = Vec::new();
 
-    for file_path in &safetensors_files {
+    for (index, file_path) in safetensors_files.iter().enumerate() {
+        crate::progress::report_before_shard(index, file_path)?;
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
         crate::validate_quantized_tensor_widths(
@@ -12209,6 +12286,7 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
                 unmatched.push(key);
             }
         }
+        crate::progress::report_after_shard(index)?;
     }
 
     tracing::info!(
@@ -12249,9 +12327,18 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
         );
     }
 
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::BeforeConversion {
+        index: 0,
+        bytes: 0,
+        kind: crate::progress::ConversionKind::FinalModelEval,
+    })?;
     model
         .eval()
         .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::AfterConversion {
+        index: 0,
+        kind: crate::progress::ConversionKind::FinalModelEval,
+    })?;
 
     Ok(())
 }
@@ -12377,14 +12464,35 @@ fn checkpoint_tensors(
         return crate::eschamoe::convert_checkpoint_auto(model_path, value.get("quantization"));
     }
 
+    let files = crate::collect_safetensors_files(model_path)?;
+    let workspace_bytes = files.iter().try_fold(0_u64, |total, file| {
+        total
+            .checked_add(std::fs::metadata(file)?.len())
+            .ok_or_else(|| {
+                crate::error::ModelError::LoadCapacity(
+                    "Qwen checkpoint workspace overflow".to_owned(),
+                )
+            })
+    })?;
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::BeforeConversion {
+        index: 0,
+        bytes: workspace_bytes,
+        kind: crate::progress::ConversionKind::FullArtifact,
+    })?;
     let mut out = Vec::new();
-    for file_path in crate::collect_safetensors_files(model_path)? {
+    for (index, file_path) in files.iter().enumerate() {
+        crate::progress::report_before_shard(index, file_path)?;
         let loaded = Array::load_safetensors(&file_path)
             .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
         for (key, value) in loaded {
             out.push((normalize_sidecar_mtp_key(&file_path, key), value));
         }
+        crate::progress::report_after_shard(index)?;
     }
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::AfterConversion {
+        index: 0,
+        kind: crate::progress::ConversionKind::FullArtifact,
+    })?;
     Ok((out, Vec::new()))
 }
 
@@ -12461,7 +12569,7 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
 
     // Fuse GDN pairs: concat + row permutation
     let mut fused_count = 0usize;
-    for (combined_key, (part_a, part_b)) in &gdn_parts {
+    for (conversion_index, (combined_key, (part_a, part_b))) in gdn_parts.iter().enumerate() {
         let (Some(a), Some(b)) = (part_a, part_b) else {
             return Err(crate::error::ModelError::Io(std::io::Error::other(
                 format!("Incomplete GDN projection pair for key: {combined_key}"),
@@ -12489,6 +12597,18 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
         } else {
             &ba_perm
         };
+        let conversion_bytes = a
+            .nbytes()
+            .checked_add(b.nbytes())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                crate::error::ModelError::LoadCapacity("Qwen fusion size overflow".to_owned())
+            })?;
+        crate::progress::report_load_boundary(crate::progress::LoadBoundary::BeforeConversion {
+            index: conversion_index,
+            bytes: conversion_bytes,
+            kind: crate::progress::ConversionKind::QwenMaterialization,
+        })?;
         match concat_and_permute(a, b, perm) {
             Ok(fused) => {
                 **param = fused;
@@ -12500,6 +12620,10 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
                 )));
             }
         }
+        crate::progress::report_load_boundary(crate::progress::LoadBoundary::AfterConversion {
+            index: conversion_index,
+            kind: crate::progress::ConversionKind::QwenMaterialization,
+        })?;
     }
 
     tracing::info!(
@@ -12536,14 +12660,42 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
         .map(|v| v != "0")
         .unwrap_or(true)
     {
-        for (_, param) in params.iter() {
+        for (index, (_, param)) in params.iter().enumerate() {
+            crate::progress::report_load_boundary(
+                crate::progress::LoadBoundary::BeforeConversion {
+                    index,
+                    bytes: u64::try_from((**param).nbytes()).map_err(|_| {
+                        crate::error::ModelError::LoadCapacity(
+                            "Qwen materialization size overflow".to_owned(),
+                        )
+                    })?,
+                    kind: crate::progress::ConversionKind::QwenMaterialization,
+                },
+            )?;
             (**param).eval().map_err(crate::error::ModelError::from)?;
+            crate::progress::report_load_boundary(
+                crate::progress::LoadBoundary::AfterConversion {
+                    index,
+                    kind: crate::progress::ConversionKind::QwenMaterialization,
+                },
+            )?;
         }
     }
 
+    let final_eval_index = params.len();
+    drop(params);
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::BeforeConversion {
+        index: final_eval_index,
+        bytes: 0,
+        kind: crate::progress::ConversionKind::FinalModelEval,
+    })?;
     model
         .eval()
         .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::AfterConversion {
+        index: final_eval_index,
+        kind: crate::progress::ConversionKind::FinalModelEval,
+    })?;
 
     Ok(escha_natives)
 }

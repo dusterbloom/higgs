@@ -286,6 +286,107 @@ pub fn resolve_dflash_min_block_override(raw: Option<&str>) -> Option<i32> {
         .filter(|value| *value >= 1)
 }
 
+fn resolve_optional_dflash_path(
+    explicit: Option<&Path>,
+    environment: Option<&str>,
+    policy: higgs_models::progress::OptionalLoadPolicy,
+) -> Option<std::path::PathBuf> {
+    match policy {
+        higgs_models::progress::OptionalLoadPolicy::Allow => explicit
+            .map(Path::to_path_buf)
+            .or_else(|| environment.map(std::path::PathBuf::from)),
+        higgs_models::progress::OptionalLoadPolicy::Suppress => None,
+    }
+}
+
+fn begin_optional_model_load(
+    path: &Path,
+    kind: higgs_models::progress::OptionalModelKind,
+) -> Result<Option<crate::mlx_tuning::ModelLoadEstimate>, EngineError> {
+    if higgs_models::progress::optional_load_policy()
+        == higgs_models::progress::OptionalLoadPolicy::Suppress
+    {
+        return Ok(None);
+    }
+    let model_type = model_loader::ModelConfig::from_dir(path)
+        .map(|config| config.model_type)
+        .unwrap_or_else(|_| "unknown".to_owned());
+    let estimate = crate::mlx_tuning::model_load_estimate(path, &model_type)
+        .map_err(|error| EngineError::Generation(format!("optional model estimate: {error}")))?;
+    higgs_models::progress::report_load_boundary(
+        higgs_models::progress::LoadBoundary::BeforeOptionalModel {
+            artifact_bytes: estimate.artifact_bytes,
+            workspace_bytes: estimate.workspace_upper_bound_bytes,
+            kind,
+        },
+    )?;
+    if higgs_models::progress::optional_load_policy()
+        == higgs_models::progress::OptionalLoadPolicy::Suppress
+    {
+        Ok(None)
+    } else {
+        Ok(Some(estimate))
+    }
+}
+
+fn finish_optional_model_load(
+    estimate: crate::mlx_tuning::ModelLoadEstimate,
+    kind: higgs_models::progress::OptionalModelKind,
+    disposition: higgs_models::progress::OptionalModelDisposition,
+) -> Result<(), EngineError> {
+    higgs_models::progress::report_load_boundary(
+        higgs_models::progress::LoadBoundary::AfterOptionalModel {
+            artifact_bytes: estimate.artifact_bytes,
+            kind,
+            disposition,
+        },
+    )?;
+    Ok(())
+}
+
+fn optional_model_error_is_capacity(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::Model(higgs_models::error::ModelError::LoadCapacity(_))
+    )
+}
+
+fn optional_model_error_is_suppressed(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::Model(higgs_models::error::ModelError::OptionalLoadSuppressed)
+    )
+}
+
+fn discard_optional_model_load(
+    estimate: crate::mlx_tuning::ModelLoadEstimate,
+    kind: higgs_models::progress::OptionalModelKind,
+) -> Result<(), EngineError> {
+    finish_optional_model_load(
+        estimate,
+        kind,
+        higgs_models::progress::OptionalModelDisposition::Discarded,
+    )
+}
+
+fn retain_optional_model_load(
+    estimate: crate::mlx_tuning::ModelLoadEstimate,
+    kind: higgs_models::progress::OptionalModelKind,
+) -> Result<higgs_models::progress::OptionalModelDisposition, EngineError> {
+    match finish_optional_model_load(
+        estimate,
+        kind,
+        higgs_models::progress::OptionalModelDisposition::Retained,
+    ) {
+        Ok(()) => Ok(higgs_models::progress::OptionalModelDisposition::Retained),
+        Err(error) if optional_model_error_is_suppressed(&error) => {
+            discard_optional_model_load(estimate, kind)?;
+            Ok(higgs_models::progress::OptionalModelDisposition::Discarded)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PFlashPlanCacheConfig {
     version: u32,
@@ -3249,8 +3350,11 @@ impl SimpleEngine {
         prefill_suffix_identity_threshold: usize,
         session_max_suffix_prefill_tokens: usize,
     ) -> Result<Self, EngineError> {
+        let optional_load_policy = higgs_models::progress::optional_load_policy();
         PFlashLoadSettings {
-            prefill_drafter_configured: prefill_drafter_path.is_some(),
+            prefill_drafter_configured: optional_load_policy
+                == higgs_models::progress::OptionalLoadPolicy::Allow
+                && prefill_drafter_path.is_some(),
             prefill_keep_ratio,
             prefill_chunk,
             prefill_avgpool,
@@ -3338,8 +3442,6 @@ impl SimpleEngine {
             tracing::info!(think_close_token, "Thinking mode enabled");
         }
 
-        set_wired_limit_to_max(raise_wired_limit);
-
         // Compute both request variants. A no-thinking override on a
         // thinking-capable model may remove `<think>\n` from the generation
         // prompt, so one load-time default is not a valid cache boundary.
@@ -3420,148 +3522,249 @@ impl SimpleEngine {
         // DFlash speculative decoding: load the drafter from the explicit path
         // or HIGGS_DFLASH_PATH. generate_inner then dispatches to the
         // draft-verify loop for unconstrained text generation.
-        let dflash = dflash_path
-            .map(Path::to_path_buf)
-            .or_else(|| {
-                std::env::var("HIGGS_DFLASH_PATH")
-                    .ok()
-                    .map(std::path::PathBuf::from)
-            })
-            .map(|dp| -> Result<DFlashState, EngineError> {
-                tracing::info!(drafter = %dp.display(), "Loading DFlash drafter");
-                let drafter = model_loader::load_dflash_drafter(&dp, model_dir)?;
-                validate_dspark_target(&model, &drafter.config)?;
-                let tap_layers = drafter.config.target_layer_ids().to_vec();
-                // Decode block size: HIGGS_DFLASH_BLOCK_SIZE overrides the
-                // trained block_size, clamped to [1, trained]. Smaller blocks
-                // amortize the per-round verify + lm_head cost better when the
-                // accept length plateaus below the trained block.
-                let trained_block = drafter.config.block_size;
-                let block_size = if drafter.config.is_dspark() {
-                    // Prism's log-SNR pattern and Markov head are trained for
-                    // the checkpoint's fixed block; match the public runtime.
-                    trained_block
-                } else {
-                    let raw = std::env::var("HIGGS_DFLASH_BLOCK_SIZE").ok();
-                    resolve_dflash_block_size_override(raw.as_deref())
-                        .map_or(trained_block, |v| v.min(trained_block))
-                };
-                let draft_cap = if drafter.config.is_dspark() {
-                    // Prism trains and publishes dSpark with four proposal
-                    // positions; keep the reference schedule for both the full
-                    // Q4 head and target-head sidecars. Any smaller cap is an
-                    // explicit experiment, never an implicit Apple default.
-                    let tuned_default = trained_block;
-                    let raw = std::env::var("HIGGS_DSPARK_DRAFT_CAP").ok();
-                    resolve_dspark_draft_cap_override(raw.as_deref())
-                        .map_or(tuned_default, |v| v.min(trained_block))
-                } else {
-                    trained_block
-                };
-                let dspark_target_head = drafter.config.is_dspark()
-                    && (drafter.config.reuse_target_head()
-                        || std::env::var("HIGGS_DSPARK_TARGET_HEAD").is_ok_and(|v| v != "0"));
-                let target_is_bonsai_lowbit = model.is_target_1bit() || model.is_target_2bit();
-                let verify_mode_raw = std::env::var("HIGGS_DFLASH_VERIFY_MODE").ok();
-                // Bonsai low-bit targets have validated block-verifier defaults:
-                // Q1 through the AC-gated row4 release benchmark and Q2 through
-                // the exact ternary row2/head path. Non-Bonsai dSpark sidecars
-                // still fail closed to CanonicalS1 unless explicitly opted in.
-                let verify_mode_raw = verify_mode_raw.or_else(|| {
-                    if drafter.config.is_dspark() && target_is_bonsai_lowbit {
-                        Some("block".to_owned())
+        let dflash_environment = std::env::var("HIGGS_DFLASH_PATH").ok();
+        let dflash = resolve_optional_dflash_path(
+            dflash_path,
+            dflash_environment.as_deref(),
+            higgs_models::progress::OptionalLoadPolicy::Allow,
+        );
+        let dflash = if let Some(dp) = dflash {
+            if let Some(optional_estimate) =
+                begin_optional_model_load(&dp, higgs_models::progress::OptionalModelKind::DFlash)?
+            {
+                let state = (|| -> Result<DFlashState, EngineError> {
+                    tracing::info!(drafter = %dp.display(), "Loading DFlash drafter");
+                    let drafter = model_loader::load_dflash_drafter(&dp, model_dir)?;
+                    validate_dspark_target(&model, &drafter.config)?;
+                    let tap_layers = drafter.config.target_layer_ids().to_vec();
+                    // Decode block size: HIGGS_DFLASH_BLOCK_SIZE overrides the
+                    // trained block_size, clamped to [1, trained]. Smaller blocks
+                    // amortize the per-round verify + lm_head cost better when the
+                    // accept length plateaus below the trained block.
+                    let trained_block = drafter.config.block_size;
+                    let block_size = if drafter.config.is_dspark() {
+                        // Prism's log-SNR pattern and Markov head are trained for
+                        // the checkpoint's fixed block; match the public runtime.
+                        trained_block
                     } else {
-                        None
-                    }
-                });
-                let requested_verify_mode = DFlashVerifyMode::for_drafter(
-                    drafter.config.is_dspark(),
-                    verify_mode_raw.as_deref(),
-                );
-                let verify_rows = draft_cap.checked_add(1).ok_or_else(|| {
-                    EngineError::Generation("dSpark verify row count overflow".to_owned())
-                })?;
-                let verify_mode = if drafter.config.is_dspark()
-                    && requested_verify_mode == DFlashVerifyMode::BatchedTape
-                {
-                    let AnyModel::Qwen3Next(target) = &model else {
-                        return Err(EngineError::Generation(
-                            "dSpark target is not Qwen3Next".to_owned(),
-                        ));
+                        let raw = std::env::var("HIGGS_DFLASH_BLOCK_SIZE").ok();
+                        resolve_dflash_block_size_override(raw.as_deref())
+                            .map_or(trained_block, |v| v.min(trained_block))
                     };
-                    let domain = target.validate_dflash_block_domain(verify_rows);
-                    if let Err(reason) = domain {
-                        tracing::warn!(
-                            %reason,
-                            verify_rows,
-                            "dSpark block verifier is outside its exact model domain; using canonical S=1"
-                        );
-                        DFlashVerifyMode::CanonicalS1
+                    let draft_cap = if drafter.config.is_dspark() {
+                        // Prism trains and publishes dSpark with four proposal
+                        // positions; keep the reference schedule for both the full
+                        // Q4 head and target-head sidecars. Any smaller cap is an
+                        // explicit experiment, never an implicit Apple default.
+                        let tuned_default = trained_block;
+                        let raw = std::env::var("HIGGS_DSPARK_DRAFT_CAP").ok();
+                        resolve_dspark_draft_cap_override(raw.as_deref())
+                            .map_or(tuned_default, |v| v.min(trained_block))
+                    } else {
+                        trained_block
+                    };
+                    let dspark_target_head = drafter.config.is_dspark()
+                        && (drafter.config.reuse_target_head()
+                            || std::env::var("HIGGS_DSPARK_TARGET_HEAD").is_ok_and(|v| v != "0"));
+                    let target_is_bonsai_lowbit = model.is_target_1bit() || model.is_target_2bit();
+                    let verify_mode_raw = std::env::var("HIGGS_DFLASH_VERIFY_MODE").ok();
+                    // Bonsai low-bit targets have validated block-verifier defaults:
+                    // Q1 through the AC-gated row4 release benchmark and Q2 through
+                    // the exact ternary row2/head path. Non-Bonsai dSpark sidecars
+                    // still fail closed to CanonicalS1 unless explicitly opted in.
+                    let verify_mode_raw = verify_mode_raw.or_else(|| {
+                        if drafter.config.is_dspark() && target_is_bonsai_lowbit {
+                            Some("block".to_owned())
+                        } else {
+                            None
+                        }
+                    });
+                    let requested_verify_mode = DFlashVerifyMode::for_drafter(
+                        drafter.config.is_dspark(),
+                        verify_mode_raw.as_deref(),
+                    );
+                    let verify_rows = draft_cap.checked_add(1).ok_or_else(|| {
+                        EngineError::Generation("dSpark verify row count overflow".to_owned())
+                    })?;
+                    let verify_mode = if drafter.config.is_dspark()
+                        && requested_verify_mode == DFlashVerifyMode::BatchedTape
+                    {
+                        let AnyModel::Qwen3Next(target) = &model else {
+                            return Err(EngineError::Generation(
+                                "dSpark target is not Qwen3Next".to_owned(),
+                            ));
+                        };
+                        let domain = target.validate_dflash_block_domain(verify_rows);
+                        if let Err(reason) = domain {
+                            tracing::warn!(
+                                %reason,
+                                verify_rows,
+                                "dSpark block verifier is outside its exact model domain; using canonical S=1"
+                            );
+                            DFlashVerifyMode::CanonicalS1
+                        } else {
+                            requested_verify_mode
+                        }
                     } else {
                         requested_verify_mode
+                    };
+                    let is_dspark = drafter.config.is_dspark();
+                    let mask_token_id = drafter.config.mask_token_id();
+                    tracing::info!(
+                        tap_layers = ?tap_layers,
+                        block_size,
+                        draft_cap,
+                        dspark_target_head,
+                        ?verify_mode,
+                        mask_token_id,
+                        "DFlash drafter loaded — speculative decoding enabled"
+                    );
+                    Ok(DFlashState {
+                        drafter: Mutex::new(drafter),
+                        tap_layers,
+                        block_size,
+                        draft_cap,
+                        is_dspark,
+                        dspark_target_head,
+                        verify_mode,
+                        mask_token_id,
+                    })
+                })();
+                match state {
+                    Ok(state) => {
+                        let disposition = retain_optional_model_load(
+                            optional_estimate,
+                            higgs_models::progress::OptionalModelKind::DFlash,
+                        )?;
+                        if disposition == higgs_models::progress::OptionalModelDisposition::Retained
+                        {
+                            Some(state)
+                        } else {
+                            drop(state);
+                            maybe_clear_mlx_cache(true, "discarded optional DFlash load");
+                            None
+                        }
                     }
-                } else {
-                    requested_verify_mode
-                };
-                let is_dspark = drafter.config.is_dspark();
-                let mask_token_id = drafter.config.mask_token_id();
-                tracing::info!(
-                    tap_layers = ?tap_layers,
-                    block_size,
-                    draft_cap,
-                    dspark_target_head,
-                    ?verify_mode,
-                    mask_token_id,
-                    "DFlash drafter loaded — speculative decoding enabled"
-                );
-                Ok(DFlashState {
-                    drafter: Mutex::new(drafter),
-                    tap_layers,
-                    block_size,
-                    draft_cap,
-                    is_dspark,
-                    dspark_target_head,
-                    verify_mode,
-                    mask_token_id,
-                })
-            })
-            .transpose()?;
+                    Err(error) if optional_model_error_is_suppressed(&error) => {
+                        discard_optional_model_load(
+                            optional_estimate,
+                            higgs_models::progress::OptionalModelKind::DFlash,
+                        )?;
+                        maybe_clear_mlx_cache(true, "discarded optional DFlash load");
+                        None
+                    }
+                    Err(error) => {
+                        discard_optional_model_load(
+                            optional_estimate,
+                            higgs_models::progress::OptionalModelKind::DFlash,
+                        )?;
+                        maybe_clear_mlx_cache(true, "discarded optional DFlash load");
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if dflash.is_some() {
+            higgs_models::progress::record_dflash_loaded();
+        }
 
-        let mut prefill_mode = prefill_compression;
+        let current_optional_policy = higgs_models::progress::optional_load_policy();
+        let mut prefill_mode = match current_optional_policy {
+            higgs_models::progress::OptionalLoadPolicy::Allow => prefill_compression,
+            higgs_models::progress::OptionalLoadPolicy::Suppress => PrefillCompressionMode::Off,
+        };
+        let prefill_drafter_path = match current_optional_policy {
+            higgs_models::progress::OptionalLoadPolicy::Allow => prefill_drafter_path,
+            higgs_models::progress::OptionalLoadPolicy::Suppress => None,
+        };
         let prefill_drafter = if prefill_mode == PrefillCompressionMode::Off {
             None
         } else if let Some(path) = prefill_drafter_path {
-            match model_loader::load_model(path) {
-                Ok(drafter) => {
-                    if let AnyModel::Transformer(ref transformer) = drafter {
-                        tracing::info!(
-                            drafter = %path.display(),
-                            scorer_model_type = transformer.model_type(),
-                            mode = ?prefill_mode,
-                            score_mode = ?prefill_score_mode,
-                            keep_ratio = prefill_keep_ratio,
-                            "PFlash prefill drafter loaded — compressive-prefill scorer armed"
-                        );
-                        Some(std::sync::Arc::new(Mutex::new(drafter)))
-                    } else {
+            let optional_estimate = begin_optional_model_load(
+                path,
+                higgs_models::progress::OptionalModelKind::PrefillDrafter,
+            )?;
+            if let Some(optional_estimate) = optional_estimate {
+                match model_loader::load_model(path) {
+                    Ok(drafter) => {
+                        if let AnyModel::Transformer(ref transformer) = drafter {
+                            let scorer_model_type = transformer.model_type().to_owned();
+                            let disposition = retain_optional_model_load(
+                                optional_estimate,
+                                higgs_models::progress::OptionalModelKind::PrefillDrafter,
+                            )?;
+                            if disposition
+                                == higgs_models::progress::OptionalModelDisposition::Retained
+                            {
+                                tracing::info!(
+                                    drafter = %path.display(),
+                                    scorer_model_type,
+                                    mode = ?prefill_mode,
+                                    score_mode = ?prefill_score_mode,
+                                    keep_ratio = prefill_keep_ratio,
+                                    "PFlash prefill drafter loaded — compressive-prefill scorer armed"
+                                );
+                                Some(std::sync::Arc::new(Mutex::new(drafter)))
+                            } else {
+                                drop(drafter);
+                                maybe_clear_mlx_cache(
+                                    true,
+                                    "discarded optional prefill drafter load",
+                                );
+                                prefill_mode = PrefillCompressionMode::Off;
+                                None
+                            }
+                        } else {
+                            let loaded_model = any_model_variant_name(&drafter);
+                            drop(drafter);
+                            discard_optional_model_load(
+                                optional_estimate,
+                                higgs_models::progress::OptionalModelKind::PrefillDrafter,
+                            )?;
+                            maybe_clear_mlx_cache(true, "discarded optional prefill drafter load");
+                            tracing::warn!(
+                                drafter = %path.display(),
+                                loaded_model,
+                                "PFlash prefill_drafter must be a dense Transformer scorer; disabling prefill compression"
+                            );
+                            prefill_mode = PrefillCompressionMode::Off;
+                            None
+                        }
+                    }
+                    Err(error) if optional_model_error_is_suppressed(&error) => {
+                        discard_optional_model_load(
+                            optional_estimate,
+                            higgs_models::progress::OptionalModelKind::PrefillDrafter,
+                        )?;
+                        maybe_clear_mlx_cache(true, "discarded optional prefill drafter load");
+                        prefill_mode = PrefillCompressionMode::Off;
+                        None
+                    }
+                    Err(error) if optional_model_error_is_capacity(&error) => {
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        discard_optional_model_load(
+                            optional_estimate,
+                            higgs_models::progress::OptionalModelKind::PrefillDrafter,
+                        )?;
+                        maybe_clear_mlx_cache(true, "discarded optional prefill drafter load");
                         tracing::warn!(
                             drafter = %path.display(),
-                            loaded_model = any_model_variant_name(&drafter),
-                            "PFlash prefill_drafter must be a dense Transformer scorer; disabling prefill compression"
+                            error = %error,
+                            "Failed to load prefill drafter; falling back to uncompressed prefill"
                         );
                         prefill_mode = PrefillCompressionMode::Off;
                         None
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        drafter = %path.display(),
-                        error = %error,
-                        "Failed to load prefill drafter; falling back to uncompressed prefill"
-                    );
-                    prefill_mode = PrefillCompressionMode::Off;
-                    None
-                }
+            } else {
+                prefill_mode = PrefillCompressionMode::Off;
+                None
             }
         } else {
             if prefill_mode != PrefillCompressionMode::Off {
@@ -3573,6 +3776,14 @@ impl SimpleEngine {
             prefill_mode = PrefillCompressionMode::Off;
             None
         };
+        if prefill_drafter.is_some() {
+            higgs_models::progress::record_prefill_drafter_loaded();
+        }
+
+        // The process-global wired-limit mutation cannot be rolled back. Keep
+        // it after strict target and optional-sidecar admission/loading so any
+        // definite rejection leaves the previous process setting untouched.
+        set_wired_limit_to_max(raise_wired_limit);
 
         let mut prefix_cache = disk_cache_config
             .map_or_else(
@@ -13623,23 +13834,25 @@ mod tests {
         SessionBootstrapReason, SessionContinuationPolicy, SessionDsparkDecodeState,
         SessionGeneration, SessionOutcome, SessionPrefillStrategy, SessionPromptTraceOutcome,
         SessionPromptTracePayloadStats, SessionRunMode, SimpleEngine, SpeculationRoute, Tokenizer,
-        adaptive_draft_depth_for_cap, cache_policy_allows_prefix_cache, canonical_prompt_extension,
-        check_stop_sequences, common_prefix_token_len, contains_real_user_query,
-        continuation_prior_len, continuation_reject_reason, continued_dspark_cold_retry_allowed,
-        derive_model_name, detect_thinking_support, dflash_accepts_pflash_plan,
-        dflash_canonical_target_is_terminal, dflash_new_stop_prefix_len,
-        dflash_resolve_target_then_draft, dflash_sparse_taps_available_for_pflash_plan,
-        dflash_tail_draft_cap, drive_canonical_dspark_round, estimate_paged_kv_blocks,
-        extract_eos_tokens, find_stop_in_tail, hybrid_checkpoint_boundary, lock_or_recover,
-        message_boundary_delta, mtp_allowed, paired_dflash_exact_domain, parse_enabled_flag,
-        pflash_actual_keep_ratio, pflash_auto_plan_worth_executing,
+        adaptive_draft_depth_for_cap, begin_optional_model_load, cache_policy_allows_prefix_cache,
+        canonical_prompt_extension, check_stop_sequences, common_prefix_token_len,
+        contains_real_user_query, continuation_prior_len, continuation_reject_reason,
+        continued_dspark_cold_retry_allowed, derive_model_name, detect_thinking_support,
+        dflash_accepts_pflash_plan, dflash_canonical_target_is_terminal,
+        dflash_new_stop_prefix_len, dflash_resolve_target_then_draft,
+        dflash_sparse_taps_available_for_pflash_plan, dflash_tail_draft_cap,
+        drive_canonical_dspark_round, estimate_paged_kv_blocks, extract_eos_tokens,
+        find_stop_in_tail, hybrid_checkpoint_boundary, lock_or_recover, message_boundary_delta,
+        mtp_allowed, optional_model_error_is_capacity, paired_dflash_exact_domain,
+        parse_enabled_flag, pflash_actual_keep_ratio, pflash_auto_plan_worth_executing,
         pflash_cache_source_and_request_tail, pflash_cache_source_and_request_tail_with_boundary,
         pflash_full_score_budget_exceeded, prefill_sample_count, reset_prefill_sample_count,
         resolve_dflash_block_size_override, resolve_dflash_min_block_override,
-        resolve_dspark_draft_cap_override, resolve_pflash_full_score_max_tokens,
-        resolve_pflash_min_free_memory_mb, resolve_speculation_route, retained_kv_storage_at,
-        select_continuation_candidate, session_prefill_strategy, session_prompt_trace_metrics,
-        stateless_mtp_family_eligible, with_chat_terminator,
+        resolve_dspark_draft_cap_override, resolve_optional_dflash_path,
+        resolve_pflash_full_score_max_tokens, resolve_pflash_min_free_memory_mb,
+        resolve_speculation_route, retained_kv_storage_at, select_continuation_candidate,
+        session_prefill_strategy, session_prompt_trace_metrics, stateless_mtp_family_eligible,
+        with_chat_terminator,
     };
 
     #[test]
@@ -13654,6 +13867,71 @@ mod tests {
         assert_eq!(resolve_dspark_draft_cap_override(Some(" 4 ")), None);
         assert_eq!(resolve_dflash_min_block_override(Some("2")), Some(2));
         assert_eq!(resolve_dflash_min_block_override(Some(" 2 ")), None);
+    }
+
+    #[test]
+    fn constrained_load_policy_suppresses_explicit_and_environment_dflash() {
+        use higgs_models::progress::OptionalLoadPolicy;
+
+        let explicit = Path::new("explicit-drafter");
+        assert_eq!(
+            resolve_optional_dflash_path(
+                Some(explicit),
+                Some("environment-drafter"),
+                OptionalLoadPolicy::Allow,
+            ),
+            Some(explicit.to_path_buf())
+        );
+        assert_eq!(
+            resolve_optional_dflash_path(
+                None,
+                Some("environment-drafter"),
+                OptionalLoadPolicy::Allow,
+            ),
+            Some(Path::new("environment-drafter").to_path_buf())
+        );
+        assert_eq!(
+            resolve_optional_dflash_path(
+                Some(explicit),
+                Some("environment-drafter"),
+                OptionalLoadPolicy::Suppress,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn optional_model_gate_rechecks_pressure_before_construction() {
+        use higgs_models::progress::{
+            LoadBoundary, OptionalLoadPolicy, OptionalModelKind, install_load_boundary_sink,
+            install_optional_load_policy, suppress_optional_loads,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let header = r#"{"x":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}"#;
+        let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.push(0);
+        std::fs::write(dir.path().join("model.safetensors"), bytes).unwrap();
+        let _policy_guard = install_optional_load_policy(OptionalLoadPolicy::Allow);
+        let _boundary_guard = install_load_boundary_sink(Box::new(|boundary| {
+            if matches!(boundary, LoadBoundary::BeforeOptionalModel { .. }) {
+                suppress_optional_loads();
+            }
+            Ok(())
+        }));
+        let estimate = begin_optional_model_load(dir.path(), OptionalModelKind::DFlash).unwrap();
+        assert!(estimate.is_none());
+    }
+
+    #[test]
+    fn optional_prefill_capacity_error_is_not_fallback_eligible() {
+        assert!(optional_model_error_is_capacity(&EngineError::Model(
+            higgs_models::error::ModelError::LoadCapacity("critical".to_owned())
+        )));
+        assert!(!optional_model_error_is_capacity(&EngineError::Generation(
+            "ordinary optional incompatibility".to_owned()
+        )));
     }
     use crate::chat_template::{ChatMessage, ChatPromptMode, ChatTemplateRenderer};
     use crate::decode::token_ledger::TokenLedger;

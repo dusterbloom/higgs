@@ -247,6 +247,123 @@ pub struct ModelFootprint {
     pub loaded_mlx_bytes: u64,
 }
 
+/// Allocation strategy selected by the real model adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoaderWorkspaceKind {
+    StandardStream,
+    QwenSpecial,
+    NativeEscha,
+    AffineEscha,
+    FullArtifact,
+    Unknown,
+}
+
+/// Strict pre-allocation upper bound for one model load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelLoadEstimate {
+    pub artifact_bytes: u64,
+    pub largest_selected_shard_bytes: u64,
+    pub workspace_kind: LoaderWorkspaceKind,
+    pub workspace_upper_bound_bytes: u64,
+    pub required_process_bytes: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ModelLoadEstimateError {
+    #[error("model artifact is unreadable, corrupt, empty, or contains unsafe links")]
+    InvalidArtifact,
+    #[error("model load estimate overflowed")]
+    ArithmeticOverflow,
+    #[error("failed to classify model loader: {0}")]
+    Loader(String),
+}
+
+/// Inspect only file metadata and safetensors headers; no MLX object exists yet.
+pub fn model_load_estimate(
+    model_dir: &Path,
+    model_type: &str,
+) -> Result<ModelLoadEstimate, ModelLoadEstimateError> {
+    let is_bonsai = if model_type == "qwen3" {
+        let bonsai_group_size = u64::try_from(higgs_models::bonsai_q1::GROUP_SIZE)
+            .map_err(|error| ModelLoadEstimateError::Loader(error.to_string()))?;
+        let config: serde_json::Value = serde_json::from_reader(
+            std::fs::File::open(model_dir.join("config.json"))
+                .map_err(|error| ModelLoadEstimateError::Loader(error.to_string()))?,
+        )
+        .map_err(|error| ModelLoadEstimateError::Loader(error.to_string()))?;
+        config.get("model_type").and_then(serde_json::Value::as_str) == Some("qwen3")
+            && config
+                .get("quantization")
+                .and_then(|value| value.get("bits"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(1)
+            && config
+                .get("quantization")
+                .and_then(|value| value.get("group_size"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(bonsai_group_size)
+    } else {
+        false
+    };
+    let files = strict_selected_model_artifact_files(model_dir, is_bonsai)
+        .ok_or(ModelLoadEstimateError::InvalidArtifact)?;
+    let artifact_bytes = files.iter().try_fold(0_u64, |sum, (_, bytes)| {
+        sum.checked_add(*bytes)
+            .ok_or(ModelLoadEstimateError::ArithmeticOverflow)
+    })?;
+    let largest_selected_shard_bytes = files
+        .iter()
+        .map(|(_, bytes)| *bytes)
+        .max()
+        .ok_or(ModelLoadEstimateError::InvalidArtifact)?;
+    let is_escha = matches!(model_type, "qwen3_5" | "qwen3_5_moe")
+        && higgs_models::eschamoe::is_eschamoe_checkpoint(model_dir)
+            .map_err(|error| ModelLoadEstimateError::Loader(error.to_string()))?;
+    let workspace_kind = if is_bonsai {
+        LoaderWorkspaceKind::FullArtifact
+    } else if is_escha && higgs_models::eschamoe::native_mode() {
+        LoaderWorkspaceKind::NativeEscha
+    } else if is_escha {
+        LoaderWorkspaceKind::AffineEscha
+    } else {
+        match model_type {
+            "qwen3_next" | "qwen3_5" | "qwen3_5_moe" => LoaderWorkspaceKind::QwenSpecial,
+            "qwen3_5_vl" | "qwen3_vl" | "qwen2_5_vl" | "llava-qwen2" | "gemma3" | "gemma3_text"
+            | "gemma4" | "gemma4_text" | "gemma4_unified" => LoaderWorkspaceKind::FullArtifact,
+            "qwen2" | "qwen3" | "llama" | "mistral" | "nanbeige" | "qwen3_moe" | "gemma2"
+            | "phi3" | "starcoder2" | "deepseek_v2" => LoaderWorkspaceKind::StandardStream,
+            _ => LoaderWorkspaceKind::Unknown,
+        }
+    };
+    finish_load_estimate(artifact_bytes, largest_selected_shard_bytes, workspace_kind)
+}
+
+fn finish_load_estimate(
+    artifact_bytes: u64,
+    largest_selected_shard_bytes: u64,
+    workspace_kind: LoaderWorkspaceKind,
+) -> Result<ModelLoadEstimate, ModelLoadEstimateError> {
+    let workspace_upper_bound_bytes = match workspace_kind {
+        LoaderWorkspaceKind::StandardStream => largest_selected_shard_bytes,
+        LoaderWorkspaceKind::QwenSpecial
+        | LoaderWorkspaceKind::NativeEscha
+        | LoaderWorkspaceKind::FullArtifact => artifact_bytes,
+        LoaderWorkspaceKind::AffineEscha | LoaderWorkspaceKind::Unknown => artifact_bytes
+            .checked_mul(2)
+            .ok_or(ModelLoadEstimateError::ArithmeticOverflow)?,
+    };
+    let required_process_bytes = artifact_bytes
+        .checked_add(workspace_upper_bound_bytes)
+        .ok_or(ModelLoadEstimateError::ArithmeticOverflow)?;
+    Ok(ModelLoadEstimate {
+        artifact_bytes,
+        largest_selected_shard_bytes,
+        workspace_kind,
+        workspace_upper_bound_bytes,
+        required_process_bytes,
+    })
+}
+
 impl ModelFootprint {
     /// Describe one model load measured without concurrent MLX allocations.
     pub fn from_load_measurements(
@@ -846,8 +963,144 @@ fn checked_artifact_total(total: u64, bytes: u64) -> Option<u64> {
     total.checked_add(bytes)
 }
 
-fn strict_model_artifact_bytes(model_dir: &Path) -> Option<u64> {
-    let mut total = 0_u64;
+const MAX_SAFETENSORS_HEADER_BYTES: u64 = 100_000_000;
+
+fn strict_selected_model_artifact_files(
+    model_dir: &Path,
+    force_consolidated_model: bool,
+) -> Option<Vec<(std::path::PathBuf, u64)>> {
+    use std::collections::BTreeSet;
+    use std::path::Component;
+
+    if !directory_tree_has_no_symlinked_directory(model_dir) {
+        return None;
+    }
+    let root_metadata = std::fs::symlink_metadata(model_dir).ok()?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return None;
+    }
+
+    let index_path = model_dir.join("model.safetensors.index.json");
+    let single_path = model_dir.join("model.safetensors");
+    let mut relative_paths = if force_consolidated_model {
+        if !single_path.exists() {
+            return None;
+        }
+        BTreeSet::from([std::path::PathBuf::from("model.safetensors")])
+    } else if index_path.exists() {
+        let index_metadata = std::fs::symlink_metadata(&index_path).ok()?;
+        if index_metadata.file_type().is_symlink() {
+            if !std::fs::metadata(&index_path).ok()?.is_file() {
+                return None;
+            }
+        } else if !index_metadata.is_file() {
+            return None;
+        }
+        let index: higgs_models::WeightMapIndex =
+            serde_json::from_reader(std::fs::File::open(&index_path).ok()?).ok()?;
+        let weight_map = index.weight_map;
+        if weight_map.is_empty() {
+            return None;
+        }
+        let mut selected = BTreeSet::new();
+        for value in weight_map.values() {
+            let relative = Path::new(value);
+            if relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                return None;
+            }
+            selected.insert(relative.to_path_buf());
+        }
+        let indexed_exist = selected
+            .iter()
+            .all(|relative| model_dir.join(relative).exists());
+        if !indexed_exist && single_path.exists() {
+            BTreeSet::from([std::path::PathBuf::from("model.safetensors")])
+        } else {
+            selected
+        }
+    } else if single_path.exists() {
+        BTreeSet::from([std::path::PathBuf::from("model.safetensors")])
+    } else {
+        return None;
+    };
+
+    if !force_consolidated_model {
+        let auxiliary = ["mtp.safetensors", "model-mtp.safetensors"]
+            .into_iter()
+            .filter(|name| model_dir.join(name).exists())
+            .collect::<Vec<_>>();
+        if auxiliary.len() > 1 {
+            return None;
+        }
+        if let Some(name) = auxiliary.first() {
+            relative_paths.insert(std::path::PathBuf::from(name));
+        }
+    }
+
+    let mut files = Vec::with_capacity(relative_paths.len());
+    for relative in relative_paths {
+        let mut current = model_dir.to_path_buf();
+        let components = relative.components().collect::<Vec<_>>();
+        for (index, component) in components.iter().enumerate() {
+            let Component::Normal(part) = component else {
+                return None;
+            };
+            current.push(part);
+            let link_metadata = std::fs::symlink_metadata(&current).ok()?;
+            if index + 1 == components.len() {
+                let metadata = if link_metadata.file_type().is_symlink() {
+                    std::fs::metadata(&current).ok()?
+                } else {
+                    link_metadata
+                };
+                if !metadata.is_file() || metadata.len() == 0 {
+                    return None;
+                }
+                validate_safetensors_header(&current, metadata.len())?;
+                files.push((current.clone(), metadata.len()));
+            } else if link_metadata.file_type().is_symlink() || !link_metadata.is_dir() {
+                return None;
+            }
+        }
+    }
+    (!files.is_empty()).then_some(files)
+}
+
+fn directory_tree_has_no_symlinked_directory(model_dir: &Path) -> bool {
+    let mut stack = vec![model_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return false;
+            };
+            let Ok(file_type) = entry.file_type() else {
+                return false;
+            };
+            if file_type.is_symlink() {
+                let Ok(target) = std::fs::metadata(entry.path()) else {
+                    return false;
+                };
+                if !target.is_file() {
+                    return false;
+                }
+            } else if file_type.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    true
+}
+
+fn strict_model_artifact_files_with_validation(
+    model_dir: &Path,
+) -> Option<Vec<(std::path::PathBuf, u64)>> {
+    let mut files = Vec::new();
     let mut stack = vec![model_dir.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
@@ -867,7 +1120,7 @@ fn strict_model_artifact_bytes(model_dir: &Path) -> Option<u64> {
                     if !metadata.is_file() {
                         return None;
                     }
-                    total = checked_artifact_total(total, metadata.len())?;
+                    files.push((path, metadata.len()));
                 }
                 continue;
             }
@@ -880,12 +1133,98 @@ fn strict_model_artifact_bytes(model_dir: &Path) -> Option<u64> {
                 if !metadata.is_file() {
                     return None;
                 }
-                total = checked_artifact_total(total, metadata.len())?;
+                files.push((path, metadata.len()));
             }
         }
     }
 
-    (total > 0).then_some(total)
+    (!files.is_empty()).then_some(files)
+}
+
+fn validate_safetensors_header(path: &Path, file_bytes: u64) -> Option<()> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut length = [0_u8; 8];
+    file.read_exact(&mut length).ok()?;
+    let header_bytes = u64::from_le_bytes(length);
+    if !safetensors_header_length_is_safe(header_bytes, file_bytes) {
+        return None;
+    }
+    let header_len = usize::try_from(header_bytes).ok()?;
+    let mut header = vec![0_u8; header_len];
+    file.read_exact(&mut header).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&header).ok()?;
+    let entries = json.as_object()?;
+    let payload_bytes = file_bytes.checked_sub(8 + header_bytes)?;
+    let mut ranges = Vec::new();
+    for (name, value) in entries {
+        if name == "__metadata__" {
+            let metadata = value.as_object()?;
+            if !metadata.values().all(serde_json::Value::is_string) {
+                return None;
+            }
+            continue;
+        }
+        let dtype_bits = safetensors_dtype_bits(value.get("dtype")?.as_str()?)?;
+        let shape = value.get("shape")?.as_array()?;
+        let elements = shape.iter().try_fold(1_u64, |total, dimension| {
+            total.checked_mul(dimension.as_u64()?)
+        })?;
+        let offsets = value.get("data_offsets")?.as_array()?;
+        if offsets.len() != 2 {
+            return None;
+        }
+        let start = offsets.first()?.as_u64()?;
+        let end = offsets.get(1)?.as_u64()?;
+        let bits = elements.checked_mul(dtype_bits)?;
+        if bits % 8 != 0 || bits / 8 != end.checked_sub(start)? {
+            return None;
+        }
+        if end > payload_bytes {
+            return None;
+        }
+        ranges.push((start, end));
+    }
+    if ranges.is_empty() {
+        return None;
+    }
+    ranges.sort_unstable();
+    let mut expected_start = 0_u64;
+    for (start, end) in ranges {
+        if start != expected_start {
+            return None;
+        }
+        expected_start = end;
+    }
+    (expected_start == payload_bytes).then_some(())
+}
+
+fn safetensors_dtype_bits(dtype: &str) -> Option<u64> {
+    match dtype {
+        "F4" => Some(4),
+        "F6_E2M3" | "F6_E3M2" => Some(6),
+        "BOOL" | "U8" | "I8" | "F8_E5M2" | "F8_E4M3" | "F8_E8M0" | "F8_E4M3FNUZ"
+        | "F8_E5M2FNUZ" => Some(8),
+        "I16" | "U16" | "F16" | "BF16" => Some(16),
+        "I32" | "U32" | "F32" => Some(32),
+        "C64" | "F64" | "I64" | "U64" => Some(64),
+        _ => None,
+    }
+}
+
+fn safetensors_header_length_is_safe(header_bytes: u64, file_bytes: u64) -> bool {
+    header_bytes > 0
+        && header_bytes <= MAX_SAFETENSORS_HEADER_BYTES
+        && header_bytes <= file_bytes.saturating_sub(8)
+}
+
+fn strict_model_artifact_bytes(model_dir: &Path) -> Option<u64> {
+    strict_model_artifact_files_with_validation(model_dir)?
+        .into_iter()
+        .try_fold(0_u64, |total, (_, bytes)| {
+            checked_artifact_total(total, bytes)
+        })
 }
 
 fn model_weight_bytes(model_dir: &Path) -> Option<u64> {
@@ -961,18 +1300,255 @@ fn model_weight_bytes(model_dir: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EngineCostDescription, MemoryPhase, MlxMemoryProbe, MlxMemoryProbeError, MlxMemorySnapshot,
-        MlxRuntimeTuning, ModelFootprint, ModelMetadata, ModelSizeClass, RequestMemorySampler,
-        RequestedMlxProfile, ResolvedMlxProfile, TransientPrefillEstimate, checked_artifact_total,
-        default_mtp_draft_n_max, heuristic_paged_kv_target_bytes_with_max, measure_mlx_memory,
-        model_weight_bytes, parse_enabled_flag, parse_mtp_draft_n_max,
+        EngineCostDescription, LoaderWorkspaceKind, MemoryPhase, MlxMemoryProbe,
+        MlxMemoryProbeError, MlxMemorySnapshot, MlxRuntimeTuning, ModelFootprint, ModelMetadata,
+        ModelSizeClass, RequestMemorySampler, RequestedMlxProfile, ResolvedMlxProfile,
+        TransientPrefillEstimate, checked_artifact_total, default_mtp_draft_n_max,
+        finish_load_estimate, heuristic_paged_kv_target_bytes_with_max, measure_mlx_memory,
+        model_load_estimate, model_weight_bytes, parse_enabled_flag, parse_mtp_draft_n_max,
         parse_positive_chunked_prefill_value, resolve_effective_mlx_profile,
-        resolve_profile_from_metadata, resolve_runtime_tuning,
+        resolve_profile_from_metadata, resolve_runtime_tuning, safetensors_header_length_is_safe,
     };
     use std::collections::VecDeque;
     use std::fs;
+    use std::path::Path;
     use std::sync::Mutex;
     use tempfile::TempDir;
+
+    fn write_tiny_safetensor(path: &Path, payload_bytes: usize) {
+        let header = format!(
+            r#"{{"x":{{"dtype":"U8","shape":[{payload_bytes}],"data_offsets":[0,{payload_bytes}]}}}}"#
+        );
+        let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend(std::iter::repeat_n(0_u8, payload_bytes));
+        fs::write(path, bytes).unwrap();
+    }
+
+    /// A standard stream must reserve its resident artifact plus only the
+    /// largest selected shard; using the smallest shard underbounds the peak.
+    #[test]
+    fn model_load_estimate_standard_uses_largest_shard() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"qwen3","quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+        write_tiny_safetensor(&dir.path().join("a.safetensors"), 3);
+        write_tiny_safetensor(&dir.path().join("b.safetensors"), 19);
+        fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{"a":"a.safetensors","b":"b.safetensors"}}"#,
+        )
+        .unwrap();
+        let a = fs::metadata(dir.path().join("a.safetensors"))
+            .unwrap()
+            .len();
+        let b = fs::metadata(dir.path().join("b.safetensors"))
+            .unwrap()
+            .len();
+        let estimate = model_load_estimate(dir.path(), "qwen3").unwrap();
+        assert_eq!(estimate.artifact_bytes, a + b);
+        assert_eq!(estimate.largest_selected_shard_bytes, b);
+        assert_eq!(estimate.workspace_kind, LoaderWorkspaceKind::StandardStream);
+        assert_eq!(estimate.workspace_upper_bound_bytes, b);
+        assert_eq!(estimate.required_process_bytes, a + b + b);
+    }
+
+    /// Treating all-weight vision rereads as streaming would allow the full
+    /// artifact map to coexist without being charged.
+    #[test]
+    fn model_load_estimate_vlm_charges_full_artifact_workspace() {
+        let dir = TempDir::new().unwrap();
+        write_tiny_safetensor(&dir.path().join("model.safetensors"), 17);
+        let artifact = fs::metadata(dir.path().join("model.safetensors"))
+            .unwrap()
+            .len();
+        let estimate = model_load_estimate(dir.path(), "qwen3_5_vl").unwrap();
+        assert_eq!(estimate.workspace_kind, LoaderWorkspaceKind::FullArtifact);
+        assert_eq!(estimate.workspace_upper_bound_bytes, artifact);
+        assert_eq!(estimate.required_process_bytes, artifact * 2);
+    }
+
+    #[test]
+    fn model_load_estimate_gemma_text_charges_full_artifact_workspace() {
+        let dir = TempDir::new().unwrap();
+        write_tiny_safetensor(&dir.path().join("model.safetensors"), 17);
+        for model_type in ["gemma3_text", "gemma4_text"] {
+            let estimate = model_load_estimate(dir.path(), model_type).unwrap();
+            assert_eq!(estimate.workspace_kind, LoaderWorkspaceKind::FullArtifact);
+            assert_eq!(
+                estimate.workspace_upper_bound_bytes,
+                estimate.artifact_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn model_load_estimate_bonsai_uses_actual_consolidated_file() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"qwen3","quantization":{"bits":1,"group_size":128}}"#,
+        )
+        .unwrap();
+        write_tiny_safetensor(&dir.path().join("model.safetensors"), 31);
+        write_tiny_safetensor(&dir.path().join("shard.safetensors"), 1);
+        fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{"x":"shard.safetensors"}}"#,
+        )
+        .unwrap();
+        let actual = fs::metadata(dir.path().join("model.safetensors"))
+            .unwrap()
+            .len();
+        let estimate = model_load_estimate(dir.path(), "qwen3").unwrap();
+        assert_eq!(estimate.workspace_kind, LoaderWorkspaceKind::FullArtifact);
+        assert_eq!(estimate.artifact_bytes, actual);
+        assert_eq!(estimate.required_process_bytes, actual * 2);
+    }
+
+    #[test]
+    fn model_load_estimate_q1_wrong_group_uses_generic_index_files() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"qwen3","quantization":{"bits":1,"group_size":64}}"#,
+        )
+        .unwrap();
+        write_tiny_safetensor(&dir.path().join("model.safetensors"), 1);
+        write_tiny_safetensor(&dir.path().join("shard.safetensors"), 31);
+        fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{"x":"shard.safetensors"}}"#,
+        )
+        .unwrap();
+        let shard = fs::metadata(dir.path().join("shard.safetensors"))
+            .unwrap()
+            .len();
+        let estimate = model_load_estimate(dir.path(), "qwen3").unwrap();
+        assert_eq!(estimate.workspace_kind, LoaderWorkspaceKind::StandardStream);
+        assert_eq!(estimate.artifact_bytes, shard);
+    }
+
+    #[test]
+    fn model_load_estimate_rejects_oversized_declared_header_before_allocation() {
+        assert!(!safetensors_header_length_is_safe(100_000_001, 100_000_009));
+        assert!(safetensors_header_length_is_safe(64, 72));
+    }
+
+    #[test]
+    fn model_load_estimate_rejects_unsafe_index_path_even_with_unrelated_weights() {
+        let root = TempDir::new().unwrap();
+        let model = root.path().join("model");
+        fs::create_dir(&model).unwrap();
+        write_tiny_safetensor(&root.path().join("outside.safetensors"), 3);
+        write_tiny_safetensor(&model.join("unrelated.safetensors"), 3);
+        fs::write(
+            model.join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{"x":"../outside.safetensors"}}"#,
+        )
+        .unwrap();
+        assert!(model_load_estimate(&model, "llama").is_err());
+    }
+
+    #[test]
+    fn model_load_estimate_uses_nonstandard_indexed_weight_filename() {
+        let dir = TempDir::new().unwrap();
+        write_tiny_safetensor(&dir.path().join("weights.data"), 7);
+        fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{"x":"weights.data"}}"#,
+        )
+        .unwrap();
+        let estimate = model_load_estimate(dir.path(), "llama").unwrap();
+        assert_eq!(
+            estimate.artifact_bytes,
+            fs::metadata(dir.path().join("weights.data")).unwrap().len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_load_estimate_accepts_hf_style_file_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let model = root.path().join("snapshot");
+        fs::create_dir(&model).unwrap();
+        let blob = root.path().join("blob");
+        write_tiny_safetensor(&blob, 9);
+        symlink(&blob, model.join("model.safetensors")).unwrap();
+        assert!(model_load_estimate(&model, "llama").is_ok());
+    }
+
+    /// Malformed safetensors may have a plausible file size but cannot be
+    /// admitted as an artifact estimate because loader metadata is mandatory.
+    #[test]
+    fn model_load_estimate_rejects_corrupt_artifact() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("model.safetensors"), b"not-a-safetensor").unwrap();
+        assert!(model_load_estimate(dir.path(), "qwen3").is_err());
+    }
+
+    #[test]
+    fn model_load_estimate_rejects_structurally_invalid_safetensors() {
+        let dir = TempDir::new().unwrap();
+        let header = r#"{"x":{"dtype":"U8","shape":[2],"data_offsets":[0,1]}}"#;
+        let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.push(0);
+        fs::write(dir.path().join("model.safetensors"), bytes).unwrap();
+        assert!(model_load_estimate(dir.path(), "qwen3").is_err());
+    }
+
+    #[test]
+    fn model_load_estimate_rejects_index_missing_mandatory_metadata() {
+        let dir = TempDir::new().unwrap();
+        write_tiny_safetensor(&dir.path().join("weights.safetensors"), 1);
+        fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"x":"weights.safetensors"}}"#,
+        )
+        .unwrap();
+        assert!(model_load_estimate(dir.path(), "qwen3").is_err());
+    }
+
+    #[test]
+    fn model_load_estimate_rejects_non_string_safetensors_metadata() {
+        let dir = TempDir::new().unwrap();
+        let header =
+            r#"{"__metadata__":{"format":7},"x":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}"#;
+        let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.push(0);
+        fs::write(dir.path().join("model.safetensors"), bytes).unwrap();
+        assert!(model_load_estimate(dir.path(), "qwen3").is_err());
+    }
+
+    /// Saturating an overflow would turn an unbounded unknown loader into a
+    /// smaller apparently safe estimate.
+    #[test]
+    fn model_load_estimate_overflow_fails_closed() {
+        assert!(finish_load_estimate(u64::MAX, 1, LoaderWorkspaceKind::Unknown).is_err());
+    }
+
+    #[test]
+    fn unknown_loader_uses_fail_closed_double_artifact_workspace() {
+        let estimate = finish_load_estimate(100, 40, LoaderWorkspaceKind::Unknown).unwrap();
+        assert_eq!(estimate.workspace_upper_bound_bytes, 200);
+        assert_eq!(estimate.required_process_bytes, 300);
+    }
+
+    /// Native Escha retains the full packed artifact and one bounded conversion
+    /// group whose conservative upper bound is the artifact itself.
+    #[test]
+    fn native_escha_estimate_is_raw_artifact_plus_one_group() {
+        let estimate = finish_load_estimate(100, 40, LoaderWorkspaceKind::NativeEscha).unwrap();
+        assert_eq!(estimate.workspace_upper_bound_bytes, 100);
+        assert_eq!(estimate.required_process_bytes, 200);
+    }
 
     #[derive(Clone, Copy)]
     struct RawMemoryMeasurement {

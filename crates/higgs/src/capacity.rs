@@ -12,8 +12,8 @@ mod registry;
 pub use profile::{LearnedBandEvidence, LearnedProfile, LearnedProfileKey, LearnedProfileStore};
 pub use registry::{
     ActiveRegistration, CacheAllocationPlan, CacheCapabilities, CapacityRegistry,
-    DrainRegistration, ModelCapacityFacts, ModelContentIdentity, PublishedMemoryMeasurement,
-    RegistrationError, RegistrationTicket, fingerprint_model_artifacts,
+    DrainRegistration, LoadCapacitySnapshot, ModelCapacityFacts, ModelContentIdentity,
+    PublishedMemoryMeasurement, RegistrationError, RegistrationTicket, fingerprint_model_artifacts,
 };
 
 /// Owned process observer; server shutdown must consume and join it.

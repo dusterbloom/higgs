@@ -1874,7 +1874,11 @@ fn load_dflash_weights(drafter: &mut DFlashDrafter, model_path: &Path) -> Result
     let mut missing: std::collections::HashSet<String> = expected_shapes.keys().cloned().collect();
     let mut params = drafter.parameters_mut().flatten();
 
-    for file_path in crate::collect_safetensors_files(model_path)? {
+    for (index, file_path) in crate::collect_safetensors_files(model_path)?
+        .iter()
+        .enumerate()
+    {
+        crate::progress::report_before_shard(index, file_path)?;
         tracing::debug!(file = %file_path.display(), "Loading DFlash weights");
         for (key, value) in Array::load_safetensors(&file_path)? {
             let Some(param) = params.get_mut(&*key) else {
@@ -1893,6 +1897,7 @@ fn load_dflash_weights(drafter: &mut DFlashDrafter, model_path: &Path) -> Result
             **param = value;
             missing.remove(&*key);
         }
+        crate::progress::report_after_shard(index)?;
     }
 
     if !missing.is_empty() {
@@ -1910,7 +1915,16 @@ fn load_dflash_weights(drafter: &mut DFlashDrafter, model_path: &Path) -> Result
         )));
     }
     validate_loaded_shapes(drafter)?;
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::BeforeConversion {
+        index: 0,
+        bytes: 0,
+        kind: crate::progress::ConversionKind::FinalModelEval,
+    })?;
     drafter.eval()?;
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::AfterConversion {
+        index: 0,
+        kind: crate::progress::ConversionKind::FinalModelEval,
+    })?;
     Ok(())
 }
 

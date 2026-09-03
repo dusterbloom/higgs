@@ -465,7 +465,27 @@ pub fn load_siglip_weights(
         all_params.push(b);
     }
     all_params.push(model.position_embedding.weight.as_ref());
+    let weight_bytes = weights.values().try_fold(0_usize, |total, value| {
+        total.checked_add(value.nbytes()).ok_or_else(|| {
+            crate::error::ModelError::LoadCapacity(
+                "SigLIP full-artifact evaluation size overflow".to_owned(),
+            )
+        })
+    })?;
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::BeforeConversion {
+        index: 0,
+        bytes: u64::try_from(weight_bytes).map_err(|_| {
+            crate::error::ModelError::LoadCapacity(
+                "SigLIP full-artifact evaluation size overflow".to_owned(),
+            )
+        })?,
+        kind: crate::progress::ConversionKind::FullArtifact,
+    })?;
     eval(all_params)?;
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::AfterConversion {
+        index: 0,
+        kind: crate::progress::ConversionKind::FullArtifact,
+    })?;
 
     Ok(())
 }

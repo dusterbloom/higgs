@@ -167,6 +167,13 @@ pub struct CacheAllocationPlan {
     pub allocations: Vec<(String, u64, u64)>,
 }
 
+/// Lock-free-by-value facts sampled at a loader allocation boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoadCapacitySnapshot {
+    pub pressure: MemoryPressure,
+    pub headroom_bytes: u64,
+}
+
 /// Proof that an allocator snapshot was published to this registry in the
 /// same serialized GPU/load window in which it was measured.
 pub struct PublishedMemoryMeasurement {
@@ -179,6 +186,11 @@ pub struct PublishedMemoryMeasurement {
 }
 
 impl PublishedMemoryMeasurement {
+    #[cfg(test)]
+    pub(crate) const fn revision(&self) -> u64 {
+        self.revision
+    }
+
     fn authorizes_bounded_recovery(&self, boot_id: &str, state: &RegistryState) -> bool {
         self.boot_id == boot_id
             && self.previous_revision.checked_add(1) == Some(self.revision)
@@ -261,6 +273,34 @@ impl CapacityRegistry {
                 .copied()
                 .unwrap_or_default(),
         ))
+    }
+
+    /// Copy the current process load envelope while holding the registry lock;
+    /// callers release it before any MLX work.
+    pub fn load_snapshot(&self) -> Option<LoadCapacitySnapshot> {
+        let state = self.lock();
+        let authority = [
+            state.memory.memory_limit_bytes,
+            state.memory.metal_recommended_working_set_bytes,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|bytes| *bytes > 0)
+        .min()?;
+        let percentage = match state.pressure {
+            MemoryPressure::Normal => 20,
+            MemoryPressure::Constrained | MemoryPressure::Critical => 30,
+        };
+        let reserve = authority
+            .checked_mul(percentage)?
+            .checked_div(100)?
+            .max(4 * 1024 * 1024 * 1024);
+        Some(LoadCapacitySnapshot {
+            pressure: state.pressure,
+            headroom_bytes: authority
+                .checked_sub(reserve)?
+                .checked_sub(state.memory.active_bytes)?,
+        })
     }
 
     /// Atomically snapshot the effective per-model cache allocations so the
@@ -1523,6 +1563,22 @@ mod tests {
         registry.commit_active(ticket, facts).unwrap().publish();
         let plan = registry.cache_allocation_plan();
         assert!(registry.publish_cache_allocation_revision(plan.revision));
+    }
+
+    /// Omitting current MLX residency from load headroom admits a second model
+    /// against bytes already owned by the first.
+    #[test]
+    fn load_snapshot_subtracts_active_residency_from_safe_envelope() {
+        let registry = CapacityRegistry::new(std::iter::empty());
+        registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 5 * GIB,
+            peak_bytes: 5 * GIB,
+            memory_limit_bytes: Some(24 * GIB),
+            metal_recommended_working_set_bytes: Some(30 * GIB),
+        });
+        let snapshot = registry.load_snapshot().unwrap();
+        assert_eq!(snapshot.pressure, MemoryPressure::Normal);
+        assert_eq!(snapshot.headroom_bytes, 24 * GIB - (24 * GIB / 5) - 5 * GIB);
     }
 
     #[test]

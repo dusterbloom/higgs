@@ -2126,7 +2126,8 @@ pub(crate) fn load_quantized_safetensors_weights_with_settings<M: ModuleParamete
 
     let mut params = model.parameters_mut().flatten();
 
-    for file_path in &safetensors_files {
+    for (index, file_path) in safetensors_files.iter().enumerate() {
+        progress::report_before_shard(index, file_path)?;
         tracing::debug!(file = %file_path.display(), "Loading weights");
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
@@ -2149,11 +2150,21 @@ pub(crate) fn load_quantized_safetensors_weights_with_settings<M: ModuleParamete
                 tracing::warn!(key = %key, "Weight key not found in model parameters");
             }
         }
+        progress::report_after_shard(index)?;
     }
 
+    progress::report_load_boundary(progress::LoadBoundary::BeforeConversion {
+        index: 0,
+        bytes: 0,
+        kind: progress::ConversionKind::FinalModelEval,
+    })?;
     model
         .eval()
         .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+    progress::report_load_boundary(progress::LoadBoundary::AfterConversion {
+        index: 0,
+        kind: progress::ConversionKind::FinalModelEval,
+    })?;
 
     Ok(())
 }
@@ -2196,7 +2207,8 @@ pub(crate) fn load_quantized_safetensors_weights_with_prefix_and_settings<
     // Loader-wide warning budget so throttling doesn't reset per shard.
     let mut total_unmatched_warns = 0usize;
 
-    for file_path in &safetensors_files {
+    for (index, file_path) in safetensors_files.iter().enumerate() {
+        progress::report_before_shard(index, file_path)?;
         tracing::debug!(file = %file_path.display(), prefix, "Loading weights with prefix");
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
@@ -2243,11 +2255,21 @@ pub(crate) fn load_quantized_safetensors_weights_with_prefix_and_settings<
             }
         }
         tracing::info!(matched, unmatched, "Weight loading stats for shard");
+        progress::report_after_shard(index)?;
     }
 
+    progress::report_load_boundary(progress::LoadBoundary::BeforeConversion {
+        index: 0,
+        bytes: 0,
+        kind: progress::ConversionKind::FinalModelEval,
+    })?;
     model
         .eval()
         .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+    progress::report_load_boundary(progress::LoadBoundary::AfterConversion {
+        index: 0,
+        kind: progress::ConversionKind::FinalModelEval,
+    })?;
 
     Ok(())
 }
@@ -2294,7 +2316,8 @@ pub(crate) fn load_quantized_safetensors_weights_optional_prefix_with_settings<
     let mut total_unmatched = 0usize;
     let mut total_unmatched_warns = 0usize;
 
-    for file_path in &safetensors_files {
+    for (index, file_path) in safetensors_files.iter().enumerate() {
+        progress::report_before_shard(index, file_path)?;
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
         validate_quantized_tensor_widths(&loaded, quantization)?;
@@ -2318,6 +2341,7 @@ pub(crate) fn load_quantized_safetensors_weights_optional_prefix_with_settings<
                 }
             }
         }
+        progress::report_after_shard(index)?;
     }
 
     tracing::info!(
@@ -2326,9 +2350,18 @@ pub(crate) fn load_quantized_safetensors_weights_optional_prefix_with_settings<
         "Weight loading stats (optional prefix)"
     );
 
+    progress::report_load_boundary(progress::LoadBoundary::BeforeConversion {
+        index: 0,
+        bytes: 0,
+        kind: progress::ConversionKind::FinalModelEval,
+    })?;
     model
         .eval()
         .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+    progress::report_load_boundary(progress::LoadBoundary::AfterConversion {
+        index: 0,
+        kind: progress::ConversionKind::FinalModelEval,
+    })?;
 
     Ok(())
 }
@@ -2444,36 +2477,134 @@ pub(crate) fn validate_quantized_tensor_widths(
 /// Checks `model.safetensors.index.json`'s weight map when present (cheap),
 /// otherwise scans the safetensors file headers. Used to detect optional weights
 /// such as a separate `lm_head` that determines tied vs untied embeddings.
-pub(crate) fn checkpoint_has_key_suffix(model_path: &Path, suffix: &str) -> bool {
+pub(crate) fn checkpoint_has_key_suffix(
+    model_path: &Path,
+    suffix: &str,
+) -> Result<bool, ModelError> {
+    Ok(checkpoint_weight_names(model_path)?
+        .iter()
+        .any(|key| key.ends_with(suffix)))
+}
+
+fn checkpoint_weight_names(model_path: &Path) -> Result<Vec<String>, ModelError> {
     let index_path = model_path.join("model.safetensors.index.json");
-    if let Ok(json) = std::fs::read_to_string(&index_path)
-        && let Ok(index) = serde_json::from_str::<WeightMapIndex>(&json)
-    {
-        return index.weight_map.keys().any(|k| k.ends_with(suffix));
+    if index_path.exists() {
+        let index: WeightMapIndex = serde_json::from_str(&std::fs::read_to_string(index_path)?)?;
+        return Ok(index.weight_map.into_keys().collect());
     }
-    collect_safetensors_files(model_path).is_ok_and(|files| {
-        files.iter().any(|f| {
-            Array::load_safetensors(f)
-                .is_ok_and(|loaded| loaded.keys().any(|k| k.ends_with(suffix)))
-        })
-    })
+
+    let mut names = Vec::new();
+    for (index, file) in collect_safetensors_files(model_path)?.iter().enumerate() {
+        progress::report_before_shard(index, file)?;
+        names.extend(safetensor_weight_names(file)?);
+        progress::report_after_shard(index)?;
+    }
+    Ok(names)
+}
+
+pub(crate) fn safetensor_weight_names(path: &Path) -> Result<Vec<String>, ModelError> {
+    use std::io::Read;
+
+    const MAX_SAFETENSORS_HEADER_BYTES: u64 = 100_000_000;
+
+    let file_bytes = std::fs::metadata(path)?.len();
+    let mut file = std::fs::File::open(path)?;
+    let mut length = [0_u8; 8];
+    file.read_exact(&mut length)?;
+    let header_bytes = u64::from_le_bytes(length);
+    if header_bytes == 0
+        || header_bytes > MAX_SAFETENSORS_HEADER_BYTES
+        || header_bytes > file_bytes.saturating_sub(8)
+    {
+        return Err(ModelError::Io(std::io::Error::other(
+            "invalid safetensors header length",
+        )));
+    }
+    let mut header = vec![
+        0_u8;
+        usize::try_from(header_bytes).map_err(|_| {
+            ModelError::Io(std::io::Error::other("safetensors header length overflow"))
+        })?
+    ];
+    file.read_exact(&mut header)?;
+    let entries: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)?;
+    let payload_bytes = file_bytes - 8 - header_bytes;
+    let mut names = Vec::with_capacity(entries.len());
+    let mut ranges = Vec::with_capacity(entries.len());
+    for (name, value) in entries {
+        if name == "__metadata__" {
+            let metadata = value.as_object().ok_or_else(|| {
+                ModelError::Io(std::io::Error::other(
+                    "safetensors __metadata__ must be an object",
+                ))
+            })?;
+            if !metadata.values().all(serde_json::Value::is_string) {
+                return Err(ModelError::Io(std::io::Error::other(
+                    "safetensors __metadata__ values must be strings",
+                )));
+            }
+            continue;
+        }
+        let info: safetensors::tensor::TensorInfo = serde_json::from_value(value)?;
+        let elements = info
+            .shape
+            .iter()
+            .try_fold(1_usize, |total, dimension| total.checked_mul(*dimension))
+            .ok_or_else(|| ModelError::Io(std::io::Error::other("tensor shape overflow")))?;
+        let bits = elements
+            .checked_mul(info.dtype.bitsize())
+            .ok_or_else(|| ModelError::Io(std::io::Error::other("tensor size overflow")))?;
+        let tensor_bytes = info.data_offsets.1.checked_sub(info.data_offsets.0);
+        if bits % 8 != 0 || tensor_bytes != Some(bits / 8) {
+            return Err(ModelError::Io(std::io::Error::other(
+                "safetensors tensor shape does not match data_offsets",
+            )));
+        }
+        let start = u64::try_from(info.data_offsets.0)
+            .map_err(|_| ModelError::Io(std::io::Error::other("tensor offset overflow")))?;
+        let end = u64::try_from(info.data_offsets.1)
+            .map_err(|_| ModelError::Io(std::io::Error::other("tensor offset overflow")))?;
+        if end > payload_bytes {
+            return Err(ModelError::Io(std::io::Error::other(
+                "safetensors data_offsets exceed file",
+            )));
+        }
+        ranges.push((start, end));
+        names.push(name);
+    }
+    if names.is_empty() {
+        return Err(ModelError::Io(std::io::Error::other(
+            "safetensors tensor map is empty",
+        )));
+    }
+    ranges.sort_unstable();
+    let mut expected_start = 0_u64;
+    for (start, end) in ranges {
+        if start != expected_start {
+            return Err(ModelError::Io(std::io::Error::other(
+                "safetensors data offsets are not contiguous",
+            )));
+        }
+        expected_start = end;
+    }
+    if expected_start != payload_bytes {
+        return Err(ModelError::Io(std::io::Error::other(
+            "safetensors payload contains unindexed bytes",
+        )));
+    }
+    Ok(names)
 }
 
 /// Whether any weight key in the checkpoint contains `needle` (e.g. a
 /// `vision_tower.` prefix on multimodal Gemma checkpoints). Like
 /// [`checkpoint_has_key_suffix`], prefers the shard index when present.
-pub(crate) fn checkpoint_has_key_containing(model_path: &Path, needle: &str) -> bool {
-    let index_path = model_path.join("model.safetensors.index.json");
-    if let Ok(json) = std::fs::read_to_string(&index_path)
-        && let Ok(index) = serde_json::from_str::<WeightMapIndex>(&json)
-    {
-        return index.weight_map.keys().any(|k| k.contains(needle));
-    }
-    collect_safetensors_files(model_path).is_ok_and(|files| {
-        files.iter().any(|f| {
-            Array::load_safetensors(f).is_ok_and(|loaded| loaded.keys().any(|k| k.contains(needle)))
-        })
-    })
+pub(crate) fn checkpoint_has_key_containing(
+    model_path: &Path,
+    needle: &str,
+) -> Result<bool, ModelError> {
+    Ok(checkpoint_weight_names(model_path)?
+        .iter()
+        .any(|key| key.contains(needle)))
 }
 
 /// Collect only the base checkpoint safetensors selected by the loader.
@@ -2584,6 +2715,115 @@ mod tests {
         dense: QLinear,
         #[param]
         quantized: QLinear,
+    }
+
+    #[derive(ModuleParameters)]
+    struct TestTwoShardModel {
+        #[param]
+        first: QLinear,
+        #[param]
+        second: QLinear,
+    }
+
+    /// Removing a pre-shard checkpoint, reporting it after allocation, or
+    /// swallowing its error would let shard two allocate under critical pressure.
+    #[test]
+    fn standard_loader_stops_before_rejected_second_shard() {
+        use crate::progress::{LoadBoundary, install_load_boundary_sink};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let values = [1.0_f32; 4];
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect::<Vec<_>>();
+        for (file, key) in [
+            ("a.safetensors", "first.weight"),
+            ("b.safetensors", "second.weight"),
+        ] {
+            let tensor = safetensors::tensor::TensorView::new(
+                safetensors::tensor::Dtype::F32,
+                vec![2, 2],
+                &bytes,
+            )
+            .unwrap();
+            safetensors::serialize_to_file([(key, tensor)], None, &dir.path().join(file)).unwrap();
+        }
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{"first.weight":"a.safetensors","second.weight":"b.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let sink_events = Rc::clone(&events);
+        let _guard = install_load_boundary_sink(Box::new(move |event| {
+            sink_events.borrow_mut().push(event);
+            if matches!(event, LoadBoundary::BeforeShard { index: 1, .. }) {
+                Err(ModelError::LoadCapacity("critical".to_owned()))
+            } else {
+                Ok(())
+            }
+        }));
+        let mut model = TestTwoShardModel {
+            first: QLinear::new(2, 2).unwrap(),
+            second: QLinear::new(2, 2).unwrap(),
+        };
+        let error = load_quantized_safetensors_weights(&mut model, dir.path(), false).unwrap_err();
+        assert!(matches!(error, ModelError::LoadCapacity(message) if message == "critical"));
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [
+                LoadBoundary::BeforeShard { index: 0, .. },
+                LoadBoundary::AfterShard { index: 0 },
+                LoadBoundary::BeforeShard { index: 1, .. },
+            ]
+        ));
+    }
+
+    #[test]
+    fn indexless_key_scan_stops_before_rejected_second_shard() {
+        use crate::progress::{LoadBoundary, install_load_boundary_sink};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let payload = [0_u8; 1];
+        for (file, key) in [
+            ("model.safetensors", "first"),
+            ("mtp.safetensors", "lm_head.weight"),
+        ] {
+            let tensor = safetensors::tensor::TensorView::new(
+                safetensors::tensor::Dtype::U8,
+                vec![1],
+                &payload,
+            )
+            .unwrap();
+            safetensors::serialize_to_file([(key, tensor)], None, &dir.path().join(file)).unwrap();
+        }
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let sink_events = Rc::clone(&events);
+        let _guard = install_load_boundary_sink(Box::new(move |event| {
+            sink_events.borrow_mut().push(event);
+            if matches!(event, LoadBoundary::BeforeShard { index: 1, .. }) {
+                Err(ModelError::LoadCapacity("critical".to_owned()))
+            } else {
+                Ok(())
+            }
+        }));
+        let error = checkpoint_has_key_suffix(dir.path(), "lm_head.weight").unwrap_err();
+        assert!(matches!(error, ModelError::LoadCapacity(message) if message == "critical"));
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [
+                LoadBoundary::BeforeShard { index: 0, .. },
+                LoadBoundary::AfterShard { index: 0 },
+                LoadBoundary::BeforeShard { index: 1, .. },
+            ]
+        ));
     }
 
     #[test]

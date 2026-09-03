@@ -192,6 +192,15 @@ enum LoadKind {
     QwenVl,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoaderBoundaryClass {
+    StandardStream,
+    QwenSpecial,
+    FullArtifact,
+    Unclassified,
+}
+
 struct BuiltinAdapter {
     id: &'static str,
     family: fn() -> ModelFamily,
@@ -199,6 +208,28 @@ struct BuiltinAdapter {
     capabilities: Capabilities,
     notes: &'static str,
     kind: LoadKind,
+}
+
+#[cfg(test)]
+impl BuiltinAdapter {
+    const fn loader_boundary_class(&self) -> LoaderBoundaryClass {
+        match self.kind {
+            LoadKind::Qwen3Next | LoadKind::Qwen35Dense | LoadKind::Qwen35Moe => {
+                LoaderBoundaryClass::QwenSpecial
+            }
+            LoadKind::Bonsai
+            | LoadKind::Gemma3
+            | LoadKind::Gemma4
+            | LoadKind::LlavaQwen2
+            | LoadKind::QwenVl => LoaderBoundaryClass::FullArtifact,
+            LoadKind::Transformer
+            | LoadKind::Qwen3Moe
+            | LoadKind::Gemma2
+            | LoadKind::Phi3
+            | LoadKind::Starcoder2
+            | LoadKind::DeepSeekV2 => LoaderBoundaryClass::StandardStream,
+        }
+    }
 }
 
 #[allow(clippy::fn_params_excessive_bools)]
@@ -876,6 +907,27 @@ mod tests {
             "linear_conv_kernel_dim": 4,
             "rms_norm_eps": 0.000_001
         })
+    }
+
+    /// Adding an adapter without classifying its direct allocation loop would
+    /// silently create an unprotected loader path.
+    #[test]
+    fn every_builtin_adapter_has_loader_boundary_inventory() {
+        let inventory = BUILTINS
+            .iter()
+            .map(|adapter| (adapter.id, adapter.loader_boundary_class()))
+            .collect::<Vec<_>>();
+        assert_eq!(inventory.len(), 14);
+        assert!(inventory.contains(&("qwen3-next", LoaderBoundaryClass::QwenSpecial)));
+        assert!(inventory.contains(&("qwen3.5-moe", LoaderBoundaryClass::QwenSpecial)));
+        assert!(inventory.contains(&("qwen_vl", LoaderBoundaryClass::FullArtifact)));
+        assert!(inventory.contains(&("llava-qwen2", LoaderBoundaryClass::FullArtifact)));
+        assert!(inventory.contains(&("gemma4-text", LoaderBoundaryClass::FullArtifact)));
+        assert!(
+            inventory
+                .iter()
+                .all(|(_, class)| *class != LoaderBoundaryClass::Unclassified)
+        );
     }
 
     #[test]

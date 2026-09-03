@@ -603,7 +603,7 @@ impl GemmaVisionTower {
 pub(crate) fn load_gemma_vision_tower(
     model_path: &Path,
 ) -> Result<Option<GemmaVisionTower>, ModelError> {
-    if !crate::checkpoint_has_key_containing(model_path, "vision_tower.") {
+    if !crate::checkpoint_has_key_containing(model_path, "vision_tower.")? {
         return Ok(None);
     }
 
@@ -658,12 +658,29 @@ pub(crate) fn load_gemma_vision_tower(
 /// Load every safetensors file in a model directory into one weight map.
 fn load_safetensor_weight_map(model_path: &Path) -> Result<HashMap<String, Array>, ModelError> {
     let files = crate::collect_safetensors_files(model_path)?;
+    let workspace_bytes = files.iter().try_fold(0_u64, |total, path| {
+        let bytes = std::fs::metadata(path)?.len();
+        total.checked_add(bytes).ok_or_else(|| {
+            ModelError::LoadCapacity("Gemma vision artifact workspace overflow".to_owned())
+        })
+    })?;
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::BeforeConversion {
+        index: 0,
+        bytes: workspace_bytes,
+        kind: crate::progress::ConversionKind::FullArtifact,
+    })?;
     let mut weights = HashMap::new();
-    for file_path in &files {
+    for (index, file_path) in files.iter().enumerate() {
+        crate::progress::report_before_shard(index, file_path)?;
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
         weights.extend(loaded);
+        crate::progress::report_after_shard(index)?;
     }
+    crate::progress::report_load_boundary(crate::progress::LoadBoundary::AfterConversion {
+        index: 0,
+        kind: crate::progress::ConversionKind::FullArtifact,
+    })?;
     Ok(weights)
 }
 
