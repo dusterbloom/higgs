@@ -4,6 +4,8 @@ use std::time::Instant;
 use higgs_engine::{EngineCostDescription, MlxMemorySnapshot};
 use serde::{Deserialize, Serialize};
 
+#[allow(dead_code)] // Task 5 attaches this completed lifecycle to AppState.
+pub(crate) mod pressure;
 mod profile;
 
 pub use profile::{LearnedBandEvidence, LearnedProfile, LearnedProfileKey, LearnedProfileStore};
@@ -39,6 +41,14 @@ pub enum MemoryPressure {
     Normal,
     Constrained,
     Critical,
+}
+
+/// One content-free system observation delivered to the capacity controller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PressureObservation {
+    pub pressure: MemoryPressure,
+    pub swap_out_delta: u64,
+    pub compressor_delta: u64,
 }
 
 /// Evidence backing the current capacity envelope.
@@ -444,6 +454,7 @@ pub struct CapacityController<C: Clock = SystemClock> {
     boot_id: String,
     decision: CapacityDecision,
     evidence: BTreeMap<u64, RuntimeBandEvidence>,
+    last_swap_out_millis: Option<u64>,
 }
 
 impl CapacityController<SystemClock> {
@@ -462,6 +473,7 @@ impl<C: Clock> CapacityController<C> {
             boot_id: uuid::Uuid::new_v4().to_string(),
             decision: unavailable_decision(),
             evidence: BTreeMap::new(),
+            last_swap_out_millis: None,
         };
         controller.decision = controller.solve_static();
         controller
@@ -475,6 +487,54 @@ impl<C: Clock> CapacityController<C> {
     #[must_use]
     pub const fn decision(&self) -> CapacityDecision {
         self.decision
+    }
+
+    #[must_use]
+    pub const fn pressure(&self) -> MemoryPressure {
+        self.inputs.pressure
+    }
+
+    /// Applies a live observation once. Repeated notifications at the same effective
+    /// pressure freeze upward learning without repeatedly multiplying the envelope.
+    pub fn apply_pressure_observation(
+        &mut self,
+        observation: PressureObservation,
+    ) -> CapacityDecision {
+        const SWAP_RECOVERY_MILLIS: u64 = 60_000;
+
+        let now = self.clock.now_millis();
+        if observation.swap_out_delta > 0 {
+            self.last_swap_out_millis = Some(now);
+        }
+        let swap_is_sticky = self.last_swap_out_millis.is_some_and(|last_swap| {
+            observation.pressure != MemoryPressure::Normal
+                || now.saturating_sub(last_swap) < SWAP_RECOVERY_MILLIS
+        });
+        if self.last_swap_out_millis.is_some() && !swap_is_sticky {
+            self.last_swap_out_millis = None;
+        }
+        let effective_pressure = if swap_is_sticky {
+            MemoryPressure::Critical
+        } else if observation.pressure == MemoryPressure::Normal && observation.compressor_delta > 0
+        {
+            // Compressor growth is deterministic evidence that a nominally normal
+            // system is dirty. It freezes rises and uses the constrained reserve;
+            // no arbitrary compression-rate threshold is invented.
+            MemoryPressure::Constrained
+        } else {
+            observation.pressure
+        };
+
+        if effective_pressure != MemoryPressure::Normal
+            || observation.swap_out_delta > 0
+            || observation.compressor_delta > 0
+        {
+            self.clear_clean_windows();
+        }
+        if effective_pressure == self.inputs.pressure {
+            return self.decision;
+        }
+        self.recompute_for_pressure(effective_pressure, None)
     }
 
     #[must_use]

@@ -44,6 +44,11 @@ ctrlc.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+dispatch2 = "0.3"
+libc = "0.2"
+
 [dev-dependencies]
 http-body-util.workspace = true
 tokio = { version = "1", features = ["macros", "rt"] }
