@@ -99,10 +99,12 @@ impl PublicationRollback {
         }
     }
 
+    fn registration(&mut self) -> &mut ActiveRegistration {
+        self.active.as_mut().expect("active registration exists")
+    }
+
     fn publish(mut self) {
-        if let Some(active) = self.active.take() {
-            active.publish();
-        }
+        self.active.take();
     }
 }
 
@@ -292,6 +294,35 @@ async fn publish_loaded_engine(
     generation_defaults: crate::config::GenerationDefaults,
     facts: ModelCapacityFacts,
 ) -> Result<(), ServerError> {
+    publish_loaded_engine_inner(
+        state,
+        name,
+        engine,
+        generation_defaults,
+        facts,
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+struct PublicationTestGate {
+    arrived: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+async fn publish_loaded_engine_inner(
+    state: &SharedState,
+    name: String,
+    engine: Engine,
+    generation_defaults: crate::config::GenerationDefaults,
+    facts: ModelCapacityFacts,
+    #[cfg(test)] publication_gate: Option<PublicationTestGate>,
+    #[cfg(test)] insertion_gate: Option<crate::router::RouteInsertionTestGate>,
+) -> Result<(), ServerError> {
     let provisional = ProvisionalEngine::new(engine, Arc::clone(&state.capacity));
     let ticket = match state.capacity.begin_registration(name.clone()) {
         Ok(ticket) => ticket,
@@ -307,7 +338,7 @@ async fn publish_loaded_engine(
             return Err(registration_error(error));
         }
     };
-    let publication = PublicationRollback::new(active, state);
+    let mut publication = PublicationRollback::new(active, state);
     if let Err((name, engine, error)) = state
         .router
         .insert_engine_with_capacity(
@@ -315,6 +346,9 @@ async fn publish_loaded_engine(
             provisional.engine(),
             generation_defaults,
             &state.capacity,
+            publication.registration(),
+            #[cfg(test)]
+            insertion_gate,
         )
         .await
     {
@@ -334,6 +368,11 @@ async fn publish_loaded_engine(
     }
     publication.publish();
     provisional.publish();
+    #[cfg(test)]
+    if let Some(gate) = publication_gate {
+        let _ = gate.arrived.send(());
+        let _ = gate.release.await;
+    }
     Ok(())
 }
 
@@ -479,7 +518,11 @@ mod tests {
 
     use crate::router::Router;
     use crate::state::AppState;
+    use axum::body::Body;
     use higgs_engine::{EngineCostDescription, MlxMemorySnapshot, TransientPrefillEstimate};
+    use http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
 
     fn build_state(toml: &str, engines: HashMap<String, Arc<Engine>>) -> SharedState {
         let dir = tempfile::tempdir().unwrap();
@@ -583,6 +626,92 @@ mod tests {
         assert_eq!(
             state.router.local_engines()[0].route_test_capacity_cache_limits(),
             (allocation.retained_bytes, allocation.prefix_cache_bytes)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_route_insertion_exposes_capacity_and_route_as_one_commit() {
+        let state = build_state("[local]\nallow_runtime_model_load = true\n", HashMap::new());
+        let (arrived, wait_arrived) = tokio::sync::oneshot::channel();
+        let (release, wait_release) = tokio::sync::oneshot::channel();
+        let publish_state = Arc::clone(&state);
+        let publication = tokio::spawn(async move {
+            publish_state
+                .capacity
+                .refresh_memory(capacity_facts("second").memory);
+            publish_loaded_engine_inner(
+                &publish_state,
+                "second".to_owned(),
+                Engine::test_stub("second"),
+                crate::config::GenerationDefaults::default(),
+                capacity_facts("second"),
+                Some(PublicationTestGate {
+                    arrived,
+                    release: wait_release,
+                }),
+                None,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), wait_arrived)
+            .await
+            .expect("publication must pause after successful router insertion")
+            .unwrap();
+
+        let app = crate::build_router(Arc::clone(&state), 30.0, None, 0, 1024, None);
+        let capacity_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/capacity?model=second")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let capacity_json: serde_json::Value = serde_json::from_slice(
+            &capacity_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        let chat_visible = matches!(
+            state.router.resolve("second", None).await,
+            Ok(crate::router::ResolvedRoute::Higgs { .. })
+        );
+        let Json(models) = list_models(State(Arc::clone(&state))).await;
+
+        let delete_state = Arc::clone(&state);
+        let delete = tokio::spawn(async move {
+            unload_model(State(delete_state), Path("second".to_owned())).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.router.contains_engine("second") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("concurrent DELETE must observe and start draining the committed route");
+        let _ = release.send(());
+
+        assert_eq!(capacity_json["availability"], "available");
+        assert!(
+            chat_visible,
+            "chat resolution must agree with capacity visibility"
+        );
+        assert!(models.data.iter().any(|model| model.id == "second"));
+        publication.await.unwrap().unwrap();
+        assert_eq!(delete.await.unwrap().unwrap(), StatusCode::NO_CONTENT);
+        assert!(!state.router.contains_engine("second"));
+        assert!(
+            state
+                .capacity
+                .begin_registration("second".to_owned())
+                .is_ok(),
+            "publication/delete race must leave no registration or drain conflict"
         );
     }
 
@@ -738,43 +867,46 @@ mod tests {
         .await
         .unwrap();
 
-        let (second, arrived, release, _) = Engine::test_stub_with_cache_gate_after("second", 1);
+        let (arrived, wait_arrived) = tokio::sync::oneshot::channel();
+        let (release, wait_release) = tokio::sync::oneshot::channel();
         let publish_state = Arc::clone(&state);
         let publication = tokio::spawn(async move {
-            publish_test_engine(
+            let facts = capacity_facts("second");
+            publish_state.capacity.refresh_memory(facts.memory);
+            publish_loaded_engine_inner(
                 &publish_state,
                 "second".to_owned(),
-                second,
+                Engine::test_stub("second"),
                 crate::config::GenerationDefaults::default(),
-                capacity_facts("second"),
+                facts,
+                None,
+                Some(crate::router::RouteInsertionTestGate {
+                    arrived,
+                    release: wait_release,
+                }),
             )
             .await
         });
-        tokio::time::timeout(Duration::from_secs(1), arrived.notified())
+        tokio::time::timeout(Duration::from_secs(1), wait_arrived)
             .await
-            .expect("publication must reach the first engine apply");
-        state
-            .capacity
-            .apply_pressure_observation(crate::capacity::PressureObservation {
-                pressure: crate::capacity::MemoryPressure::Critical,
-                swap_out_delta: 1,
-                compressor_delta: 1,
-            });
-        release.notify_waiters();
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while state
-                .router
-                .local_engines()
-                .iter()
-                .all(|engine| engine.model_name() != "second")
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("revision retry must insert the disabled route");
+            .expect("publication must pause immediately after disabled insertion")
+            .unwrap();
+        assert_eq!(
+            state.capacity.snapshot("second").unwrap().availability,
+            crate::capacity::CapacityAvailability::Unavailable
+        );
+        assert!(!matches!(
+            state.router.resolve("second", None).await,
+            Ok(crate::router::ResolvedRoute::Higgs { .. })
+        ));
+        let Json(models) = list_models(State(Arc::clone(&state))).await;
+        assert!(models.data.iter().all(|model| model.id != "second"));
+        assert!(matches!(
+            unload_model(State(Arc::clone(&state)), Path("second".to_owned())).await,
+            Err(ServerError::ModelNotFound(_))
+        ));
         publication.abort();
+        drop(release);
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {

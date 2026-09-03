@@ -75,6 +75,8 @@ fn every_runtime_or_layout_mutation_changes_the_capacity_identity() {
         ("HIGGS_ESCHA_TRELLIS_GEMM", "1"),
         ("HIGGS_ESCHA_QGEMM_SIMD", "0"),
         ("HIGGS_ESCHA_QGEMM_BM", "64"),
+        ("HIGGS_NO_MEM_LIMIT", "1"),
+        ("HIGGS_WIRED_LIMIT_MODE", "legacy"),
     ];
 
     for (name, value) in mutations {
@@ -95,6 +97,32 @@ fn runtime_identity_normalizes_equivalent_inputs_and_model_context() {
     assert_eq!(
         identity_with(&[("HIGGS_DFLASH_VERIFY_MODE", "sequential")]),
         identity_with(&[("HIGGS_DFLASH_VERIFY_MODE", "canonical")])
+    );
+    assert_eq!(
+        identity_with(&[("HIGGS_NO_MEM_LIMIT", "0")]),
+        identity_with(&[("HIGGS_NO_MEM_LIMIT", "1")]),
+        "allocator limits are disabled by variable presence, independent of its value"
+    );
+    assert_eq!(
+        identity_with(&[("HIGGS_WIRED_LIMIT_MODE", "safe")]),
+        identity_with(&[("HIGGS_WIRED_LIMIT_MODE", "legacy")])
+    );
+    assert_eq!(
+        identity_with(&[("HIGGS_WIRED_LIMIT_MODE", "caps")]),
+        identity_with(&[("HIGGS_WIRED_LIMIT_MODE", "legacy")])
+    );
+    assert_eq!(
+        identity_with(&[("HIGGS_WIRED_LIMIT_MODE", "unknown")]),
+        identity_with(&[]),
+        "unknown wired modes resolve to the default MLX wired-limit policy"
+    );
+    assert_eq!(
+        identity_with(&[
+            ("HIGGS_NO_MEM_LIMIT", "1"),
+            ("HIGGS_WIRED_LIMIT_MODE", "legacy"),
+        ]),
+        identity_with(&[("HIGGS_NO_MEM_LIMIT", "1")]),
+        "disabled allocator limits override the legacy/wired selection"
     );
 
     let regular = resolved_runtime_identity_with(false, false, |_| None);

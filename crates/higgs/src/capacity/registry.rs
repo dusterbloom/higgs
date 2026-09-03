@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use super::{
     CAPACITY_SCHEMA_VERSION, CapacityAvailability, CapacityBasis, CapacityController,
     CapacityInputs, CapacitySnapshot, LearnedProfile, LearnedProfileKey, LearnedProfileStore,
-    MemoryPressure, PressureObservation,
+    MemoryPressure, PressureObservation, ZeroCapacityRecovery,
 };
 
 const FINGERPRINT_DOMAIN: &[u8] = b"higgs:model-content:v1\0";
@@ -311,18 +311,35 @@ impl CapacityRegistry {
         if apply_allocation_totals(&mut shared, &effective).is_err() {
             shared.active_reservation_bytes = u64::MAX;
         }
-        recompute_active_models(&mut state, shared);
+        recompute_active_models(&mut state, shared, ZeroCapacityRecovery::Preserve);
         true
     }
 
-    /// Run the non-blocking route visibility flip while the acknowledged cache
+    /// Commit registration and route visibility while the acknowledged cache
     /// revision is still current. The closure must only mutate the router map;
     /// it must never await or call back into the registry.
-    pub fn publish_route_if_current(&self, revision: u64, publish: impl FnOnce()) -> bool {
-        let state = self.lock();
+    fn publish_active_route_if_current(
+        &self,
+        model: &str,
+        nonce: uuid::Uuid,
+        revision: u64,
+        publish: impl FnOnce(),
+    ) -> bool {
+        let mut state = self.lock();
         if state.cache_revision != revision || state.published_cache_revision != revision {
             return false;
         }
+        let Some(entry) = state.models.get_mut(model) else {
+            return false;
+        };
+        let Some(active) = entry.active.as_mut() else {
+            return false;
+        };
+        if active.lifecycle_nonce != nonce || active.draining {
+            return false;
+        }
+        active.published = true;
+        entry.generation = entry.generation.saturating_add(1);
         publish();
         true
     }
@@ -401,7 +418,7 @@ impl CapacityRegistry {
         for (name, entry) in &state.models {
             if let Some(active) = &entry.active {
                 let mut controller = active.controller.transactional_copy();
-                replace_shared_ledger(&mut controller, shared);
+                replace_shared_ledger(&mut controller, shared, ZeroCapacityRecovery::Preserve);
                 if !active.draining
                     && controller.decision().availability != CapacityAvailability::Available
                 {
@@ -426,7 +443,7 @@ impl CapacityRegistry {
             }
         }
         // Re-apply the shared memory snapshot after the checked candidate build.
-        replace_shared_ledger(&mut candidate, shared);
+        replace_shared_ledger(&mut candidate, shared, ZeroCapacityRecovery::Preserve);
         let lifecycle_nonce = ticket.nonce;
         {
             let entry = state.models.entry(ticket.model.clone()).or_default();
@@ -531,7 +548,7 @@ impl CapacityRegistry {
         }
         if removed {
             state.published_cache_allocations.remove(&drain.model);
-            recompute_registry(&mut state);
+            recompute_registry_with(&mut state, ZeroCapacityRecovery::BoundedMinimum);
         }
         drain.finished = true;
         drop(state);
@@ -581,10 +598,15 @@ impl CapacityRegistry {
 
     pub fn refresh_memory(&self, memory: MlxMemorySnapshot) -> PublishedMemoryMeasurement {
         let mut state = self.lock();
+        let zero_recovery = if memory.active_bytes < state.memory.active_bytes {
+            ZeroCapacityRecovery::BoundedMinimum
+        } else {
+            ZeroCapacityRecovery::Preserve
+        };
         state.memory = memory;
         state.memory_revision = state.memory_revision.saturating_add(1);
         let revision = state.memory_revision;
-        recompute_registry(&mut state);
+        recompute_registry_with(&mut state, zero_recovery);
         PublishedMemoryMeasurement {
             boot_id: self.boot_id.clone(),
             revision,
@@ -606,7 +628,7 @@ impl CapacityRegistry {
                 entry.active = None;
                 entry.generation = entry.generation.saturating_add(1);
             }
-            recompute_registry(&mut state);
+            recompute_registry_with(&mut state, ZeroCapacityRecovery::BoundedMinimum);
         }
     }
 
@@ -740,6 +762,18 @@ pub struct ActiveRegistration {
 }
 
 impl ActiveRegistration {
+    pub(crate) fn publish_route_if_current(
+        &mut self,
+        revision: u64,
+        publish: impl FnOnce(),
+    ) -> bool {
+        let published = self.registry.upgrade().is_some_and(|registry| {
+            registry.publish_active_route_if_current(&self.model, self.nonce, revision, publish)
+        });
+        self.published |= published;
+        published
+    }
+
     pub fn publish(mut self) {
         self.published = self
             .registry
@@ -864,21 +898,30 @@ fn shared_ledger_with(
     Ok(shared)
 }
 
-fn replace_shared_ledger(controller: &mut CapacityController, shared: SharedLedger) {
+fn replace_shared_ledger(
+    controller: &mut CapacityController,
+    shared: SharedLedger,
+    zero_recovery: ZeroCapacityRecovery,
+) {
     controller.replace_shared_residency(
         shared.memory,
         shared.loaded_model_bytes,
         shared.retained_bytes,
         shared.prefix_cache_bytes,
         shared.active_reservation_bytes,
+        zero_recovery,
     );
 }
 
-fn recompute_active_models(state: &mut RegistryState, shared: SharedLedger) {
+fn recompute_active_models(
+    state: &mut RegistryState,
+    shared: SharedLedger,
+    zero_recovery: ZeroCapacityRecovery,
+) {
     for entry in state.models.values_mut() {
         if let Some(active) = entry.active.as_mut() {
             let before = active.controller.decision();
-            replace_shared_ledger(&mut active.controller, shared);
+            replace_shared_ledger(&mut active.controller, shared, zero_recovery);
             if active.controller.decision() != before {
                 entry.generation = entry.generation.saturating_add(1);
             }
@@ -887,6 +930,10 @@ fn recompute_active_models(state: &mut RegistryState, shared: SharedLedger) {
 }
 
 fn recompute_registry(state: &mut RegistryState) {
+    recompute_registry_with(state, ZeroCapacityRecovery::Preserve);
+}
+
+fn recompute_registry_with(state: &mut RegistryState, zero_recovery: ZeroCapacityRecovery) {
     let old_allocations = std::mem::take(&mut state.desired_cache_allocations);
     let allocations = cache_allocations_with(state, None);
     state.desired_cache_allocations = allocations.as_ref().cloned().unwrap_or_default();
@@ -904,7 +951,7 @@ fn recompute_registry(state: &mut RegistryState) {
     if allocations.is_err() || apply_allocation_totals(&mut shared, &effective).is_err() {
         shared.active_reservation_bytes = u64::MAX;
     }
-    recompute_active_models(state, shared);
+    recompute_active_models(state, shared, zero_recovery);
 }
 
 fn max_cache_allocation(left: CacheAllocation, right: CacheAllocation) -> CacheAllocation {
@@ -1714,6 +1761,28 @@ mod tests {
     }
 
     #[test]
+    fn constrained_zero_is_not_reseeded_by_shared_ledger_recompute() {
+        let registry = CapacityRegistry::new(["first".to_owned()]);
+        let mut first = facts("first", 5 * GIB);
+        first.configured_total_token_ceiling = Some(1_024);
+        first.configured_output_token_ceiling = Some(1_024);
+        register(&registry, first);
+        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 1_024);
+
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Constrained,
+            swap_out_delta: 0,
+            compressor_delta: 1,
+        });
+
+        assert_eq!(
+            registry.snapshot("first").unwrap().safe_total_tokens,
+            0,
+            "the shared-ledger pass must preserve the pressure controller's zero downshift"
+        );
+    }
+
+    #[test]
     fn pressure_seed_before_boot_registration_controls_first_policy() {
         let registry = CapacityRegistry::new(["escha".to_owned()]);
         registry.apply_pressure_observation(PressureObservation {
@@ -1882,6 +1951,50 @@ mod tests {
             .unwrap();
 
         assert!(registry.snapshot("second").unwrap().safe_total_tokens <= constrained);
+    }
+
+    #[test]
+    fn rejected_coload_cleanup_seeds_bounded_recovery_from_zero() {
+        let registry = CapacityRegistry::new(["first".to_owned(), "second".to_owned()]);
+        register(&registry, facts("first", 5 * GIB));
+        let full = registry.snapshot("first").unwrap().safe_total_tokens;
+        assert!(full > 8_192);
+
+        let ticket = registry.begin_registration("second".to_owned()).unwrap();
+        registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 20 * GIB,
+            peak_bytes: 20 * GIB,
+            memory_limit_bytes: Some(24 * GIB),
+            metal_recommended_working_set_bytes: Some(24 * GIB),
+        });
+        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
+        assert!(matches!(
+            registry.commit_active(ticket, facts("second", 5 * GIB)),
+            Err(RegistrationError::InsufficientCapacity(_))
+        ));
+
+        registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 5 * GIB,
+            peak_bytes: 20 * GIB,
+            memory_limit_bytes: Some(24 * GIB),
+            metal_recommended_working_set_bytes: Some(24 * GIB),
+        });
+        let recovered = registry.snapshot("first").unwrap();
+        assert_eq!(recovered.availability, CapacityAvailability::Available);
+        assert_eq!(recovered.safe_total_tokens, 8_192);
+        assert!(recovered.safe_total_tokens < full);
+
+        registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 4 * GIB,
+            peak_bytes: 20 * GIB,
+            memory_limit_bytes: Some(24 * GIB),
+            metal_recommended_working_set_bytes: Some(24 * GIB),
+        });
+        assert_eq!(
+            registry.snapshot("first").unwrap().safe_total_tokens,
+            recovered.safe_total_tokens,
+            "additional cleanup headroom must follow recovery hysteresis, not jump full"
+        );
     }
 
     #[test]

@@ -13,6 +13,27 @@ use serde_json::{Value, json};
 #[serde(transparent)]
 pub struct ResolvedRuntimeIdentity(Value);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MlxAllocatorPolicy {
+    Disabled,
+    Legacy,
+    WiredLimit,
+}
+
+pub(crate) fn resolve_mlx_allocator_policy(
+    no_mem_limit: Option<&str>,
+    wired_limit_mode: Option<&str>,
+) -> MlxAllocatorPolicy {
+    if no_mem_limit.is_some() {
+        MlxAllocatorPolicy::Disabled
+    } else if matches!(wired_limit_mode, Some("legacy" | "safe" | "caps")) {
+        MlxAllocatorPolicy::Legacy
+    } else {
+        MlxAllocatorPolicy::WiredLimit
+    }
+}
+
 /// Resolve the process environment into the canonical capacity-profile identity.
 #[must_use]
 pub fn resolved_runtime_identity(
@@ -144,8 +165,13 @@ fn resolved_runtime_identity_with_selection(
     );
     let escha_affine_bits =
         optional_i32("HIGGS_ESCHA_AFFINE_BITS").filter(|bits| (2..=8).contains(bits));
+    let no_mem_limit = env("HIGGS_NO_MEM_LIMIT");
+    let wired_limit_mode = env("HIGGS_WIRED_LIMIT_MODE");
+    let allocator_policy =
+        resolve_mlx_allocator_policy(no_mem_limit.as_deref(), wired_limit_mode.as_deref());
 
     let Value::Object(mut identity) = json!({
+        "mlxAllocatorPolicy": allocator_policy,
         "eschamoeNative": is_eschamoe && nonzero("HIGGS_ESCHA_NATIVE", true),
         "eschamoeAffineBitsOverride": escha_affine_bits,
         "eschamoeTrellisGemm": is_eschamoe && env("HIGGS_ESCHA_TRELLIS_GEMM").as_deref() == Some("1"),

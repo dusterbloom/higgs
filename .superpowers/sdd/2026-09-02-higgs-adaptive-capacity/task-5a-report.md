@@ -1,5 +1,59 @@
 # Task 5A report: bind model lifecycle
 
+## Controller review correction round 2/5
+
+- [x] Make active capacity registration and route visibility one externally
+  atomic publication.
+- [x] Recover a zero envelope only from measured residency cleanup, with the
+  bounded minimum and existing hysteresis.
+- [x] Add normalized MLX allocator policy to the canonical runtime identity by
+  sharing the exact resolver used by runtime setup.
+- [x] Complete independent re-review, full release gates, and final GitNexus
+  staged/compare verification.
+
+### Round 2 implementation evidence
+
+- Runtime insertion first installs a disabled route. The active-registration
+  nonce, acknowledged cache-policy revision, capacity publication, generation
+  bump, and non-awaiting route-ready flip are then committed while the registry
+  transaction is held. Before that commit, capacity GET reports unavailable,
+  chat resolution and model listing omit the route, and DELETE reports not
+  found. Cancellation drops both rollback owners, removes the disabled route,
+  joins and drops the engine, clears allocator cache, remeasures, and leaves no
+  registration or drain conflict. After commit, concurrent DELETE can drain and
+  durably clean the published engine while the load future is paused at the
+  deterministic post-insertion gate.
+- Shared-residency replacement distinguishes pressure/cache recomputation from
+  genuine cleanup. A measured `active_bytes` decrease or fixed model-residency
+  removal may seed at most 8,192 tokens from zero; all other recomputations
+  preserve the current zero bound. Further headroom improvement remains subject
+  to the controller's recovery hysteresis.
+- The canonical engine runtime identity now serializes the resolved allocator
+  policy as `disabled`, `legacy`, or `wired_limit`. The same pure resolver drives
+  `set_wired_limit_to_max`: presence of `HIGGS_NO_MEM_LIMIT` disables limits;
+  `legacy`, `safe`, and `caps` select legacy caps; all other wired-mode values
+  select the default wired limit.
+
+### Round 2 TDD and mutation evidence
+
+- The atomic-publication regression initially observed capacity as
+  `unavailable` after the route was already usable. It now gates immediately
+  after successful insertion and proves capacity GET, chat resolution, list,
+  and concurrent DELETE all agree with the single committed state.
+- The cancellation regression now gates immediately after disabled insertion.
+  Its readiness mutation exposed a route through direct/default resolution;
+  filtering both lookup paths on `capacity_ready` makes the exact test pass.
+- The rejected co-load cleanup regression initially remained unavailable after
+  memory fell from 20 GiB to 5 GiB. It now recovers to exactly the bounded 8,192
+  token seed and does not jump on a subsequent 4 GiB measurement.
+- Independent review then found an over-broad recovery mutation: a 1,024-token
+  constrained envelope fell to zero and the same shared-ledger pass restored it
+  to 1,024. The exact RED reproduced that value; cause-scoped recovery now
+  preserves zero while the cleanup regression remains green.
+- Adding either allocator environment switch initially left the runtime
+  identity unchanged. Mutation coverage now proves each resolved policy change
+  changes identity while equivalent spellings normalize to one key.
+
 ## Controller review correction round 1/5
 
 - [x] Preserve controller pressure and rise hysteresis across shared-ledger updates.
@@ -170,21 +224,21 @@ cancellation, and shutdown-order fixes, and reported no remaining findings.
 
 ## Release verification
 
-- Focused registry correction suite: 32 passed, 0 failed.
+- Focused registry correction suite: 34 passed, 0 failed.
 - Focused Qwen identity correction: 1 passed, 0 failed.
-- Focused disabled-route cancellation correction: 1 passed, 0 failed.
+- Focused route lifecycle correction suite: 21 passed, 0 failed.
 - `higgs-models` release library: 753 passed, 0 failed, 46 ignored.
 - `higgs-engine` release library: 596 passed, 0 failed, 5 ignored.
 - Runtime-identity integration: 3 passed, 0 failed.
-- Higgs release library: 717 passed, 0 failed.
+- Higgs release library: 720 passed, 0 failed.
 - Higgs release integration: 107 passed, 0 failed, 10 ignored.
 - Higgs release binary: 4 passed, 0 failed.
 - Higgs release build: passed.
-- GitNexus staged detection: 17 indexed files, 205 changed symbols, 184
+- GitNexus staged detection: 9 files, 50 changed symbols, 109
   affected processes, CRITICAL as expected for the lifecycle/router surface.
-- GitNexus compare-to-`main` detection: 236 files, 4,519 changed symbols, 858
+- GitNexus compare-to-`main` detection: 236 files, 4,627 changed symbols, 861
   affected processes, CRITICAL across the complete multi-task branch; the
-  Task 5A staged set remains the bounded 17-file indexed subset above.
+  Task 5A staged set remains the bounded 9-file subset above.
 
 The build emitted pre-existing `higgs-models` unused-code warnings and reported
 that `mlx.metallib` was absent from the local MLX build output. Production

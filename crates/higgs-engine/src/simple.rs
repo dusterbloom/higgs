@@ -1741,16 +1741,17 @@ pub(crate) fn set_wired_limit_to_max(enabled: bool) {
     {
         unsafe {
             let wired_mode = std::env::var("HIGGS_WIRED_LIMIT_MODE").ok();
-            let use_legacy_limits =
-                matches!(wired_mode.as_deref(), Some("legacy" | "safe" | "caps"));
+            let no_mem_limit = std::env::var("HIGGS_NO_MEM_LIMIT").ok();
+            let allocator_policy = crate::runtime_identity::resolve_mlx_allocator_policy(
+                no_mem_limit.as_deref(),
+                wired_mode.as_deref(),
+            );
             let mut prev_mem: usize = 0;
             let mut prev_cache: usize = 0;
             let mut prev_wired: usize = 0;
 
-            let limits_enabled = std::env::var("HIGGS_NO_MEM_LIMIT").is_err();
-
-            if limits_enabled {
-                if use_legacy_limits {
+            match allocator_policy {
+                crate::runtime_identity::MlxAllocatorPolicy::Legacy => {
                     let mem_limit = max_rec * 3 / 4;
                     let cache_limit = max_rec / 2;
                     mlx_sys::mlx_set_memory_limit(&raw mut prev_mem, mem_limit);
@@ -1764,7 +1765,8 @@ pub(crate) fn set_wired_limit_to_max(enabled: bool) {
                         prev_cache_mb = prev_cache / (1024 * 1024),
                         "Configured MLX legacy memory/cache caps",
                     );
-                } else {
+                }
+                crate::runtime_identity::MlxAllocatorPolicy::WiredLimit => {
                     mlx_sys::mlx_set_wired_limit(&raw mut prev_wired, max_rec);
                     tracing::info!(
                         mode = "mlx_wired_limit",
@@ -1774,16 +1776,11 @@ pub(crate) fn set_wired_limit_to_max(enabled: bool) {
                         "Configured MLX wired limit",
                     );
                 }
-            } else {
-                tracing::info!(
-                    mode = if use_legacy_limits {
-                        "legacy"
-                    } else {
-                        "mlx_wired_limit"
-                    },
+                crate::runtime_identity::MlxAllocatorPolicy::Disabled => tracing::info!(
+                    mode = "disabled",
                     max_recommended_mb = max_rec / (1024 * 1024),
                     "Skipped MLX memory-limit configuration",
-                );
+                ),
             }
         }
     }

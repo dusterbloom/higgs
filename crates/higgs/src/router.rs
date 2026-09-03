@@ -4,7 +4,7 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use regex::Regex;
 use tracing::warn;
 
-use crate::capacity::CapacityRegistry;
+use crate::capacity::{ActiveRegistration, CapacityRegistry};
 use crate::config::{ApiFormat, GenerationDefaults, HiggsConfig};
 use crate::state::Engine;
 
@@ -114,6 +114,12 @@ struct DisabledRouteGuard<'a> {
     router: &'a Router,
     name: String,
     armed: bool,
+}
+
+#[cfg(test)]
+pub(crate) struct RouteInsertionTestGate {
+    pub(crate) arrived: tokio::sync::oneshot::Sender<()>,
+    pub(crate) release: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl DisabledRouteGuard<'_> {
@@ -394,12 +400,14 @@ impl Router {
     /// Atomically apply one current cache policy to the loaded set and a
     /// provisional engine, then expose that engine before a newer publisher
     /// can overtake it.
-    pub async fn insert_engine_with_capacity(
+    pub(crate) async fn insert_engine_with_capacity(
         &self,
         name: String,
         engine: Arc<Engine>,
         generation_defaults: GenerationDefaults,
         capacity: &CapacityRegistry,
+        registration: &mut ActiveRegistration,
+        #[cfg(test)] mut insertion_gate: Option<RouteInsertionTestGate>,
     ) -> Result<(), (String, Arc<Engine>, String)> {
         let _serialized = self.cache_policy.lock().await;
         let mut inserted = false;
@@ -451,9 +459,12 @@ impl Router {
                     armed: true,
                 });
                 #[cfg(test)]
-                tokio::task::yield_now().await;
+                if let Some(gate) = insertion_gate.take() {
+                    let _ = gate.arrived.send(());
+                    let _ = gate.release.await;
+                }
             }
-            if capacity.publish_route_if_current(plan.revision, || {
+            if registration.publish_route_if_current(plan.revision, || {
                 let mut engines = self.engines_write();
                 let entry = engines
                     .get_mut(&name)
@@ -565,13 +576,16 @@ impl Router {
             RouteTarget::Higgs { model_rewrite } => {
                 let lookup_name = model_rewrite.as_deref().unwrap_or(model);
                 let engines = self.engines_read();
-                let (entry, resolved_name) = if let Some(entry) = engines.get(lookup_name) {
+                let (entry, resolved_name) = if let Some(entry) = engines
+                    .get(lookup_name)
+                    .filter(|entry| entry.capacity_ready)
+                {
                     (entry.clone(), lookup_name.to_owned())
                 } else if model == "auto" {
                     // "auto" is a virtual model name; pick any loaded engine
                     let (name, entry) = engines
                         .iter()
-                        .next()
+                        .find(|(_, entry)| entry.capacity_ready)
                         .ok_or_else(|| "no local models loaded for default route".to_owned())?;
                     (entry.clone(), name.clone())
                 } else {

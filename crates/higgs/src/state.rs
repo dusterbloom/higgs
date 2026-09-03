@@ -309,35 +309,6 @@ impl Engine {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_stub_with_cache_gate_after(
-        name: &str,
-        gate_after: u64,
-    ) -> (
-        Self,
-        Arc<tokio::sync::Notify>,
-        Arc<tokio::sync::Notify>,
-        Arc<std::sync::atomic::AtomicU64>,
-    ) {
-        let stub = RouteTestStub::new(name);
-        let arrived = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        *stub.cache_apply_gate.lock().unwrap() =
-            Some((gate_after, Arc::clone(&arrived), Arc::clone(&release)));
-        let count = Arc::clone(&stub.cache_apply_count);
-        (Self::Stub(stub), arrived, release, count)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn route_test_cache_apply_count(&self) -> u64 {
-        match self {
-            Self::Stub(stub) => stub
-                .cache_apply_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            _ => 0,
-        }
-    }
-
-    #[cfg(test)]
     pub(crate) fn route_test_mutations(&self) -> u64 {
         match self {
             Self::Stub(stub) => stub.mutation_count(),

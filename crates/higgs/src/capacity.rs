@@ -109,6 +109,12 @@ pub struct PressureObservation {
     pub compressor_delta: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ZeroCapacityRecovery {
+    Preserve,
+    BoundedMinimum,
+}
+
 /// Evidence backing the current capacity envelope.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -545,6 +551,7 @@ impl<C: Clock> CapacityController<C> {
         retained_bytes: u64,
         prefix_cache_bytes: u64,
         active_reservation_bytes: u64,
+        zero_recovery: ZeroCapacityRecovery,
     ) {
         let prior_total = self.decision.safe_total_tokens;
         self.inputs.memory = memory;
@@ -553,7 +560,15 @@ impl<C: Clock> CapacityController<C> {
         self.inputs.prefix_cache_bytes = prefix_cache_bytes;
         self.inputs.active_reservation_bytes = active_reservation_bytes;
         let raw = self.solve_static();
-        self.decision = raw.bounded_by(prior_total);
+        let recovery_ceiling = if prior_total == 0
+            && raw.availability == CapacityAvailability::Available
+            && zero_recovery == ZeroCapacityRecovery::BoundedMinimum
+        {
+            raw.safe_total_tokens.min(MINIMUM_RECOVERY_TOTAL_TOKENS)
+        } else {
+            prior_total
+        };
+        self.decision = raw.bounded_by(recovery_ceiling);
         if self.inputs.pressure == MemoryPressure::Critical {
             self.decision.availability = CapacityAvailability::Unavailable;
         }
