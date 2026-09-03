@@ -60,6 +60,11 @@ struct BatchRequest {
     /// bypassed.
     image_inputs: Vec<ImageInput>,
     response_tx: tokio::sync::mpsc::Sender<StreamingOutput>,
+    /// Per-request stop signal: the route worker's generation stop captured
+    /// at submit (disconnect/pressure/drain/watchdog), signalled by the
+    /// streaming forwarder on client disconnect. Checked by the worker at
+    /// every safe allocation boundary.
+    stop: crate::stop::GenerationStop,
 }
 
 enum BatchCommand {
@@ -145,6 +150,7 @@ struct ActiveRequest {
     response_tx: tokio::sync::mpsc::Sender<StreamingOutput>,
     prompt_len: u32,
     detok: IncrementalDetok,
+    stop: crate::stop::GenerationStop,
 }
 
 /// A request whose prompt is being fed through the model over multiple turns
@@ -450,7 +456,11 @@ impl BatchEngine {
             });
         }
 
-        // Submit request and collect all streaming outputs.
+        // Submit request and collect all streaming outputs. The stop signal
+        // is the route worker's thread-local generation stop (disconnect,
+        // pressure, drain, watchdog); without one, a default (never-signalled
+        // externally) stop still carries worker-side cancellation coverage.
+        let stop = crate::stop::generation_stop().unwrap_or_default();
         let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel(32);
 
         self.request_tx
@@ -464,12 +474,14 @@ impl BatchEngine {
                 constraint,
                 image_inputs: image_inputs.unwrap_or_default(),
                 response_tx: internal_tx,
+                stop: stop.clone(),
             }))
             .map_err(|_| EngineError::Generation("Engine shut down".to_owned()))?;
 
         let mut full_text = String::new();
         let mut finish_reason = "length".to_owned();
         let mut completion_tokens: u32 = 0;
+        let mut saw_terminal = false;
         let mut all_logprobs: Option<Vec<higgs_models::TokenLogprobInfo>> = logprobs.then(Vec::new);
         // The worker reports the post-preprocess prompt length on every chunk;
         // capture it from the first one so multimodal usage matches the
@@ -497,8 +509,18 @@ impl BatchEngine {
                 all_lp.push(lp);
             }
             if output.finished {
+                saw_terminal = true;
                 break;
             }
+        }
+
+        // The worker removed the request without a terminal chunk (its
+        // response channel closed) only when a stop boundary fired; that is
+        // a typed failure, never a partial success.
+        if !saw_terminal && stop.is_stopped() {
+            return Err(stop.reason().map_or(EngineError::Cancelled, |reason| {
+                EngineError::from_stop_reason(&reason)
+            }));
         }
 
         Ok(GenerationOutput {
@@ -582,6 +604,10 @@ impl BatchEngine {
 
         // Submit request -- the background loop sends tokens directly to
         // an internal channel, and we forward them to the caller's sender.
+        // The stop signal carries the route worker's thread-local generation
+        // stop so the worker observes disconnect/pressure/drain/watchdog at
+        // its allocation boundaries.
+        let stop = crate::stop::generation_stop().unwrap_or_default();
         let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel(32);
 
         self.request_tx
@@ -595,6 +621,7 @@ impl BatchEngine {
                 constraint,
                 image_inputs: image_inputs.unwrap_or_default(),
                 response_tx: internal_tx,
+                stop: stop.clone(),
             }))
             .map_err(|_| EngineError::Generation("Engine shut down".to_owned()))?;
 
@@ -610,13 +637,13 @@ impl BatchEngine {
             }
             let finished = output.finished;
             if sender.blocking_send(output).is_err() {
-                // Client disconnected mid-stream. The internal worker may
-                // already be executing the next decode round for this
-                // request, so the allocation the caller's reservation covers
-                // is still live. Discard the remaining outputs and hold
-                // until the worker's terminal chunk (finished or error)
-                // confirms allocation stopped — returning here would release
-                // capacity the worker is still spending.
+                // Client disconnected mid-stream: record it so the worker
+                // stops allocating at its next boundary instead of decoding
+                // to max_tokens. Then keep draining (discarding) until the
+                // worker's terminal chunk or channel close confirms removal —
+                // returning here would release capacity the worker is still
+                // spending.
+                stop.stop(crate::stop::StopReason::ClientDisconnect);
                 if finished {
                     break;
                 }
@@ -652,6 +679,39 @@ impl Drop for BatchEngine {
 // Background worker loop
 // ---------------------------------------------------------------------------
 
+/// Safe-boundary liveness for one request: it is dead when a stop reason is
+/// recorded (disconnect signalled by the forwarder, critical pressure, drain,
+/// watchdog) or its response channel already closed. Checked before prefill
+/// start, between prefill chunks, and before every decode round — the points
+/// where the next unit of allocation is decided.
+fn request_is_dead(
+    stop: &crate::stop::GenerationStop,
+    response_tx: &tokio::sync::mpsc::Sender<StreamingOutput>,
+) -> bool {
+    stop.check().is_some() || response_tx.is_closed()
+}
+
+/// Remove dead requests before the next allocation unit. Each survivor notes
+/// progress (one decode round / prefill chunk = progress). Returns how many
+/// were removed.
+fn sweep_cancelled(active: &mut Vec<ActiveRequest>) -> usize {
+    let mut cancelled = Vec::new();
+    for (i, ar) in active.iter().enumerate() {
+        if request_is_dead(&ar.stop, &ar.response_tx) {
+            cancelled.push(i);
+        }
+    }
+    let removed = cancelled.len();
+    for i in cancelled.into_iter().rev() {
+        let ar = active.swap_remove(i);
+        tracing::debug!(reason = ?ar.stop.reason(), "batch request cancelled at allocation boundary");
+    }
+    for ar in active {
+        ar.stop.note_progress();
+    }
+    removed
+}
+
 #[allow(clippy::too_many_lines)]
 fn worker_loop(
     mut model: AnyModel,
@@ -677,6 +737,13 @@ fn worker_loop(
             if let Ok(command) = request_rx.try_recv()
                 && let Some(req) = apply_batch_command(command, &mut prefix_cache, &cache_control)
             {
+                // Safe boundary before prefill start: a dead request
+                // allocates nothing. Dropping it closes its response channel,
+                // which is the submitter's terminal signal.
+                if request_is_dead(&req.stop, &req.response_tx) {
+                    tracing::debug!("batch request cancelled before prefill start");
+                    continue;
+                }
                 // The Higgs caller already owns its process GPU gate. Take the
                 // lower-level MLX gate only for this unit of work; holding it
                 // while idle would deadlock a co-resident Simple engine.
@@ -711,6 +778,14 @@ fn worker_loop(
         }
 
         if let Some(prefill) = pending_prefill.take() {
+            // Safe boundary between prefill chunks: a dead request is
+            // dropped instead of advanced; its channel close is the
+            // submitter's terminal signal.
+            if request_is_dead(&prefill.req.stop, &prefill.req.response_tx) {
+                tracing::debug!("batch prefill cancelled before advance");
+                continue;
+            }
+            prefill.req.stop.note_progress();
             let _mlx_gate = higgs_models::mlx_exec::acquire();
             let response_tx = prefill.req.response_tx.clone();
             match advance_prefill(
@@ -738,6 +813,11 @@ fn worker_loop(
             if let Some(req) =
                 blocking_next_request(&mut request_rx, &mut prefix_cache, &cache_control)
             {
+                // Safe boundary before prefill start (idle path).
+                if request_is_dead(&req.stop, &req.response_tx) {
+                    tracing::debug!("batch request cancelled before prefill start");
+                    continue;
+                }
                 let _mlx_gate = higgs_models::mlx_exec::acquire();
                 if prefill_yield_tokens == 0 {
                     let response_tx = req.response_tx.clone();
@@ -777,6 +857,9 @@ fn worker_loop(
         //    Use batched decode when possible (Transformer architecture, >1
         //    request, no constrained generation). Falls back to pipelined
         //    sequential decode otherwise.
+        // Safe boundary before the decode round.
+        sweep_cancelled(&mut active);
+
         let mut finished_indices = Vec::new();
         let use_batched = active.len() > 1
             && model.supports_batched_decode()
@@ -1106,6 +1189,7 @@ fn send_prefill_error(tx: &tokio::sync::mpsc::Sender<StreamingOutput>, error: &E
         | EngineError::Template(_)
         | EngineError::Generation(_)
         | EngineError::Cancelled
+        | EngineError::CapacityInterrupted { .. }
         | EngineError::RetainedSessionUnavailable(_) => (WORKER_ERROR_FINISH, error.to_string()),
     };
     let _ = tx.blocking_send(StreamingOutput {
@@ -1430,6 +1514,7 @@ fn complete_prefill(
             response_tx: req.response_tx,
             prompt_len,
             detok,
+            stop: req.stop,
         }))
     }
 }
@@ -1642,6 +1727,219 @@ mod tests {
             image_marker_text: None,
             vision_capabilities: None,
         }
+    }
+
+    #[test]
+    fn sweep_removes_stopped_or_disconnected_requests_and_notes_progress() {
+        let (live_tx, _live_rx) = tokio::sync::mpsc::channel(4);
+        let (gone_tx, gone_rx) = tokio::sync::mpsc::channel(4);
+        drop(gone_rx);
+
+        let (mut alive, _alive_worker_rx) = make_active_request(8, vec![]);
+        let (mut pressured, _pressured_rx) = make_active_request(8, vec![]);
+        let (mut disconnected, _disconnected_rx) = make_active_request(8, vec![]);
+        let mut active = vec![alive, pressured, disconnected];
+        // 0: alive but stalled — no stop, open channel → survives and notes.
+        active[0].response_tx = live_tx.clone();
+        active[0].stop = crate::stop::GenerationStop::new(Some(std::time::Duration::from_secs(60)));
+        // 1: external stop (critical pressure) → removed.
+        active[1].response_tx = live_tx;
+        active[1]
+            .stop
+            .stop(crate::stop::StopReason::CriticalPressure {
+                boot_id: "boot".to_owned(),
+                generation: 3,
+            });
+        // 2: open stop but closed response channel → removed.
+        active[2].response_tx = gone_tx;
+
+        assert_eq!(sweep_cancelled(&mut active), 2);
+        assert_eq!(active.len(), 1);
+        // The survivor's watchdog was reset by the progress note.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(active[0].stop.check().is_none());
+    }
+
+    #[test]
+    fn request_is_dead_covers_stop_reason_and_closed_channel() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let stop = crate::stop::GenerationStop::new(None);
+        assert!(!request_is_dead(&stop, &tx));
+        stop.stop(crate::stop::StopReason::ModelDrain);
+        assert!(request_is_dead(&stop, &tx));
+
+        let stop = crate::stop::GenerationStop::new(None);
+        drop(rx);
+        assert!(request_is_dead(&stop, &tx));
+    }
+
+    #[test]
+    fn streaming_disconnect_signals_the_worker_stop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let cache_control = Arc::new(Mutex::new(CacheControlState::default()));
+        let first_sent = Arc::new(AtomicBool::new(false));
+        let client_dropped = Arc::new(AtomicBool::new(false));
+        let observed_reason = Arc::new(Mutex::new(None));
+        let worker_first = Arc::clone(&first_sent);
+        let worker_gate = Arc::clone(&client_dropped);
+        let worker_reason = Arc::clone(&observed_reason);
+        let worker = std::thread::spawn(move || {
+            while let Some(command) = request_rx.blocking_recv() {
+                let BatchCommand::Generate(req) = command else {
+                    continue;
+                };
+                let tx = req.response_tx;
+                let _ = tx.blocking_send(StreamingOutput {
+                    new_text: "a".to_owned(),
+                    finished: false,
+                    finish_reason: None,
+                    prompt_tokens: 3,
+                    completion_tokens: 1,
+                    token_logprob: None,
+                    prefill_progress: None,
+                });
+                worker_first.store(true, Ordering::SeqCst);
+                // Wait for the client to go away, then send the next round:
+                // the forwarder's send fails, which records ClientDisconnect
+                // into the request's stop — exactly what the worker observes
+                // at its next allocation boundary.
+                while !worker_gate.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                let _ = tx.blocking_send(StreamingOutput {
+                    new_text: "b".to_owned(),
+                    finished: false,
+                    finish_reason: None,
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    token_logprob: None,
+                    prefill_progress: None,
+                });
+                while req.stop.reason().is_none() {
+                    std::thread::yield_now();
+                }
+                *worker_reason.lock().unwrap() = Some(req.stop.reason());
+                let _ = tx.blocking_send(StreamingOutput {
+                    new_text: String::new(),
+                    finished: true,
+                    finish_reason: Some("length".to_owned()),
+                    prompt_tokens: 3,
+                    completion_tokens: 1,
+                    token_logprob: None,
+                    prefill_progress: None,
+                });
+            }
+        });
+        let engine = BatchEngine {
+            request_tx,
+            cache_control,
+            worker: Some(worker),
+            tokenizer: make_tokenizer(),
+            template: ChatTemplateRenderer::new("").unwrap(),
+            model_name: "disconnect-signal".to_owned(),
+            eos_token_ids: Vec::new(),
+            hidden_size: AtomicI32::new(1),
+            is_vlm: false,
+            image_marker_text: None,
+            vision_capabilities: None,
+        };
+
+        let (client_tx, client_rx) = tokio::sync::mpsc::channel(32);
+        let generate = std::thread::spawn(move || {
+            engine.generate_streaming_with_thinking(
+                &[1, 2, 3],
+                10,
+                &SamplingParams::default(),
+                &[],
+                false,
+                None,
+                &client_tx,
+                false,
+                false,
+                None,
+                None,
+            )
+        });
+        while !first_sent.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        drop(client_rx);
+        client_dropped.store(true, Ordering::SeqCst);
+        let result = generate.join().expect("generate must not panic");
+        assert!(result.is_ok());
+        assert_eq!(
+            *observed_reason.lock().unwrap(),
+            Some(Some(crate::stop::StopReason::ClientDisconnect))
+        );
+    }
+
+    #[test]
+    fn non_streaming_removal_without_terminal_is_a_typed_failure() {
+        // A worker that removes the request without a terminal chunk (what
+        // every stop boundary now does) must surface as the recorded stop
+        // reason, never as a partial success.
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let cache_control = Arc::new(Mutex::new(CacheControlState::default()));
+        let stop = crate::stop::GenerationStop::new(None);
+        stop.stop(crate::stop::StopReason::CriticalPressure {
+            boot_id: "boot-9".to_owned(),
+            generation: 11,
+        });
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || {
+            while let Some(command) = request_rx.blocking_recv() {
+                let BatchCommand::Generate(req) = command else {
+                    continue;
+                };
+                let _ = req.response_tx.blocking_send(StreamingOutput {
+                    new_text: "partial".to_owned(),
+                    finished: false,
+                    finish_reason: None,
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    token_logprob: None,
+                    prefill_progress: None,
+                });
+                // Simulate removal at a stop boundary: the recorded reason is
+                // what the worker observed, then the channel closes.
+                assert!(worker_stop.is_stopped());
+                drop(req.response_tx);
+            }
+        });
+        let engine = BatchEngine {
+            request_tx,
+            cache_control,
+            worker: Some(worker),
+            tokenizer: make_tokenizer(),
+            template: ChatTemplateRenderer::new("").unwrap(),
+            model_name: "non-streaming-removal".to_owned(),
+            eos_token_ids: Vec::new(),
+            hidden_size: AtomicI32::new(1),
+            is_vlm: false,
+            image_marker_text: None,
+            vision_capabilities: None,
+        };
+
+        let _guard = crate::stop::install_generation_stop(stop);
+        let result = engine.generate(
+            &[1, 2, 3],
+            10,
+            &SamplingParams::default(),
+            &[],
+            false,
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(EngineError::CapacityInterrupted {
+                boot_id,
+                generation: 11,
+            }) if boot_id == "boot-9"
+        ));
     }
 
     #[test]
@@ -1929,6 +2227,7 @@ mod tests {
             logprob_top_n: None,
             constraint: None,
             response_tx: tx,
+            stop: crate::stop::GenerationStop::default(),
             prompt_len: 5,
             detok: IncrementalDetok::new(
                 String::new(),
@@ -2141,6 +2440,7 @@ mod tests {
             top_logprobs: None,
             constraint: None,
             response_tx: tx,
+            stop: crate::stop::GenerationStop::default(),
             image_inputs: vec![test_image_input()],
         };
 
@@ -2174,6 +2474,7 @@ mod tests {
             top_logprobs: None,
             constraint: None,
             response_tx: tx,
+            stop: crate::stop::GenerationStop::default(),
             image_inputs: vec![],
         };
 
@@ -2249,6 +2550,7 @@ mod tests {
             constraint: None,
             response_tx: tx.clone(),
             image_inputs,
+            stop: crate::stop::GenerationStop::default(),
         };
         let tokenizer = make_tokenizer();
 
@@ -2419,6 +2721,7 @@ mod tests {
             top_logprobs: None,
             constraint: None,
             response_tx: tx,
+            stop: crate::stop::GenerationStop::default(),
             image_inputs: vec![],
         };
         let dummy_batch = ImageBatch {
@@ -2466,6 +2769,7 @@ mod tests {
                 top_logprobs: None,
                 constraint: None,
                 response_tx: tx,
+                stop: crate::stop::GenerationStop::default(),
                 image_inputs: vec![],
             };
             let mut prefix_cache = PrefixCache::new(8);

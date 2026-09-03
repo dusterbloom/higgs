@@ -344,6 +344,26 @@ pub(crate) fn suffix_charging_route_test_state(
     (state, engine)
 }
 
+/// Arm the reservation's stop with the configured request-timeout watchdog
+/// and install it thread-locally for the worker's engine call. Engines
+/// observe it at every bounded prefill chunk and decode step; critical
+/// pressure and model drain are signalled through the same handle by the
+/// registry.
+pub(crate) fn install_reservation_stop(
+    reservation: &RequestReservation,
+    watchdog: Option<std::time::Duration>,
+) -> higgs_engine::stop::GenerationStopGuard {
+    let stop = reservation.stop();
+    stop.set_watchdog(watchdog);
+    higgs_engine::stop::install_generation_stop(stop)
+}
+
+/// The no-progress watchdog window: the configured server request timeout.
+pub(crate) fn request_watchdog(state: &crate::state::SharedState) -> Option<std::time::Duration> {
+    let timeout = state.config.server.timeout;
+    (timeout > 0.0).then(|| std::time::Duration::from_secs_f64(timeout))
+}
+
 fn capacity_server_error(error: CapacityAdmissionError) -> crate::error::ServerError {
     match error {
         CapacityAdmissionError::Exceeded(error) => {

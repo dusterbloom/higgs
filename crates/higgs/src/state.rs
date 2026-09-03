@@ -423,7 +423,8 @@ impl Engine {
                 if stub.name().starts_with("zero-prefix-")
                     || stub.name() == "blocking-required-post-admission-evicted"
                     || stub.name() == "session-prefill-render-spy"
-                    || stub.name() == "prompt-limit-mutation-spy" =>
+                    || stub.name() == "prompt-limit-mutation-spy"
+                    || stub.name() == "capacity-interrupted" =>
             {
                 route_test_tokenizer()
             }
@@ -1272,6 +1273,13 @@ impl Engine {
                 constraint,
                 image_inputs,
             ),
+            #[cfg(test)]
+            Self::Stub(stub) if stub.name() == "capacity-interrupted" => {
+                Err(EngineError::CapacityInterrupted {
+                    boot_id: "boot-route-test".to_owned(),
+                    generation: 4,
+                })
+            }
             #[cfg(test)]
             Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
         }

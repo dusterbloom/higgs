@@ -418,6 +418,7 @@ async fn chat_completions_non_streaming(
     )
     .await?;
     let assumed_retained_prefix = u64::try_from(retained_prefix).unwrap_or(u64::MAX);
+    let watchdog = crate::capacity::request_watchdog(&state);
     drop_requested_retained_sessions(
         Arc::clone(&engine),
         req.drop_session_id,
@@ -442,6 +443,7 @@ async fn chat_completions_non_streaming(
         let sampling_c = sampling.clone();
         let pflash_policy_c = pflash_policy.clone();
         let session_output = tokio::task::spawn_blocking(move || {
+            let _stop_guard = crate::capacity::install_reservation_stop(&reservation, watchdog);
             let _reservation = reservation;
             engine_c.generate_session_routed_with_thinking(
                 sid,
@@ -472,6 +474,7 @@ async fn chat_completions_non_streaming(
         ));
     } else {
         tokio::task::spawn_blocking(move || {
+            let _stop_guard = crate::capacity::install_reservation_stop(&reservation, watchdog);
             let _reservation = reservation;
             engine.generate_with_thinking_and_pflash_policy_with_cache(
                 &prompt_tokens,
@@ -895,6 +898,7 @@ async fn chat_completions_stream(
     )
     .await?;
     let assumed_retained_prefix = u64::try_from(retained_prefix).unwrap_or(u64::MAX);
+    let watchdog = crate::capacity::request_watchdog(&state);
     drop_requested_retained_sessions(
         Arc::clone(&engine),
         req.drop_session_id,
@@ -906,7 +910,7 @@ async fn chat_completions_stream(
         .is_some_and(|lease| engine.lease_retained_session(lease.session_id, lease.ttl_seconds));
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-    let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel::<crate::sse::WorkerTerminal>();
     let (acceptance, acceptance_rx) =
         if continuation_policy == SessionContinuationPolicy::RequireContinuation {
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -930,6 +934,7 @@ async fn chat_completions_stream(
         let messages_c = messages.clone();
         let pflash_policy_c = pflash_policy.clone();
         tokio::task::spawn_blocking(move || {
+            let _stop_guard = crate::capacity::install_reservation_stop(&reservation, watchdog);
             let _reservation = reservation;
             let result = worker_engine.generate_session_routed_streaming_with_thinking(
                 sid,
@@ -955,11 +960,12 @@ async fn chat_completions_stream(
                     tracing::error!(error = %e, "Session-routed generation error during streaming");
                 }
             }
-            let _ = terminal_tx.send(result.map_err(|error| error.to_string()));
+            let _ = terminal_tx.send(crate::sse::WorkerTerminal::from_engine_result(result));
         });
     } else {
         let worker_engine = Arc::clone(&engine);
         tokio::task::spawn_blocking(move || {
+            let _stop_guard = crate::capacity::install_reservation_stop(&reservation, watchdog);
             let _reservation = reservation;
             let result = worker_engine
                 .generate_streaming_with_thinking_and_pflash_policy_with_cache(
@@ -981,7 +987,7 @@ async fn chat_completions_stream(
             if let Err(ref e) = result {
                 tracing::error!(error = %e, "Generation error during streaming");
             }
-            let _ = terminal_tx.send(result.map_err(|error| error.to_string()));
+            let _ = terminal_tx.send(crate::sse::WorkerTerminal::from_engine_result(result));
         });
     }
 
@@ -1145,27 +1151,46 @@ async fn chat_completions_stream(
             }
         }
 
-        let terminal_error = match terminal_rx.await {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(error),
-            Err(error) => Some(format!(
+        let terminal = terminal_rx.await.unwrap_or_else(|error| {
+            crate::sse::WorkerTerminal::Failed(format!(
                 "streaming generation worker terminated unexpectedly: {error}"
-            )),
-        };
-        if let Some(error) = terminal_error {
-            tracing::error!(error = %error, "Streaming generation terminated with an error");
-            if let Some(ref m) = metrics {
-                if let Some(id) = metrics_id {
-                    m.fail_stream(
-                        id,
-                        u64::from(output_token_count),
-                        start.elapsed(),
-                        error.clone(),
-                    );
+            ))
+        });
+        match terminal {
+            crate::sse::WorkerTerminal::Completed => {}
+            crate::sse::WorkerTerminal::Capacity(info) => {
+                // Exact frozen v1 terminal event, then the normal tail
+                // terminates the stream with [DONE].
+                if let Some(ref m) = metrics {
+                    if let Some(id) = metrics_id {
+                        m.fail_stream(
+                            id,
+                            u64::from(output_token_count),
+                            start.elapsed(),
+                            "capacity_interrupted".to_owned(),
+                        );
+                    }
                 }
+                yield Ok(Event::default().data(crate::sse::capacity_interrupted_event_json(
+                    &info,
+                    u64::from(output_token_count),
+                )));
             }
-            yield Ok(Event::default().data(streaming_error_json(&error)));
-            return;
+            crate::sse::WorkerTerminal::Failed(error) => {
+                tracing::error!(error = %error, "Streaming generation terminated with an error");
+                if let Some(ref m) = metrics {
+                    if let Some(id) = metrics_id {
+                        m.fail_stream(
+                            id,
+                            u64::from(output_token_count),
+                            start.elapsed(),
+                            error.clone(),
+                        );
+                    }
+                }
+                yield Ok(Event::default().data(streaming_error_json(&error)));
+                return;
+            }
         }
 
         // Flush any remaining buffered content.
@@ -1314,7 +1339,10 @@ pub(crate) fn map_engine_error(e: higgs_engine::error::EngineError) -> ServerErr
         | higgs_engine::error::EngineError::Tokenization(_)
         | higgs_engine::error::EngineError::Template(_)
         | higgs_engine::error::EngineError::Generation(_)
-        | higgs_engine::error::EngineError::Cancelled) => ServerError::Engine(other),
+        | higgs_engine::error::EngineError::Cancelled
+        | higgs_engine::error::EngineError::CapacityInterrupted { .. }) => {
+            ServerError::Engine(other)
+        }
     }
 }
 
@@ -1908,6 +1936,46 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["code"], "retained_session_unavailable");
+    }
+
+    #[tokio::test]
+    async fn capacity_interrupted_stream_emits_exact_terminal_event_then_done() {
+        let model = "capacity-interrupted";
+        let engine = Arc::new(Engine::test_stub(model));
+        let request = chat_request(serde_json::json!({
+            "model": model,
+            "stream": true,
+            "max_tokens": 8
+        }));
+
+        let stream = chat_completions_stream(
+            streaming_test_state(),
+            request,
+            Arc::clone(&engine),
+            GenerationDefaults::default(),
+            None,
+            crate::router::RoutingMethod::Direct,
+        )
+        .await
+        .expect("admitted stream must start");
+        let response = axum::response::sse::Sse::new(stream).into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        // Exact frozen v1 terminal payload.
+        assert!(
+            body.contains(r#""type":"higgs_capacity_interrupted""#),
+            "{body}"
+        );
+        assert!(body.contains(r#""code":"capacity_interrupted""#), "{body}");
+        assert!(body.contains(r#""bootId":"boot-route-test""#), "{body}");
+        assert!(body.contains(r#""generation":4"#), "{body}");
+        assert!(body.contains(r#""partialOutputTokens":0"#), "{body}");
+        // The typed event precedes the normal terminator.
+        let event_at = body.find("higgs_capacity_interrupted").expect("event");
+        let done_at = body.find("[DONE]").expect("[DONE]");
+        assert!(event_at < done_at, "{body}");
     }
 
     #[tokio::test]

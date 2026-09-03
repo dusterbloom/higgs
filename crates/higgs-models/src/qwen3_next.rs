@@ -9168,7 +9168,8 @@ impl Qwen3NextCausalLM {
             }
             mlx_rs::transforms::eval(targets)?;
             offset += chunk_size;
-            crate::progress::report_prefill_progress(offset, T);
+            crate::progress::report_prefill_progress(offset, T)
+                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
         }
 
         // Last chunk: use forward_last_token which efficiently projects only
@@ -9178,7 +9179,8 @@ impl Qwen3NextCausalLM {
         // The loop only reports up to the final chunk boundary; emit the
         // terminal 100% mark once the last chunk is processed so clients don't
         // stall just short of `total`.
-        crate::progress::report_prefill_progress(T, T);
+        crate::progress::report_prefill_progress(T, T)
+            .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
         Ok(logits)
     }
 

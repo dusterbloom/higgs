@@ -312,7 +312,9 @@ async fn create_message_non_streaming(
     let image_inputs = (!media.is_empty() && engine.is_vlm())
         .then(|| media.into_iter().map(MediaItem::into).collect());
 
+    let watchdog = crate::capacity::request_watchdog(&state);
     let output = tokio::task::spawn_blocking(move || {
+        let _stop_guard = crate::capacity::install_reservation_stop(&reservation, watchdog);
         let _reservation = reservation;
         engine.generate_with_thinking(
             &prompt_tokens,
@@ -445,8 +447,11 @@ async fn create_message_stream(
 
     // Spawn generation before creating the stream so prefill starts immediately
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel::<crate::sse::WorkerTerminal>();
+    let watchdog = crate::capacity::request_watchdog(&state);
 
     tokio::task::spawn_blocking(move || {
+        let _stop_guard = crate::capacity::install_reservation_stop(&reservation, watchdog);
         let _reservation = reservation;
         let result = engine.generate_streaming_with_thinking(
             &prompt_tokens,
@@ -463,9 +468,10 @@ async fn create_message_stream(
             image_inputs,
             None,
         );
-        if let Err(e) = result {
+        if let Err(e) = &result {
             tracing::error!(error = %e, "Generation error during Anthropic streaming");
         }
+        let _ = terminal_tx.send(crate::sse::WorkerTerminal::from_engine_result(result));
     });
 
     let start = Instant::now();
@@ -566,6 +572,25 @@ async fn create_message_stream(
         if let Some(ref m) = metrics {
             if let Some(id) = metrics_id {
                 m.finalize_stream(id, u64::from(total_output_tokens), start.elapsed());
+            }
+        }
+
+        match terminal_rx.await.unwrap_or_else(|error| {
+            crate::sse::WorkerTerminal::Failed(format!(
+                "streaming generation worker terminated unexpectedly: {error}"
+            ))
+        }) {
+            crate::sse::WorkerTerminal::Completed
+            | crate::sse::WorkerTerminal::Failed(_) => {}
+            crate::sse::WorkerTerminal::Capacity(info) => {
+                // Exact frozen v1 terminal event, then the normal message
+                // stop tail.
+                yield Ok(Event::default().data(
+                    crate::sse::capacity_interrupted_event_json(
+                        &info,
+                        u64::from(total_output_tokens),
+                    ),
+                ));
             }
         }
 

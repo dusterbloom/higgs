@@ -871,7 +871,8 @@ impl AnyModel {
             }
             eval(targets)?;
             offset += chunk_size;
-            progress::report_prefill_progress(offset, T);
+            progress::report_prefill_progress(offset, T)
+                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
         }
 
         // Last chunk: forward + LM head projection on last position only.
@@ -880,7 +881,8 @@ impl AnyModel {
         // The loop only reports up to the final chunk boundary; emit the
         // terminal 100% mark once the last chunk is processed so clients don't
         // stall just short of `total`.
-        progress::report_prefill_progress(T, T);
+        progress::report_prefill_progress(T, T)
+            .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
         Ok(logits)
     }
 

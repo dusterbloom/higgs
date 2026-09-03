@@ -12877,7 +12877,10 @@ impl SimpleEngine {
 
         // Stream prefill progress only when the caller opted in (OpenAI
         // `return_progress: true`). Direct higgs-engine callers and BatchEngine
-        // keep the progress-free streaming contract: no sink, no extra events.
+        // keep the progress-free streaming contract: no extra events. A sink
+        // is still installed — progress-free — whenever the worker installed
+        // a generation stop, because the chunk boundary between prefill
+        // chunks is the cancellation observation point.
         //
         // The chunked-prefill loops report suffix-relative completions through a
         // thread-local sink; map them to absolute prompt position by adding the
@@ -12885,46 +12888,79 @@ impl SimpleEngine {
         // progress-only outputs. try_send: never stall prefill on a slow
         // consumer — dropped progress events are harmless. The returned guard is
         // held for the prefill's duration and uninstalls the sink on drop.
-        let prefill_sink = return_progress.then(|| {
-            let cached = prepared.reused_prefix_tokens;
-            let make_progress_output = move |suffix_done: u32| StreamingOutput {
-                new_text: String::new(),
-                finished: false,
-                finish_reason: None,
-                prompt_tokens: prompt_len,
-                completion_tokens: 0,
-                token_logprob: None,
-                prefill_progress: Some(crate::engine::PrefillProgress {
-                    processed: (cached + suffix_done).min(prompt_len),
-                    cached,
-                    total: prompt_len,
-                }),
-            };
-            // Initial event: tells the client the total (and cache hit) before
-            // the first ~1024-token chunk completes.
-            let _ = sender.try_send(make_progress_output(0));
-            let progress_sender = sender.clone();
-            higgs_models::progress::install_prefill_progress_sink(Box::new(move |done, _total| {
-                let _ = progress_sender.try_send(make_progress_output(
-                    u32::try_from(done.max(0)).unwrap_or(0),
-                ));
-            }))
-        });
+        let prefill_sink =
+            (return_progress || crate::stop::generation_stop().is_some()).then(|| {
+                let cached = prepared.reused_prefix_tokens;
+                let make_progress_output = move |suffix_done: u32| StreamingOutput {
+                    new_text: String::new(),
+                    finished: false,
+                    finish_reason: None,
+                    prompt_tokens: prompt_len,
+                    completion_tokens: 0,
+                    token_logprob: None,
+                    prefill_progress: Some(crate::engine::PrefillProgress {
+                        processed: (cached + suffix_done).min(prompt_len),
+                        cached,
+                        total: prompt_len,
+                    }),
+                };
+                // Initial event: tells the client the total (and cache hit) before
+                // the first ~1024-token chunk completes.
+                if return_progress {
+                    let _ = sender.try_send(make_progress_output(0));
+                }
+                let progress_sender = sender.clone();
+                higgs_models::progress::install_prefill_progress_sink(Box::new(
+                    move |done, _total| {
+                        // Cancellation boundary between prefill chunks: a recorded
+                        // stop reason (pressure/drain/watchdog) or a disconnected
+                        // client aborts before the next chunk allocates. The
+                        // stream entry maps ModelError::PrefillCancelled back to
+                        // the recorded reason.
+                        if crate::stop::generation_stop_check().is_some()
+                            || progress_sender.is_closed()
+                        {
+                            return Err(higgs_models::error::ModelError::PrefillCancelled);
+                        }
+                        if return_progress {
+                            let _ = progress_sender.try_send(make_progress_output(
+                                u32::try_from(done.max(0)).unwrap_or(0),
+                            ));
+                        }
+                        Ok(())
+                    },
+                ))
+            });
 
-        let (current_token, first_logprob_data, prefill_hidden) = self.run_prefill(
-            prepared_prompt_tokens,
-            self.gen_prompt_suffixes.for_request(enable_thinking),
-            &mut prepared,
-            params,
-            logprob_top_n,
-            constraint.as_ref(),
-            capture_mtp_prefill,
-            cache_policy_allows_prefix_cache(allow_prefix_cache) && compressed.is_none(),
-            checkpoint_id,
-            compressed.as_ref(),
-            None,
-            None,
-        )?;
+        let (current_token, first_logprob_data, prefill_hidden) = self
+            .run_prefill(
+                prepared_prompt_tokens,
+                self.gen_prompt_suffixes.for_request(enable_thinking),
+                &mut prepared,
+                params,
+                logprob_top_n,
+                constraint.as_ref(),
+                capture_mtp_prefill,
+                cache_policy_allows_prefix_cache(allow_prefix_cache) && compressed.is_none(),
+                checkpoint_id,
+                compressed.as_ref(),
+                None,
+                None,
+            )
+            .map_err(|error| match error {
+                // The prefill sink aborts with PrefillCancelled once a stop
+                // reason is recorded or the client disconnected; surface the
+                // recorded reason (typed for critical pressure) instead of a
+                // generic model error.
+                EngineError::Model(higgs_models::error::ModelError::PrefillCancelled) => {
+                    crate::stop::generation_stop()
+                        .and_then(|stop| stop.reason())
+                        .map_or(EngineError::Cancelled, |reason| {
+                            EngineError::from_stop_reason(&reason)
+                        })
+                }
+                other => other,
+            })?;
         // Prefill done — decode must not report progress. Dropping the Option
         // uninstalls the sink when present; a no-op when progress was off.
         drop(prefill_sink);
@@ -13056,6 +13092,14 @@ impl SimpleEngine {
         }
 
         loop {
+            // Decode-step cancellation boundary: a recorded stop reason
+            // (disconnect observed elsewhere, critical pressure, drain, or
+            // the no-progress watchdog) ends allocation before the next
+            // forward. Each emitted token counts as progress.
+            if let Some(reason) = crate::stop::generation_stop_check() {
+                return Err(EngineError::from_stop_reason(&reason));
+            }
+            crate::stop::generation_stop().map_or((), |stop| stop.note_progress());
             // When constrained, extract the sampled token and advance the FSM
             // before decode_step, so the mask is always applied at the correct
             // FSM state (mirrors the non-streaming pattern in generate_inner).

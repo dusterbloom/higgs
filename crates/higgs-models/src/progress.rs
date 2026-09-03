@@ -13,7 +13,7 @@ use std::path::Path;
 
 use crate::error::ModelError;
 
-type Sink = Box<dyn FnMut(i32, i32)>;
+type Sink = Box<dyn FnMut(i32, i32) -> Result<(), ModelError>>;
 type LoadSink = Box<dyn FnMut(LoadBoundary) -> Result<(), ModelError>>;
 
 /// The kind of allocation-producing conversion about to run while loading.
@@ -220,12 +220,11 @@ pub fn install_prefill_progress_sink(sink: Sink) -> PrefillSinkGuard {
 ///
 /// The sink is invoked while the thread-local is `borrow_mut`-held, so the
 /// sink must not call back into this function or reinstall the sink.
-pub fn report_prefill_progress(processed: i32, total: i32) {
-    PREFILL_SINK.with(|s| {
-        if let Some(f) = s.borrow_mut().as_mut() {
-            f(processed, total);
-        }
-    });
+pub fn report_prefill_progress(processed: i32, total: i32) -> Result<(), ModelError> {
+    PREFILL_SINK.with(|s| match s.borrow_mut().as_mut() {
+        Some(f) => f(processed, total),
+        None => Ok(()),
+    })
 }
 
 #[cfg(test)]
@@ -241,20 +240,36 @@ mod tests {
         let seen: Rc<RefCell<Vec<(i32, i32)>>> = Rc::new(RefCell::new(Vec::new()));
 
         // No sink installed — must not panic, must not record.
-        report_prefill_progress(512, 4096);
+        report_prefill_progress(512, 4096).unwrap();
         assert!(seen.borrow().is_empty());
 
         let sink_seen = Rc::clone(&seen);
         let guard = install_prefill_progress_sink(Box::new(move |p, t| {
             sink_seen.borrow_mut().push((p, t));
+            Ok(())
         }));
-        report_prefill_progress(1024, 4096);
-        report_prefill_progress(2048, 4096);
+        report_prefill_progress(1024, 4096).unwrap();
+        report_prefill_progress(2048, 4096).unwrap();
         drop(guard);
 
         // After the guard drops, reports are no-ops again.
-        report_prefill_progress(3072, 4096);
+        report_prefill_progress(3072, 4096).unwrap();
         assert_eq!(*seen.borrow(), vec![(1024, 4096), (2048, 4096)]);
+    }
+
+    /// A sink that observes cancellation returns `Err` and the report
+    /// propagates it, so chunked prefill loops abort at the next chunk
+    /// boundary instead of continuing to allocate.
+    #[test]
+    fn test_sink_abort_propagates() {
+        let guard =
+            install_prefill_progress_sink(Box::new(|_p, _t| Err(ModelError::PrefillCancelled)));
+        assert!(matches!(
+            report_prefill_progress(1024, 4096),
+            Err(ModelError::PrefillCancelled)
+        ));
+        drop(guard);
+        assert!(report_prefill_progress(2048, 4096).is_ok());
     }
 
     /// Removing the load-boundary reporter or failing to restore a nested sink

@@ -161,6 +161,11 @@ struct RegistryState {
 struct ActiveReservation {
     model: String,
     bytes: u64,
+    /// Stop signal shared with the owning worker. Critical pressure and model
+    /// drain interrupt live reservations through it; the worker acknowledges
+    /// at its next allocation boundary and releases the guard only after
+    /// allocation has stopped.
+    stop: higgs_engine::stop::GenerationStop,
 }
 
 #[derive(Debug)]
@@ -266,9 +271,18 @@ pub struct RequestReservation {
     id: uuid::Uuid,
     bytes: u64,
     released: bool,
+    stop: higgs_engine::stop::GenerationStop,
 }
 
 impl RequestReservation {
+    /// The stop signal shared with the capacity registry. The route worker
+    /// installs it thread-locally beside this guard so engine allocation
+    /// boundaries observe critical pressure, drain, and disconnect.
+    #[must_use]
+    pub fn stop(&self) -> higgs_engine::stop::GenerationStop {
+        self.stop.clone()
+    }
+
     #[must_use]
     pub const fn bytes(&self) -> u64 {
         self.bytes
@@ -495,11 +509,13 @@ impl CapacityRegistry {
             ));
         };
         let id = uuid::Uuid::new_v4();
+        let stop = higgs_engine::stop::GenerationStop::default();
         state.active_reservations.insert(
             id,
             ActiveReservation {
                 model: model.to_owned(),
                 bytes,
+                stop: stop.clone(),
             },
         );
         RequestReservationAttempt::Reserved(RequestReservation {
@@ -507,6 +523,7 @@ impl CapacityRegistry {
             id,
             bytes,
             released: false,
+            stop,
         })
     }
 
@@ -1047,6 +1064,17 @@ impl CapacityRegistry {
         active.drain_nonce = Some(nonce);
         active.frozen_cache_allocation = Some(frozen_cache_allocation);
         entry.generation = entry.generation.saturating_add(1);
+        // Cancel-and-join: interrupt this model's live reservations so their
+        // workers stop allocating at the next boundary and the final
+        // unregister's wait-for-zero drains promptly instead of waiting for
+        // max_tokens.
+        for reservation in state.active_reservations.values() {
+            if reservation.model == model {
+                reservation
+                    .stop
+                    .stop(higgs_engine::stop::StopReason::ModelDrain);
+            }
+        }
         let mut removed_waiters = Vec::new();
         state.admission_queue.retain(|waiter| {
             if waiter.model == model {
@@ -1174,6 +1202,24 @@ impl CapacityRegistry {
             }
         }
         state.pressure = effective_pressure;
+        if effective_pressure == MemoryPressure::Critical {
+            // Interrupt every live reservation: each worker acknowledges at
+            // its next allocation boundary and surfaces the typed capacity
+            // interruption. Bytes are NOT released here — the worker-owned
+            // guard still drops only after allocation has stopped.
+            for reservation in state.active_reservations.values() {
+                let generation = state
+                    .models
+                    .get(&reservation.model)
+                    .map_or(0, |entry| entry.generation);
+                reservation
+                    .stop
+                    .stop(higgs_engine::stop::StopReason::CriticalPressure {
+                        boot_id: self.boot_id.clone(),
+                        generation,
+                    });
+            }
+        }
         recompute_registry(&mut state);
         let wake = state
             .admission_queue
@@ -2416,6 +2462,67 @@ mod tests {
         assert_eq!(registry.active_reservation_count("model"), 1);
         drop(replacement);
         follower.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_admission_critical_pressure_interrupts_live_reservations() {
+        let registry = CapacityRegistry::new(["model".to_owned()]);
+        register(&registry, admission_facts("model"));
+        let reservation = registry
+            .reserve_request("model", admission_request(1_024, 1_024))
+            .await
+            .unwrap();
+        assert_eq!(reservation.stop().reason(), None);
+
+        let generation_before = registry.snapshot("model").unwrap().generation;
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Critical,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+
+        // The interrupt carries this boot's identity and the post-transition
+        // generation nanobot will retry against.
+        assert!(
+            matches!(
+                reservation.stop().reason(),
+                Some(higgs_engine::stop::StopReason::CriticalPressure {
+                    boot_id,
+                    generation,
+                }) if *boot_id == registry.boot_id().to_owned()
+                    && generation >= generation_before
+            ),
+            "unexpected interrupt payload: {:?}",
+            reservation.stop().reason()
+        );
+        // Bytes are still held: the worker releases its guard only after it
+        // acknowledges at an allocation boundary.
+        assert_eq!(registry.active_reservation_count("model"), 1);
+        drop(reservation);
+        assert_eq!(registry.active_reservation_count("model"), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_admission_drain_cancels_and_joins_active_reservations() {
+        let registry = CapacityRegistry::new(["model".to_owned()]);
+        register(&registry, admission_facts("model"));
+        let reservation = registry
+            .reserve_request("model", admission_request(1_024, 1_024))
+            .await
+            .unwrap();
+        assert_eq!(reservation.stop().reason(), None);
+
+        let drain = registry.begin_drain("model").unwrap();
+        assert_eq!(
+            reservation.stop().reason(),
+            Some(higgs_engine::stop::StopReason::ModelDrain)
+        );
+        drop(reservation);
+        // With the interrupted worker released, the drain can complete.
+        registry
+            .finish_unregister(drain, None)
+            .expect("drain finishes after worker release");
+        assert_eq!(registry.active_reservation_count("model"), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

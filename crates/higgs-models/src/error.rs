@@ -28,6 +28,9 @@ pub enum ModelError {
 
     #[error("Optional model load suppressed after pressure increased")]
     OptionalLoadSuppressed,
+
+    #[error("Prefill cancelled by observer")]
+    PrefillCancelled,
 }
 
 #[allow(clippy::panic, clippy::unwrap_used)]

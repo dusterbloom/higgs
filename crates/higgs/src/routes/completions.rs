@@ -179,7 +179,9 @@ async fn completions_non_streaming(
 
     let tokenizer = engine.tokenizer().clone();
     let checkpoint_id = req.checkpoint_id.clone();
+    let watchdog = crate::capacity::request_watchdog(&state);
     let output = tokio::task::spawn_blocking(move || {
+        let _stop_guard = crate::capacity::install_reservation_stop(&reservation, watchdog);
         let _reservation = reservation;
         engine.generate(
             &prompt_tokens,
@@ -256,8 +258,11 @@ async fn completions_stream(
     let checkpoint_id = req.checkpoint_id;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel::<crate::sse::WorkerTerminal>();
+    let watchdog = crate::capacity::request_watchdog(&state);
 
     tokio::task::spawn_blocking(move || {
+        let _stop_guard = crate::capacity::install_reservation_stop(&reservation, watchdog);
         let _reservation = reservation;
         let result = engine.generate_streaming(
             &prompt_tokens,
@@ -271,9 +276,10 @@ async fn completions_stream(
             None,
             checkpoint_id.as_deref(),
         );
-        if let Err(e) = result {
+        if let Err(e) = &result {
             tracing::error!(error = %e, "Generation error during streaming");
         }
+        let _ = terminal_tx.send(crate::sse::WorkerTerminal::from_engine_result(result));
     });
 
     let start = Instant::now();
@@ -306,6 +312,21 @@ async fn completions_stream(
             match writer.write(&choice) {
                 Ok(json) => yield Ok(Event::default().data(json)),
                 Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
+            }
+        }
+
+        match terminal_rx.await.unwrap_or_else(|error| {
+            crate::sse::WorkerTerminal::Failed(format!(
+                "streaming generation worker terminated unexpectedly: {error}"
+            ))
+        }) {
+            crate::sse::WorkerTerminal::Completed
+            | crate::sse::WorkerTerminal::Failed(_) => {}
+            crate::sse::WorkerTerminal::Capacity(info) => {
+                // Exact frozen v1 terminal event, then the normal [DONE].
+                yield Ok(Event::default().data(
+                    crate::sse::capacity_interrupted_event_json(&info, output_tokens),
+                ));
             }
         }
 

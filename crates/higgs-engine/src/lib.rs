@@ -19,6 +19,7 @@ pub mod reasoning_parser;
 pub mod runtime_identity;
 pub mod scheduler;
 pub mod simple;
+pub mod stop;
 pub mod tool_parser;
 
 pub use mlx_tuning::{

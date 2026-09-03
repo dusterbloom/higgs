@@ -20,6 +20,59 @@ use crate::types::openai::{
     ChatCompletionDelta, ChoiceLogprobs, CompletionChunkChoice, CompletionUsage,
 };
 
+/// Typed capacity interruption delivered by a streaming worker after the
+/// SSE stream has begun. Carries exactly the frozen v1 wire fields.
+#[derive(Debug, Clone)]
+pub(crate) struct CapacityInterruptInfo {
+    pub boot_id: String,
+    pub generation: u64,
+}
+
+/// Streaming worker terminal outcome: success, a typed capacity
+/// interruption, or an ordinary failure message.
+#[derive(Debug)]
+pub(crate) enum WorkerTerminal {
+    Completed,
+    Capacity(CapacityInterruptInfo),
+    Failed(String),
+}
+
+impl WorkerTerminal {
+    /// Classify an engine result for the terminal channel.
+    pub(crate) fn from_engine_result(result: Result<(), higgs_engine::error::EngineError>) -> Self {
+        match result {
+            Ok(()) => Self::Completed,
+            Err(higgs_engine::error::EngineError::CapacityInterrupted {
+                boot_id,
+                generation,
+            }) => Self::Capacity(CapacityInterruptInfo {
+                boot_id,
+                generation,
+            }),
+            Err(other) => Self::Failed(other.to_string()),
+        }
+    }
+}
+
+/// The exact frozen v1 terminal capacity SSE payload:
+/// `{"error":{"type":"higgs_capacity_interrupted","code":"capacity_interrupted","bootId":"…","generation":N,"partialOutputTokens":M}}`.
+/// Followed by the normal `[DONE]` terminator at the call site.
+pub(crate) fn capacity_interrupted_event_json(
+    info: &CapacityInterruptInfo,
+    partial_output_tokens: u64,
+) -> String {
+    serde_json::json!({
+        "error": {
+            "type": "higgs_capacity_interrupted",
+            "code": "capacity_interrupted",
+            "bootId": info.boot_id,
+            "generation": info.generation,
+            "partialOutputTokens": partial_output_tokens,
+        }
+    })
+    .to_string()
+}
+
 /// Pre-serialized prefix + reusable buffer for chat-completion SSE chunks.
 ///
 /// `pub` so the criterion bench in `benches/sse_serialize.rs` can call the
