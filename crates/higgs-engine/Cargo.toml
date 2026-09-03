@@ -21,7 +21,7 @@ minijinja.workspace = true
 minijinja-contrib.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 outlines-core = { version = "0.2.14", default-features = false }
 half = { version = "2.4", features = ["bytemuck"] }
 memmap2 = "0.9"

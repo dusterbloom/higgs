@@ -59,6 +59,9 @@ pub struct RouteTestStub {
     mutation_sequence: std::sync::Mutex<Vec<String>>,
     retained_sessions: std::sync::Mutex<std::collections::HashSet<u64>>,
     capacity_cache_limits: std::sync::Mutex<(u64, u64)>,
+    cache_apply_count: Arc<std::sync::atomic::AtomicU64>,
+    cache_apply_gate:
+        std::sync::Mutex<Option<(u64, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 #[cfg(test)]
@@ -70,6 +73,8 @@ impl RouteTestStub {
             mutation_sequence: std::sync::Mutex::new(Vec::new()),
             retained_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
             capacity_cache_limits: std::sync::Mutex::new((0, 0)),
+            cache_apply_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cache_apply_gate: std::sync::Mutex::new(None),
         }
     }
 
@@ -140,6 +145,24 @@ impl RouteTestStub {
     fn capacity_cache_limits(&self) -> (u64, u64) {
         *self.capacity_cache_limits.lock().unwrap()
     }
+
+    async fn wait_cache_apply_gate(&self) {
+        let count = self
+            .cache_apply_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        let gate = {
+            let mut gate = self.cache_apply_gate.lock().unwrap();
+            gate.as_ref()
+                .is_some_and(|(gate_after, _, _)| count >= *gate_after)
+                .then(|| gate.take())
+                .flatten()
+        };
+        if let Some((_, arrived, release)) = gate {
+            arrived.notify_one();
+            release.notified().await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -190,6 +213,16 @@ pub enum Engine {
 }
 
 impl Engine {
+    #[must_use]
+    pub const fn cache_capabilities(&self) -> crate::capacity::CacheCapabilities {
+        match self {
+            Self::Simple(_) => crate::capacity::CacheCapabilities::SIMPLE,
+            Self::Batch(_) => crate::capacity::CacheCapabilities::BATCH,
+            #[cfg(test)]
+            Self::Stub(_) => crate::capacity::CacheCapabilities::SIMPLE,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn load_simple<P: AsRef<Path>>(
         dir: P,
@@ -261,6 +294,47 @@ impl Engine {
     #[cfg(test)]
     pub fn test_stub(name: &str) -> Self {
         Self::Stub(RouteTestStub::new(name))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_stub_with_cache_gate(
+        name: &str,
+    ) -> (Self, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let stub = RouteTestStub::new(name);
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *stub.cache_apply_gate.lock().unwrap() =
+            Some((1, Arc::clone(&arrived), Arc::clone(&release)));
+        (Self::Stub(stub), arrived, release)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_stub_with_cache_gate_after(
+        name: &str,
+        gate_after: u64,
+    ) -> (
+        Self,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        let stub = RouteTestStub::new(name);
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *stub.cache_apply_gate.lock().unwrap() =
+            Some((gate_after, Arc::clone(&arrived), Arc::clone(&release)));
+        let count = Arc::clone(&stub.cache_apply_count);
+        (Self::Stub(stub), arrived, release, count)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn route_test_cache_apply_count(&self) -> u64 {
+        match self {
+            Self::Stub(stub) => stub
+                .cache_apply_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            _ => 0,
+        }
     }
 
     #[cfg(test)]
@@ -1142,10 +1216,12 @@ impl Engine {
 
     /// Apply the process registry's effective cache allocation. Batch engines
     /// acknowledge the worker-side eviction before this returns.
-    pub fn apply_capacity_cache_limits(
+    pub async fn apply_capacity_cache_limits(
         &self,
+        revision: u64,
         retained_bytes: u64,
         prefix_bytes: u64,
+        pressure: crate::capacity::MemoryPressure,
     ) -> Result<(), EngineError> {
         let retained_limit = usize::try_from(retained_bytes).map_err(|_| {
             EngineError::Generation("retained cache allocation exceeds platform usize".to_owned())
@@ -1155,12 +1231,25 @@ impl Engine {
         })?;
         match self {
             Self::Simple(engine) => {
-                engine.apply_capacity_cache_limits(retained_limit, prefix_limit);
+                engine.apply_capacity_cache_limits(
+                    retained_limit,
+                    prefix_limit,
+                    if pressure == crate::capacity::MemoryPressure::Critical {
+                        higgs_engine::simple::CachePressurePolicy::Critical
+                    } else {
+                        higgs_engine::simple::CachePressurePolicy::Normal
+                    },
+                );
                 Ok(())
             }
-            Self::Batch(engine) => engine.apply_capacity_cache_limit(prefix_limit),
+            Self::Batch(engine) => {
+                engine
+                    .apply_capacity_cache_limit(revision, prefix_limit)
+                    .await
+            }
             #[cfg(test)]
             Self::Stub(stub) => {
+                stub.wait_cache_apply_gate().await;
                 stub.set_capacity_cache_limits(retained_bytes, prefix_bytes);
                 Ok(())
             }
@@ -1234,10 +1323,7 @@ pub fn build_engine(
         )
         .map_err(|e| e.to_string())?
     };
-    let name = model_cfg
-        .name
-        .clone()
-        .unwrap_or_else(|| engine.model_name().to_owned());
+    let name = resolve_exposed_model_name(model_cfg.name.as_deref(), &model_cfg.path, resolved);
     Ok((name, engine))
 }
 
@@ -1276,10 +1362,22 @@ pub fn build_engine_with_capacity(
                 return Err(format!("failed to measure MLX after model load: {error}"));
             }
         };
+        // Publish while the process GPU/load gate is still held. Lifecycle
+        // commits may complete out of order, but can no longer regress the
+        // allocator authority to an older per-load snapshot.
+        capacity.refresh_memory(after);
         Ok((name, engine, before, after))
     })?;
+    let cache_capabilities = engine.cache_capabilities();
     let facts = match build_capacity_facts_from_measurements(
-        &name, resolved, model_cfg, config, identity, before, after,
+        &name,
+        resolved,
+        model_cfg,
+        config,
+        identity,
+        before,
+        after,
+        cache_capabilities,
     ) {
         Ok(facts) => facts,
         Err(error) => {
@@ -1309,7 +1407,7 @@ pub fn release_failed_engine(engine: Engine, capacity: &CapacityRegistry) {
 pub fn refresh_after_engine_drop(
     capacity: &CapacityRegistry,
     reason: &'static str,
-) -> Option<higgs_engine::MlxMemorySnapshot> {
+) -> Option<crate::capacity::PublishedMemoryMeasurement> {
     #[cfg(test)]
     {
         let _ = (capacity, reason);
@@ -1320,27 +1418,24 @@ pub fn refresh_after_engine_drop(
 }
 
 pub(crate) fn measure_after_engine_drop(
+    capacity: &CapacityRegistry,
     reason: &'static str,
-) -> Option<higgs_engine::MlxMemorySnapshot> {
+) -> Option<crate::capacity::PublishedMemoryMeasurement> {
     #[cfg(test)]
     {
-        // Unit-test stub engines do not initialize an MLX allocator; entering
-        // its Objective-C cleanup path would raise an uncatchable foreign
-        // exception. Integration/release builds always execute the real seam.
-        let _ = reason;
+        let _ = (capacity, reason);
         None
     }
     #[cfg(not(test))]
-    with_serialized_mlx_load(|| measure_after_engine_drop_locked(reason))
+    with_serialized_mlx_load(|| refresh_after_engine_drop_locked(capacity, reason))
 }
 
 fn refresh_after_engine_drop_locked(
     capacity: &CapacityRegistry,
     reason: &'static str,
-) -> Option<higgs_engine::MlxMemorySnapshot> {
+) -> Option<crate::capacity::PublishedMemoryMeasurement> {
     let memory = measure_after_engine_drop_locked(reason)?;
-    capacity.refresh_memory(memory);
-    Some(memory)
+    Some(capacity.refresh_memory(memory))
 }
 
 fn measure_after_engine_drop_locked(
@@ -1359,6 +1454,7 @@ fn build_capacity_facts_from_measurements(
     identity: ModelContentIdentity,
     before: higgs_engine::MlxMemorySnapshot,
     after: higgs_engine::MlxMemorySnapshot,
+    cache_capabilities: crate::capacity::CacheCapabilities,
 ) -> Result<ModelCapacityFacts, String> {
     const MIB: u64 = 1024 * 1024;
     let footprint = ModelFootprint::from_load_measurements(resolved, before, after)
@@ -1399,6 +1495,12 @@ fn build_capacity_facts_from_measurements(
         .and_then(serde_json::Value::as_str);
     let is_eschamoe = higgs_models::eschamoe::is_eschamoe_checkpoint(resolved)
         .map_err(|error| format!("failed to identify model execution mode: {error}"))?;
+    let runtime_environment = resolved_model_runtime_identity(
+        resolved,
+        &model_json,
+        is_eschamoe,
+        model_cfg.mla_latent_cache.unwrap_or(false),
+    );
     let weight_execution = if is_eschamoe && higgs_models::eschamoe::native_mode() {
         "eschamoe-native"
     } else if is_eschamoe {
@@ -1439,7 +1541,7 @@ fn build_capacity_facts_from_measurements(
         &kv_representation,
         prefill_model_identity.clone(),
         drafter_identity.clone(),
-        is_eschamoe,
+        runtime_environment,
         after,
     );
 
@@ -1459,6 +1561,7 @@ fn build_capacity_facts_from_measurements(
             .map_err(|_| "retained byte ceiling overflows u64".to_owned())?,
         prefix_cache_bytes_ceiling: u64::try_from(model_cfg.kv_cache_bytes)
             .map_err(|_| "prefix-cache byte ceiling overflows u64".to_owned())?,
+        cache_capabilities,
         configured_total_token_ceiling: None,
         configured_output_token_ceiling: Some(u64::from(config.server.max_tokens)),
         quantization,
@@ -1482,13 +1585,13 @@ fn learned_profile_key(
     kv_representation: &str,
     prefill_model_identity: Option<String>,
     drafter_identity: Option<String>,
-    is_eschamoe: bool,
+    runtime_environment: Option<higgs_engine::runtime_identity::ResolvedRuntimeIdentity>,
     memory: higgs_engine::MlxMemorySnapshot,
 ) -> Option<LearnedProfileKey> {
     let platform = platform_identity()?;
     let backend_authority_bytes = smaller_nonzero_memory_authority(memory)?;
     let higgs_build = executable_build_identity()?;
-    let runtime_environment = resolved_capacity_environment(model_cfg, is_eschamoe);
+    let runtime_environment = runtime_environment?;
     let settings = serde_json::json!({
         "capacitySchema": CAPACITY_SCHEMA_VERSION,
         "batch": model_cfg.batch,
@@ -1548,78 +1651,35 @@ fn learned_profile_key(
     })
 }
 
-fn resolved_capacity_environment(model_cfg: &ModelConfig, is_eschamoe: bool) -> serde_json::Value {
-    resolved_capacity_environment_with(model_cfg, is_eschamoe, |name| std::env::var(name).ok())
-}
-
-fn resolved_capacity_environment_with(
-    model_cfg: &ModelConfig,
+fn resolved_model_runtime_identity(
+    model_dir: &Path,
+    model_json: &serde_json::Value,
     is_eschamoe: bool,
-    env: impl Fn(&str) -> Option<String>,
-) -> serde_json::Value {
-    let flag = |name: &str, default: bool| {
-        env(name)
-            .as_deref()
-            .and_then(parse_enabled_flag)
-            .unwrap_or(default)
-    };
-    let nonzero = |name: &str, default: bool| env(name).map_or(default, |value| value != "0");
-    let optional_usize =
-        |name: &str| env(name).and_then(|value| value.trim().parse::<usize>().ok());
-    let dflash_verify_mode = env("HIGGS_DFLASH_VERIFY_MODE")
-        .map(|value| value.trim().to_ascii_lowercase())
-        .map_or("default", |value| match value.as_str() {
-            "block" | "batched" | "batched-tape" => "batched_tape",
-            "canonical" | "sequential" | "s1" => "canonical_s1",
-            _ => "canonical_s1",
-        });
-    let prompt_defaults = higgs_engine::mtp::PromptLookupConfig::default();
-    let dflash_confidence_bits = env("HIGGS_DFLASH_CONF_TRUNC")
-        .map_or(Some(0.5_f32), |value| {
-            value
-                .trim()
-                .parse::<f32>()
-                .ok()
-                .filter(|threshold| *threshold > 0.0 && *threshold <= 1.0)
-        })
-        .map(f32::to_bits);
-    let mla_latent =
-        higgs_models::cache::resolve_mla_latent_cache(model_cfg.mla_latent_cache.unwrap_or(false));
-    serde_json::json!({
-        "eschamoeNative": is_eschamoe && higgs_models::eschamoe::native_mode(),
-        "eschamoeTrellisGemm": is_eschamoe && higgs_models::eschamoe::trellis_gemm_mode(),
-        "eschamoeQgemmSimd": is_eschamoe && higgs_models::eschamoe::qgemm_simd_mode(),
-        "mlaLatentCache": mla_latent,
-        "prefixCache": flag("HIGGS_PREFIX_CACHE", true),
-        "experimentalPagedKv": flag("HIGGS_EXPERIMENTAL_PAGED_KV", false),
-        "promptLookup": flag("HIGGS_PROMPT_LOOKUP", false),
-        "promptLookupUnchecked": flag("HIGGS_PROMPT_LOOKUP_UNCHECKED", false),
-        "promptLookupDraftMax": optional_usize("HIGGS_PROMPT_LOOKUP_DRAFT_N_MAX").unwrap_or(prompt_defaults.max_drafts),
-        "promptLookupNgramMax": optional_usize("HIGGS_PROMPT_LOOKUP_NGRAM_MAX").unwrap_or(prompt_defaults.max_ngram),
-        "promptLookupWindow": optional_usize("HIGGS_PROMPT_LOOKUP_WINDOW").unwrap_or(prompt_defaults.max_window),
-        "pflashFullScoreMaxTokens": higgs_engine::simple::resolve_pflash_full_score_max_tokens(env("HIGGS_PREFLASH_FULL_SCORE_MAX_TOKENS").as_deref()),
-        "pflashMinimumFreeMb": higgs_engine::simple::resolve_pflash_min_free_memory_mb(env("HIGGS_PREFLASH_MIN_FREE_MB").as_deref()),
-        "mtpAdaptiveDraft": flag("HIGGS_MTP_ADAPTIVE_DRAFT", false),
-        "mtpPromptLookup": flag("HIGGS_MTP_PROMPT_LOOKUP", false),
-        "mtpPrimePrefill": flag("HIGGS_MTP_PRIME_PREFILL", true),
-        "dflashBlockSize": higgs_engine::simple::resolve_dflash_block_size_override(env("HIGGS_DFLASH_BLOCK_SIZE").as_deref()),
-        "dsparkDraftCapOverride": higgs_engine::simple::resolve_dspark_draft_cap_override(env("HIGGS_DSPARK_DRAFT_CAP").as_deref()),
-        "dflashVerifyMode": dflash_verify_mode,
-        "dflashTargetHead": nonzero("HIGGS_DSPARK_TARGET_HEAD", false),
-        "dflashAdaptive": nonzero("HIGGS_DFLASH_ADAPTIVE", true),
-        "dflashGate": nonzero("HIGGS_DFLASH_GATE", true),
-        "dflashMinimumBlock": higgs_engine::simple::resolve_dflash_min_block_override(env("HIGGS_DFLASH_MIN_BLOCK").as_deref()),
-        "dflashConfidenceBits": dflash_confidence_bits,
-        "dflashFusedConvolution": flag("HIGGS_DFLASH_FUSED_CONV", false),
-        "dflashGdnConfigCache": flag("HIGGS_DFLASH_GDN_CONFIG_CACHE", false),
-    })
-}
-
-fn parse_enabled_flag(raw: &str) -> Option<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "on" | "yes" => Some(true),
-        "0" | "false" | "off" | "no" => Some(false),
-        _ => None,
+    mla_latent_cache: bool,
+) -> Option<higgs_engine::runtime_identity::ResolvedRuntimeIdentity> {
+    let runtime_config = model_json.get("text_config").unwrap_or(model_json);
+    let model_type = runtime_config
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if matches!(
+        model_type,
+        "qwen3_next" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe"
+    ) {
+        let args =
+            higgs_models::qwen3_next::resolve_runtime_model_args(model_dir, model_json).ok()?;
+        Some(
+            higgs_engine::runtime_identity::resolved_runtime_identity_for_qwen(
+                is_eschamoe,
+                mla_latent_cache,
+                &args,
+            ),
+        )
+    } else {
+        Some(higgs_engine::runtime_identity::resolved_runtime_identity(
+            is_eschamoe,
+            mla_latent_cache,
+        ))
     }
 }
 
@@ -1772,10 +1832,9 @@ impl AppState {
         http_client: reqwest::Client,
         metrics: Option<Arc<MetricsStore>>,
     ) -> Self {
-        let known_models = config
-            .models
-            .iter()
-            .map(|model| model.name.clone().unwrap_or_else(|| model.path.clone()));
+        let known_models = config.models.iter().map(|model| {
+            resolve_exposed_model_name(model.name.as_deref(), &model.path, Path::new(&model.path))
+        });
         let capacity = CapacityRegistry::new(known_models);
         Self::with_capacity_registry(router, config, http_client, metrics, capacity)
     }
@@ -1796,6 +1855,27 @@ impl AppState {
             capacity,
         }
     }
+}
+
+/// Apply the engine's exposed-name rule before a model enters either the known
+/// catalog or the live routing table. Explicit aliases remain authoritative.
+#[must_use]
+pub fn resolve_exposed_model_name(
+    configured_name: Option<&str>,
+    configured_path: &str,
+    resolved_path: &Path,
+) -> String {
+    if let Some(name) = configured_name {
+        return name.to_owned();
+    }
+    let configured = Path::new(configured_path);
+    if !configured.exists()
+        && configured == resolved_path
+        && crate::model_resolver::is_hf_model_id(configured_path)
+    {
+        return configured_path.to_owned();
+    }
+    higgs_engine::simple::exposed_model_name(resolved_path)
 }
 
 /// Type alias for the shared state used by Axum handlers.
@@ -1823,24 +1903,110 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capacity_profile_environment_matches_untrimmed_engine_numeric_parsing() {
-        let environment =
-            resolved_capacity_environment_with(&ModelConfig::default(), false, |name| {
-                matches!(
-                    name,
+    fn exposed_model_name_is_identical_for_catalog_and_loaded_paths() {
+        assert_eq!(
+            resolve_exposed_model_name(Some("alias"), "/models/raw", Path::new("/models/raw")),
+            "alias"
+        );
+        assert_eq!(
+            resolve_exposed_model_name(None, "/models/Escha-35B", Path::new("/models/Escha-35B")),
+            "Escha-35B"
+        );
+        assert_eq!(
+            resolve_exposed_model_name(None, "NexVeridian/Escha", Path::new("NexVeridian/Escha")),
+            "NexVeridian/Escha"
+        );
+        assert_eq!(
+            resolve_exposed_model_name(
+                None,
+                "NexVeridian/Escha",
+                Path::new("/cache/models--NexVeridian--Escha/snapshots/deadbeef"),
+            ),
+            "NexVeridian/Escha"
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let local = root.path().join("models").join("foo");
+        std::fs::create_dir_all(&local).unwrap();
+        assert_eq!(
+            resolve_exposed_model_name(None, "models/foo", &local),
+            "foo"
+        );
+    }
+
+    #[test]
+    fn capacity_profile_environment_uses_the_canonical_engine_identity() {
+        let environment = serde_json::to_value(
+            higgs_engine::runtime_identity::resolved_runtime_identity_with(false, false, |name| {
+                match name {
                     "HIGGS_PREFLASH_FULL_SCORE_MAX_TOKENS"
-                        | "HIGGS_PREFLASH_MIN_FREE_MB"
-                        | "HIGGS_DFLASH_BLOCK_SIZE"
-                        | "HIGGS_DSPARK_DRAFT_CAP"
-                        | "HIGGS_DFLASH_MIN_BLOCK"
-                )
-                .then(|| " 4096 ".to_owned())
-            });
+                    | "HIGGS_PREFLASH_MIN_FREE_MB"
+                    | "HIGGS_DFLASH_BLOCK_SIZE"
+                    | "HIGGS_DSPARK_DRAFT_CAP"
+                    | "HIGGS_DFLASH_MIN_BLOCK" => Some(" 4096 ".to_owned()),
+                    "HIGGS_DENSE_REQUANT_8BIT" => Some("1".to_owned()),
+                    "HIGGS_BONSAI_QMV_KERNEL" => Some("legacy".to_owned()),
+                    _ => None,
+                }
+            }),
+        )
+        .unwrap();
         assert_eq!(environment["pflashFullScoreMaxTokens"], 8192);
         assert_eq!(environment["pflashMinimumFreeMb"], 2048);
         assert!(environment["dflashBlockSize"].is_null());
         assert!(environment["dsparkDraftCapOverride"].is_null());
         assert!(environment["dflashMinimumBlock"].is_null());
+        assert_eq!(environment["denseGdnRequant8Bit"], true);
+        assert_eq!(environment["bonsaiQmvKernel"], "legacy");
+    }
+
+    #[test]
+    fn runtime_identity_supports_non_qwen_and_nested_qwen_configs() {
+        assert!(
+            resolved_model_runtime_identity(
+                Path::new("/does/not/need/model/artifacts"),
+                &serde_json::json!({"model_type": "gemma3_text"}),
+                false,
+                false,
+            )
+            .is_some(),
+            "non-Qwen families retain generic canonical profile identity"
+        );
+
+        let nested = serde_json::json!({
+            "model_type": "qwen3_5",
+            "quantization": {
+                "mode": "affine",
+                "bits": 2,
+                "group_size": 64
+            },
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 5120,
+                "num_hidden_layers": 64,
+                "intermediate_size": 17408,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 64,
+                "rms_norm_eps": 0.000001,
+                "vocab_size": 1024,
+                "max_position_embeddings": 512
+            }
+        });
+        let model_dir = tempfile::tempdir().unwrap();
+        let identity = resolved_model_runtime_identity(model_dir.path(), &nested, true, false)
+            .expect("nested Qwen text config resolves typed identity");
+        let value = serde_json::to_value(identity).unwrap();
+        assert_ne!(value["denseFfnGateUp"], "auto");
+        assert_eq!(value["bonsaiQ2Simd"], "escha_qwen38");
+
+        let top_level_moe = nested["text_config"].clone();
+        let identity =
+            resolved_model_runtime_identity(model_dir.path(), &top_level_moe, false, false)
+                .expect("top-level Qwen3.5 MoE config resolves typed identity");
+        let value = serde_json::to_value(identity).unwrap();
+        assert_ne!(value["denseFfnGateUp"], "auto");
+        assert_ne!(value["bonsaiQ2Simd"], "auto");
     }
 
     #[test]
@@ -1993,6 +2159,7 @@ mod tests {
             identity,
             before,
             after,
+            crate::capacity::CacheCapabilities::SIMPLE,
         )
         .unwrap();
 

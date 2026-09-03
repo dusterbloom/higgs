@@ -1114,6 +1114,63 @@ struct RetentionMutation {
     oversized: bool,
 }
 
+/// Registry pressure intent for cache enforcement. Normal reductions preserve
+/// leases whenever unleased eviction is sufficient; both policies revoke the
+/// minimum remaining leases required to honor the hard process allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CachePressurePolicy {
+    Normal,
+    Critical,
+}
+
+fn enforce_retained_byte_limit(
+    map: &mut std::collections::HashMap<u64, RetainedKv>,
+    max_bytes: usize,
+    _policy: CachePressurePolicy,
+) -> RetentionMutation {
+    let now = std::time::Instant::now();
+    let mut result = RetentionMutation::default();
+    for entry in map.values_mut() {
+        if entry.lease_expires_at.is_some_and(|expiry| expiry <= now) {
+            entry.lease_expires_at = None;
+            result.expired_leases = result.expired_leases.saturating_add(1);
+        }
+    }
+    let mut total = map.values().fold(0usize, |sum, entry| {
+        sum.saturating_add(entry.state.estimated_bytes())
+    });
+    while total > max_bytes {
+        let Some(id) = map
+            .iter()
+            .filter(|(_, entry)| entry.lease_expires_at.is_none())
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(&id, _)| id)
+        else {
+            break;
+        };
+        if let Some(entry) = map.remove(&id) {
+            total = total.saturating_sub(entry.state.estimated_bytes());
+            result.evicted = result.evicted.saturating_add(1);
+        }
+    }
+    while total > max_bytes {
+        let Some(id) = map
+            .iter()
+            .filter_map(|(&id, entry)| entry.lease_expires_at.map(|expiry| (id, expiry)))
+            .min_by_key(|(_, expiry)| *expiry)
+            .map(|(id, _)| id)
+        else {
+            break;
+        };
+        if let Some(entry) = map.remove(&id) {
+            total = total.saturating_sub(entry.state.estimated_bytes());
+            result.evicted = result.evicted.saturating_add(1);
+            result.broken_leases = result.broken_leases.saturating_add(1);
+        }
+    }
+    result
+}
+
 fn stash_into_bounded_with_source(
     map: &mut std::collections::HashMap<u64, RetainedKv>,
     session_id: u64,
@@ -3911,12 +3968,33 @@ impl SimpleEngine {
     }
 
     /// Apply the registry's per-model shares of the process cache envelope.
-    pub fn apply_capacity_cache_limits(&self, retained_bytes: usize, prefix_bytes: usize) {
+    pub fn apply_capacity_cache_limits(
+        &self,
+        retained_bytes: usize,
+        prefix_bytes: usize,
+        policy: CachePressurePolicy,
+    ) {
         let previous = self
             .capacity_retained_bytes
             .swap(retained_bytes, Ordering::AcqRel);
         if retained_bytes < previous {
-            lock_or_recover(&self.retained).clear();
+            let mutation = enforce_retained_byte_limit(
+                &mut lock_or_recover(&self.retained),
+                retained_bytes,
+                policy,
+            );
+            self.cache_metrics.sessions_evicted.fetch_add(
+                u64::try_from(mutation.evicted).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            self.cache_metrics.expired_leases.fetch_add(
+                u64::try_from(mutation.expired_leases).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            self.cache_metrics.broken_leases.fetch_add(
+                u64::try_from(mutation.broken_leases).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
         }
         lock_or_recover(&self.prefix_cache).set_capacity_max_bytes(prefix_bytes);
     }
@@ -13037,6 +13115,13 @@ pub(crate) fn derive_model_name(model_dir: &Path) -> String {
     "unknown".to_owned()
 }
 
+/// Canonical externally visible name for a resolved local or Hugging Face
+/// snapshot path. Server catalogs and loaded engines must use this same rule.
+#[must_use]
+pub fn exposed_model_name(model_dir: &Path) -> String {
+    derive_model_name(model_dir)
+}
+
 /// Extract EOS token IDs from config.json.
 /// Resolve a special token (e.g. `<|im_end|>`) to its single vocab id via the
 /// tokenizer, or `None` if it does not encode to exactly one token.
@@ -16218,7 +16303,6 @@ mod tests {
     fn retention_caps_bound_the_retained_map() {
         use super::{RetainedKv, evict_idle_from, retention_token_cap, stash_into};
         use crate::cache::paired::RetainedState;
-        use higgs_models::AnyCache;
         use higgs_models::turboquant::KvCacheConfig;
         use std::collections::HashMap;
         use std::time::{Duration, Instant};
@@ -16460,7 +16544,6 @@ mod tests {
     fn active_lease_survives_idle_until_expiry_and_expiry_is_reported() {
         use super::{RetainedKv, evict_idle_except_from};
         use crate::cache::paired::RetainedState;
-        use higgs_models::AnyCache;
         use std::collections::HashMap;
         use std::time::{Duration, Instant};
 
@@ -16499,7 +16582,6 @@ mod tests {
     fn hard_limits_evict_unleased_then_earliest_expiring_lease() {
         use super::{RetainedKv, RetentionLimits, stash_into_bounded};
         use crate::cache::paired::RetainedState;
-        use higgs_models::AnyCache;
         use std::collections::HashMap;
         use std::time::{Duration, Instant};
 
@@ -16554,6 +16636,110 @@ mod tests {
         assert!(!retained.contains_key(&1), "earliest lease expires first");
         assert!(retained.contains_key(&3));
         assert!(retained.contains_key(&4));
+    }
+
+    #[test]
+    fn capacity_limit_decrease_evicts_unleased_before_preserving_live_leases() {
+        use super::{CachePressurePolicy, RetainedKv, enforce_retained_byte_limit};
+        use crate::cache::paired::RetainedState;
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        let state =
+            || RetainedState::target_only_unchecked_for_test(validated_session_target(1), vec![1]);
+        let now = Instant::now();
+        let mut retained = HashMap::from([
+            (
+                1,
+                RetainedKv {
+                    state: state(),
+                    last_used: now,
+                    lease_expires_at: Some(now + Duration::from_secs(60)),
+                    source: super::RetainedPromptSource::GeneratedAssistantReplay,
+                },
+            ),
+            (
+                2,
+                RetainedKv {
+                    state: state(),
+                    last_used: now - Duration::from_secs(10),
+                    lease_expires_at: None,
+                    source: super::RetainedPromptSource::GeneratedAssistantReplay,
+                },
+            ),
+        ]);
+        let leased_bytes = retained[&1].state.estimated_bytes();
+
+        let mutation =
+            enforce_retained_byte_limit(&mut retained, leased_bytes, CachePressurePolicy::Normal);
+        assert_eq!(mutation.evicted, 1);
+        assert_eq!(mutation.broken_leases, 0);
+        assert!(retained.contains_key(&1));
+        assert!(!retained.contains_key(&2));
+    }
+
+    #[test]
+    fn critical_capacity_policy_explicitly_evicts_active_retained_leases() {
+        use super::{CachePressurePolicy, RetainedKv, enforce_retained_byte_limit};
+        use crate::cache::paired::RetainedState;
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let state =
+            RetainedState::target_only_unchecked_for_test(validated_session_target(1), vec![1]);
+        let mut retained = HashMap::from([(
+            1,
+            RetainedKv {
+                state,
+                last_used: now,
+                lease_expires_at: Some(now + Duration::from_secs(60)),
+                source: super::RetainedPromptSource::GeneratedAssistantReplay,
+            },
+        )]);
+        let mutation = enforce_retained_byte_limit(&mut retained, 0, CachePressurePolicy::Critical);
+        assert_eq!(mutation.broken_leases, 1);
+        assert!(!retained.contains_key(&1));
+    }
+
+    #[test]
+    fn normal_capacity_decrease_breaks_only_the_minimum_leases_when_required() {
+        use super::{CachePressurePolicy, RetainedKv, enforce_retained_byte_limit};
+        use crate::cache::paired::RetainedState;
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let state =
+            || RetainedState::target_only_unchecked_for_test(validated_session_target(1), vec![1]);
+        let mut retained = HashMap::from([
+            (
+                1,
+                RetainedKv {
+                    state: state(),
+                    last_used: now,
+                    lease_expires_at: Some(now + Duration::from_secs(10)),
+                    source: super::RetainedPromptSource::GeneratedAssistantReplay,
+                },
+            ),
+            (
+                2,
+                RetainedKv {
+                    state: state(),
+                    last_used: now,
+                    lease_expires_at: Some(now + Duration::from_secs(20)),
+                    source: super::RetainedPromptSource::GeneratedAssistantReplay,
+                },
+            ),
+        ]);
+        let one_entry = retained[&1].state.estimated_bytes();
+
+        let mutation =
+            enforce_retained_byte_limit(&mut retained, one_entry, CachePressurePolicy::Normal);
+        assert_eq!(mutation.evicted, 1);
+        assert_eq!(mutation.broken_leases, 1);
+        assert!(!retained.contains_key(&1), "earliest lease is broken first");
+        assert!(retained.contains_key(&2));
     }
 
     #[test]

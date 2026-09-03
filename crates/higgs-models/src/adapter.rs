@@ -570,11 +570,9 @@ impl ModelAdapter for BuiltinAdapter {
             }
             LoadKind::Bonsai => crate::bonsai_q1::load_bonsai_q1_with_config(dir, &model.raw)
                 .map(AnyModel::BonsaiQ1),
-            LoadKind::Qwen3Next => {
-                crate::qwen3_next::load_qwen3_next_args_from_value(model.resolved_config().clone())
-                    .and_then(|args| crate::qwen3_next::load_qwen3_next_model_with_args(dir, args))
-                    .map(AnyModel::Qwen3Next)
-            }
+            LoadKind::Qwen3Next => crate::qwen3_next::resolve_runtime_model_args(dir, &model.raw)
+                .and_then(|args| crate::qwen3_next::load_qwen3_next_model_with_args(dir, args))
+                .map(AnyModel::Qwen3Next),
             LoadKind::Qwen35Dense => qwen35_args(model)
                 .and_then(|args| crate::qwen3_next::load_qwen3_5_model_with_args(dir, args))
                 .map(AnyModel::Qwen3Next),
@@ -625,12 +623,7 @@ impl ModelAdapter for BuiltinAdapter {
 }
 
 fn qwen35_args(model: &DetectedModel) -> Result<crate::qwen3_next::Qwen3NextModelArgs, ModelError> {
-    if model.raw.get("text_config").is_some() {
-        crate::qwen3_next::load_qwen3_5_text_config_args_from_value(&model.dir, &model.raw)
-    } else {
-        let wrapped = serde_json::json!({ "text_config": model.raw.clone() });
-        crate::qwen3_next::load_qwen3_5_text_config_args_from_value(&model.dir, &wrapped)
-    }
+    crate::qwen3_next::resolve_runtime_model_args(&model.dir, &model.raw)
 }
 
 fn as_model_adapter(adapter: &'static BuiltinAdapter) -> &'static dyn ModelAdapter {

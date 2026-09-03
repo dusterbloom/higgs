@@ -16,6 +16,7 @@ pub mod prompt_cache;
 pub mod prune;
 pub mod prune_eval;
 pub mod reasoning_parser;
+pub mod runtime_identity;
 pub mod scheduler;
 pub mod simple;
 pub mod tool_parser;

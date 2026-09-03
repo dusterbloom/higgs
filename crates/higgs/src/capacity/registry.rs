@@ -22,6 +22,25 @@ pub struct ModelContentIdentity {
     pub artifact_bytes: u64,
 }
 
+/// Cache classes an engine can actually enforce. A zero ceiling remains
+/// automatic for supported classes; unsupported classes receive no allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CacheCapabilities {
+    pub retained_sessions: bool,
+    pub prefix_cache: bool,
+}
+
+impl CacheCapabilities {
+    pub const SIMPLE: Self = Self {
+        retained_sessions: true,
+        prefix_cache: true,
+    };
+    pub const BATCH: Self = Self {
+        retained_sessions: false,
+        prefix_cache: true,
+    };
+}
+
 /// Immutable inputs captured after one model has loaded successfully.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelCapacityFacts {
@@ -37,6 +56,7 @@ pub struct ModelCapacityFacts {
     pub prefix_cache_resident_bytes: u64,
     pub retained_bytes_ceiling: u64,
     pub prefix_cache_bytes_ceiling: u64,
+    pub cache_capabilities: CacheCapabilities,
     pub configured_total_token_ceiling: Option<u64>,
     pub configured_output_token_ceiling: Option<u64>,
     pub quantization: String,
@@ -98,6 +118,7 @@ struct ActiveModel {
     drain_nonce: Option<uuid::Uuid>,
     draining: bool,
     frozen_cache_allocation: Option<CacheAllocation>,
+    published: bool,
 }
 
 #[derive(Debug)]
@@ -124,13 +145,32 @@ struct RegistryState {
     pressure_controller: CapacityController,
     pressure: MemoryPressure,
     memory: MlxMemorySnapshot,
-    cache_allocations: BTreeMap<String, CacheAllocation>,
+    memory_revision: u64,
+    desired_cache_allocations: BTreeMap<String, CacheAllocation>,
+    published_cache_allocations: BTreeMap<String, CacheAllocation>,
+    cache_revision: u64,
+    published_cache_revision: u64,
+    cache_plan_pressure: MemoryPressure,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct CacheAllocation {
     retained_bytes: u64,
     prefix_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CacheAllocationPlan {
+    pub revision: u64,
+    pub pressure: MemoryPressure,
+    pub allocations: Vec<(String, u64, u64)>,
+}
+
+/// Proof that an allocator snapshot was published to this registry in the
+/// same serialized GPU/load window in which it was measured.
+pub struct PublishedMemoryMeasurement {
+    boot_id: String,
+    revision: u64,
 }
 
 /// The single process-wide authority for model capacity and shared residency.
@@ -171,7 +211,12 @@ impl CapacityRegistry {
                 pressure_controller: registry_pressure_controller(),
                 pressure: MemoryPressure::Normal,
                 memory: MlxMemorySnapshot::default(),
-                cache_allocations: BTreeMap::new(),
+                memory_revision: 0,
+                desired_cache_allocations: BTreeMap::new(),
+                published_cache_allocations: BTreeMap::new(),
+                cache_revision: 0,
+                published_cache_revision: 0,
+                cache_plan_pressure: MemoryPressure::Normal,
             }),
         })
     }
@@ -193,7 +238,7 @@ impl CapacityRegistry {
             entry,
             state.pressure,
             state
-                .cache_allocations
+                .published_cache_allocations
                 .get(model)
                 .copied()
                 .unwrap_or_default(),
@@ -205,7 +250,7 @@ impl CapacityRegistry {
     pub fn cache_allocations(&self) -> Vec<(String, u64, u64)> {
         let state = self.lock();
         state
-            .cache_allocations
+            .desired_cache_allocations
             .iter()
             .map(|(model, allocation)| {
                 (
@@ -215,6 +260,71 @@ impl CapacityRegistry {
                 )
             })
             .collect()
+    }
+
+    #[must_use]
+    pub fn cache_allocation_plan(&self) -> CacheAllocationPlan {
+        let state = self.lock();
+        CacheAllocationPlan {
+            revision: state.cache_revision,
+            pressure: state.pressure,
+            allocations: state
+                .desired_cache_allocations
+                .iter()
+                .map(|(model, allocation)| {
+                    (
+                        model.clone(),
+                        allocation.retained_bytes,
+                        allocation.prefix_bytes,
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Publish only the exact policy revision engines acknowledged. A newer
+    /// pressure/load recomputation makes the caller retry the new plan.
+    pub fn publish_cache_allocation_revision(&self, revision: u64) -> bool {
+        let mut state = self.lock();
+        if state.cache_revision != revision {
+            return false;
+        }
+        let desired = state.desired_cache_allocations.clone();
+        let old = std::mem::replace(&mut state.published_cache_allocations, desired);
+        let published = state.published_cache_allocations.clone();
+        state.published_cache_revision = revision;
+        for (name, entry) in &mut state.models {
+            if old.get(name) != published.get(name)
+                && entry
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.published && !active.draining)
+            {
+                entry.generation = entry.generation.saturating_add(1);
+            }
+        }
+        let mut shared = shared_ledger_with(&state, None, None).unwrap_or_default();
+        let effective = conservative_cache_allocations(
+            &state.desired_cache_allocations,
+            &state.published_cache_allocations,
+        );
+        if apply_allocation_totals(&mut shared, &effective).is_err() {
+            shared.active_reservation_bytes = u64::MAX;
+        }
+        recompute_active_models(&mut state, shared);
+        true
+    }
+
+    /// Run the non-blocking route visibility flip while the acknowledged cache
+    /// revision is still current. The closure must only mutate the router map;
+    /// it must never await or call back into the registry.
+    pub fn publish_route_if_current(&self, revision: u64, publish: impl FnOnce()) -> bool {
+        let state = self.lock();
+        if state.cache_revision != revision || state.published_cache_revision != revision {
+            return false;
+        }
+        publish();
+        true
     }
 
     pub fn begin_registration(
@@ -259,6 +369,10 @@ impl CapacityRegistry {
         }
 
         let candidate_allocations = cache_allocations_with(&state, Some(&facts))?;
+        let candidate_allocations = conservative_cache_allocations(
+            &candidate_allocations,
+            &state.published_cache_allocations,
+        );
         let mut shared = shared_ledger_with(&state, Some(&facts), None)?;
         apply_allocation_totals(&mut shared, &candidate_allocations)?;
         let mut candidate = facts.controller(shared, state.pressure);
@@ -297,7 +411,6 @@ impl CapacityRegistry {
             }
         }
 
-        state.memory = facts.memory;
         for (name, controller) in existing {
             if let Some(entry) = state.models.get_mut(&name) {
                 let changed = entry
@@ -327,6 +440,7 @@ impl CapacityRegistry {
                 drain_nonce: None,
                 draining: false,
                 frozen_cache_allocation: None,
+                published: false,
             });
         }
         state.registering.remove(&ticket.model);
@@ -348,10 +462,18 @@ impl CapacityRegistry {
     ) -> Result<DrainRegistration, RegistrationError> {
         let mut state = self.lock();
         let frozen_cache_allocation = state
-            .cache_allocations
+            .desired_cache_allocations
             .get(model)
             .copied()
             .unwrap_or_default();
+        let frozen_cache_allocation = max_cache_allocation(
+            frozen_cache_allocation,
+            state
+                .published_cache_allocations
+                .get(model)
+                .copied()
+                .unwrap_or_default(),
+        );
         let entry = state
             .models
             .get_mut(model)
@@ -380,13 +502,22 @@ impl CapacityRegistry {
     pub fn finish_unregister(
         &self,
         mut drain: DrainRegistration,
-        memory_after_release: Option<MlxMemorySnapshot>,
+        memory_after_release: Option<PublishedMemoryMeasurement>,
     ) -> io::Result<()> {
         if !drain.belongs_to(self) {
             return Ok(());
         }
         let mut state = self.lock();
+        if let Some(measurement) = memory_after_release.as_ref()
+            && (measurement.boot_id != self.boot_id || measurement.revision > state.memory_revision)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unload memory measurement does not belong to this registry revision",
+            ));
+        }
         let mut persisted = None;
+        let mut removed = false;
         if let Some(entry) = state.models.get_mut(&drain.model)
             && entry
                 .active
@@ -396,9 +527,10 @@ impl CapacityRegistry {
             persisted = entry.active.as_ref().and_then(profile_record);
             entry.active = None;
             entry.generation = entry.generation.saturating_add(1);
-            if let Some(memory) = memory_after_release {
-                state.memory = memory;
-            }
+            removed = true;
+        }
+        if removed {
+            state.published_cache_allocations.remove(&drain.model);
             recompute_registry(&mut state);
         }
         drain.finished = true;
@@ -447,10 +579,16 @@ impl CapacityRegistry {
         recompute_registry(&mut state);
     }
 
-    pub fn refresh_memory(&self, memory: MlxMemorySnapshot) {
+    pub fn refresh_memory(&self, memory: MlxMemorySnapshot) -> PublishedMemoryMeasurement {
         let mut state = self.lock();
         state.memory = memory;
+        state.memory_revision = state.memory_revision.saturating_add(1);
+        let revision = state.memory_revision;
         recompute_registry(&mut state);
+        PublishedMemoryMeasurement {
+            boot_id: self.boot_id.clone(),
+            revision,
+        }
     }
 
     fn rollback_active(&self, model: &str, nonce: uuid::Uuid, remove_on_rollback: bool) {
@@ -470,6 +608,22 @@ impl CapacityRegistry {
             }
             recompute_registry(&mut state);
         }
+    }
+
+    fn publish_active(&self, model: &str, nonce: uuid::Uuid) -> bool {
+        let mut state = self.lock();
+        let Some(entry) = state.models.get_mut(model) else {
+            return false;
+        };
+        let Some(active) = entry.active.as_mut() else {
+            return false;
+        };
+        if active.lifecycle_nonce != nonce || active.draining {
+            return false;
+        }
+        active.published = true;
+        entry.generation = entry.generation.saturating_add(1);
+        true
     }
 
     fn cancel_registration(&self, model: &str, newly_known: bool) {
@@ -587,7 +741,10 @@ pub struct ActiveRegistration {
 
 impl ActiveRegistration {
     pub fn publish(mut self) {
-        self.published = true;
+        self.published = self
+            .registry
+            .upgrade()
+            .is_some_and(|registry| registry.publish_active(&self.model, self.nonce));
     }
 }
 
@@ -660,7 +817,7 @@ fn shared_ledger_with(
     removed: Option<&str>,
 ) -> Result<SharedLedger, RegistrationError> {
     let mut shared = SharedLedger {
-        memory: added.map_or(state.memory, |facts| facts.memory),
+        memory: state.memory,
         ..SharedLedger::default()
     };
     for (name, entry) in &state.models {
@@ -672,14 +829,18 @@ fn shared_ledger_with(
                 .loaded_model_bytes
                 .checked_add(active.facts.loaded_model_bytes)
                 .ok_or(RegistrationError::ArithmeticOverflow)?;
-            shared.retained_bytes = shared
-                .retained_bytes
-                .checked_add(active.facts.retained_resident_bytes)
-                .ok_or(RegistrationError::ArithmeticOverflow)?;
-            shared.prefix_cache_bytes = shared
-                .prefix_cache_bytes
-                .checked_add(active.facts.prefix_cache_resident_bytes)
-                .ok_or(RegistrationError::ArithmeticOverflow)?;
+            if active.facts.cache_capabilities.retained_sessions {
+                shared.retained_bytes = shared
+                    .retained_bytes
+                    .checked_add(active.facts.retained_resident_bytes)
+                    .ok_or(RegistrationError::ArithmeticOverflow)?;
+            }
+            if active.facts.cache_capabilities.prefix_cache {
+                shared.prefix_cache_bytes = shared
+                    .prefix_cache_bytes
+                    .checked_add(active.facts.prefix_cache_resident_bytes)
+                    .ok_or(RegistrationError::ArithmeticOverflow)?;
+            }
         }
     }
     if let Some(facts) = added {
@@ -687,25 +848,30 @@ fn shared_ledger_with(
             .loaded_model_bytes
             .checked_add(facts.loaded_model_bytes)
             .ok_or(RegistrationError::ArithmeticOverflow)?;
-        shared.retained_bytes = shared
-            .retained_bytes
-            .checked_add(facts.retained_resident_bytes)
-            .ok_or(RegistrationError::ArithmeticOverflow)?;
-        shared.prefix_cache_bytes = shared
-            .prefix_cache_bytes
-            .checked_add(facts.prefix_cache_resident_bytes)
-            .ok_or(RegistrationError::ArithmeticOverflow)?;
+        if facts.cache_capabilities.retained_sessions {
+            shared.retained_bytes = shared
+                .retained_bytes
+                .checked_add(facts.retained_resident_bytes)
+                .ok_or(RegistrationError::ArithmeticOverflow)?;
+        }
+        if facts.cache_capabilities.prefix_cache {
+            shared.prefix_cache_bytes = shared
+                .prefix_cache_bytes
+                .checked_add(facts.prefix_cache_resident_bytes)
+                .ok_or(RegistrationError::ArithmeticOverflow)?;
+        }
     }
     Ok(shared)
 }
 
 fn replace_shared_ledger(controller: &mut CapacityController, shared: SharedLedger) {
-    controller.inputs.memory = shared.memory;
-    controller.inputs.loaded_model_bytes = shared.loaded_model_bytes;
-    controller.inputs.retained_bytes = shared.retained_bytes;
-    controller.inputs.prefix_cache_bytes = shared.prefix_cache_bytes;
-    controller.inputs.active_reservation_bytes = shared.active_reservation_bytes;
-    controller.decision = controller.solve_static();
+    controller.replace_shared_residency(
+        shared.memory,
+        shared.loaded_model_bytes,
+        shared.retained_bytes,
+        shared.prefix_cache_bytes,
+        shared.active_reservation_bytes,
+    );
 }
 
 fn recompute_active_models(state: &mut RegistryState, shared: SharedLedger) {
@@ -721,23 +887,45 @@ fn recompute_active_models(state: &mut RegistryState, shared: SharedLedger) {
 }
 
 fn recompute_registry(state: &mut RegistryState) {
-    let old_allocations = std::mem::take(&mut state.cache_allocations);
+    let old_allocations = std::mem::take(&mut state.desired_cache_allocations);
     let allocations = cache_allocations_with(state, None);
-    state.cache_allocations = allocations.as_ref().cloned().unwrap_or_default();
-    for (name, entry) in &mut state.models {
-        if old_allocations.get(name) != state.cache_allocations.get(name)
-            && entry.active.as_ref().is_some_and(|active| !active.draining)
-        {
-            entry.generation = entry.generation.saturating_add(1);
-        }
+    state.desired_cache_allocations = allocations.as_ref().cloned().unwrap_or_default();
+    if old_allocations != state.desired_cache_allocations
+        || state.cache_plan_pressure != state.pressure
+    {
+        state.cache_revision = state.cache_revision.saturating_add(1);
+        state.cache_plan_pressure = state.pressure;
     }
     let mut shared = shared_ledger_with(state, None, None).unwrap_or_default();
-    if allocations.is_err()
-        || apply_allocation_totals(&mut shared, &state.cache_allocations).is_err()
-    {
+    let effective = conservative_cache_allocations(
+        &state.desired_cache_allocations,
+        &state.published_cache_allocations,
+    );
+    if allocations.is_err() || apply_allocation_totals(&mut shared, &effective).is_err() {
         shared.active_reservation_bytes = u64::MAX;
     }
     recompute_active_models(state, shared);
+}
+
+fn max_cache_allocation(left: CacheAllocation, right: CacheAllocation) -> CacheAllocation {
+    CacheAllocation {
+        retained_bytes: left.retained_bytes.max(right.retained_bytes),
+        prefix_bytes: left.prefix_bytes.max(right.prefix_bytes),
+    }
+}
+
+fn conservative_cache_allocations(
+    desired: &BTreeMap<String, CacheAllocation>,
+    published: &BTreeMap<String, CacheAllocation>,
+) -> BTreeMap<String, CacheAllocation> {
+    let mut effective = published.clone();
+    for (name, allocation) in desired {
+        effective
+            .entry(name.clone())
+            .and_modify(|current| *current = max_cache_allocation(*current, *allocation))
+            .or_insert(*allocation);
+    }
+    effective
 }
 
 fn cache_allocations_with(
@@ -753,22 +941,42 @@ fn cache_allocations_with(
             if let Some(allocation) = active.frozen_cache_allocation {
                 frozen.insert(name.clone(), allocation);
             } else {
-                requested_retained.insert(name.clone(), active.facts.retained_bytes_ceiling);
-                requested_prefix.insert(name.clone(), active.facts.prefix_cache_bytes_ceiling);
+                if active.facts.cache_capabilities.retained_sessions {
+                    requested_retained.insert(name.clone(), active.facts.retained_bytes_ceiling);
+                }
+                if active.facts.cache_capabilities.prefix_cache {
+                    requested_prefix.insert(name.clone(), active.facts.prefix_cache_bytes_ceiling);
+                }
             }
-            resident_cache = resident_cache
-                .checked_add(active.facts.retained_resident_bytes)
-                .and_then(|bytes| bytes.checked_add(active.facts.prefix_cache_resident_bytes))
-                .ok_or(RegistrationError::ArithmeticOverflow)?;
+            if active.facts.cache_capabilities.retained_sessions {
+                resident_cache = resident_cache
+                    .checked_add(active.facts.retained_resident_bytes)
+                    .ok_or(RegistrationError::ArithmeticOverflow)?;
+            }
+            if active.facts.cache_capabilities.prefix_cache {
+                resident_cache = resident_cache
+                    .checked_add(active.facts.prefix_cache_resident_bytes)
+                    .ok_or(RegistrationError::ArithmeticOverflow)?;
+            }
         }
     }
     if let Some(facts) = added {
-        requested_retained.insert(facts.model.clone(), facts.retained_bytes_ceiling);
-        requested_prefix.insert(facts.model.clone(), facts.prefix_cache_bytes_ceiling);
-        resident_cache = resident_cache
-            .checked_add(facts.retained_resident_bytes)
-            .and_then(|bytes| bytes.checked_add(facts.prefix_cache_resident_bytes))
-            .ok_or(RegistrationError::ArithmeticOverflow)?;
+        if facts.cache_capabilities.retained_sessions {
+            requested_retained.insert(facts.model.clone(), facts.retained_bytes_ceiling);
+        }
+        if facts.cache_capabilities.prefix_cache {
+            requested_prefix.insert(facts.model.clone(), facts.prefix_cache_bytes_ceiling);
+        }
+        if facts.cache_capabilities.retained_sessions {
+            resident_cache = resident_cache
+                .checked_add(facts.retained_resident_bytes)
+                .ok_or(RegistrationError::ArithmeticOverflow)?;
+        }
+        if facts.cache_capabilities.prefix_cache {
+            resident_cache = resident_cache
+                .checked_add(facts.prefix_cache_resident_bytes)
+                .ok_or(RegistrationError::ArithmeticOverflow)?;
+        }
     }
     if requested_retained.is_empty() && requested_prefix.is_empty() && frozen.is_empty() {
         return Ok(BTreeMap::new());
@@ -793,6 +1001,13 @@ fn cache_allocations_with(
         if *requested == 0 {
             *requested = automatic_ceiling;
         }
+    }
+    if state.pressure == MemoryPressure::Critical {
+        let mut allocations = frozen;
+        for name in requested_retained.keys().chain(requested_prefix.keys()) {
+            allocations.entry(name.clone()).or_default();
+        }
+        return Ok(allocations);
     }
     let percentage = match state.pressure {
         MemoryPressure::Normal => 20,
@@ -938,7 +1153,10 @@ fn snapshot_for(
     pressure: MemoryPressure,
     allocation: CacheAllocation,
 ) -> CapacitySnapshot {
-    let active = entry.active.as_ref().filter(|active| !active.draining);
+    let active = entry
+        .active
+        .as_ref()
+        .filter(|active| active.published && !active.draining);
     let (availability, safe_total_tokens, recommended_output_tokens, max_prompt_tokens) = active
         .map(|active| {
             let decision = active.controller.decision();
@@ -962,7 +1180,9 @@ fn snapshot_for(
         recommended_output_tokens,
         max_prompt_tokens,
         retained_session_tokens: active.map_or(0, |active| {
-            if active.facts.retained_session_tokens == 0 {
+            if !active.facts.cache_capabilities.retained_sessions {
+                0
+            } else if active.facts.retained_session_tokens == 0 {
                 max_prompt_tokens
             } else {
                 active.facts.retained_session_tokens.min(max_prompt_tokens)
@@ -1188,6 +1408,7 @@ mod tests {
             prefix_cache_resident_bytes: 0,
             retained_bytes_ceiling: 2 * GIB,
             prefix_cache_bytes_ceiling: GIB,
+            cache_capabilities: CacheCapabilities::SIMPLE,
             configured_total_token_ceiling: None,
             configured_output_token_ceiling: Some(4_096),
             quantization: "3bit".to_owned(),
@@ -1201,8 +1422,44 @@ mod tests {
     }
 
     fn register(registry: &Arc<CapacityRegistry>, facts: ModelCapacityFacts) {
+        registry.refresh_memory(facts.memory);
         let ticket = registry.begin_registration(facts.model.clone()).unwrap();
         registry.commit_active(ticket, facts).unwrap().publish();
+        let plan = registry.cache_allocation_plan();
+        assert!(registry.publish_cache_allocation_revision(plan.revision));
+    }
+
+    #[test]
+    fn snapshots_publish_cache_bytes_only_after_exact_engine_acknowledgement() {
+        let registry = CapacityRegistry::new(["model".to_owned()]);
+        let model_facts = facts("model", 5 * GIB);
+        registry.refresh_memory(model_facts.memory);
+        let ticket = registry.begin_registration("model".to_owned()).unwrap();
+        let active = registry.commit_active(ticket, model_facts).unwrap();
+        let plan = registry.cache_allocation_plan();
+
+        let before = registry.snapshot("model").unwrap();
+        assert_eq!((before.retained_bytes, before.prefix_cache_bytes), (0, 0));
+        assert_eq!(before.availability, CapacityAvailability::Unavailable);
+
+        assert!(registry.publish_cache_allocation_revision(plan.revision));
+        let acknowledged_but_hidden = registry.snapshot("model").unwrap();
+        assert_eq!(
+            (
+                acknowledged_but_hidden.retained_bytes,
+                acknowledged_but_hidden.prefix_cache_bytes,
+            ),
+            (0, 0),
+            "a provisional model stays unavailable until route insertion commits"
+        );
+        active.publish();
+
+        let published = registry.snapshot("model").unwrap();
+        assert_eq!(
+            (published.retained_bytes, published.prefix_cache_bytes),
+            (plan.allocations[0].1, plan.allocations[0].2)
+        );
+        assert_eq!(published.availability, CapacityAvailability::Available);
     }
 
     fn learned_key(model: &str) -> LearnedProfileKey {
@@ -1330,9 +1587,9 @@ mod tests {
         );
 
         let ticket = registry.begin_registration("escha".to_owned()).unwrap();
-        let active = registry
-            .commit_active(ticket, facts("escha", 5 * GIB))
-            .unwrap();
+        let model_facts = facts("escha", 5 * GIB);
+        registry.refresh_memory(model_facts.memory);
+        let active = registry.commit_active(ticket, model_facts).unwrap();
         let active_generation = registry.snapshot("escha").unwrap().generation;
         assert!(active_generation > first_generation);
         drop(active);
@@ -1354,9 +1611,9 @@ mod tests {
         ));
 
         let ticket = registry.begin_registration("dynamic".to_owned()).unwrap();
-        let active = registry
-            .commit_active(ticket, facts("dynamic", 5 * GIB))
-            .unwrap();
+        let model_facts = facts("dynamic", 5 * GIB);
+        registry.refresh_memory(model_facts.memory);
+        let active = registry.commit_active(ticket, model_facts).unwrap();
         drop(active);
         assert!(matches!(
             registry.snapshot("dynamic"),
@@ -1405,6 +1662,97 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_cache_classes_are_neither_allocated_nor_charged() {
+        let registry = CapacityRegistry::new(["batch".to_owned(), "simple".to_owned()]);
+        let mut batch = facts("batch", 5 * GIB);
+        batch.cache_capabilities = CacheCapabilities {
+            retained_sessions: false,
+            prefix_cache: true,
+        };
+        batch.retained_bytes_ceiling = 0;
+        batch.prefix_cache_bytes_ceiling = 0;
+        register(&registry, batch);
+
+        let batch = registry.snapshot("batch").unwrap();
+        assert_eq!(batch.retained_bytes, 0);
+        assert_eq!(batch.retained_session_tokens, 0);
+        assert!(batch.prefix_cache_bytes > 0);
+
+        let mut simple = facts("simple", 5 * GIB);
+        simple.retained_bytes_ceiling = 0;
+        simple.prefix_cache_bytes_ceiling = 0;
+        register(&registry, simple);
+        let simple = registry.snapshot("simple").unwrap();
+        assert!(simple.retained_bytes > 0);
+        assert!(simple.prefix_cache_bytes > 0);
+    }
+
+    #[test]
+    fn constrained_shared_ledger_recompute_preserves_pressure_downshift() {
+        let registry = CapacityRegistry::new(["first".to_owned(), "second".to_owned()]);
+        register(&registry, facts("first", 5 * GIB));
+        let normal = registry.snapshot("first").unwrap().safe_total_tokens;
+
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Constrained,
+            swap_out_delta: 0,
+            compressor_delta: 1,
+        });
+        let constrained = registry.snapshot("first").unwrap().safe_total_tokens;
+        assert!(constrained <= normal * 75 / 100);
+
+        registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 4 * GIB,
+            peak_bytes: 5 * GIB,
+            memory_limit_bytes: Some(24 * GIB),
+            metal_recommended_working_set_bytes: Some(24 * GIB),
+        });
+        assert!(
+            registry.snapshot("first").unwrap().safe_total_tokens <= constrained,
+            "a shared-ledger replacement must not discard the live pressure bound"
+        );
+    }
+
+    #[test]
+    fn pressure_seed_before_boot_registration_controls_first_policy() {
+        let registry = CapacityRegistry::new(["escha".to_owned()]);
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Constrained,
+            swap_out_delta: 0,
+            compressor_delta: 1,
+        });
+        register(&registry, facts("escha", 5 * GIB));
+
+        let snapshot = registry.snapshot("escha").unwrap();
+        assert_eq!(snapshot.pressure, MemoryPressure::Constrained);
+        assert_eq!(
+            registry.cache_allocation_plan().pressure,
+            MemoryPressure::Constrained
+        );
+    }
+
+    #[test]
+    fn normal_shared_ledger_recompute_does_not_instantly_restore_capacity() {
+        let registry = CapacityRegistry::new(["first".to_owned(), "second".to_owned()]);
+        register(&registry, facts("first", 5 * GIB));
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Constrained,
+            swap_out_delta: 0,
+            compressor_delta: 1,
+        });
+        let constrained = registry.snapshot("first").unwrap().safe_total_tokens;
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Normal,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+        let recovering = registry.snapshot("first").unwrap().safe_total_tokens;
+        register(&registry, facts("second", 5 * GIB));
+        assert!(registry.snapshot("first").unwrap().safe_total_tokens <= recovering);
+        assert!(recovering <= constrained.saturating_add(131_072));
+    }
+
+    #[test]
     fn process_cache_allocations_stay_inside_one_shared_envelope() {
         let registry = CapacityRegistry::new(["first".to_owned(), "second".to_owned()]);
         register(&registry, facts("first", 5 * GIB));
@@ -1419,6 +1767,22 @@ mod tests {
         let process_envelope = 24 * GIB - (24 * GIB * 20 / 100) - 5 * GIB;
         assert!(total <= process_envelope);
         assert_eq!(allocations.len(), 2);
+    }
+
+    #[test]
+    fn stale_cache_policy_revision_cannot_be_published() {
+        let registry = CapacityRegistry::new(["escha".to_owned()]);
+        register(&registry, facts("escha", 5 * GIB));
+        let first = registry.cache_allocation_plan();
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Critical,
+            swap_out_delta: 1,
+            compressor_delta: 1,
+        });
+        let second = registry.cache_allocation_plan();
+        assert!(second.revision > first.revision);
+        assert!(!registry.publish_cache_allocation_revision(first.revision));
+        assert!(registry.publish_cache_allocation_revision(second.revision));
     }
 
     #[test]
@@ -1492,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn final_unregister_recomputes_shared_headroom_from_post_release_memory() {
+    fn final_unregister_refreshes_memory_without_bypassing_recovery_ramp() {
         let registry = CapacityRegistry::new(["first".to_owned(), "second".to_owned()]);
         register(&registry, facts("first", 5 * GIB));
         let mut second = facts("second", 5 * GIB);
@@ -1507,19 +1871,66 @@ mod tests {
             constrained,
             "draining allocations stay reserved until the engine is destroyed"
         );
+        let measurement = registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 5 * GIB,
+            peak_bytes: 10 * GIB,
+            memory_limit_bytes: Some(24 * GIB),
+            metal_recommended_working_set_bytes: Some(24 * GIB),
+        });
         registry
-            .finish_unregister(
-                drain,
-                Some(MlxMemorySnapshot {
-                    active_bytes: 5 * GIB,
-                    peak_bytes: 10 * GIB,
-                    memory_limit_bytes: Some(24 * GIB),
-                    metal_recommended_working_set_bytes: Some(24 * GIB),
-                }),
-            )
+            .finish_unregister(drain, Some(measurement))
             .unwrap();
 
-        assert!(registry.snapshot("second").unwrap().safe_total_tokens > constrained);
+        assert!(registry.snapshot("second").unwrap().safe_total_tokens <= constrained);
+    }
+
+    #[test]
+    fn later_load_measurement_survives_out_of_order_registration_commits() {
+        let registry = CapacityRegistry::new(["first".to_owned(), "second".to_owned()]);
+        let first_ticket = registry.begin_registration("first".to_owned()).unwrap();
+        let second_ticket = registry.begin_registration("second".to_owned()).unwrap();
+        let mut first = facts("first", 5 * GIB);
+        let mut second = facts("second", 5 * GIB);
+        first.memory.active_bytes = 5 * GIB;
+        second.memory.active_bytes = 10 * GIB;
+
+        registry.refresh_memory(first.memory);
+        registry.refresh_memory(second.memory);
+        let second_active = registry.commit_active(second_ticket, second).unwrap();
+        let first_active = registry.commit_active(first_ticket, first).unwrap();
+
+        assert_eq!(registry.lock().memory.active_bytes, 10 * GIB);
+        assert!(
+            registry.snapshot("first").unwrap().safe_total_tokens
+                <= registry.snapshot("second").unwrap().safe_total_tokens
+        );
+        drop((first_active, second_active));
+    }
+
+    #[test]
+    fn stale_unload_measurement_cannot_replace_a_later_load_measurement() {
+        let registry = CapacityRegistry::new(["old".to_owned(), "new".to_owned()]);
+        register(&registry, facts("old", 5 * GIB));
+        let drain = registry.begin_drain("old").unwrap();
+        let after_unload = MlxMemorySnapshot {
+            active_bytes: 0,
+            peak_bytes: 5 * GIB,
+            memory_limit_bytes: Some(24 * GIB),
+            metal_recommended_working_set_bytes: Some(24 * GIB),
+        };
+        let unload_measurement = registry.refresh_memory(after_unload);
+
+        let mut new = facts("new", 5 * GIB);
+        new.memory.active_bytes = 8 * GIB;
+        registry.refresh_memory(new.memory);
+        let ticket = registry.begin_registration("new".to_owned()).unwrap();
+        registry.commit_active(ticket, new).unwrap().publish();
+
+        registry
+            .finish_unregister(drain, Some(unload_measurement))
+            .unwrap();
+        assert_eq!(registry.lock().memory.active_bytes, 8 * GIB);
+        assert!(registry.snapshot("new").unwrap().safe_total_tokens > 0);
     }
 
     #[test]
@@ -1553,6 +1964,48 @@ mod tests {
     }
 
     #[test]
+    fn critical_pressure_evicts_active_optional_caches_but_keeps_draining_reserved() {
+        let registry = CapacityRegistry::new(["draining".to_owned(), "active".to_owned()]);
+        register(&registry, facts("draining", 5 * GIB));
+        register(&registry, facts("active", 5 * GIB));
+        let drain = registry.begin_drain("draining").unwrap();
+        let frozen = registry
+            .cache_allocations()
+            .into_iter()
+            .find(|(name, _, _)| name == "draining")
+            .unwrap();
+
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Critical,
+            swap_out_delta: 1,
+            compressor_delta: 1,
+        });
+        let allocations = registry.cache_allocations();
+        assert_eq!(
+            allocations
+                .iter()
+                .find(|(name, _, _)| name == "draining")
+                .unwrap(),
+            &frozen
+        );
+        assert_eq!(
+            allocations
+                .iter()
+                .find(|(name, _, _)| name == "active")
+                .map(|(_, retained, prefix)| (*retained, *prefix)),
+            Some((0, 0))
+        );
+
+        registry.finish_unregister(drain, None).unwrap();
+        assert!(
+            registry
+                .cache_allocations()
+                .iter()
+                .all(|(name, _, _)| name != "draining")
+        );
+    }
+
+    #[test]
     fn capacity_revision_during_drain_cannot_strand_the_lifecycle_token() {
         let registry = CapacityRegistry::new(["escha".to_owned()]);
         register(&registry, facts("escha", 5 * GIB));
@@ -1575,10 +2028,10 @@ mod tests {
     #[test]
     fn capacity_revision_during_publication_cannot_strand_the_lifecycle_token() {
         let registry = CapacityRegistry::new(["escha".to_owned()]);
+        let model_facts = facts("escha", 5 * GIB);
+        registry.refresh_memory(model_facts.memory);
         let ticket = registry.begin_registration("escha".to_owned()).unwrap();
-        let active = registry
-            .commit_active(ticket, facts("escha", 5 * GIB))
-            .unwrap();
+        let active = registry.commit_active(ticket, model_facts).unwrap();
         let provisional_generation = registry.snapshot("escha").unwrap().generation;
         registry.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Constrained,

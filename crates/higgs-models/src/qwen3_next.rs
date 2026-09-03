@@ -373,7 +373,7 @@ const ESCHA_QWEN38_Q2_SIMD_WEIGHT_SHAPES: &[[i32; 2]] = &[
 
 /// Decode-time policy resolved when a model is built, never in the hot path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Q2SimdDecodePolicy {
+pub enum Q2SimdDecodePolicy {
     Stock,
     EschaQwen38,
     ForceOn,
@@ -409,6 +409,50 @@ fn q2_simd_decode_policy(
         Some("1") => Q2SimdDecodePolicy::ForceOn,
         Some("0") => Q2SimdDecodePolicy::Stock,
         _ => escha_qwen38_q2_decode_policy(is_eschamoe_checkpoint, args),
+    }
+}
+
+/// Model- and platform-resolved dense execution choices. This is the same
+/// value consumed when dense blocks are constructed and fingerprinted for
+/// learned capacity profiles, so an environment-level `auto` never survives
+/// into profile identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedDenseRuntimeSelections {
+    pub q2_simd_decode_policy: Q2SimdDecodePolicy,
+    pub gate_up_fused: bool,
+}
+
+#[must_use]
+pub fn resolved_dense_runtime_selections(
+    args: &Qwen3NextModelArgs,
+    is_eschamoe_checkpoint: bool,
+) -> ResolvedDenseRuntimeSelections {
+    resolved_dense_runtime_selections_with(
+        args,
+        is_eschamoe_checkpoint,
+        std::env::var("HIGGS_BONSAI_Q2_SIMD").ok().as_deref(),
+        std::env::var("HIGGS_DENSE_FFN_GATE_UP").ok().as_deref(),
+        apple_cpu_brand(),
+    )
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn resolved_dense_runtime_selections_with(
+    args: &Qwen3NextModelArgs,
+    is_eschamoe_checkpoint: bool,
+    q2_simd_raw: Option<&str>,
+    gate_up_raw: Option<&str>,
+    cpu_brand: Option<&str>,
+) -> ResolvedDenseRuntimeSelections {
+    let q2_simd_decode_policy = q2_simd_decode_policy(q2_simd_raw, is_eschamoe_checkpoint, args);
+    ResolvedDenseRuntimeSelections {
+        q2_simd_decode_policy,
+        gate_up_fused: dense_ffn_gate_up_fused(
+            gate_up_raw,
+            q2_simd_decode_policy,
+            !should_force_dense_decode_safe_defaults_for_brand(cpu_brand),
+        ),
     }
 }
 
@@ -7010,16 +7054,9 @@ impl FfnBlock {
         let g_spec = resolve_quant_for(args, &format!("{mlp_prefix}.gate_proj"));
         let u_spec = resolve_quant_for(args, &format!("{mlp_prefix}.up_proj"));
         let d_spec = resolve_quant_for(args, &format!("{mlp_prefix}.down_proj"));
-        let q2_simd_policy = q2_simd_decode_policy(
-            std::env::var("HIGGS_BONSAI_Q2_SIMD").ok().as_deref(),
-            args.is_eschamoe_checkpoint,
-            args,
-        );
-        let gate_up_fused = dense_ffn_gate_up_fused(
-            std::env::var("HIGGS_DENSE_FFN_GATE_UP").ok().as_deref(),
-            q2_simd_policy,
-            !should_force_dense_decode_safe_defaults_for_brand(apple_cpu_brand()),
-        );
+        let dense_runtime = resolved_dense_runtime_selections(args, args.is_eschamoe_checkpoint);
+        let q2_simd_policy = dense_runtime.q2_simd_decode_policy;
+        let gate_up_fused = dense_runtime.gate_up_fused;
         Ok(Self {
             gate: None,
             switch_mlp: None,
@@ -10643,8 +10680,38 @@ pub fn load_model_args<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextModelArg
     let config_path = model_dir.as_ref().join("config.json");
     let file = std::fs::File::open(config_path)?;
     let config: serde_json::Value = serde_json::from_reader(file)?;
-    let mut args = load_qwen3_next_args_from_value(config)?;
-    args.dense_attention_outputs = detect_dense_attention_outputs(model_dir.as_ref());
+    resolve_runtime_model_args(model_dir.as_ref(), &config)
+}
+
+/// Resolve the exact Qwen Next / Qwen3.5 arguments consumed by model loading.
+///
+/// Keeping wrapper normalization, checkpoint layout scans, and Escha affine
+/// conversion in one resolver prevents capacity-profile identity from
+/// describing different execution choices than the loader constructs.
+pub fn resolve_runtime_model_args(
+    model_dir: &Path,
+    config: &serde_json::Value,
+) -> Result<Qwen3NextModelArgs, ModelError> {
+    let runtime_config = config.get("text_config").unwrap_or(config);
+    let model_type = runtime_config
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let mut args = if config.get("text_config").is_some()
+        || matches!(model_type, "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe")
+    {
+        if config.get("text_config").is_some() {
+            load_qwen3_5_text_config_args_from_value(model_dir, config)?
+        } else {
+            let wrapped = serde_json::json!({ "text_config": config.clone() });
+            load_qwen3_5_text_config_args_from_value(model_dir, &wrapped)?
+        }
+    } else {
+        let mut args = load_qwen3_next_args_from_value(runtime_config.clone())?;
+        args.dense_attention_outputs = detect_dense_attention_outputs(model_dir);
+        args
+    };
+    force_eschamoe_quant_layout(&mut args, model_dir)?;
     Ok(args)
 }
 
@@ -11221,7 +11288,7 @@ fn load_qwen3_5_moe_text_config_args<P: AsRef<Path>>(
     let config_path = model_dir.as_ref().join("config.json");
     let file = std::fs::File::open(config_path)?;
     let config: serde_json::Value = serde_json::from_reader(file)?;
-    load_qwen3_5_text_config_args_from_value(model_dir.as_ref(), &config)
+    resolve_runtime_model_args(model_dir.as_ref(), &config)
 }
 
 pub(crate) fn load_qwen3_5_text_config_args_from_value(
@@ -11566,8 +11633,7 @@ fn qwen3_5_mixed_ba_quantization_layers(
 /// provided), or a separately loaded canonical model instance.
 pub fn load_qwen3_5_model<P: AsRef<Path>>(model_dir: P) -> Result<Qwen3NextCausalLM, ModelError> {
     let model_path = model_dir.as_ref();
-    let mut args = load_qwen3_5_moe_text_config_args(model_path)?;
-    force_eschamoe_quant_layout(&mut args, model_path)?;
+    let args = load_qwen3_5_moe_text_config_args(model_path)?;
     load_qwen3_5_model_with_args(model_path, args)
 }
 
@@ -11643,8 +11709,7 @@ pub fn load_qwen3_5_moe_model<P: AsRef<Path>>(
     model_dir: P,
 ) -> Result<Qwen3NextCausalLM, ModelError> {
     let model_path = model_dir.as_ref();
-    let mut args = load_qwen3_5_moe_text_config_args(model_path)?;
-    force_eschamoe_quant_layout(&mut args, model_path)?;
+    let args = load_qwen3_5_moe_text_config_args(model_path)?;
     load_qwen3_5_moe_model_with_args(model_path, args)
 }
 
@@ -13958,6 +14023,28 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn dense_runtime_selection_resolves_auto_from_model_and_platform_facts() {
+        let args = minimal_qwen3_next_args();
+        let safe_platform =
+            resolved_dense_runtime_selections_with(&args, false, None, None, Some("Apple M4"));
+        assert_eq!(
+            safe_platform.q2_simd_decode_policy,
+            Q2SimdDecodePolicy::Stock
+        );
+        assert!(!safe_platform.gate_up_fused);
+
+        let forced = resolved_dense_runtime_selections_with(
+            &args,
+            false,
+            Some("1"),
+            Some("fused"),
+            Some("Apple M4"),
+        );
+        assert_eq!(forced.q2_simd_decode_policy, Q2SimdDecodePolicy::ForceOn);
+        assert!(forced.gate_up_fused);
     }
 
     /// Full args suitable for `Qwen3NextCausalLM::new()` validation tests.

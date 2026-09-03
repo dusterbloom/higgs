@@ -1,5 +1,57 @@
 # Task 5A report: bind model lifecycle
 
+## Controller review correction round 1/5
+
+- [x] Preserve controller pressure and rise hysteresis across shared-ledger updates.
+- [x] Serialize revisioned registry cache publication through engine application.
+- [x] Support non-macOS observer startup and seed pressure before boot loading.
+- [x] Evict optional caches on critical pressure without releasing drain freezes.
+- [x] Replace Higgs' partial environment key with one canonical engine/model runtime identity.
+- [x] Make cancelled runtime loads own durable join/drop/cleanup/remeasure rollback.
+- [x] Replace Batch cache busy-wait with cancellation-safe asynchronous acknowledgement.
+- [x] Lower Simple retained limits by evicting unleased entries before leased entries.
+- [x] Publish and allocate only cache classes each engine supports.
+- [x] Use one exposed-name resolver for catalog, boot, and runtime model paths.
+- [x] Re-review all corrections, rerun full release gates, and record final evidence.
+
+### Round 1 implementation evidence
+
+- Shared-ledger replacement now uses a controller-owned bounded recomputation;
+  it preserves the current pressure downshift and cannot jump upward during
+  normal recovery, registration, memory refresh, or drain completion.
+- Cache allocation is a monotonic revisioned plan. One async Router publisher
+  serializes plan application, retries a pressure/load race, and acknowledges
+  only the exact registry revision applied before route visibility.
+- Critical pressure assigns zero to supported optional cache classes while a
+  draining model's frozen allocation remains reserved through atomic finish.
+- Engine facts declare supported cache classes. Batch receives only a prefix
+  allocation and publishes zero retained-session tokens; zero remains
+  automatic for every supported class.
+- Batch cache control uses bounded async queue send plus Tokio oneshot
+  acknowledgement. The current-thread saturated-queue regression proves the
+  runtime continues scheduling instead of busy-spinning or blocking.
+- Simple retained-cap reductions evict least-recently-used unleased entries
+  first, then break only the minimum earliest-expiring leases needed to reach
+  the explicit cap. Critical zero policy revokes the optional retained cache.
+- The observer starts and seeds before boot loads. Its coordinator applies
+  pressure to the registry while no Router exists, then weak-attaches the
+  Router and immediately publishes the latest revision. Non-macOS uses an
+  owned, stoppable no-op source rather than failing server startup.
+- Runtime loads retain their blocking JoinHandle in a cancellation guard. A
+  detached cleanup supervisor joins a completed engine, clears allocator
+  cache, remeasures, and refreshes the registry; a second provisional guard is
+  disarmed only after cache policy, route insertion, and capacity publication.
+- One typed engine-owned `ResolvedRuntimeIdentity` replaces Higgs' duplicate
+  environment inventory. Qwen profile identity consumes the same path-aware
+  resolver as all three Qwen adapter load arms, including wrapper flattening,
+  outer quantization, checkpoint layout scans, GDN overrides, and Escha affine
+  layout. Its mutation suite covers resolved choices across dense requant,
+  Bonsai, compiled GDN/gating, async state eval, QGEMV, dSpark/Q2,
+  PFlash/DFlash, Escha, MLA, and TurboQuant.
+- Catalog and loaded-model identity use one exposed-name resolver for explicit
+  aliases, local paths, configured Hugging Face IDs, and resolved HF snapshots;
+  boot registration no longer seeds raw-path aliases.
+
 ## Outcome
 
 Higgs now owns one process-wide `CapacityRegistry` for every configured and
@@ -39,7 +91,10 @@ focused fixtures/tests, `sha2 = "0.11"`, and this task record. Unrelated
 
 - Registration tickets and drain tokens use private immutable UUID nonces;
   capacity generations cannot strand or authorize lifecycle completion.
-- Load measurement is serialized against inference and concurrent loads.
+- Load measurement is serialized against inference and concurrent loads and is
+  published to a monotonic registry revision before the GPU/load gate is
+  released. Out-of-order lifecycle commits solve from the latest published
+  allocator state and cannot overwrite it with per-load facts.
 - A post-load rejection or insertion failure drops/joins the engine, invokes
   the shared allocator-cache cleanup, remeasures, and rolls back registration.
 - `BatchEngine` owns its worker `JoinHandle`; acknowledged shutdown guarantees
@@ -49,7 +104,7 @@ focused fixtures/tests, `sha2 = "0.11"`, and this task record. Unrelated
 - A draining model's exact pre-drain cache allocation is frozen across every
   pressure/registration recomputation. It is subtracted before fair-sharing
   the remainder and released only by drain cancellation or atomic
-  `finish_unregister(final_snapshot)` after join/drop/cleanup.
+  `finish_unregister(published_measurement)` after join/drop/cleanup.
 - Router cache updates use one coherent registry allocation snapshot. An
   unchanged cap is a true no-op, including no PagedPrefixCache revision
   invalidation.
@@ -93,27 +148,43 @@ focused fixtures/tests, `sha2 = "0.11"`, and this task record. Unrelated
   cache-emptiness assertion and passed after restoration.
 - The prepared DFlash pair regression proves an unchanged PagedPrefixCache cap
   preserves its publication revision and live pair.
+- Reordered load commits initially replaced a 10 GiB allocator snapshot with a
+  stale 5 GiB snapshot; reordered unload completion replaced a later 8 GiB
+  snapshot with stale zero. Publishing measurements before gate release and
+  removing lifecycle snapshot assignment makes both deterministic regressions
+  pass.
+- The unsupported-cache mutation published 49,152 retained-session tokens for
+  Batch. Capability-gated publication now returns zero while Simple preserves
+  zero-as-automatic semantics.
+- The Qwen identity mutation resolved nested outer affine Q2 as `disabled`
+  instead of `escha_qwen38`; the shared execution resolver makes that test and
+  the top-level `qwen3_5_moe` regression pass.
+- The shutdown-order regression initially failed to compile before the shared
+  stop-then-cleanup seam existed. It now proves that observer cancellation and
+  join complete before learned-profile persistence or PID-file removal, on
+  both successful and failed server exits.
 
-Three independent review passes were completed. The final re-review was CLEAN
-after verifying immutable drain allocations and shared engine/profile parsers.
+The final independent controller re-review inspected all eleven corrections,
+the subsequent measurement-order, Qwen resolver, cache-capability,
+cancellation, and shutdown-order fixes, and reported no remaining findings.
 
 ## Release verification
 
-- Focused registry: 23 passed, 0 failed.
-- Focused profile/parser regressions: 2 passed, 0 failed.
-- `cargo test --release -p higgs-engine --lib -- --test-threads=1`:
-  590 passed, 0 failed, 5 ignored.
-- `cargo test --release -p higgs --lib -- --test-threads=1`:
-  699 passed, 0 failed.
-- `cargo test --release -p higgs --test integration_tests -- --test-threads=1`:
-  107 passed, 0 failed, 10 ignored.
-- `cargo build --release -p higgs`: passed.
-- `git diff --check`: passed before staging.
-- GitNexus staged detection: 23 files, 131 changed symbols, 81 affected
-  execution flows, CRITICAL as expected for the authorized lifecycle surface.
-- GitNexus compare-to-main detection: 234 files, 4,202 symbols, 296 flows,
-  CRITICAL; this intentionally includes the preceding capacity-plan tasks on
-  the feature branch rather than only Task 5A.
+- Focused registry correction suite: 32 passed, 0 failed.
+- Focused Qwen identity correction: 1 passed, 0 failed.
+- Focused disabled-route cancellation correction: 1 passed, 0 failed.
+- `higgs-models` release library: 753 passed, 0 failed, 46 ignored.
+- `higgs-engine` release library: 596 passed, 0 failed, 5 ignored.
+- Runtime-identity integration: 3 passed, 0 failed.
+- Higgs release library: 717 passed, 0 failed.
+- Higgs release integration: 107 passed, 0 failed, 10 ignored.
+- Higgs release binary: 4 passed, 0 failed.
+- Higgs release build: passed.
+- GitNexus staged detection: 17 indexed files, 205 changed symbols, 184
+  affected processes, CRITICAL as expected for the lifecycle/router surface.
+- GitNexus compare-to-`main` detection: 236 files, 4,519 changed symbols, 858
+  affected processes, CRITICAL across the complete multi-task branch; the
+  Task 5A staged set remains the bounded 17-file indexed subset above.
 
 The build emitted pre-existing `higgs-models` unused-code warnings and reported
 that `mlx.metallib` was absent from the local MLX build output. Production

@@ -12,7 +12,10 @@ use clap::Parser;
 
 use higgs::{
     build_router,
-    capacity::{ActiveRegistration, CapacityRegistry, start_capacity_pressure_observer},
+    capacity::{
+        ActiveRegistration, CapacityPressureCoordinator, CapacityRegistry,
+        start_capacity_pressure_observer,
+    },
     config::{
         self, Cli, Commands, ConfigAction, HiggsConfig, MetricsLogConfig, ServeArgs, StartArgs,
         StopArgs,
@@ -193,16 +196,17 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
     }
 
     // One registry owns shared residency and pressure across every local model.
-    let capacity = CapacityRegistry::new_with_profile_dir(
-        higgs_config
-            .models
-            .iter()
-            .map(|model| model.name.clone().unwrap_or_else(|| model.path.clone())),
-        capacity_profile_dir(cli),
-    );
+    let capacity =
+        CapacityRegistry::new_with_profile_dir(std::iter::empty(), capacity_profile_dir(cli));
+    let pressure_coordinator = CapacityPressureCoordinator::new(Arc::clone(&capacity));
+    let pressure_observer =
+        start_capacity_pressure_observer(Arc::clone(&pressure_coordinator)).await?;
+
+    let mut pid_written = false;
+    let serve_result: Result<(), Box<dyn std::error::Error>> = async {
 
     // Loaded models remain provisional until the router accepts the complete set.
-    let (engines, registrations) = load_engines(&higgs_config, &capacity)?;
+    let (engines, registrations) = load_engines(&higgs_config, &capacity).await?;
     let cleanup_engines = engines.clone();
     let router = match Router::from_config(&higgs_config, engines) {
         Ok(router) => router,
@@ -254,6 +258,7 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
         metrics,
         Arc::clone(&capacity),
     ));
+    pressure_coordinator.attach(&shared_state).await?;
 
     // Build router with middleware
     let app = build_router(
@@ -268,21 +273,32 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
     // Start server
     tracing::info!(addr = %bind_addr, "Starting server");
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    let pressure_observer = start_capacity_pressure_observer(shared_state).await?;
-
     // Write PID file after bind succeeds so it's never stale on bind errors
     higgs::daemon::write_pid_file(profile);
+    pid_written = true;
 
     let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(higgs::daemon::await_shutdown_signal());
-    let (server_result, observer_result) =
-        await_server_then_stop(server, || pressure_observer.stop()).await;
-    let persist_result = capacity.persist_profiles();
-    higgs::daemon::remove_pid_file(profile);
-    server_result?;
+    server.await?;
+    Ok(())
+    }
+    .await;
+    let (observer_result, persist_result) = stop_observer_then_cleanup(
+        || pressure_observer.stop(),
+        || {
+            if !pid_written {
+                return Ok(());
+            }
+            let persist_result = capacity.persist_profiles();
+            higgs::daemon::remove_pid_file(profile);
+            persist_result
+        },
+    )
+    .await;
+    serve_result?;
     observer_result?;
     persist_result?;
     Ok(())
@@ -300,7 +316,7 @@ fn capacity_profile_dir(cli: &Cli) -> PathBuf {
         .join("capacity")
 }
 
-fn load_engines(
+async fn load_engines(
     config: &HiggsConfig,
     capacity: &Arc<CapacityRegistry>,
 ) -> Result<(HashMap<String, Arc<Engine>>, Vec<ActiveRegistration>), Box<dyn std::error::Error>> {
@@ -351,40 +367,47 @@ fn load_engines(
                 return Err(error.into());
             }
         };
-        let allocation = match capacity.snapshot(&name) {
-            Ok(allocation) => allocation,
-            Err(error) => {
+        loop {
+            let plan = capacity.cache_allocation_plan();
+            let Some((_, retained, prefix)) =
+                plan.allocations.iter().find(|(model, _, _)| model == &name)
+            else {
                 drop(registration);
                 release_failed_engine(engine, capacity);
-                return Err(error.into());
+                return Err(format!("cache allocation missing for '{name}'").into());
+            };
+            if let Err(error) = engine
+                .apply_capacity_cache_limits(plan.revision, *retained, *prefix, plan.pressure)
+                .await
+            {
+                drop(registration);
+                release_failed_engine(engine, capacity);
+                return Err(
+                    format!("failed to apply cache allocation for '{name}': {error}").into(),
+                );
             }
-        };
-        if let Err(error) = engine
-            .apply_capacity_cache_limits(allocation.retained_bytes, allocation.prefix_cache_bytes)
-        {
-            drop(registration);
-            release_failed_engine(engine, capacity);
-            return Err(format!("failed to apply cache allocation for '{name}': {error}").into());
-        }
-        for (loaded_name, loaded_engine) in &engines {
-            let allocation = match capacity.snapshot(loaded_name) {
-                Ok(allocation) => allocation,
-                Err(error) => {
+            for (loaded_name, loaded_engine) in &engines {
+                let Some((_, retained, prefix)) = plan
+                    .allocations
+                    .iter()
+                    .find(|(model, _, _)| model == loaded_name)
+                else {
+                    continue;
+                };
+                if let Err(error) = loaded_engine
+                    .apply_capacity_cache_limits(plan.revision, *retained, *prefix, plan.pressure)
+                    .await
+                {
                     drop(registration);
                     release_failed_engine(engine, capacity);
-                    return Err(error.into());
+                    return Err(format!(
+                        "failed to apply cache allocation for '{loaded_name}': {error}"
+                    )
+                    .into());
                 }
-            };
-            if let Err(error) = loaded_engine.apply_capacity_cache_limits(
-                allocation.retained_bytes,
-                allocation.prefix_cache_bytes,
-            ) {
-                drop(registration);
-                release_failed_engine(engine, capacity);
-                return Err(format!(
-                    "failed to apply cache allocation for '{loaded_name}': {error}"
-                )
-                .into());
+            }
+            if capacity.publish_cache_allocation_revision(plan.revision) {
+                break;
             }
         }
         tracing::info!(model_name = %name, "Model loaded");
@@ -396,6 +419,7 @@ fn load_engines(
     Ok((engines, registrations))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn await_server_then_stop<ServerFuture, Stop, StopFuture, ServerError>(
     server: ServerFuture,
     stop: Stop,
@@ -408,6 +432,20 @@ where
     let server_result = server.into_future().await;
     let observer_result = stop().await;
     (server_result, observer_result)
+}
+
+async fn stop_observer_then_cleanup<Stop, StopFuture, Cleanup, CleanupResult>(
+    stop: Stop,
+    cleanup: Cleanup,
+) -> (Result<(), String>, CleanupResult)
+where
+    Stop: FnOnce() -> StopFuture,
+    StopFuture: Future<Output = Result<(), String>>,
+    Cleanup: FnOnce() -> CleanupResult,
+{
+    let observer_result = stop().await;
+    let cleanup_result = cleanup();
+    (observer_result, cleanup_result)
 }
 
 fn ensure_local_runtime_ready(config: &HiggsConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -600,5 +638,32 @@ mod tests {
         assert_eq!(server, Err("server failed"));
         assert_eq!(observer, Ok(()));
         assert!(stopped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn observer_is_stopped_before_pid_cleanup() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        events.lock().unwrap().push("server_return");
+        let stop_events = Arc::clone(&events);
+        let cleanup_events = Arc::clone(&events);
+
+        let (observer, cleanup) = stop_observer_then_cleanup(
+            move || async move {
+                stop_events.lock().unwrap().push("observer_stopped");
+                Ok::<(), String>(())
+            },
+            move || {
+                cleanup_events.lock().unwrap().push("pid_cleanup");
+                Ok::<(), String>(())
+            },
+        )
+        .await;
+
+        assert_eq!(observer, Ok(()));
+        assert_eq!(cleanup, Ok(()));
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["server_return", "observer_stopped", "pid_cleanup"]
+        );
     }
 }

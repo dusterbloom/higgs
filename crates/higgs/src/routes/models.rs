@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::{
     Json,
@@ -9,13 +9,13 @@ use axum::{
 use bytes::Bytes;
 
 use crate::{
-    capacity::{DrainRegistration, ModelCapacityFacts, RegistrationError},
+    capacity::{ActiveRegistration, DrainRegistration, ModelCapacityFacts, RegistrationError},
     config::{ModelConfig, validate_pflash_settings},
     error::ServerError,
     model_resolver,
     state::{
         Engine, SharedState, build_engine_with_capacity, measure_after_engine_drop,
-        refresh_after_engine_drop, release_failed_engine,
+        release_failed_engine,
     },
     types::openai::{ModelList, ModelObject},
 };
@@ -26,6 +26,160 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Poll cadence while draining references to an unloaded model.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+type LoadedEngine = Result<(String, Engine, ModelCapacityFacts), String>;
+
+/// Owns an in-progress blocking load. Dropping the awaiting HTTP future hands
+/// the still-running task to a detached cleanup task instead of detaching the
+/// model allocation itself.
+struct RuntimeLoadGuard {
+    task: Option<tokio::task::JoinHandle<LoadedEngine>>,
+    capacity: Arc<crate::capacity::CapacityRegistry>,
+    #[cfg(test)]
+    cleanup_ack: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl RuntimeLoadGuard {
+    fn spawn(
+        capacity: Arc<crate::capacity::CapacityRegistry>,
+        load: impl FnOnce() -> LoadedEngine + Send + 'static,
+    ) -> Self {
+        Self {
+            task: Some(tokio::task::spawn_blocking(load)),
+            capacity,
+            #[cfg(test)]
+            cleanup_ack: None,
+        }
+    }
+
+    async fn finish(mut self) -> Result<LoadedEngine, tokio::task::JoinError> {
+        let result = self.task.as_mut().expect("runtime load task exists").await;
+        self.task.take();
+        result
+    }
+}
+
+impl Drop for RuntimeLoadGuard {
+    fn drop(&mut self) {
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        let capacity = Arc::clone(&self.capacity);
+        #[cfg(test)]
+        let cleanup_ack = self.cleanup_ack.take();
+        tokio::spawn(async move {
+            if let Ok(Ok((_name, engine, _facts))) = task.await {
+                let _ =
+                    tokio::task::spawn_blocking(move || release_failed_engine(engine, &capacity))
+                        .await;
+            }
+            #[cfg(test)]
+            if let Some(cleanup_ack) = cleanup_ack {
+                let _ = cleanup_ack.send(());
+            }
+        });
+    }
+}
+
+struct ProvisionalEngine {
+    engine: Option<Arc<Engine>>,
+    capacity: Arc<crate::capacity::CapacityRegistry>,
+}
+
+struct PublicationRollback {
+    active: Option<ActiveRegistration>,
+    state: SharedState,
+}
+
+impl PublicationRollback {
+    fn new(active: ActiveRegistration, state: &SharedState) -> Self {
+        Self {
+            active: Some(active),
+            state: Arc::clone(state),
+        }
+    }
+
+    fn publish(mut self) {
+        if let Some(active) = self.active.take() {
+            active.publish();
+        }
+    }
+}
+
+impl Drop for PublicationRollback {
+    fn drop(&mut self) {
+        let Some(active) = self.active.take() else {
+            return;
+        };
+        drop(active);
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            if let Err(error) = state
+                .router
+                .apply_capacity_cache_allocations(&state.capacity)
+                .await
+            {
+                tracing::warn!(%error, "failed to restore cache policy after cancelled publication");
+            }
+        });
+    }
+}
+
+impl ProvisionalEngine {
+    fn new(engine: Engine, capacity: Arc<crate::capacity::CapacityRegistry>) -> Self {
+        Self {
+            engine: Some(Arc::new(engine)),
+            capacity,
+        }
+    }
+
+    fn engine(&self) -> Arc<Engine> {
+        Arc::clone(self.engine.as_ref().expect("provisional engine exists"))
+    }
+
+    fn publish(mut self) {
+        self.engine.take();
+    }
+
+    async fn cleanup(mut self) {
+        if let Some(engine) = self.engine.take() {
+            let capacity = Arc::clone(&self.capacity);
+            let cleanup = tokio::spawn(cleanup_shared_engine(engine, capacity));
+            let _ = cleanup.await;
+        }
+    }
+}
+
+async fn cleanup_shared_engine(
+    mut engine: Arc<Engine>,
+    capacity: Arc<crate::capacity::CapacityRegistry>,
+) {
+    loop {
+        match Arc::try_unwrap(engine) {
+            Ok(engine) => {
+                let _ = tokio::task::spawn_blocking(move || {
+                    release_failed_engine(engine, &capacity);
+                })
+                .await;
+                return;
+            }
+            Err(shared) => {
+                engine = shared;
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        }
+    }
+}
+
+impl Drop for ProvisionalEngine {
+    fn drop(&mut self) {
+        let Some(engine) = self.engine.take() else {
+            return;
+        };
+        let capacity = Arc::clone(&self.capacity);
+        tokio::spawn(cleanup_shared_engine(engine, capacity));
+    }
+}
 
 /// `GET /v1/models` -- list the locally loaded models.
 pub async fn list_models(State(state): State<SharedState>) -> Json<ModelList> {
@@ -93,14 +247,26 @@ pub async fn load_model(
             model_cfg.path, model_cfg.path
         ))
     })?;
+    let exposed_name = crate::state::resolve_exposed_model_name(
+        model_cfg.name.as_deref(),
+        &model_cfg.path,
+        &resolved,
+    );
+    if state.router.contains_engine(&exposed_name) {
+        return Err(ServerError::Conflict(format!(
+            "model '{exposed_name}' is already loaded"
+        )));
+    }
 
     // The weight load is blocking and GPU-bound; keep it off the async runtime.
     let config = state.config.clone();
     let capacity = Arc::clone(&state.capacity);
     let cfg = model_cfg.clone();
-    let (name, engine, facts) = tokio::task::spawn_blocking(move || {
+    let load_capacity = Arc::clone(&capacity);
+    let (name, engine, facts) = RuntimeLoadGuard::spawn(load_capacity, move || {
         build_engine_with_capacity(&resolved, &cfg, &config, &capacity)
     })
+    .finish()
     .await
     .map_err(|e| ServerError::InternalError(format!("model load task failed: {e}")))?
     .map_err(ServerError::BadRequest)?;
@@ -112,84 +278,62 @@ pub async fn load_model(
         engine,
         model_cfg.generation_defaults.clone(),
         facts,
-    )?;
+    )
+    .await?;
 
     tracing::info!(model_name = %name, "Model loaded at runtime");
     Ok(Json(model_object(name, vision)))
 }
 
-fn publish_loaded_engine(
+async fn publish_loaded_engine(
     state: &SharedState,
     name: String,
     engine: Engine,
     generation_defaults: crate::config::GenerationDefaults,
     facts: ModelCapacityFacts,
 ) -> Result<(), ServerError> {
+    let provisional = ProvisionalEngine::new(engine, Arc::clone(&state.capacity));
     let ticket = match state.capacity.begin_registration(name.clone()) {
         Ok(ticket) => ticket,
         Err(error) => {
-            release_failed_engine(engine, &state.capacity);
+            provisional.cleanup().await;
             return Err(registration_error(error));
         }
     };
     let active = match state.capacity.commit_active(ticket, facts) {
         Ok(active) => active,
         Err(error) => {
-            release_failed_engine(engine, &state.capacity);
+            provisional.cleanup().await;
             return Err(registration_error(error));
         }
     };
-    let allocation = match state.capacity.snapshot(&name) {
-        Ok(allocation) => allocation,
-        Err(error) => {
-            drop(active);
-            release_failed_engine(engine, &state.capacity);
-            return Err(registration_error(error));
-        }
-    };
-    if let Err(error) =
-        engine.apply_capacity_cache_limits(allocation.retained_bytes, allocation.prefix_cache_bytes)
-    {
-        drop(active);
-        release_failed_engine(engine, &state.capacity);
-        let _ = state
-            .router
-            .apply_capacity_cache_allocations(&state.capacity);
-        return Err(ServerError::InternalError(format!(
-            "failed to apply cache allocation for '{name}': {error}"
-        )));
-    }
-    if let Err(error) = state
+    let publication = PublicationRollback::new(active, state);
+    if let Err((name, engine, error)) = state
         .router
-        .apply_capacity_cache_allocations(&state.capacity)
+        .insert_engine_with_capacity(
+            name,
+            provisional.engine(),
+            generation_defaults,
+            &state.capacity,
+        )
+        .await
     {
-        drop(active);
-        release_failed_engine(engine, &state.capacity);
+        drop(engine);
+        provisional.cleanup().await;
         let _ = state
             .router
-            .apply_capacity_cache_allocations(&state.capacity);
-        return Err(ServerError::InternalError(error));
+            .apply_capacity_cache_allocations(&state.capacity)
+            .await;
+        return if error == "model name is already loaded" {
+            Err(ServerError::Conflict(format!(
+                "model '{name}' is already loaded"
+            )))
+        } else {
+            Err(ServerError::InternalError(error))
+        };
     }
-    if let Err((name, engine)) =
-        state
-            .router
-            .insert_engine_with_defaults(name, Arc::new(engine), generation_defaults)
-    {
-        drop(active);
-        if let Ok(engine) = Arc::try_unwrap(engine)
-            && let Err(error) = engine.shutdown()
-        {
-            tracing::warn!(%error, "failed to join engine after publication failure");
-        }
-        let _ = refresh_after_engine_drop(&state.capacity, "failed model publication");
-        let _ = state
-            .router
-            .apply_capacity_cache_allocations(&state.capacity);
-        return Err(ServerError::Conflict(format!(
-            "model '{name}' is already loaded"
-        )));
-    }
-    active.publish();
+    publication.publish();
+    provisional.publish();
     Ok(())
 }
 
@@ -261,8 +405,9 @@ struct CapacityDrain {
 }
 
 impl CapacityDrain {
-    fn finish(self) {
-        let memory_after_release = measure_after_engine_drop("model unload/swap");
+    async fn finish(self) {
+        let memory_after_release =
+            measure_after_engine_drop(&self.state.capacity, "model unload/swap");
         if let Err(error) = self
             .state
             .capacity
@@ -274,6 +419,7 @@ impl CapacityDrain {
             .state
             .router
             .apply_capacity_cache_allocations(&self.state.capacity)
+            .await
         {
             tracing::warn!(%error, "failed to apply cache allocations after model unload");
         }
@@ -281,36 +427,16 @@ impl CapacityDrain {
 }
 
 async fn drain_and_drop(
-    mut engine: Arc<Engine>,
+    engine: Arc<Engine>,
     timeout: Duration,
     capacity_drain: Option<CapacityDrain>,
 ) -> bool {
-    let start = Instant::now();
-    loop {
-        match Arc::try_unwrap(engine) {
-            Ok(owned) => {
-                if let Err(error) = owned.shutdown() {
-                    tracing::warn!(%error, "failed to join model engine during unload");
-                }
-                // The engine's KV/prefix caches and weights are now freed, but
-                // MLX parks the buffers in its allocator pool — return them to
-                // the OS so a free-then-load swap actually reclaims memory. No
-                // `eval`, so this is safe outside the GPU gate (same as `drop`).
-                if let Some(drain) = capacity_drain {
-                    drain.finish();
-                }
-                return true;
-            }
-            Err(shared) => {
-                if start.elapsed() >= timeout {
-                    tokio::spawn(drain_in_background(shared, capacity_drain));
-                    return false;
-                }
-                engine = shared;
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-        }
-    }
+    let (finished, wait_finished) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        drain_in_background(engine, capacity_drain).await;
+        let _ = finished.send(());
+    });
+    tokio::time::timeout(timeout, wait_finished).await.is_ok()
 }
 
 /// Poll until the detached engine reference is sole-owned, then drop it.
@@ -322,7 +448,7 @@ async fn drain_in_background(mut engine: Arc<Engine>, capacity_drain: Option<Cap
                     tracing::warn!(%error, "failed to join model engine during deferred unload");
                 }
                 if let Some(drain) = capacity_drain {
-                    drain.finish();
+                    drain.finish().await;
                 }
                 return;
             }
@@ -349,6 +475,7 @@ fn model_object(name: String, vision: bool) -> ModelObject {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::time::Instant;
 
     use crate::router::Router;
     use crate::state::AppState;
@@ -404,6 +531,7 @@ mod tests {
             prefix_cache_resident_bytes: 0,
             retained_bytes_ceiling: 2 * GIB,
             prefix_cache_bytes_ceiling: GIB,
+            cache_capabilities: crate::capacity::CacheCapabilities::SIMPLE,
             configured_total_token_ceiling: None,
             configured_output_token_ceiling: Some(4_096),
             quantization: "3bit".to_owned(),
@@ -416,19 +544,34 @@ mod tests {
         }
     }
 
-    #[test]
-    fn publish_loaded_engine_commits_capacity_before_route_visibility() {
+    async fn publish_test_engine(
+        state: &SharedState,
+        name: String,
+        engine: Engine,
+        generation_defaults: crate::config::GenerationDefaults,
+        facts: ModelCapacityFacts,
+    ) -> Result<(), ServerError> {
+        // Production facts are returned only after their allocator snapshot is
+        // published inside the serialized MLX load window. Stub tests model
+        // that boundary explicitly before entering lifecycle publication.
+        state.capacity.refresh_memory(facts.memory);
+        publish_loaded_engine(state, name, engine, generation_defaults, facts).await
+    }
+
+    #[tokio::test]
+    async fn publish_loaded_engine_commits_capacity_before_route_visibility() {
         let state = build_state("[local]\nallow_runtime_model_load = true\n", HashMap::new());
         assert!(!state.router.contains_engine("escha"));
         assert!(state.capacity.snapshot("escha").is_err());
 
-        publish_loaded_engine(
+        publish_test_engine(
             &state,
             "escha".to_owned(),
             Engine::test_stub("escha"),
             crate::config::GenerationDefaults::default(),
             capacity_facts("escha"),
         )
+        .await
         .unwrap();
 
         assert!(state.router.contains_engine("escha"));
@@ -443,20 +586,234 @@ mod tests {
         );
     }
 
-    #[test]
-    fn router_insertion_failure_rolls_back_active_capacity() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn pressure_racing_cache_publication_finishes_on_latest_revision() {
+        let state = build_state("[local]\nallow_runtime_model_load = true\n", HashMap::new());
+        publish_test_engine(
+            &state,
+            "escha".to_owned(),
+            Engine::test_stub("escha"),
+            crate::config::GenerationDefaults::default(),
+            capacity_facts("escha"),
+        )
+        .await
+        .unwrap();
+
+        let pressure_state = Arc::clone(&state);
+        let pressure = tokio::spawn(async move {
+            pressure_state.capacity.apply_pressure_observation(
+                crate::capacity::PressureObservation {
+                    pressure: crate::capacity::MemoryPressure::Critical,
+                    swap_out_delta: 1,
+                    compressor_delta: 1,
+                },
+            );
+            pressure_state
+                .router
+                .apply_capacity_cache_allocations(&pressure_state.capacity)
+                .await
+                .unwrap();
+        });
+        state
+            .router
+            .apply_capacity_cache_allocations(&state.capacity)
+            .await
+            .unwrap();
+        pressure.await.unwrap();
+
+        let allocation = state.capacity.snapshot("escha").unwrap();
+        assert_eq!(
+            allocation.pressure,
+            crate::capacity::MemoryPressure::Critical
+        );
+        assert_eq!(
+            state.router.local_engines()[0].route_test_capacity_cache_limits(),
+            (allocation.retained_bytes, allocation.prefix_cache_bytes)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_committed_publication_restores_existing_engine_policy() {
+        let state = build_state("[local]\nallow_runtime_model_load = true\n", HashMap::new());
+        let mut first_facts = capacity_facts("first");
+        first_facts.retained_bytes_ceiling = 0;
+        first_facts.prefix_cache_bytes_ceiling = 0;
+        publish_test_engine(
+            &state,
+            "first".to_owned(),
+            Engine::test_stub("first"),
+            crate::config::GenerationDefaults::default(),
+            first_facts,
+        )
+        .await
+        .unwrap();
+        let first_engine = state.router.local_engines()[0].clone();
+        let baseline = first_engine.route_test_capacity_cache_limits();
+        state.capacity.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 5 * 1024 * 1024 * 1024,
+            peak_bytes: 5 * 1024 * 1024 * 1024,
+            memory_limit_bytes: Some(128 * 1024 * 1024 * 1024),
+            metal_recommended_working_set_bytes: Some(128 * 1024 * 1024 * 1024),
+        });
+        let expected_after_rollback = state
+            .capacity
+            .cache_allocation_plan()
+            .allocations
+            .into_iter()
+            .find(|(name, _, _)| name == "first")
+            .map(|(_, retained, prefix)| (retained, prefix))
+            .unwrap();
+        assert_ne!(expected_after_rollback, baseline);
+
+        let (second_engine, arrived, release) = Engine::test_stub_with_cache_gate("second");
+        let mut second_facts = capacity_facts("second");
+        second_facts.memory.memory_limit_bytes = Some(128 * 1024 * 1024 * 1024);
+        second_facts.memory.metal_recommended_working_set_bytes =
+            second_facts.memory.memory_limit_bytes;
+        second_facts.retained_bytes_ceiling = 0;
+        second_facts.prefix_cache_bytes_ceiling = 0;
+        let publish_state = Arc::clone(&state);
+        let publication = tokio::spawn(async move {
+            publish_test_engine(
+                &publish_state,
+                "second".to_owned(),
+                second_engine,
+                crate::config::GenerationDefaults::default(),
+                second_facts,
+            )
+            .await
+        });
+        if tokio::time::timeout(Duration::from_secs(1), arrived.notified())
+            .await
+            .is_err()
+        {
+            panic!(
+                "publication never reached cache gate: {:?}",
+                publication.await
+            );
+        }
+        assert_ne!(first_engine.route_test_capacity_cache_limits(), baseline);
+        let published_first = state.capacity.snapshot("first").unwrap();
+        assert_eq!(
+            (
+                published_first.retained_bytes,
+                published_first.prefix_cache_bytes
+            ),
+            baseline,
+            "capacity API must retain acknowledged bytes until the whole plan is applied"
+        );
+        assert_eq!(
+            state.capacity.snapshot("second").unwrap().availability,
+            crate::capacity::CapacityAvailability::Unavailable,
+            "provisional model must remain unavailable before route publication"
+        );
+        publication.abort();
+        release.notify_waiters();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state.capacity.snapshot("second").is_err()
+                    && first_engine.route_test_capacity_cache_limits() == expected_after_rollback
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("publication rollback must restore the latest policy");
+        assert!(!state.router.contains_engine("second"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_after_disabled_route_insertion_removes_the_uncommitted_entry() {
+        let state = build_state("[local]\nallow_runtime_model_load = true\n", HashMap::new());
+        publish_test_engine(
+            &state,
+            "first".to_owned(),
+            Engine::test_stub("first"),
+            crate::config::GenerationDefaults::default(),
+            capacity_facts("first"),
+        )
+        .await
+        .unwrap();
+
+        let (second, arrived, release, _) = Engine::test_stub_with_cache_gate_after("second", 1);
+        let publish_state = Arc::clone(&state);
+        let publication = tokio::spawn(async move {
+            publish_test_engine(
+                &publish_state,
+                "second".to_owned(),
+                second,
+                crate::config::GenerationDefaults::default(),
+                capacity_facts("second"),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), arrived.notified())
+            .await
+            .expect("publication must reach the first engine apply");
+        state
+            .capacity
+            .apply_pressure_observation(crate::capacity::PressureObservation {
+                pressure: crate::capacity::MemoryPressure::Critical,
+                swap_out_delta: 1,
+                compressor_delta: 1,
+            });
+        release.notify_waiters();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state
+                .router
+                .local_engines()
+                .iter()
+                .all(|engine| engine.model_name() != "second")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("revision retry must insert the disabled route");
+        publication.abort();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let absent = state
+                    .router
+                    .local_engines()
+                    .iter()
+                    .all(|engine| engine.model_name() != "second");
+                if absent && state.capacity.snapshot("second").is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled disabled route must be removed and capacity rolled back");
+        assert!(
+            state
+                .capacity
+                .begin_registration("second".to_owned())
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn router_insertion_failure_rolls_back_active_capacity() {
         let state = build_state(
             "[local]\nallow_runtime_model_load = true\n",
             stub_engines(&["escha"]),
         );
 
-        let error = publish_loaded_engine(
+        let error = publish_test_engine(
             &state,
             "escha".to_owned(),
             Engine::test_stub("replacement"),
             crate::config::GenerationDefaults::default(),
             capacity_facts("escha"),
         )
+        .await
         .unwrap_err();
 
         assert!(matches!(error, ServerError::Conflict(_)));
@@ -504,6 +861,34 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ServerError::Forbidden(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_runtime_load_waits_for_cleanup_and_never_registers() {
+        let capacity = crate::capacity::CapacityRegistry::new(["cancelled".to_owned()]);
+        let (started, wait_started) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let (cleanup_ack, wait_cleanup) = tokio::sync::oneshot::channel();
+        let mut guard = RuntimeLoadGuard::spawn(Arc::clone(&capacity), move || {
+            started.send(()).unwrap();
+            wait_release.recv().unwrap();
+            Ok((
+                "cancelled".to_owned(),
+                Engine::test_stub("cancelled"),
+                capacity_facts("cancelled"),
+            ))
+        });
+        guard.cleanup_ack = Some(cleanup_ack);
+        let waiter = tokio::spawn(async move { guard.finish().await });
+        wait_started.recv_timeout(Duration::from_secs(1)).unwrap();
+        waiter.abort();
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), wait_cleanup)
+            .await
+            .expect("cancellation cleanup must be durable")
+            .unwrap();
+
+        assert!(capacity.begin_registration("cancelled".to_owned()).is_ok());
     }
 
     #[tokio::test]
@@ -566,13 +951,14 @@ mod tests {
     #[tokio::test]
     async fn unload_removes_engine_and_frees_it() {
         let state = build_state("[local]\nallow_runtime_model_load = true\n", HashMap::new());
-        publish_loaded_engine(
+        publish_test_engine(
             &state,
             "llama".to_owned(),
             Engine::test_stub("llama"),
             crate::config::GenerationDefaults::default(),
             capacity_facts("llama"),
         )
+        .await
         .unwrap();
         let status = unload_model(State(Arc::clone(&state)), Path("llama".to_owned()))
             .await
@@ -585,13 +971,14 @@ mod tests {
     #[tokio::test]
     async fn unload_marks_capacity_unavailable_and_keeps_known_identity() {
         let state = build_state("[local]\nallow_runtime_model_load = true\n", HashMap::new());
-        publish_loaded_engine(
+        publish_test_engine(
             &state,
             "escha".to_owned(),
             Engine::test_stub("escha"),
             crate::config::GenerationDefaults::default(),
             capacity_facts("escha"),
         )
+        .await
         .unwrap();
         let before = state.capacity.snapshot("escha").unwrap();
 
@@ -639,5 +1026,66 @@ mod tests {
         let drained = drain_and_drop(engine, Duration::from_millis(80), None).await;
         assert!(!drained, "should time out while a reference is held");
         drop(clone); // let the detached task finish
+    }
+
+    #[tokio::test]
+    async fn cancelling_unload_keeps_drain_cleanup_owned_until_final_unregister() {
+        let state = build_state("[local]\nallow_runtime_model_load = true\n", HashMap::new());
+        publish_test_engine(
+            &state,
+            "busy".to_owned(),
+            Engine::test_stub("busy"),
+            crate::config::GenerationDefaults::default(),
+            capacity_facts("busy"),
+        )
+        .await
+        .unwrap();
+        let lease = state.router.local_engines()[0].clone();
+        let unload_state = Arc::clone(&state);
+        let unload = tokio::spawn(async move {
+            unload_model(State(unload_state), Path("busy".to_owned())).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.router.contains_engine("busy") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        unload.abort();
+        drop(lease);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(ticket) = state.capacity.begin_registration("busy".to_owned()) {
+                    drop(ticket);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached drain must finish unregister after handler cancellation");
+    }
+
+    #[tokio::test]
+    async fn cancelling_explicit_provisional_cleanup_does_not_drop_the_cleanup_owner() {
+        let capacity = crate::capacity::CapacityRegistry::new(std::iter::empty());
+        let provisional =
+            ProvisionalEngine::new(Engine::test_stub("provisional"), Arc::clone(&capacity));
+        let leased = provisional.engine();
+        let weak = Arc::downgrade(&leased);
+        let cleanup = tokio::spawn(provisional.cleanup());
+        tokio::task::yield_now().await;
+        cleanup.abort();
+        drop(leased);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached provisional cleanup must retain ownership through cancellation");
     }
 }

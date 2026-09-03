@@ -95,6 +95,7 @@ mod tests {
             prefix_cache_resident_bytes: 0,
             retained_bytes_ceiling: 2 * GIB,
             prefix_cache_bytes_ceiling: GIB,
+            cache_capabilities: crate::capacity::CacheCapabilities::SIMPLE,
             configured_total_token_ceiling: None,
             configured_output_token_ceiling: Some(4_096),
             quantization: "3bit".to_owned(),
@@ -142,11 +143,10 @@ mod tests {
     #[tokio::test]
     async fn active_route_returns_the_stored_snapshot_unchanged() {
         let registry = CapacityRegistry::new(["escha".to_owned()]);
+        let facts = active_facts();
+        registry.refresh_memory(facts.memory);
         let ticket = registry.begin_registration("escha".to_owned()).unwrap();
-        registry
-            .commit_active(ticket, active_facts())
-            .unwrap()
-            .publish();
+        registry.commit_active(ticket, facts).unwrap().publish();
         let expected = serde_json::to_value(registry.snapshot("escha").unwrap()).unwrap();
         let app = crate::build_router(state_with(Arc::clone(&registry)), 30.0, None, 0, 1024, None);
         let response = app

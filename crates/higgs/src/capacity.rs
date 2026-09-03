@@ -11,19 +11,49 @@ mod registry;
 
 pub use profile::{LearnedBandEvidence, LearnedProfile, LearnedProfileKey, LearnedProfileStore};
 pub use registry::{
-    ActiveRegistration, CapacityRegistry, DrainRegistration, ModelCapacityFacts,
-    ModelContentIdentity, RegistrationError, RegistrationTicket, fingerprint_model_artifacts,
+    ActiveRegistration, CacheAllocationPlan, CacheCapabilities, CapacityRegistry,
+    DrainRegistration, ModelCapacityFacts, ModelContentIdentity, PublishedMemoryMeasurement,
+    RegistrationError, RegistrationTicket, fingerprint_model_artifacts,
 };
 
 /// Owned process observer; server shutdown must consume and join it.
 #[must_use = "the process pressure observer must be stopped and joined"]
 pub struct CapacityPressureObserver(Option<pressure::PressureObserverHandle>);
 
+/// Sole observer sink. It records pressure before boot models load, then gains
+/// a weak router attachment and immediately applies the latest cache policy.
+pub struct CapacityPressureCoordinator {
+    capacity: std::sync::Arc<CapacityRegistry>,
+    state: std::sync::RwLock<Option<std::sync::Weak<crate::state::AppState>>>,
+}
+
+impl CapacityPressureCoordinator {
+    #[must_use]
+    pub fn new(capacity: std::sync::Arc<CapacityRegistry>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            capacity,
+            state: std::sync::RwLock::new(None),
+        })
+    }
+
+    pub async fn attach(&self, state: &crate::state::SharedState) -> Result<(), String> {
+        *self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::sync::Arc::downgrade(state));
+        state
+            .router
+            .apply_capacity_cache_allocations(&self.capacity)
+            .await
+    }
+}
+
 pub async fn start_capacity_pressure_observer(
-    state: crate::state::SharedState,
+    coordinator: std::sync::Arc<CapacityPressureCoordinator>,
 ) -> Result<CapacityPressureObserver, String> {
     pressure::system_observer_config()
-        .start(state)
+        .start(coordinator)
         .await
         .map(|handle| CapacityPressureObserver(Some(handle)))
         .map_err(|error| error.to_string())
@@ -503,6 +533,29 @@ impl<C: Clock> CapacityController<C> {
             evidence: self.evidence.clone(),
             last_swap_out_millis: self.last_swap_out_millis,
             strongest_pressure_since_normal: self.strongest_pressure_since_normal,
+        }
+    }
+
+    /// Replace process-wide residency inputs without discarding a pressure
+    /// downshift or bypassing the evidence-gated recovery ramp.
+    pub(crate) fn replace_shared_residency(
+        &mut self,
+        memory: MlxMemorySnapshot,
+        loaded_model_bytes: u64,
+        retained_bytes: u64,
+        prefix_cache_bytes: u64,
+        active_reservation_bytes: u64,
+    ) {
+        let prior_total = self.decision.safe_total_tokens;
+        self.inputs.memory = memory;
+        self.inputs.loaded_model_bytes = loaded_model_bytes;
+        self.inputs.retained_bytes = retained_bytes;
+        self.inputs.prefix_cache_bytes = prefix_cache_bytes;
+        self.inputs.active_reservation_bytes = active_reservation_bytes;
+        let raw = self.solve_static();
+        self.decision = raw.bounded_by(prior_total);
+        if self.inputs.pressure == MemoryPressure::Critical {
+            self.decision.availability = CapacityAvailability::Unavailable;
         }
     }
 

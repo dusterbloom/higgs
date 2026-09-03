@@ -5,8 +5,10 @@ use tokio::{
     task::JoinHandle,
 };
 
-use super::{CapacityController, CapacityRegistry, Clock, MemoryPressure, PressureObservation};
-use crate::state::AppState;
+use super::{
+    CapacityController, CapacityPressureCoordinator, CapacityRegistry, Clock, MemoryPressure,
+    PressureObservation,
+};
 
 const VM_COUNTER_SAMPLE_PERIOD: Duration = Duration::from_secs(1);
 
@@ -39,6 +41,29 @@ pub(crate) trait PressureEventSource: Send + 'static {
     ) -> Result<Box<dyn ProducerHandle>, PressureObserverError>;
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) struct NoopPressureSource;
+
+#[cfg(any(test, not(target_os = "macos")))]
+struct NoopPressureHandle;
+
+#[cfg(any(test, not(target_os = "macos")))]
+impl ProducerHandle for NoopPressureHandle {
+    fn cancel(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(async {})
+    }
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+impl PressureEventSource for NoopPressureSource {
+    fn start(
+        self,
+        _sender: mpsc::UnboundedSender<ObserverEvent>,
+    ) -> Result<Box<dyn ProducerHandle>, PressureObserverError> {
+        Ok(Box::new(NoopPressureHandle))
+    }
+}
+
 pub(crate) trait PressureObservationSink: Send + Sync + 'static {
     fn apply<'a>(
         &'a self,
@@ -68,14 +93,25 @@ impl PressureObservationSink for CapacityRegistry {
     }
 }
 
-impl PressureObservationSink for AppState {
+impl PressureObservationSink for CapacityPressureCoordinator {
     fn apply<'a>(
         &'a self,
         observation: PressureObservation,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             self.capacity.apply_pressure_observation(observation);
-            if let Err(error) = self.router.apply_capacity_cache_allocations(&self.capacity) {
+            let state = self
+                .state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade);
+            if let Some(state) = state
+                && let Err(error) = state
+                    .router
+                    .apply_capacity_cache_allocations(&self.capacity)
+                    .await
+            {
                 tracing::warn!(%error, "failed to apply pressure-adjusted cache allocations");
             }
         })
@@ -559,21 +595,9 @@ mod platform {
 
 #[cfg(not(target_os = "macos"))]
 mod platform {
-    use super::{
-        CounterSampler, ObserverEvent, PressureEventSource, PressureObserverError, ProducerHandle,
-        VmCounters, mpsc,
-    };
+    use super::{CounterSampler, VmCounters};
 
-    pub(crate) struct SystemPressureSource;
-
-    impl PressureEventSource for SystemPressureSource {
-        fn start(
-            self,
-            _sender: mpsc::UnboundedSender<ObserverEvent>,
-        ) -> Result<Box<dyn ProducerHandle>, PressureObserverError> {
-            Err(PressureObserverError::UnsupportedPlatform)
-        }
-    }
+    pub(crate) use super::NoopPressureSource as SystemPressureSource;
 
     pub(crate) struct SystemVmCounters;
 
@@ -621,11 +645,34 @@ mod tests {
         PressureObservation, floor_1024,
     };
     use super::{
-        CounterSampler, ObserverEvent, PressureEventSource, PressureObserverConfig, ProducerHandle,
-        VmCounters,
+        CounterSampler, NoopPressureSource, ObserverEvent, PressureEventSource,
+        PressureObserverConfig, ProducerHandle, VmCounters,
     };
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[tokio::test]
+    async fn portable_noop_pressure_source_owns_a_stoppable_handle() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let handle = NoopPressureSource.start(sender).unwrap();
+
+        handle.cancel().await;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn system_observer_starts_and_stops_on_non_macos() {
+        let controller = Arc::new(tokio::sync::Mutex::new(CapacityController::with_clock(
+            controller_inputs(),
+            TestClock::new(),
+        )));
+
+        let handle = super::system_observer_config()
+            .start(controller)
+            .await
+            .unwrap();
+        handle.stop().await.unwrap();
+    }
 
     #[derive(Clone)]
     struct TestClock(Arc<AtomicU64>);

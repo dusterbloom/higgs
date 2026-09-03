@@ -8,6 +8,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use higgs_models::mlx_exec::{async_eval, eval};
 use higgs_models::{
@@ -63,10 +64,72 @@ struct BatchRequest {
 
 enum BatchCommand {
     Generate(BatchRequest),
-    SetPrefixCacheBytes {
-        bytes: usize,
-        acknowledged: std::sync::mpsc::Sender<()>,
-    },
+    SetPrefixCacheBytes { requested_revision: u64 },
+}
+
+/// Bounded coalescing state: commands are only wakeups; the latest tuple and
+/// acknowledgement waiters remain authoritative across enqueue timeouts.
+#[derive(Default)]
+struct CacheControlState {
+    desired_revision: u64,
+    desired_bytes: usize,
+    applied_revision: u64,
+    acknowledgements: Vec<(u64, tokio::sync::oneshot::Sender<u64>)>,
+}
+
+async fn send_cache_control(
+    request_tx: &tokio::sync::mpsc::Sender<BatchCommand>,
+    desired: &Arc<Mutex<CacheControlState>>,
+    revision: u64,
+    prefix_bytes: usize,
+    timeout: std::time::Duration,
+) -> Result<(), EngineError> {
+    let (acknowledged, wait) = tokio::sync::oneshot::channel();
+    let should_wake = {
+        let mut state = desired.lock().unwrap_or_else(PoisonError::into_inner);
+        if revision <= state.applied_revision {
+            return Ok(());
+        }
+        let changed = revision > state.desired_revision;
+        if changed {
+            state.desired_revision = revision;
+            state.desired_bytes = prefix_bytes;
+        }
+        state.acknowledgements.push((revision, acknowledged));
+        changed
+    };
+    if should_wake {
+        match tokio::time::timeout(
+            timeout,
+            request_tx.send(BatchCommand::SetPrefixCacheBytes {
+                requested_revision: revision,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) | Err(_) => {}
+            Ok(Err(_)) => return Err(EngineError::Generation("Engine shut down".to_owned())),
+        }
+    }
+    tokio::time::timeout(timeout, wait)
+        .await
+        .map_err(|_| {
+            EngineError::Generation("batch cache update acknowledgement timed out".to_owned())
+        })?
+        .map_err(|_| {
+            EngineError::Generation(
+                "batch engine stopped before applying its cache allocation".to_owned(),
+            )
+        })
+        .and_then(|applied| {
+            if applied >= revision {
+                Ok(())
+            } else {
+                Err(EngineError::Generation(
+                    "batch engine acknowledged a stale cache allocation".to_owned(),
+                ))
+            }
+        })
 }
 
 /// An in-flight request being actively decoded.
@@ -126,6 +189,7 @@ fn prefill_chunk_ranges(token_count: usize, quantum: usize) -> Vec<std::ops::Ran
 /// token level instead of being fully serialized.
 pub struct BatchEngine {
     request_tx: tokio::sync::mpsc::Sender<BatchCommand>,
+    cache_control: Arc<Mutex<CacheControlState>>,
     worker: Option<std::thread::JoinHandle<()>>,
     tokenizer: Tokenizer,
     template: ChatTemplateRenderer,
@@ -183,6 +247,8 @@ impl BatchEngine {
         crate::simple::set_wired_limit_to_max(raise_wired_limit);
 
         let (request_tx, request_rx) = tokio::sync::mpsc::channel(REQUEST_QUEUE_CAPACITY);
+        let cache_control = Arc::new(Mutex::new(CacheControlState::default()));
+        let worker_cache_control = Arc::clone(&cache_control);
         let eos_ids = eos_token_ids.clone();
         let tok = tokenizer.clone();
 
@@ -194,6 +260,7 @@ impl BatchEngine {
                     &tok,
                     &eos_ids,
                     request_rx,
+                    worker_cache_control,
                     kv_cache_config.kv_cache_bytes,
                     prefill_yield_tokens.unwrap_or(0),
                 );
@@ -208,6 +275,7 @@ impl BatchEngine {
 
         Ok(Self {
             request_tx,
+            cache_control,
             worker: Some(worker),
             tokenizer,
             template,
@@ -243,29 +311,20 @@ impl BatchEngine {
 
     /// Apply the process registry's effective prefix-cache allocation and wait
     /// until the worker has evicted entries above the new limit.
-    pub fn apply_capacity_cache_limit(&self, prefix_bytes: usize) -> Result<(), EngineError> {
-        let (acknowledged, wait) = std::sync::mpsc::channel();
-        let mut command = BatchCommand::SetPrefixCacheBytes {
-            bytes: prefix_bytes,
-            acknowledged,
-        };
-        loop {
-            match self.request_tx.try_send(command) {
-                Ok(()) => break,
-                Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
-                    command = returned;
-                    std::thread::yield_now();
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    return Err(EngineError::Generation("Engine shut down".to_owned()));
-                }
-            }
-        }
-        wait.recv().map_err(|_| {
-            EngineError::Generation(
-                "batch engine stopped before applying its cache allocation".to_owned(),
-            )
-        })
+    pub async fn apply_capacity_cache_limit(
+        &self,
+        revision: u64,
+        prefix_bytes: usize,
+    ) -> Result<(), EngineError> {
+        const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        send_cache_control(
+            &self.request_tx,
+            &self.cache_control,
+            revision,
+            prefix_bytes,
+            CONTROL_TIMEOUT,
+        )
+        .await
     }
 
     pub const fn tokenizer(&self) -> &Tokenizer {
@@ -589,6 +648,7 @@ fn worker_loop(
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
     mut request_rx: tokio::sync::mpsc::Receiver<BatchCommand>,
+    cache_control: Arc<Mutex<CacheControlState>>,
     prefix_cache_bytes: usize,
     prefill_yield_tokens: u32,
 ) {
@@ -598,13 +658,14 @@ fn worker_loop(
     let mut pending_prefill: Option<PendingPrefill> = None;
 
     loop {
+        apply_pending_cache_control(&mut prefix_cache, &cache_control);
         // 1. Prefill at most one pending request per iteration.
         //    This interleaves prefill with decode so long prefills don't
         //    starve active requests, keeping TTFT low for new arrivals
         //    while maintaining token throughput for in-flight requests.
         if pending_prefill.is_none() {
             if let Ok(command) = request_rx.try_recv()
-                && let Some(req) = apply_batch_command(command, &mut prefix_cache)
+                && let Some(req) = apply_batch_command(command, &mut prefix_cache, &cache_control)
             {
                 // The Higgs caller already owns its process GPU gate. Take the
                 // lower-level MLX gate only for this unit of work; holding it
@@ -664,7 +725,9 @@ fn worker_loop(
 
         // 2. If no active requests, block until one arrives.
         if active.is_empty() && pending_prefill.is_none() {
-            if let Some(req) = blocking_next_request(&mut request_rx, &mut prefix_cache) {
+            if let Some(req) =
+                blocking_next_request(&mut request_rx, &mut prefix_cache, &cache_control)
+            {
                 let _mlx_gate = higgs_models::mlx_exec::acquire();
                 if prefill_yield_tokens == 0 {
                     let response_tx = req.response_tx.clone();
@@ -756,28 +819,60 @@ fn worker_loop(
 fn apply_batch_command(
     command: BatchCommand,
     prefix_cache: &mut PrefixCache,
+    desired: &Arc<Mutex<CacheControlState>>,
 ) -> Option<BatchRequest> {
     match command {
         BatchCommand::Generate(request) => Some(request),
-        BatchCommand::SetPrefixCacheBytes {
-            bytes,
-            acknowledged,
-        } => {
-            let _mlx_gate = higgs_models::mlx_exec::acquire();
-            prefix_cache.set_capacity_max_bytes(bytes);
-            let _ = acknowledged.send(());
+        BatchCommand::SetPrefixCacheBytes { requested_revision } => {
+            apply_pending_cache_control(prefix_cache, desired);
+            debug_assert!(
+                desired
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .applied_revision
+                    >= requested_revision
+            );
             None
         }
     }
 }
 
+fn apply_pending_cache_control(
+    prefix_cache: &mut PrefixCache,
+    desired: &Arc<Mutex<CacheControlState>>,
+) {
+    let target = {
+        let state = desired.lock().unwrap_or_else(PoisonError::into_inner);
+        (state.desired_revision > state.applied_revision)
+            .then_some((state.desired_revision, state.desired_bytes))
+    };
+    let Some((revision, bytes)) = target else {
+        return;
+    };
+    let _mlx_gate = higgs_models::mlx_exec::acquire();
+    prefix_cache.set_capacity_max_bytes(bytes);
+    let mut state = desired.lock().unwrap_or_else(PoisonError::into_inner);
+    state.applied_revision = state.applied_revision.max(revision);
+    let applied = state.applied_revision;
+    let mut pending = Vec::new();
+    for (requested, acknowledged) in state.acknowledgements.drain(..) {
+        if requested <= applied {
+            let _ = acknowledged.send(applied);
+        } else {
+            pending.push((requested, acknowledged));
+        }
+    }
+    state.acknowledgements = pending;
+}
+
 fn blocking_next_request(
     request_rx: &mut tokio::sync::mpsc::Receiver<BatchCommand>,
     prefix_cache: &mut PrefixCache,
+    desired: &Arc<Mutex<CacheControlState>>,
 ) -> Option<BatchRequest> {
     loop {
         let command = request_rx.blocking_recv()?;
-        if let Some(request) = apply_batch_command(command, prefix_cache) {
+        if let Some(request) = apply_batch_command(command, prefix_cache, desired) {
             return Some(request);
         }
     }
@@ -1516,15 +1611,17 @@ mod tests {
         )
         .unwrap();
         let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let cache_control = Arc::new(Mutex::new(CacheControlState::default()));
+        let worker_control = Arc::clone(&cache_control);
         let worker = std::thread::spawn(move || {
+            let mut prefix_cache = PrefixCache::new(1);
             while let Some(command) = request_rx.blocking_recv() {
-                if let BatchCommand::SetPrefixCacheBytes { acknowledged, .. } = command {
-                    let _ = acknowledged.send(());
-                }
+                let _ = apply_batch_command(command, &mut prefix_cache, &worker_control);
             }
         });
         BatchEngine {
             request_tx,
+            cache_control,
             worker: Some(worker),
             tokenizer,
             template,
@@ -1572,21 +1669,88 @@ mod tests {
         engine.shutdown().unwrap();
     }
 
-    #[test]
-    fn cache_limit_update_is_acknowledged_by_worker_before_returning() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn cache_limit_update_is_acknowledged_by_worker_before_returning() {
         let engine = batch_prompt_test_engine();
-        engine.apply_capacity_cache_limit(0).unwrap();
+        engine.apply_capacity_cache_limit(1, 0).await.unwrap();
         engine.shutdown().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn saturated_cache_control_queue_yields_instead_of_blocking_runtime() {
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let desired = Arc::new(Mutex::new(CacheControlState::default()));
+        request_tx
+            .send(BatchCommand::SetPrefixCacheBytes {
+                requested_revision: 1,
+            })
+            .await
+            .unwrap();
+        let worker_desired = Arc::clone(&desired);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let mut prefix_cache = PrefixCache::new(1);
+            while let Some(command) = request_rx.recv().await {
+                let _ = apply_batch_command(command, &mut prefix_cache, &worker_desired);
+            }
+        });
+
+        send_cache_control(
+            &request_tx,
+            &desired,
+            2,
+            2,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn abandoned_stale_control_wake_applies_the_latest_requested_revision() {
+        let (acknowledged, wait) = tokio::sync::oneshot::channel();
+        let desired = Arc::new(Mutex::new(CacheControlState {
+            desired_revision: 2,
+            desired_bytes: 2048,
+            acknowledgements: vec![(2, acknowledged)],
+            ..CacheControlState::default()
+        }));
+        let mut prefix_cache = PrefixCache::new(1).with_max_bytes(8192);
+
+        assert!(
+            apply_batch_command(
+                BatchCommand::SetPrefixCacheBytes {
+                    requested_revision: 1,
+                },
+                &mut prefix_cache,
+                &desired,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            desired
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .applied_revision,
+            2
+        );
+        assert_eq!(wait.blocking_recv().unwrap(), 2);
     }
 
     #[test]
     fn idle_batch_worker_releases_mlx_gate_and_control_updates_serialize() {
         let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let desired = Arc::new(Mutex::new(CacheControlState {
+            desired_revision: 1,
+            desired_bytes: 1024,
+            ..CacheControlState::default()
+        }));
+        let worker_desired = Arc::clone(&desired);
         let (worker_ready, wait_ready) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let mut cache = PrefixCache::new(1);
             worker_ready.send(()).unwrap();
-            let _ = blocking_next_request(&mut request_rx, &mut cache);
+            let _ = blocking_next_request(&mut request_rx, &mut cache, &worker_desired);
         });
         wait_ready.recv().unwrap();
 
@@ -1602,15 +1766,20 @@ mod tests {
             .expect("an idle Batch worker must not own the process MLX gate");
 
         let (control_done, wait_control) = std::sync::mpsc::channel();
+        let control_desired = Arc::clone(&desired);
         let control = std::thread::spawn(move || {
-            let (acknowledged, wait) = std::sync::mpsc::channel();
+            let (acknowledged, wait) = tokio::sync::oneshot::channel();
+            control_desired
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .acknowledgements
+                .push((1, acknowledged));
             request_tx
                 .blocking_send(BatchCommand::SetPrefixCacheBytes {
-                    bytes: 1024,
-                    acknowledged,
+                    requested_revision: 1,
                 })
                 .unwrap();
-            wait.recv().unwrap();
+            wait.blocking_recv().unwrap();
             control_done.send(()).unwrap();
         });
         assert!(

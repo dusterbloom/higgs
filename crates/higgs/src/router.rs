@@ -82,6 +82,7 @@ struct AutoRouteEntry {
 struct LocalEngineEntry {
     engine: Arc<Engine>,
     generation_defaults: GenerationDefaults,
+    capacity_ready: bool,
 }
 
 /// Routes model names to local engines or remote providers.
@@ -96,6 +97,7 @@ pub struct Router {
     /// Guarded by a `RwLock`: `resolve`/`list` take a read lock and clone the
     /// `Arc` out, so an in-flight request is never tied to map membership.
     local_engines: RwLock<HashMap<String, LocalEngineEntry>>,
+    cache_policy: tokio::sync::Mutex<()>,
     compiled_routes: Vec<CompiledRoute>,
     auto_routes: Vec<AutoRouteEntry>,
     auto_candidates: Vec<RouteCandidate>,
@@ -106,6 +108,33 @@ pub struct Router {
     auto_router_force: bool,
     auto_router_timeout_ms: u64,
     default_target: RouteTarget,
+}
+
+struct DisabledRouteGuard<'a> {
+    router: &'a Router,
+    name: String,
+    armed: bool,
+}
+
+impl DisabledRouteGuard<'_> {
+    fn remove(mut self) -> Arc<Engine> {
+        self.armed = false;
+        self.router
+            .remove_engine(&self.name)
+            .expect("disabled route entry exists")
+    }
+
+    fn publish(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DisabledRouteGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.router.remove_engine(&self.name);
+        }
+    }
 }
 
 impl Router {
@@ -177,6 +206,7 @@ impl Router {
                     LocalEngineEntry {
                         engine,
                         generation_defaults,
+                        capacity_ready: true,
                     },
                 )
             })
@@ -205,6 +235,7 @@ impl Router {
 
         Ok(Self {
             local_engines: RwLock::new(local_engines),
+            cache_policy: tokio::sync::Mutex::new(()),
             compiled_routes,
             auto_routes,
             auto_candidates,
@@ -238,7 +269,11 @@ impl Router {
         // Direct engine lookup. Clone the Arc out and drop the read guard
         // immediately -- the in-flight request owns the engine independent of
         // map membership, so a concurrent unload can never free it mid-request.
-        let direct = self.engines_read().get(model).cloned();
+        let direct = self
+            .engines_read()
+            .get(model)
+            .filter(|entry| entry.capacity_ready)
+            .cloned();
         if let Some(entry) = direct {
             return Ok(ResolvedRoute::Higgs {
                 engine: entry.engine,
@@ -261,7 +296,12 @@ impl Router {
 
     /// Sorted names of all loaded local engines (snapshot under a read lock).
     pub fn local_model_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.engines_read().keys().cloned().collect();
+        let mut names: Vec<String> = self
+            .engines_read()
+            .iter()
+            .filter(|(_, entry)| entry.capacity_ready)
+            .map(|(name, _)| name.clone())
+            .collect();
         names.sort_unstable();
         names
     }
@@ -272,6 +312,7 @@ impl Router {
         let mut models: Vec<(String, bool)> = self
             .engines_read()
             .iter()
+            .filter(|(_, entry)| entry.capacity_ready)
             .map(|(name, entry)| (name.clone(), entry.engine.is_vlm()))
             .collect();
         models.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -280,7 +321,9 @@ impl Router {
 
     /// Whether a local engine is currently registered under `name`.
     pub fn contains_engine(&self, name: &str) -> bool {
-        self.engines_read().contains_key(name)
+        self.engines_read()
+            .get(name)
+            .is_some_and(|entry| entry.capacity_ready)
     }
 
     /// Register a freshly-loaded engine. Returns `Err(name)` if the name is
@@ -307,6 +350,7 @@ impl Router {
             LocalEngineEntry {
                 engine,
                 generation_defaults,
+                capacity_ready: true,
             },
         );
         Ok(())
@@ -333,25 +377,129 @@ impl Router {
 
     /// Apply one coherent registry allocation snapshot without holding the
     /// router lock while a batch worker acknowledges eviction.
-    pub fn apply_capacity_cache_allocations(
+    pub async fn apply_capacity_cache_allocations(
         &self,
         capacity: &CapacityRegistry,
     ) -> Result<(), String> {
-        let allocations = capacity.cache_allocations();
+        let _serialized = self.cache_policy.lock().await;
+        loop {
+            let plan = capacity.cache_allocation_plan();
+            self.apply_cache_plan(&plan, None).await?;
+            if capacity.publish_cache_allocation_revision(plan.revision) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Atomically apply one current cache policy to the loaded set and a
+    /// provisional engine, then expose that engine before a newer publisher
+    /// can overtake it.
+    pub async fn insert_engine_with_capacity(
+        &self,
+        name: String,
+        engine: Arc<Engine>,
+        generation_defaults: GenerationDefaults,
+        capacity: &CapacityRegistry,
+    ) -> Result<(), (String, Arc<Engine>, String)> {
+        let _serialized = self.cache_policy.lock().await;
+        let mut inserted = false;
+        let mut disabled_route: Option<DisabledRouteGuard<'_>> = None;
+        let mut pending_engine = Some(engine);
+        let mut pending_defaults = Some(generation_defaults);
+        loop {
+            let plan = capacity.cache_allocation_plan();
+            let provisional = pending_engine.as_ref().map(|engine| (&*name, engine));
+            if let Err(error) = self.apply_cache_plan(&plan, provisional).await {
+                let engine = if inserted {
+                    disabled_route
+                        .take()
+                        .expect("disabled route guard exists")
+                        .remove()
+                } else {
+                    pending_engine.take().expect("provisional engine exists")
+                };
+                return Err((name, engine, error));
+            }
+            if !capacity.publish_cache_allocation_revision(plan.revision) {
+                continue;
+            }
+            if !inserted {
+                {
+                    let mut engines = self.engines_write();
+                    if engines.contains_key(&name) {
+                        return Err((
+                            name,
+                            pending_engine.take().expect("provisional engine exists"),
+                            "model name is already loaded".to_owned(),
+                        ));
+                    }
+                    engines.insert(
+                        name.clone(),
+                        LocalEngineEntry {
+                            engine: pending_engine.take().expect("provisional engine exists"),
+                            generation_defaults: pending_defaults
+                                .take()
+                                .expect("provisional defaults exist"),
+                            capacity_ready: false,
+                        },
+                    );
+                }
+                inserted = true;
+                disabled_route = Some(DisabledRouteGuard {
+                    router: self,
+                    name: name.clone(),
+                    armed: true,
+                });
+                #[cfg(test)]
+                tokio::task::yield_now().await;
+            }
+            if capacity.publish_route_if_current(plan.revision, || {
+                let mut engines = self.engines_write();
+                let entry = engines
+                    .get_mut(&name)
+                    .expect("capacity publication retains its disabled engine entry");
+                entry.capacity_ready = true;
+            }) {
+                disabled_route
+                    .take()
+                    .expect("disabled route guard exists")
+                    .publish();
+                return Ok(());
+            }
+        }
+    }
+
+    async fn apply_cache_plan(
+        &self,
+        plan: &crate::capacity::CacheAllocationPlan,
+        provisional: Option<(&str, &Arc<Engine>)>,
+    ) -> Result<(), String> {
         let engines = {
             let loaded = self.engines_read();
-            allocations
-                .into_iter()
+            plan.allocations
+                .iter()
                 .filter_map(|(name, retained, prefix)| {
                     loaded
-                        .get(&name)
-                        .map(|entry| (name, Arc::clone(&entry.engine), retained, prefix))
+                        .get(name)
+                        .map(|entry| (name.clone(), Arc::clone(&entry.engine), *retained, *prefix))
                 })
                 .collect::<Vec<_>>()
         };
         for (name, engine, retained, prefix) in engines {
             engine
-                .apply_capacity_cache_limits(retained, prefix)
+                .apply_capacity_cache_limits(plan.revision, retained, prefix, plan.pressure)
+                .await
+                .map_err(|error| {
+                    format!("failed to apply cache allocation for '{name}': {error}")
+                })?;
+        }
+        if let Some((name, engine)) = provisional
+            && let Some((_, retained, prefix)) =
+                plan.allocations.iter().find(|(model, _, _)| model == name)
+        {
+            engine
+                .apply_capacity_cache_limits(plan.revision, *retained, *prefix, plan.pressure)
+                .await
                 .map_err(|error| {
                     format!("failed to apply cache allocation for '{name}': {error}")
                 })?;
