@@ -392,6 +392,10 @@ impl CapacityRegistry {
                     completed: false,
                 };
                 loop {
+                    // Fresh allocator bytes before every grant attempt: the
+                    // dequeue revalidation must not decide on memory that was
+                    // cached before the waiter entered the FIFO.
+                    self.refresh_measured_memory();
                     match self.try_grant_waiter(id, model) {
                         RequestReservationAttempt::Reserved(reservation) => {
                             queued.completed = true;
@@ -415,6 +419,20 @@ impl CapacityRegistry {
     ) -> RequestReservationAttempt {
         let mut state = self.lock();
         self.try_reserve_locked(&mut state, model, request, false)
+    }
+
+    /// Sample the live MLX allocator and publish it so admission decisions
+    /// see fresh bytes, not the last observer's cached snapshot. Positive
+    /// unaccounted MLX bytes left by prior work must be visible to an
+    /// otherwise-successful admission. Test builds skip sampling: they
+    /// publish deterministic memory explicitly via `refresh_memory`.
+    pub(crate) fn refresh_measured_memory(&self) {
+        if cfg!(test) {
+            return;
+        }
+        if let Ok(memory) = MlxMemorySnapshot::measure() {
+            self.refresh_memory(memory);
+        }
     }
 
     fn try_reserve_locked(
@@ -1660,10 +1678,13 @@ fn recompute_registry_with(state: &mut RegistryState, zero_recovery: ZeroCapacit
     let old_allocations = std::mem::take(&mut state.desired_cache_allocations);
     let allocations = cache_allocations_with(state, None);
     let mut desired = allocations.as_ref().cloned().unwrap_or_default();
-    if !state.active_reservations.is_empty() {
-        // A request was admitted against the current cache ceiling. Pressure
-        // and memory observations may lower that ceiling, but cannot restore
-        // reclaimed bytes until all worker-owned reservations have drained.
+    if !state.active_reservations.is_empty() || !state.admission_queue.is_empty() {
+        // A request was admitted against the current cache ceiling — or is
+        // queued to be. Pressure and memory observations may lower that
+        // ceiling, but cannot restore reclaimed bytes until the FIFO is fully
+        // idle: a recompute in the release→acquire handoff window (no active
+        // reservations, waiters still queued) must not enlarge the ceiling a
+        // queued waiter was admitted against.
         for (model, allocation) in &mut desired {
             let ceiling = old_allocations.get(model).copied().unwrap_or_default();
             allocation.retained_bytes = allocation.retained_bytes.min(ceiling.retained_bytes);
@@ -2268,7 +2289,11 @@ mod tests {
             .reserve_request("model", admission_request(1_024, 0))
             .await
             .unwrap();
-        assert_eq!(zero_output.bytes(), 2 * GIB);
+        assert_eq!(
+            zero_output.bytes(),
+            GIB,
+            "zero requested output must reserve zero output bytes"
+        );
         drop(zero_output);
 
         let requested_output = registry
@@ -2517,6 +2542,16 @@ mod tests {
             tokio::task::yield_now().await;
         }
         drop(guard);
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Normal,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+        assert_eq!(
+            registry.cache_allocation_plan().allocations[0].2,
+            0,
+            "a queued-only FIFO handoff window must keep the reclaimed ceiling"
+        );
         let follower_guard = follower.await.unwrap().unwrap();
         assert_eq!(
             registry.cache_allocation_plan().allocations[0].2,
@@ -2527,6 +2562,63 @@ mod tests {
         assert!(
             registry.cache_allocation_plan().allocations[0].2 > 0,
             "the ordinary ACK path may propose restoration after the final guard"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_admission_queued_handoff_keeps_reclaimed_ceiling_through_recompute() {
+        // Same reclaimed-ceiling state as the guard-release test above, but
+        // the pressure publication lands in the window after the leader's
+        // release and before the queued follower acquires: only waiters, no
+        // active reservations. The recompute must not restore reclaimed
+        // caches in that window.
+        let registry = CapacityRegistry::new(["model".to_owned()]);
+        let mut model_facts = admission_facts("model");
+        model_facts.loaded_model_bytes = GIB;
+        model_facts.memory.active_bytes = GIB;
+        model_facts.memory.peak_bytes = GIB;
+        model_facts.prefix_cache_bytes_ceiling = 2 * GIB;
+        register(&registry, model_facts);
+        registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 2 * GIB,
+            peak_bytes: 2 * GIB,
+            memory_limit_bytes: Some(10 * GIB),
+            metal_recommended_working_set_bytes: Some(10 * GIB),
+        });
+        let mut request = admission_request(1_024, 1_024);
+        request.retained_growth_bytes = GIB;
+
+        assert!(registry.request_cache_reclamation(CacheReclamation::Prefix));
+        let reclaimed = registry.cache_allocation_plan();
+        assert!(registry.publish_cache_allocation_revision(reclaimed.revision));
+        let guard = registry.reserve_request("model", request).await.unwrap();
+
+        let waiting_registry = Arc::clone(&registry);
+        let follower =
+            tokio::spawn(async move { waiting_registry.reserve_request("model", request).await });
+        while registry.queued_waiter_count() != 1 {
+            assert!(!follower.is_finished(), "follower did not enter FIFO");
+            tokio::task::yield_now().await;
+        }
+        // Release the leader, then synchronously publish a restorative
+        // observation before the follower task runs: `active_reservations`
+        // is empty but the FIFO still holds the queued follower.
+        drop(guard);
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Normal,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+        assert_eq!(
+            registry.cache_allocation_plan().allocations[0].2,
+            0,
+            "queued-only handoff keeps the reclaimed ceiling across recompute"
+        );
+        let follower_guard = follower.await.unwrap().unwrap();
+        drop(follower_guard);
+        assert!(
+            registry.cache_allocation_plan().allocations[0].2 > 0,
+            "restoration resumes only after the final waiter drains"
         );
     }
 

@@ -610,7 +610,17 @@ impl BatchEngine {
             }
             let finished = output.finished;
             if sender.blocking_send(output).is_err() {
-                break; // Client disconnected
+                // Client disconnected mid-stream. The internal worker may
+                // already be executing the next decode round for this
+                // request, so the allocation the caller's reservation covers
+                // is still live. Discard the remaining outputs and hold
+                // until the worker's terminal chunk (finished or error)
+                // confirms allocation stopped — returning here would release
+                // capacity the worker is still spending.
+                if finished {
+                    break;
+                }
+                continue;
             }
             if finished {
                 break;
@@ -1632,6 +1642,108 @@ mod tests {
             image_marker_text: None,
             vision_capabilities: None,
         }
+    }
+
+    #[test]
+    fn batch_streaming_drains_to_worker_terminal_after_client_disconnect() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let cache_control = Arc::new(Mutex::new(CacheControlState::default()));
+        let first_sent = Arc::new(AtomicBool::new(false));
+        let terminal_sent = Arc::new(AtomicBool::new(false));
+        let client_dropped = Arc::new(AtomicBool::new(false));
+        let worker_first = Arc::clone(&first_sent);
+        let worker_terminal = Arc::clone(&terminal_sent);
+        let worker_gate = Arc::clone(&client_dropped);
+        let worker = std::thread::spawn(move || {
+            while let Some(command) = request_rx.blocking_recv() {
+                let BatchCommand::Generate(req) = command else {
+                    continue;
+                };
+                let tx = req.response_tx;
+                let _ = tx.blocking_send(StreamingOutput {
+                    new_text: "a".to_owned(),
+                    finished: false,
+                    finish_reason: None,
+                    prompt_tokens: 3,
+                    completion_tokens: 1,
+                    token_logprob: None,
+                    prefill_progress: None,
+                });
+                worker_first.store(true, Ordering::SeqCst);
+                while !worker_gate.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                // Next decode round lands after the HTTP client is gone: the
+                // internal worker still holds this request's allocation.
+                let _ = tx.blocking_send(StreamingOutput {
+                    new_text: "b".to_owned(),
+                    finished: false,
+                    finish_reason: None,
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    token_logprob: None,
+                    prefill_progress: None,
+                });
+                // Terminal worker chunk: allocation for the request stops.
+                let _ = tx.blocking_send(StreamingOutput {
+                    new_text: String::new(),
+                    finished: true,
+                    finish_reason: Some(WORKER_ERROR_FINISH.to_owned()),
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    token_logprob: None,
+                    prefill_progress: None,
+                });
+                worker_terminal.store(true, Ordering::SeqCst);
+            }
+        });
+        let engine = BatchEngine {
+            request_tx,
+            cache_control,
+            worker: Some(worker),
+            tokenizer: make_tokenizer(),
+            template: ChatTemplateRenderer::new("").unwrap(),
+            model_name: "disconnect-scripted".to_owned(),
+            eos_token_ids: Vec::new(),
+            hidden_size: AtomicI32::new(1),
+            is_vlm: false,
+            image_marker_text: None,
+            vision_capabilities: None,
+        };
+
+        let (client_tx, client_rx) = tokio::sync::mpsc::channel(32);
+        let generate = std::thread::spawn(move || {
+            engine.generate_streaming_with_thinking(
+                &[1, 2, 3],
+                10,
+                &SamplingParams::default(),
+                &[],
+                false,
+                None,
+                &client_tx,
+                false,
+                false,
+                None,
+                None,
+            )
+        });
+        while !first_sent.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        drop(client_rx);
+        client_dropped.store(true, Ordering::SeqCst);
+
+        let result = generate.join().expect("generate thread must not panic");
+        assert!(
+            terminal_sent.load(Ordering::SeqCst),
+            "worker must reach its terminal chunk"
+        );
+        assert!(
+            result.is_err(),
+            "streaming must hold until the batch worker's terminal chunk instead of returning on forward failure"
+        );
     }
 
     #[test]

@@ -399,6 +399,11 @@ async fn chat_completions_non_streaming(
             req.session_id.unwrap_or_default(),
         ));
     }
+    // Race-safe retained-prefix fact: admission charges only the uncached
+    // suffix; the session worker revalidates this fact at acceptance.
+    let retained_prefix = session_id
+        .and_then(|sid| engine.retained_session_prefix_len(sid, &prompt_tokens))
+        .unwrap_or(0);
     let reservation = crate::capacity::admit_generation_request(
         &state,
         &req.model,
@@ -408,9 +413,11 @@ async fn chat_completions_non_streaming(
             crate::capacity::ExecutionPath::Cold
         },
         prompt_tokens.len(),
+        prompt_tokens.len() - retained_prefix,
         max_tokens,
     )
     .await?;
+    let assumed_retained_prefix = u64::try_from(retained_prefix).unwrap_or(u64::MAX);
     drop_requested_retained_sessions(
         Arc::clone(&engine),
         req.drop_session_id,
@@ -447,6 +454,7 @@ async fn chat_completions_non_streaming(
                 tool_payload,
                 &pflash_policy_c,
                 continuation_policy,
+                assumed_retained_prefix,
             )
         })
         .await
@@ -868,6 +876,11 @@ async fn chat_completions_stream(
             request_session_id.unwrap_or_default(),
         ));
     }
+    // Race-safe retained-prefix fact: admission charges only the uncached
+    // suffix; the session worker revalidates this fact at acceptance.
+    let retained_prefix = stream_session_id
+        .and_then(|sid| engine.retained_session_prefix_len(sid, &prompt_tokens))
+        .unwrap_or(0);
     let reservation = crate::capacity::admit_generation_request(
         &state,
         &model,
@@ -877,9 +890,11 @@ async fn chat_completions_stream(
             crate::capacity::ExecutionPath::Cold
         },
         prompt_tokens.len(),
+        prompt_tokens.len() - retained_prefix,
         max_tokens,
     )
     .await?;
+    let assumed_retained_prefix = u64::try_from(retained_prefix).unwrap_or(u64::MAX);
     drop_requested_retained_sessions(
         Arc::clone(&engine),
         req.drop_session_id,
@@ -929,6 +944,7 @@ async fn chat_completions_stream(
                 &pflash_policy_c,
                 continuation_policy,
                 acceptance,
+                assumed_retained_prefix,
             );
             match &result {
                 Ok(()) => {}
@@ -2731,5 +2747,80 @@ mod tests {
         assert!(engine.route_test_mutation_sequence().is_empty());
         assert_eq!(state.capacity.active_reservation_count(model), 0);
         assert!(state.capacity.admission_test_memory().1 > initial_memory_revision);
+    }
+
+    #[tokio::test]
+    async fn retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker() {
+        let model = "zero-prefix-accept";
+        let (state, engine) = crate::capacity::suffix_charging_route_test_state(model);
+        engine.test_set_chat_prompt_tokens(vec![7; 3_000]);
+        engine.test_retain_session_tokens(42, vec![7; 2_900]);
+        let request = |extra: serde_json::Value| {
+            let mut request = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            if let (Some(dst), Some(src)) = (request.as_object_mut(), extra.as_object()) {
+                dst.extend(src.clone());
+            }
+            serde_json::from_value::<ChatCompletionRequest>(request).unwrap()
+        };
+
+        // Charging only the uncached 100-token suffix fits an envelope that a
+        // cold full-prompt transient charge cannot (subtest 2 proves that).
+        let admitted = chat_completions_non_streaming(
+            Arc::clone(&state),
+            request(serde_json::json!({"session_id": 42, "max_tokens": 16})),
+            Arc::clone(&engine),
+            GenerationDefaults::default(),
+        )
+        .await;
+        assert!(
+            admitted.is_ok(),
+            "suffix-charged session turn must admit: {admitted:?}"
+        );
+        assert_eq!(
+            state.capacity.active_reservation_count(model),
+            0,
+            "worker-owned reservation must release after completion"
+        );
+
+        // Same prompt without retained state must exceed the envelope: this is
+        // the exact charge the pre-fix code applied to session turns.
+        let cold = chat_completions_non_streaming(
+            Arc::clone(&state),
+            request(serde_json::json!({"session_id": 43, "max_tokens": 16})),
+            Arc::clone(&engine),
+            GenerationDefaults::default(),
+        )
+        .await;
+        assert!(
+            matches!(cold, Err(ServerError::CapacityExceeded(_))),
+            "cold full-prompt charge must still 413: {cold:?}"
+        );
+
+        // Worker-acceptance revalidation: admission measures a 2,900-token
+        // retained prefix, then the request itself drops session 42 before
+        // the worker runs. The shrunk retained state must surface the
+        // existing typed 409 instead of proceeding undercharged.
+        let revalidated = chat_completions_non_streaming(
+            Arc::clone(&state),
+            request(serde_json::json!({
+                "session_id": 42,
+                "drop_session_ids": [42],
+                "max_tokens": 16
+            })),
+            Arc::clone(&engine),
+            GenerationDefaults::default(),
+        )
+        .await;
+        assert!(
+            matches!(
+                revalidated,
+                Err(ServerError::RetainedSessionUnavailable(42))
+            ),
+            "shrunk retained prefix must fail as the typed 409: {revalidated:?}"
+        );
+        assert_eq!(state.capacity.active_reservation_count(model), 0);
     }
 }

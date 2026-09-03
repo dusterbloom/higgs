@@ -79,6 +79,7 @@ pub(crate) async fn admit_generation_request(
     model: &str,
     execution_path: ExecutionPath,
     prompt_tokens: usize,
+    uncached_suffix_tokens: usize,
     output_tokens: u32,
 ) -> Result<RequestReservation, crate::error::ServerError> {
     #[cfg(test)]
@@ -96,14 +97,25 @@ pub(crate) async fn admit_generation_request(
             generation(),
         ))
     };
+    // Admission charges only the uncached suffix. Callers obtain the
+    // retained-prefix fact race-safely before this call and the session
+    // worker revalidates it at acceptance; a suffix above the prompt can
+    // only come from a stale fact and is clamped, never enlarged.
+    let suffix_tokens =
+        u64::try_from(uncached_suffix_tokens.min(prompt_tokens)).map_err(|_| unavailable())?;
     let prompt_tokens = u64::try_from(prompt_tokens).map_err(|_| unavailable())?;
     let request = RequestCost {
         execution_path,
         prompt_tokens,
-        suffix_tokens: prompt_tokens,
+        suffix_tokens: suffix_tokens.min(prompt_tokens),
         output_tokens: u64::from(output_tokens),
         retained_growth_bytes: 0,
     };
+
+    // Fresh allocator bytes before the first atomic decision: positive
+    // unaccounted MLX bytes from prior work must be visible even when the
+    // decision would otherwise succeed, not only after a rejection.
+    state.capacity.refresh_measured_memory();
 
     let mut attempt = state.capacity.try_reserve_request(model, request);
     for reclamation in [CacheReclamation::Prefix, CacheReclamation::Retained] {
@@ -259,6 +271,65 @@ pub(crate) fn rejecting_route_test_state(
     let mut facts = route_test_facts(model, memory, MIB, 4_096);
     facts.cache_capabilities.prefix_cache = true;
     facts.prefix_cache_bytes_ceiling = GIB;
+    state
+        .capacity
+        .commit_active(ticket, facts)
+        .expect("commit test registration")
+        .publish();
+    let plan = state.capacity.cache_allocation_plan();
+    assert!(
+        state
+            .capacity
+            .publish_cache_allocation_revision(plan.revision)
+    );
+    (state, engine)
+}
+
+/// Route-test state whose admission envelope binds on bytes, not the token
+/// ceiling, and whose transient prefill cost is real — so RetainedSuffix
+/// charging of only the uncached suffix is observable through the route.
+#[cfg(test)]
+pub(crate) fn suffix_charging_route_test_state(
+    model: &str,
+) -> (
+    crate::state::SharedState,
+    std::sync::Arc<crate::state::Engine>,
+) {
+    use std::collections::HashMap;
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    let engine = std::sync::Arc::new(crate::state::Engine::test_stub(model));
+    let dir = tempfile::tempdir().expect("test config directory");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[provider.stub]\nurl = \"http://127.0.0.1:1\"\n").expect("test config");
+    let config = crate::config::load_config_file(&path, None).expect("load test config");
+    let router = crate::router::Router::from_config(
+        &config,
+        HashMap::from([(model.to_owned(), std::sync::Arc::clone(&engine))]),
+    )
+    .expect("test router");
+    let state = std::sync::Arc::new(crate::state::AppState::new(
+        router,
+        config,
+        reqwest::Client::new(),
+        None,
+    ));
+    let memory = MlxMemorySnapshot {
+        active_bytes: 2 * GIB,
+        peak_bytes: 2 * GIB,
+        memory_limit_bytes: Some(12 * GIB),
+        metal_recommended_working_set_bytes: Some(12 * GIB),
+    };
+    state.capacity.refresh_memory(memory);
+    let ticket = state
+        .capacity
+        .begin_registration(model.to_owned())
+        .expect("begin test registration");
+    let mut facts = route_test_facts(model, memory, MIB, 3_072);
+    facts.costs.transient_prefill.base_bytes = MIB;
+    facts.costs.transient_prefill.bytes_per_prompt_token = 4 * MIB;
+    facts.costs.transient_prefill.max_prompt_tokens = 8_192;
     state
         .capacity
         .commit_active(ticket, facts)
@@ -1348,10 +1419,15 @@ impl<C: Clock> CapacityController<C> {
         publication_worst_path: bool,
     ) -> Option<ByteLedger> {
         let prompt_bytes = self.inputs.costs.persistent_bytes(request.prompt_tokens)?;
-        let output_bytes = self
-            .inputs
-            .costs
-            .persistent_bytes(request.output_tokens.max(MINIMUM_OUTPUT_RESERVE_TOKENS))?;
+        // Request admission charges the exact requested output. The
+        // publication floor keeps published limits conservative for the
+        // worst case of a request that grows its own output later.
+        let output_charge_tokens = if publication_worst_path {
+            request.output_tokens.max(MINIMUM_OUTPUT_RESERVE_TOKENS)
+        } else {
+            request.output_tokens
+        };
+        let output_bytes = self.inputs.costs.persistent_bytes(output_charge_tokens)?;
         let prefill_tokens = match request.execution_path {
             ExecutionPath::Cold => request.prompt_tokens,
             ExecutionPath::RetainedSuffix | ExecutionPath::RadixHit => {
@@ -1836,12 +1912,13 @@ mod tests {
         assert!(ledger.total_bytes().is_some());
 
         let short_output = controller.byte_ledger(request(49_152, 512)).unwrap();
-        assert_eq!(short_output.output_bytes, 1024 * 20_480);
+        assert_eq!(short_output.output_bytes, 512 * 20_480);
 
         let without_output = controller.byte_ledger(request(49_152, 0)).unwrap();
+        assert_eq!(without_output.output_bytes, 0);
         assert_eq!(
             ledger.total_bytes().unwrap() - without_output.total_bytes().unwrap(),
-            (4_096 - MINIMUM_OUTPUT_RESERVE_TOKENS) * 20_480
+            4_096 * 20_480
         );
     }
 

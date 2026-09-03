@@ -4253,6 +4253,29 @@ impl SimpleEngine {
             .map(|kept| kept.state.tokens().to_vec())
     }
 
+    /// Length of the token prefix `prompt_tokens` shares with the retained
+    /// session state, or `None` when nothing is retained. This is the
+    /// race-safe fact capacity admission charges as already cached; it must
+    /// be revalidated at worker acceptance because a lease eviction or drop
+    /// between admission and generation would make the real prefill larger
+    /// than the reservation.
+    pub fn retained_session_prefix_len(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+    ) -> Option<usize> {
+        lock_or_recover(&self.retained)
+            .get(&session_id)
+            .map(|kept| {
+                kept.state
+                    .tokens()
+                    .iter()
+                    .zip(prompt_tokens)
+                    .take_while(|(retained, prompt)| retained == prompt)
+                    .count()
+            })
+    }
+
     fn retained_prompt_source_for_tokens(
         &self,
         session_id: u64,
@@ -6241,6 +6264,7 @@ impl SimpleEngine {
         tool_payload: SessionPromptTracePayloadStats,
         pflash_policy: &PFlashPromptPolicy,
         continuation_policy: SessionContinuationPolicy,
+        assumed_retained_prefix_tokens: u64,
     ) -> Result<SessionGeneration, EngineError> {
         let timing = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
         let total_start = std::time::Instant::now();
@@ -6250,6 +6274,25 @@ impl SimpleEngine {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let retained_tokens = self.retained_session_tokens(session_id);
+        // Worker-acceptance revalidation of the admission fact: capacity
+        // charged only the uncached suffix measured before admission. If the
+        // retained prefix shrank since (lease eviction, drop), the remaining
+        // prefill would exceed the reservation — fail as a typed continuation
+        // miss so the client retries against freshly measured capacity.
+        let actual_prefix = retained_tokens
+            .as_deref()
+            .map(|retained| {
+                retained
+                    .iter()
+                    .zip(prompt_tokens)
+                    .take_while(|(retained, prompt)| retained == prompt)
+                    .count()
+            })
+            .unwrap_or(0);
+        let actual_prefix = u64::try_from(actual_prefix).unwrap_or(u64::MAX);
+        if assumed_retained_prefix_tokens > actual_prefix {
+            return Err(EngineError::RetainedSessionUnavailable(session_id));
+        }
         let continued_prompt = self.continued_prompt_tokens_from_retained(
             session_id,
             retained_tokens.as_deref(),
@@ -6370,6 +6413,7 @@ impl SimpleEngine {
         pflash_policy: &PFlashPromptPolicy,
         continuation_policy: SessionContinuationPolicy,
         mut acceptance: Option<SessionStreamAcceptance>,
+        assumed_retained_prefix_tokens: u64,
     ) -> Result<(), EngineError> {
         let timing = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
         let total_start = std::time::Instant::now();
@@ -6379,6 +6423,28 @@ impl SimpleEngine {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let retained_tokens = self.retained_session_tokens(session_id);
+        // Worker-acceptance revalidation of the admission fact: capacity
+        // charged only the uncached suffix measured before admission. If the
+        // retained prefix shrank since (lease eviction, drop), the remaining
+        // prefill would exceed the reservation — fail as a typed continuation
+        // miss so the client retries against freshly measured capacity.
+        let actual_prefix = retained_tokens
+            .as_deref()
+            .map(|retained| {
+                retained
+                    .iter()
+                    .zip(prompt_tokens)
+                    .take_while(|(retained, prompt)| retained == prompt)
+                    .count()
+            })
+            .unwrap_or(0);
+        let actual_prefix = u64::try_from(actual_prefix).unwrap_or(u64::MAX);
+        if assumed_retained_prefix_tokens > actual_prefix {
+            if let Some(acceptance) = acceptance.take() {
+                let _ = acceptance.send(Err(session_id));
+            }
+            return Err(EngineError::RetainedSessionUnavailable(session_id));
+        }
         let continued_prompt = self.continued_prompt_tokens_from_retained(
             session_id,
             retained_tokens.as_deref(),
@@ -14511,6 +14577,7 @@ mod tests {
                 SessionPromptTracePayloadStats::default(),
                 &expanded_policy,
                 SessionContinuationPolicy::RequireContinuation,
+                0,
             )
             .unwrap();
 
@@ -15176,6 +15243,7 @@ mod tests {
                 SessionPromptTracePayloadStats::default(),
                 &PFlashPromptPolicy::default(),
                 SessionContinuationPolicy::RequireContinuation,
+                0,
             )
             .unwrap();
         assert!(continued.continued, "zero-prefix cache was not continuable");
@@ -15204,6 +15272,7 @@ mod tests {
                 &PFlashPromptPolicy::default(),
                 SessionContinuationPolicy::RequireContinuation,
                 Some(accept_tx),
+                0,
             )
             .unwrap();
         assert_eq!(accept_rx.blocking_recv().unwrap(), Ok(()));
@@ -15233,6 +15302,7 @@ mod tests {
                 &PFlashPromptPolicy::default(),
                 SessionContinuationPolicy::RequireContinuation,
                 Some(accept_tx),
+                0,
             )
             .unwrap();
 
@@ -15264,6 +15334,7 @@ mod tests {
                 SessionPromptTracePayloadStats::default(),
                 &PFlashPromptPolicy::default(),
                 SessionContinuationPolicy::RequireContinuation,
+                0,
             )
             .unwrap();
 
@@ -15294,6 +15365,7 @@ mod tests {
             SessionPromptTracePayloadStats::default(),
             &PFlashPromptPolicy::default(),
             SessionContinuationPolicy::RequireContinuation,
+            0,
         );
         REQUIRED_POST_ADMISSION_EVICT_SESSION.store(0, std::sync::atomic::Ordering::SeqCst);
 
@@ -15334,6 +15406,7 @@ mod tests {
                 &PFlashPromptPolicy::default(),
                 SessionContinuationPolicy::RequireContinuation,
                 Some(accept_tx),
+                0,
             )
             .unwrap_err();
 
@@ -15381,6 +15454,7 @@ mod tests {
                 &PFlashPromptPolicy::default(),
                 SessionContinuationPolicy::RequireContinuation,
                 Some(accept_tx),
+                0,
             )
             .unwrap_err();
 
@@ -15480,6 +15554,7 @@ mod tests {
                 SessionPromptTracePayloadStats::default(),
                 &PFlashPromptPolicy::default(),
                 SessionContinuationPolicy::RequireContinuation,
+                0,
             )
             .unwrap_err();
 
@@ -15511,6 +15586,7 @@ mod tests {
                 &PFlashPromptPolicy::default(),
                 SessionContinuationPolicy::RequireContinuation,
                 Some(accept_tx),
+                0,
             )
             .unwrap_err();
 
@@ -15546,6 +15622,7 @@ mod tests {
                 &PFlashPromptPolicy::default(),
                 SessionContinuationPolicy::RequireContinuation,
                 Some(accept_tx),
+                0,
             )
         });
 

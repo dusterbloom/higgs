@@ -172,6 +172,7 @@ async fn completions_non_streaming(
         &req.model,
         crate::capacity::ExecutionPath::Cold,
         prompt_tokens.len(),
+        prompt_tokens.len(),
         max_tokens,
     )
     .await?;
@@ -243,6 +244,7 @@ async fn completions_stream(
         &state,
         &req.model,
         crate::capacity::ExecutionPath::Cold,
+        prompt_tokens.len(),
         prompt_tokens.len(),
         max_tokens,
     )

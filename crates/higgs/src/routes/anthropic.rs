@@ -299,6 +299,7 @@ async fn create_message_non_streaming(
         &req.model,
         crate::capacity::ExecutionPath::Cold,
         prompt_tokens.len(),
+        prompt_tokens.len(),
         max_tokens,
     )
     .await?;
@@ -429,6 +430,7 @@ async fn create_message_stream(
         &state,
         &req.model,
         crate::capacity::ExecutionPath::Cold,
+        prompt_tokens.len(),
         prompt_tokens.len(),
         max_tokens,
     )

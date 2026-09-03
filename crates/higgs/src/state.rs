@@ -57,7 +57,10 @@ pub struct RouteTestStub {
     name: String,
     mutations: std::sync::atomic::AtomicU64,
     mutation_sequence: std::sync::Mutex<Vec<String>>,
-    retained_sessions: std::sync::Mutex<std::collections::HashSet<u64>>,
+    retained_sessions: std::sync::Mutex<std::collections::HashMap<u64, Vec<u32>>>,
+    /// Optional prompt tokens the stub reports for chat-prompt preparation,
+    /// letting route tests shape admission's prompt/suffix charge.
+    chat_prompt_tokens: std::sync::Mutex<Vec<u32>>,
     capacity_cache_limits: std::sync::Mutex<(u64, u64)>,
     cache_apply_count: Arc<std::sync::atomic::AtomicU64>,
     cache_apply_gate:
@@ -71,7 +74,8 @@ impl RouteTestStub {
             name: name.to_owned(),
             mutations: std::sync::atomic::AtomicU64::new(0),
             mutation_sequence: std::sync::Mutex::new(Vec::new()),
-            retained_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
+            retained_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            chat_prompt_tokens: std::sync::Mutex::new(Vec::new()),
             capacity_cache_limits: std::sync::Mutex::new((0, 0)),
             cache_apply_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cache_apply_gate: std::sync::Mutex::new(None),
@@ -95,8 +99,8 @@ impl RouteTestStub {
     fn route_session(&self, session_id: u64) -> bool {
         let continued = {
             let mut sessions = self.retained_sessions.lock().unwrap();
-            let continued = sessions.contains(&session_id);
-            sessions.insert(session_id);
+            let continued = sessions.contains_key(&session_id);
+            sessions.entry(session_id).or_default();
             continued
         };
         let action = if continued { "continue" } else { "retain" };
@@ -109,7 +113,7 @@ impl RouteTestStub {
             .retained_sessions
             .lock()
             .unwrap()
-            .iter()
+            .keys()
             .copied()
             .collect();
         ids.sort_unstable();
@@ -117,17 +121,60 @@ impl RouteTestStub {
     }
 
     fn drop_session(&self, session_id: u64) -> bool {
-        let dropped = self.retained_sessions.lock().unwrap().remove(&session_id);
+        let dropped = self
+            .retained_sessions
+            .lock()
+            .unwrap()
+            .remove(&session_id)
+            .is_some();
         self.record_named_mutation(format!("drop:{session_id}"));
         dropped
     }
 
     fn lease_session(&self, session_id: u64, ttl_seconds: u32) -> bool {
-        let retained = self.retained_sessions.lock().unwrap().contains(&session_id);
+        let retained = self
+            .retained_sessions
+            .lock()
+            .unwrap()
+            .contains_key(&session_id);
         if retained {
             self.record_named_mutation(format!("lease:{session_id}:{ttl_seconds}"));
         }
         retained
+    }
+
+    /// Seed retained session tokens so route tests can shape the uncached
+    /// suffix fact admission charges.
+    fn retain_session_tokens(&self, session_id: u64, tokens: Vec<u32>) {
+        self.retained_sessions
+            .lock()
+            .unwrap()
+            .insert(session_id, tokens);
+    }
+
+    /// Seed the prompt tokens reported by chat-prompt preparation.
+    fn set_chat_prompt_tokens(&self, tokens: Vec<u32>) {
+        *self.chat_prompt_tokens.lock().unwrap() = tokens;
+    }
+
+    fn chat_prompt_tokens(&self) -> Vec<u32> {
+        self.chat_prompt_tokens.lock().unwrap().clone()
+    }
+
+    /// Common retained/prompt prefix length, mirroring
+    /// `SimpleEngine::retained_session_prefix_len` for route tests.
+    fn retained_session_prefix_len(&self, session_id: u64, prompt_tokens: &[u32]) -> Option<usize> {
+        self.retained_sessions
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .map(|retained| {
+                retained
+                    .iter()
+                    .zip(prompt_tokens)
+                    .take_while(|(retained, prompt)| retained == prompt)
+                    .count()
+            })
     }
 
     fn mutation_count(&self) -> u64 {
@@ -294,6 +341,23 @@ impl Engine {
     #[cfg(test)]
     pub fn test_stub(name: &str) -> Self {
         Self::Stub(RouteTestStub::new(name))
+    }
+
+    /// Seed retained-session tokens on a stub engine (no-op on real engines).
+    #[cfg(test)]
+    pub fn test_retain_session_tokens(&self, session_id: u64, tokens: Vec<u32>) {
+        if let Self::Stub(stub) = self {
+            stub.retain_session_tokens(session_id, tokens);
+        }
+    }
+
+    /// Seed the prompt tokens a stub engine reports for chat-prompt
+    /// preparation (no-op on real engines).
+    #[cfg(test)]
+    pub fn test_set_chat_prompt_tokens(&self, tokens: Vec<u32>) {
+        if let Self::Stub(stub) = self {
+            stub.set_chat_prompt_tokens(tokens);
+        }
     }
 
     #[cfg(test)]
@@ -500,6 +564,10 @@ impl Engine {
                 .prepare_chat_prompt_for_mode(messages, tools, mode)
                 .map(|tokens| (tokens, PFlashPromptPolicy::default())),
             #[cfg(test)]
+            Self::Stub(stub) if !stub.chat_prompt_tokens().is_empty() => {
+                Ok((stub.chat_prompt_tokens(), PFlashPromptPolicy::default()))
+            }
+            #[cfg(test)]
             Self::Stub(stub) if stub.name() == "session-prefill-render-spy" => Ok((
                 match mode {
                     ChatPromptMode::SessionPrefill => vec![7],
@@ -536,6 +604,22 @@ impl Engine {
                 }
                 false
             }
+        }
+    }
+
+    /// Common retained/prompt prefix length — the race-safe fact capacity
+    /// admission charges as already cached. `None` means no retained state is
+    /// known (callers then charge the full prompt).
+    pub fn retained_session_prefix_len(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+    ) -> Option<usize> {
+        match self {
+            Self::Simple(e) => e.retained_session_prefix_len(session_id, prompt_tokens),
+            Self::Batch(_) => None,
+            #[cfg(test)]
+            Self::Stub(stub) => stub.retained_session_prefix_len(session_id, prompt_tokens),
         }
     }
 
@@ -683,6 +767,7 @@ impl Engine {
         tool_payload: SessionPromptTracePayloadStats,
         pflash_policy: &PFlashPromptPolicy,
         continuation_policy: SessionContinuationPolicy,
+        assumed_retained_prefix_tokens: u64,
     ) -> Result<SessionGeneration, EngineError> {
         let _gpu = gpu_gate();
         match self {
@@ -697,6 +782,7 @@ impl Engine {
                 tool_payload,
                 pflash_policy,
                 continuation_policy,
+                assumed_retained_prefix_tokens,
             ),
             Self::Batch(_) => Err(EngineError::Generation(
                 "session_id (session-routed generation) is only supported by the Simple engine"
@@ -704,6 +790,13 @@ impl Engine {
             )),
             #[cfg(test)]
             Self::Stub(stub) => {
+                if usize::try_from(assumed_retained_prefix_tokens).unwrap_or(usize::MAX)
+                    > stub
+                        .retained_session_prefix_len(session_id, prompt_tokens)
+                        .unwrap_or(0)
+                {
+                    return Err(EngineError::RetainedSessionUnavailable(session_id));
+                }
                 if stub.name() == "blocking-required-post-admission-evicted" {
                     return Err(EngineError::RetainedSessionUnavailable(session_id));
                 }
@@ -758,6 +851,7 @@ impl Engine {
         pflash_policy: &PFlashPromptPolicy,
         continuation_policy: SessionContinuationPolicy,
         mut acceptance: Option<SessionStreamAcceptance>,
+        assumed_retained_prefix_tokens: u64,
     ) -> Result<(), EngineError> {
         let _gpu = gpu_gate();
         match self {
@@ -774,6 +868,7 @@ impl Engine {
                 pflash_policy,
                 continuation_policy,
                 acceptance,
+                assumed_retained_prefix_tokens,
             ),
             Self::Batch(_) => {
                 if let Some(acceptance) = acceptance.take() {
@@ -785,73 +880,79 @@ impl Engine {
                 ))
             }
             #[cfg(test)]
-            Self::Stub(stub) if stub.name() == "session-prefill-render-spy" => {
-                stub.record_mutation();
-                if let Some(acceptance) = acceptance.take() {
-                    let _ = acceptance.send(Ok(()));
+            Self::Stub(stub) => {
+                if usize::try_from(assumed_retained_prefix_tokens).unwrap_or(usize::MAX)
+                    > stub
+                        .retained_session_prefix_len(session_id, prompt_tokens)
+                        .unwrap_or(0)
+                {
+                    if let Some(acceptance) = acceptance.take() {
+                        let _ = acceptance.send(Err(session_id));
+                    }
+                    return Err(EngineError::RetainedSessionUnavailable(session_id));
                 }
-                sender
-                    .blocking_send(StreamingOutput {
-                        new_text: String::new(),
-                        finished: true,
-                        finish_reason: Some("length".to_owned()),
-                        prompt_tokens: u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX),
-                        completion_tokens: 0,
-                        token_logprob: None,
-                        prefill_progress: None,
-                    })
-                    .map_err(|_| EngineError::Cancelled)
-            }
-            #[cfg(test)]
-            Self::Stub(stub) if stub.name() == "zero-prefix-materialization-fail" => {
-                Err(EngineError::Generation(
-                    "injected retained-state materialization failure".to_owned(),
-                ))
-            }
-            #[cfg(test)]
-            Self::Stub(stub) if stub.name() == "zero-prefix-accept" => {
-                let continued = stub.route_session(session_id);
-                if let Some(acceptance) = acceptance.take() {
-                    let _ = acceptance.send(Ok(()));
-                }
-                if continued {
+                if stub.name() == "session-prefill-render-spy" {
+                    stub.record_mutation();
+                    if let Some(acceptance) = acceptance.take() {
+                        let _ = acceptance.send(Ok(()));
+                    }
                     sender
                         .blocking_send(StreamingOutput {
                             new_text: String::new(),
-                            finished: false,
-                            finish_reason: None,
+                            finished: true,
+                            finish_reason: Some("length".to_owned()),
+                            prompt_tokens: u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX),
+                            completion_tokens: 0,
+                            token_logprob: None,
+                            prefill_progress: None,
+                        })
+                        .map_err(|_| EngineError::Cancelled)
+                } else if stub.name() == "zero-prefix-materialization-fail" {
+                    Err(EngineError::Generation(
+                        "injected retained-state materialization failure".to_owned(),
+                    ))
+                } else if stub.name() == "zero-prefix-accept" {
+                    let continued = stub.route_session(session_id);
+                    if let Some(acceptance) = acceptance.take() {
+                        let _ = acceptance.send(Ok(()));
+                    }
+                    if continued {
+                        sender
+                            .blocking_send(StreamingOutput {
+                                new_text: String::new(),
+                                finished: false,
+                                finish_reason: None,
+                                prompt_tokens: 1,
+                                completion_tokens: 0,
+                                token_logprob: None,
+                                prefill_progress: Some(higgs_engine::engine::PrefillProgress {
+                                    processed: 1,
+                                    cached: 1,
+                                    total: 1,
+                                }),
+                            })
+                            .map_err(|_| EngineError::Cancelled)?;
+                    }
+                    sender
+                        .blocking_send(StreamingOutput {
+                            new_text: String::new(),
+                            finished: true,
+                            finish_reason: Some("length".to_owned()),
                             prompt_tokens: 1,
                             completion_tokens: 0,
                             token_logprob: None,
-                            prefill_progress: Some(higgs_engine::engine::PrefillProgress {
-                                processed: 1,
-                                cached: 1,
-                                total: 1,
-                            }),
+                            prefill_progress: None,
                         })
-                        .map_err(|_| EngineError::Cancelled)?;
+                        .map_err(|_| EngineError::Cancelled)
+                } else {
+                    if stub.name() == "prompt-limit-mutation-spy" {
+                        stub.record_mutation();
+                    }
+                    if let Some(acceptance) = acceptance.take() {
+                        let _ = acceptance.send(Err(session_id));
+                    }
+                    Err(EngineError::RetainedSessionUnavailable(session_id))
                 }
-                sender
-                    .blocking_send(StreamingOutput {
-                        new_text: String::new(),
-                        finished: true,
-                        finish_reason: Some("length".to_owned()),
-                        prompt_tokens: 1,
-                        completion_tokens: 0,
-                        token_logprob: None,
-                        prefill_progress: None,
-                    })
-                    .map_err(|_| EngineError::Cancelled)
-            }
-            #[cfg(test)]
-            Self::Stub(stub) => {
-                if stub.name() == "prompt-limit-mutation-spy" {
-                    stub.record_mutation();
-                }
-                if let Some(acceptance) = acceptance.take() {
-                    let _ = acceptance.send(Err(session_id));
-                }
-                Err(EngineError::RetainedSessionUnavailable(session_id))
             }
         }
     }
