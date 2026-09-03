@@ -1643,20 +1643,17 @@ impl LoadCapacityLedger {
                     ConversionKind::NativeEscha
                     | ConversionKind::AffineEscha
                     | ConversionKind::QwenMaterialization => workspace.max(bytes),
-                    ConversionKind::GemmaExpertReshape => self
-                        .active_shard
-                        .map(|(_, shard_bytes)| shard_bytes)
-                        .ok_or_else(|| {
-                            higgs_models::error::ModelError::LoadCapacity(
-                                "Gemma expert reshape without active shard".to_owned(),
-                            )
-                        })?
-                        .checked_add(bytes)
-                        .ok_or_else(|| {
-                            higgs_models::error::ModelError::LoadCapacity(
-                                "Gemma expert workspace byte ledger overflow".to_owned(),
-                            )
-                        })?,
+                    ConversionKind::GemmaExpertReshape => {
+                        let shard_bytes = self
+                            .active_shard
+                            .map(|(_, shard_bytes)| shard_bytes)
+                            .ok_or_else(|| {
+                                higgs_models::error::ModelError::LoadCapacity(
+                                    "Gemma expert reshape without active shard".to_owned(),
+                                )
+                            })?;
+                        workspace.max(shard_bytes).max(bytes)
+                    }
                     ConversionKind::FullArtifact => {
                         self.full_artifact_workspace_active = true;
                         workspace.max(bytes)
@@ -2348,27 +2345,53 @@ mod tests {
     }
 
     /// Gemma's second pass keeps the whole loaded shard map alive while each
-    /// expert tensor is reshaped. A pressure transition between those two
-    /// boundaries must therefore retain the shard charge.
+    /// expert tensor is reshaped. The tensor is part of that shard, so the
+    /// exact full-artifact bound remains 2A while pressure may still reject it.
     #[test]
-    fn gemma_expert_reshape_retains_live_shard_across_pressure_transition() {
+    fn gemma_expert_reshape_preserves_full_artifact_bound_across_pressure_transition() {
         let estimate = higgs_engine::ModelLoadEstimate {
             artifact_bytes: 100,
-            largest_selected_shard_bytes: 60,
-            workspace_kind: higgs_engine::LoaderWorkspaceKind::StandardStream,
-            workspace_upper_bound_bytes: 60,
-            required_process_bytes: 160,
+            largest_selected_shard_bytes: 100,
+            workspace_kind: higgs_engine::LoaderWorkspaceKind::FullArtifact,
+            workspace_upper_bound_bytes: 100,
+            required_process_bytes: 200,
         };
         let mut ledger = LoadCapacityLedger::new(estimate);
         ledger
             .enforce(
                 crate::capacity::LoadCapacitySnapshot {
                     pressure: crate::capacity::MemoryPressure::Normal,
-                    headroom_bytes: 190,
+                    headroom_bytes: 200,
+                },
+                higgs_models::progress::LoadBoundary::BeforeConversion {
+                    index: 0,
+                    bytes: 100,
+                    kind: higgs_models::progress::ConversionKind::FullArtifact,
+                },
+            )
+            .unwrap();
+        ledger
+            .enforce(
+                crate::capacity::LoadCapacitySnapshot {
+                    pressure: crate::capacity::MemoryPressure::Normal,
+                    headroom_bytes: 200,
                 },
                 higgs_models::progress::LoadBoundary::BeforeShard {
                     index: 3,
+                    bytes: 100,
+                },
+            )
+            .unwrap();
+        ledger
+            .enforce(
+                crate::capacity::LoadCapacitySnapshot {
+                    pressure: crate::capacity::MemoryPressure::Normal,
+                    headroom_bytes: 200,
+                },
+                higgs_models::progress::LoadBoundary::BeforeConversion {
+                    index: 7,
                     bytes: 60,
+                    kind: higgs_models::progress::ConversionKind::GemmaExpertReshape,
                 },
             )
             .unwrap();
@@ -2377,11 +2400,11 @@ mod tests {
             .enforce(
                 crate::capacity::LoadCapacitySnapshot {
                     pressure: crate::capacity::MemoryPressure::Constrained,
-                    headroom_bytes: 189,
+                    headroom_bytes: 199,
                 },
                 higgs_models::progress::LoadBoundary::BeforeConversion {
-                    index: 7,
-                    bytes: 30,
+                    index: 8,
+                    bytes: 40,
                     kind: higgs_models::progress::ConversionKind::GemmaExpertReshape,
                 },
             )

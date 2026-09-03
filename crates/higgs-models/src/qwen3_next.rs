@@ -11876,24 +11876,28 @@ fn apply_escha_natives(
 
 fn retry_after_failed_model<T, U, E>(
     failed_model: T,
-    release_allocator: impl FnOnce(),
+    release_allocator: impl FnOnce() -> Result<(), E>,
     retry: impl FnOnce() -> Result<U, E>,
 ) -> Result<U, E> {
     drop(failed_model);
-    release_allocator();
+    release_allocator()?;
     retry()
 }
 
 #[allow(unsafe_code)]
-fn clear_mlx_cache_for_gdn_retry() {
+fn clear_mlx_cache_for_gdn_retry() -> Result<(), ModelError> {
     let rc = unsafe { mlx_sys::mlx_clear_cache() };
     if rc == 0 {
         tracing::debug!("Cleared MLX allocator cache before separate GDN retry");
+        Ok(())
     } else {
         tracing::warn!(
             rc,
             "Failed to clear MLX allocator cache before separate GDN retry"
         );
+        Err(ModelError::LoadCapacity(format!(
+            "failed to clear MLX allocator cache before separate GDN retry: status {rc}"
+        )))
     }
 }
 
@@ -12789,7 +12793,10 @@ mod tests {
         let retry_events = Rc::clone(&events);
         retry_after_failed_model(
             FailedModel(Rc::clone(&events)),
-            move || release_events.borrow_mut().push("clear-allocator-cache"),
+            move || {
+                release_events.borrow_mut().push("clear-allocator-cache");
+                Ok::<_, ()>(())
+            },
             move || {
                 retry_events.borrow_mut().push("retry-allocation");
                 Ok::<_, ()>(())
@@ -12805,6 +12812,24 @@ mod tests {
                 "retry-allocation"
             ]
         );
+    }
+
+    #[test]
+    fn mixed_bit_retry_aborts_before_allocation_when_allocator_release_fails() {
+        use std::cell::Cell;
+
+        let retry_reached = Cell::new(false);
+        let result = retry_after_failed_model(
+            (),
+            || Err::<(), _>("synthetic allocator release failure"),
+            || {
+                retry_reached.set(true);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result.unwrap_err(), "synthetic allocator release failure");
+        assert!(!retry_reached.get());
     }
 
     #[test]
