@@ -538,13 +538,11 @@ impl<C: Clock> CapacityController<C> {
             return self.decision;
         }
         if effective_pressure == MemoryPressure::Normal {
-            self.strongest_pressure_since_normal = MemoryPressure::Normal;
             return self.recompute_for_pressure(effective_pressure, None);
         }
         if pressure_severity(effective_pressure)
             > pressure_severity(self.strongest_pressure_since_normal)
         {
-            self.strongest_pressure_since_normal = effective_pressure;
             return self.recompute_for_pressure(effective_pressure, None);
         }
 
@@ -554,8 +552,13 @@ impl<C: Clock> CapacityController<C> {
         // already-downshifted token envelope again.
         let previous_total = self.decision.safe_total_tokens;
         let recomputed = self.recompute_for_pressure(effective_pressure, None);
+        let transition_total = if previous_total == 0 {
+            recomputed.safe_total_tokens
+        } else {
+            previous_total
+        };
         let mut transition = self.decision_for_total(
-            previous_total,
+            transition_total,
             recomputed.usable_bytes,
             recomputed.recommended_output_tokens,
         );
@@ -639,6 +642,13 @@ impl<C: Clock> CapacityController<C> {
     ) -> CapacityDecision {
         let previous = self.decision.safe_total_tokens;
         self.inputs.pressure = pressure;
+        if pressure == MemoryPressure::Normal {
+            self.strongest_pressure_since_normal = MemoryPressure::Normal;
+        } else if pressure_severity(pressure)
+            > pressure_severity(self.strongest_pressure_since_normal)
+        {
+            self.strongest_pressure_since_normal = pressure;
+        }
         if pressure != MemoryPressure::Normal {
             self.clear_clean_windows();
         }
@@ -662,10 +672,19 @@ impl<C: Clock> CapacityController<C> {
             MemoryPressure::Critical => Some(50),
         };
         self.decision = if let Some(percent) = fraction {
-            let downshift = previous
-                .checked_mul(percent)
-                .map(|tokens| floor_1024(tokens / 100))
-                .unwrap_or(0);
+            let downshift = if previous == 0
+                && pressure == MemoryPressure::Constrained
+                && recomputed.availability == CapacityAvailability::Available
+            {
+                recomputed
+                    .safe_total_tokens
+                    .min(MINIMUM_RECOVERY_TOTAL_TOKENS)
+            } else {
+                previous
+                    .checked_mul(percent)
+                    .map(|tokens| floor_1024(tokens / 100))
+                    .unwrap_or(0)
+            };
             let total = downshift.min(recomputed.safe_total_tokens);
             let mut decision = self.decision_for_total(
                 total,
@@ -1577,6 +1596,78 @@ mod tests {
             floor_1024(before_critical * 50 / 100)
         );
         assert_eq!(critical.availability, CapacityAvailability::Unavailable);
+    }
+
+    #[test]
+    fn critical_construction_and_restore_recover_bounded_on_constrained_observation() {
+        let normal_inputs = controller_inputs(48, 48);
+        let full_static = CapacityController::new(normal_inputs)
+            .decision()
+            .safe_total_tokens;
+        let mut critical_inputs = normal_inputs;
+        critical_inputs.pressure = MemoryPressure::Critical;
+
+        let mut trained = CapacityController::new(normal_inputs);
+        trained.observe(AllocationObservation::clean(
+            ExecutionPath::Cold,
+            8192,
+            512,
+            GIB,
+            2 * GIB,
+        ));
+        let key = learned_profile_key();
+        let profile = trained.export_profile(key.clone(), 8 * GIB).unwrap();
+
+        let mut constructed = CapacityController::new(critical_inputs);
+        let mut restored = CapacityController::new(critical_inputs);
+        assert!(restored.restore_profile(&profile, &key, 8 * GIB));
+
+        for controller in [&mut constructed, &mut restored] {
+            let recovered = controller.apply_pressure_observation(PressureObservation {
+                pressure: MemoryPressure::Constrained,
+                swap_out_delta: 0,
+                compressor_delta: 0,
+            });
+            assert_eq!(recovered.safe_total_tokens, 8_192);
+            assert_eq!(recovered.availability, CapacityAvailability::Available);
+            assert!(recovered.safe_total_tokens < full_static);
+        }
+    }
+
+    #[test]
+    fn direct_critical_recompute_marks_constrained_observation_as_recovery() {
+        let mut controller = CapacityController::new(controller_inputs(48, 48));
+        let critical = controller.recompute_for_pressure(MemoryPressure::Critical, None);
+        assert_eq!(critical.safe_total_tokens, 65_536);
+
+        let constrained = controller.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Constrained,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+        assert_eq!(constrained.safe_total_tokens, 65_536);
+        assert_eq!(constrained.availability, CapacityAvailability::Available);
+    }
+
+    #[test]
+    fn direct_normal_recompute_ends_episode_before_fresh_warning() {
+        let mut controller = CapacityController::new(controller_inputs(48, 48));
+        let critical = controller.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Critical,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+        assert_eq!(critical.safe_total_tokens, 65_536);
+        let normal = controller.recompute_for_pressure(MemoryPressure::Normal, None);
+        assert_eq!(normal.safe_total_tokens, 65_536);
+
+        let warning = controller.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Constrained,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+        assert_eq!(warning.safe_total_tokens, 49_152);
+        assert_eq!(warning.availability, CapacityAvailability::Available);
     }
 
     #[derive(Clone)]
