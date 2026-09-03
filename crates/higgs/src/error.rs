@@ -53,10 +53,38 @@ pub enum ServerError {
 
     #[error("Proxy error: {0}")]
     ProxyError(String),
+
+    #[error("Request exceeds the current capacity envelope")]
+    CapacityExceeded(crate::capacity::CapacityExceededError),
+
+    #[error("Capacity is temporarily unavailable")]
+    CapacityUnavailable(crate::capacity::CapacityUnavailableError),
 }
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
+        match self {
+            Self::CapacityExceeded(error) => {
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(crate::capacity::CapacityErrorEnvelope::new(error)),
+                )
+                    .into_response();
+            }
+            Self::CapacityUnavailable(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(crate::capacity::CapacityErrorEnvelope::new(error)),
+                )
+                    .into_response();
+            }
+            other => other.into_standard_response(),
+        }
+    }
+}
+
+impl ServerError {
+    fn into_standard_response(self) -> Response {
         let (status, error_type, message, code) = match &self {
             Self::Engine(e) => {
                 tracing::error!(error = %e, "Engine error");
@@ -115,6 +143,9 @@ impl IntoResponse for ServerError {
                     "Upstream provider error".to_owned(),
                     None,
                 )
+            }
+            Self::CapacityExceeded(_) | Self::CapacityUnavailable(_) => {
+                unreachable!("typed capacity errors return before standard error serialization")
             }
         };
 
@@ -225,6 +256,46 @@ mod tests {
                 .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"]["code"], "retained_session_unavailable");
+    }
+
+    #[tokio::test]
+    async fn capacity_admission_errors_preserve_exact_typed_envelopes() {
+        let exceeded =
+            crate::capacity::CapacityExceededError::new(1_024, 2_048, "boot-a".to_owned(), 7);
+        let (status, body) =
+            response_status_and_body(ServerError::CapacityExceeded(exceeded).into_response()).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": {
+                    "type": "higgs_capacity_exceeded",
+                    "code": "compact_and_retry",
+                    "safePromptTokens": 1024,
+                    "safeTotalTokens": 2048,
+                    "bootId": "boot-a",
+                    "generation": 7
+                }
+            })
+        );
+
+        let unavailable = crate::capacity::CapacityUnavailableError::new("boot-b".to_owned(), 9);
+        let (status, body) =
+            response_status_and_body(ServerError::CapacityUnavailable(unavailable).into_response())
+                .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": {
+                    "type": "higgs_capacity_unavailable",
+                    "code": "capacity_unavailable",
+                    "bootId": "boot-b",
+                    "generation": 9,
+                    "retryAfterMs": 5000
+                }
+            })
+        );
     }
 
     #[tokio::test]

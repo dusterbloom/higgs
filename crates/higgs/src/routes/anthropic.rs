@@ -294,6 +294,14 @@ async fn create_message_non_streaming(
     let prompt_tokens = engine
         .prepare_chat_prompt_with_thinking(&engine_messages, tools, thinking_enabled)
         .map_err(ServerError::Engine)?;
+    let reservation = crate::capacity::admit_generation_request(
+        &state,
+        &req.model,
+        crate::capacity::ExecutionPath::Cold,
+        prompt_tokens.len(),
+        max_tokens,
+    )
+    .await?;
 
     // Multimodal requests: hand the raw decoded images to the engine, which
     // preprocesses them into a family-native `ImageBatch` and expands each
@@ -304,6 +312,7 @@ async fn create_message_non_streaming(
         .then(|| media.into_iter().map(MediaItem::into).collect());
 
     let output = tokio::task::spawn_blocking(move || {
+        let _reservation = reservation;
         engine.generate_with_thinking(
             &prompt_tokens,
             max_tokens,
@@ -416,6 +425,14 @@ async fn create_message_stream(
     let prompt_tokens = engine
         .prepare_chat_prompt_with_thinking(&engine_messages, tools, thinking_enabled)
         .map_err(ServerError::Engine)?;
+    let reservation = crate::capacity::admit_generation_request(
+        &state,
+        &req.model,
+        crate::capacity::ExecutionPath::Cold,
+        prompt_tokens.len(),
+        max_tokens,
+    )
+    .await?;
 
     let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     let model = req.model;
@@ -428,6 +445,7 @@ async fn create_message_stream(
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
 
     tokio::task::spawn_blocking(move || {
+        let _reservation = reservation;
         let result = engine.generate_streaming_with_thinking(
             &prompt_tokens,
             max_tokens,
@@ -671,6 +689,12 @@ pub async fn count_tokens(
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use super::{
+        CreateMessageRequest, ServerError, create_message_non_streaming, create_message_stream,
+    };
+
     /// A valid 1x1 red PNG (passes byte-size and dimension checks).
     const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
@@ -775,5 +799,36 @@ mod tests {
             status, 500,
             "stub generation must fail as a server error, got {status}: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn capacity_admission_rejects_both_anthropic_variants_before_worker_mutation() {
+        let model = "prompt-limit-mutation-spy";
+        let (state, engine) = crate::capacity::rejecting_route_test_state(model);
+        let request = |stream| {
+            serde_json::from_value::<CreateMessageRequest>(serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 5120,
+                "stream": stream
+            }))
+            .unwrap()
+        };
+
+        let blocking =
+            create_message_non_streaming(Arc::clone(&state), request(false), Arc::clone(&engine))
+                .await;
+        assert!(matches!(blocking, Err(ServerError::CapacityExceeded(_))));
+        let streaming = create_message_stream(
+            Arc::clone(&state),
+            request(true),
+            Arc::clone(&engine),
+            None,
+            crate::router::RoutingMethod::Direct,
+        )
+        .await;
+        assert!(matches!(streaming, Err(ServerError::CapacityExceeded(_))));
+        assert!(engine.route_test_mutation_sequence().is_empty());
+        assert_eq!(state.capacity.active_reservation_count(model), 0);
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
@@ -8,9 +8,10 @@ use higgs_engine::{EngineCostDescription, MlxMemorySnapshot, TransientPrefillEst
 use sha2::{Digest, Sha256};
 
 use super::{
-    CAPACITY_SCHEMA_VERSION, CapacityAvailability, CapacityBasis, CapacityController,
-    CapacityInputs, CapacitySnapshot, LearnedProfile, LearnedProfileKey, LearnedProfileStore,
-    MemoryPressure, PressureObservation, ZeroCapacityRecovery,
+    Admission, CAPACITY_SCHEMA_VERSION, CapacityAvailability, CapacityBasis, CapacityController,
+    CapacityExceededError, CapacityInputs, CapacitySnapshot, CapacityUnavailableError,
+    LearnedProfile, LearnedProfileKey, LearnedProfileStore, MemoryPressure, PressureObservation,
+    RequestCost, ZeroCapacityRecovery,
 };
 
 const FINGERPRINT_DOMAIN: &[u8] = b"higgs:model-content:v1\0";
@@ -152,6 +153,23 @@ struct RegistryState {
     cache_revision: u64,
     published_cache_revision: u64,
     cache_plan_pressure: MemoryPressure,
+    active_reservations: BTreeMap<uuid::Uuid, ActiveReservation>,
+    admission_queue: VecDeque<AdmissionWaiter>,
+}
+
+#[derive(Debug)]
+struct ActiveReservation {
+    model: String,
+    bytes: u64,
+}
+
+#[derive(Debug)]
+struct AdmissionWaiter {
+    id: uuid::Uuid,
+    model: String,
+    request: RequestCost,
+    boot_id: String,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -208,6 +226,87 @@ pub struct CapacityRegistry {
     boot_id: String,
     profile_dir: Option<PathBuf>,
     state: Mutex<RegistryState>,
+    reservation_changed: tokio::sync::Notify,
+}
+
+#[derive(Debug)]
+pub enum CapacityAdmissionError {
+    Exceeded(CapacityExceededError),
+    Unavailable(CapacityUnavailableError),
+}
+
+impl CapacityAdmissionError {
+    #[must_use]
+    pub fn boot_id(&self) -> &str {
+        match self {
+            Self::Exceeded(error) => error.boot_id(),
+            Self::Unavailable(error) => error.boot_id(),
+        }
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        match self {
+            Self::Exceeded(error) => error.generation(),
+            Self::Unavailable(error) => error.generation(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CacheReclamation {
+    Prefix,
+    Retained,
+}
+
+#[must_use = "dropping the request reservation releases its process-wide bytes"]
+#[derive(Debug)]
+pub struct RequestReservation {
+    registry: Weak<CapacityRegistry>,
+    id: uuid::Uuid,
+    bytes: u64,
+    released: bool,
+}
+
+impl RequestReservation {
+    #[must_use]
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for RequestReservation {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        if let Some(registry) = self.registry.upgrade() {
+            registry.release_reservation(self.id);
+        }
+        self.released = true;
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RequestReservationAttempt {
+    Reserved(RequestReservation),
+    Contended,
+    Rejected(CapacityAdmissionError),
+}
+
+struct QueuedReservation {
+    registry: Arc<CapacityRegistry>,
+    id: uuid::Uuid,
+    notify: Arc<tokio::sync::Notify>,
+    completed: bool,
+}
+
+impl Drop for QueuedReservation {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.registry.cancel_waiter(self.id);
+        }
+    }
 }
 
 impl CapacityRegistry {
@@ -247,13 +346,340 @@ impl CapacityRegistry {
                 cache_revision: 0,
                 published_cache_revision: 0,
                 cache_plan_pressure: MemoryPressure::Normal,
+                active_reservations: BTreeMap::new(),
+                admission_queue: VecDeque::new(),
             }),
+            reservation_changed: tokio::sync::Notify::new(),
         })
     }
 
     #[must_use]
     pub fn boot_id(&self) -> String {
         self.boot_id.clone()
+    }
+
+    /// Atomically reserve the request peak, or wait in the process-wide FIFO
+    /// when the request is individually safe but blocked by older reservations.
+    pub async fn reserve_request(
+        self: &Arc<Self>,
+        model: &str,
+        request: RequestCost,
+    ) -> Result<RequestReservation, CapacityAdmissionError> {
+        let id = uuid::Uuid::new_v4();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let attempt = {
+            let mut state = self.lock();
+            let attempt = self.try_reserve_locked(&mut state, model, request, false);
+            if matches!(attempt, RequestReservationAttempt::Contended) {
+                state.admission_queue.push_back(AdmissionWaiter {
+                    id,
+                    model: model.to_owned(),
+                    request,
+                    boot_id: self.boot_id.clone(),
+                    notify: Arc::clone(&notify),
+                });
+            }
+            attempt
+        };
+        match attempt {
+            RequestReservationAttempt::Reserved(reservation) => Ok(reservation),
+            RequestReservationAttempt::Rejected(error) => Err(error),
+            RequestReservationAttempt::Contended => {
+                let mut queued = QueuedReservation {
+                    registry: Arc::clone(self),
+                    id,
+                    notify,
+                    completed: false,
+                };
+                loop {
+                    match self.try_grant_waiter(id, model) {
+                        RequestReservationAttempt::Reserved(reservation) => {
+                            queued.completed = true;
+                            return Ok(reservation);
+                        }
+                        RequestReservationAttempt::Rejected(error) => {
+                            queued.completed = true;
+                            return Err(error);
+                        }
+                        RequestReservationAttempt::Contended => queued.notify.notified().await,
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn try_reserve_request(
+        self: &Arc<Self>,
+        model: &str,
+        request: RequestCost,
+    ) -> RequestReservationAttempt {
+        let mut state = self.lock();
+        self.try_reserve_locked(&mut state, model, request, false)
+    }
+
+    fn try_reserve_locked(
+        self: &Arc<Self>,
+        state: &mut RegistryState,
+        model: &str,
+        request: RequestCost,
+        queue_head: bool,
+    ) -> RequestReservationAttempt {
+        let Some(entry) = state.models.get(model) else {
+            return RequestReservationAttempt::Rejected(CapacityAdmissionError::Unavailable(
+                CapacityUnavailableError::new(self.boot_id.clone(), 0),
+            ));
+        };
+        let generation = entry.generation;
+        let Some(active) = entry
+            .active
+            .as_ref()
+            .filter(|active| active.published && !active.draining)
+        else {
+            return RequestReservationAttempt::Rejected(CapacityAdmissionError::Unavailable(
+                CapacityUnavailableError::new(self.boot_id.clone(), generation),
+            ));
+        };
+
+        let shared = match effective_shared_ledger(state) {
+            Ok(shared) => shared,
+            Err(_) => {
+                return RequestReservationAttempt::Rejected(CapacityAdmissionError::Unavailable(
+                    CapacityUnavailableError::new(self.boot_id.clone(), generation),
+                ));
+            }
+        };
+        let individual = active.controller.transactional_copy();
+        let individual_ledger = match individual.admit(request) {
+            Admission::Admitted(ledger) => ledger,
+            other => {
+                return RequestReservationAttempt::Rejected(admission_error(
+                    &self.boot_id,
+                    generation,
+                    other,
+                ));
+            }
+        };
+
+        if !queue_head && !state.admission_queue.is_empty() {
+            return RequestReservationAttempt::Contended;
+        }
+        let mut current = active.controller.transactional_copy();
+        replace_shared_ledger(&mut current, shared, ZeroCapacityRecovery::Preserve);
+        let current = current.admit(request);
+        if !matches!(current, Admission::Admitted(_)) {
+            return RequestReservationAttempt::Contended;
+        }
+        let Some(bytes) =
+            request_reservation_bytes(individual_ledger, request.retained_growth_bytes)
+        else {
+            return RequestReservationAttempt::Rejected(CapacityAdmissionError::Unavailable(
+                CapacityUnavailableError::new(self.boot_id.clone(), generation),
+            ));
+        };
+        let id = uuid::Uuid::new_v4();
+        state.active_reservations.insert(
+            id,
+            ActiveReservation {
+                model: model.to_owned(),
+                bytes,
+            },
+        );
+        RequestReservationAttempt::Reserved(RequestReservation {
+            registry: Arc::downgrade(self),
+            id,
+            bytes,
+            released: false,
+        })
+    }
+
+    fn try_grant_waiter(
+        self: &Arc<Self>,
+        id: uuid::Uuid,
+        model: &str,
+    ) -> RequestReservationAttempt {
+        let (result, wake_next) = {
+            let mut state = self.lock();
+            let Some(waiter) = state.admission_queue.front() else {
+                let generation = state.models.get(model).map_or(0, |entry| entry.generation);
+                return RequestReservationAttempt::Rejected(CapacityAdmissionError::Unavailable(
+                    CapacityUnavailableError::new(self.boot_id.clone(), generation),
+                ));
+            };
+            if waiter.id != id && state.admission_queue.iter().any(|waiter| waiter.id == id) {
+                return RequestReservationAttempt::Contended;
+            }
+            if waiter.id != id {
+                let generation = state.models.get(model).map_or(0, |entry| entry.generation);
+                return RequestReservationAttempt::Rejected(CapacityAdmissionError::Unavailable(
+                    CapacityUnavailableError::new(self.boot_id.clone(), generation),
+                ));
+            }
+            let model = waiter.model.clone();
+            let request = waiter.request;
+            let boot_matches = waiter.boot_id == self.boot_id;
+            let result = if boot_matches {
+                self.try_reserve_locked(&mut state, &model, request, true)
+            } else {
+                RequestReservationAttempt::Rejected(CapacityAdmissionError::Unavailable(
+                    CapacityUnavailableError::new(self.boot_id.clone(), 0),
+                ))
+            };
+            let wake_next = if matches!(
+                result,
+                RequestReservationAttempt::Reserved(_) | RequestReservationAttempt::Rejected(_)
+            ) {
+                state.admission_queue.pop_front();
+                restore_cache_policy_if_admission_idle(&mut state);
+                state
+                    .admission_queue
+                    .front()
+                    .map(|waiter| Arc::clone(&waiter.notify))
+            } else {
+                None
+            };
+            (result, wake_next)
+        };
+        if let Some(notify) = wake_next {
+            notify.notify_one();
+        }
+        result
+    }
+
+    fn cancel_waiter(&self, id: uuid::Uuid) {
+        let wake_next = {
+            let mut state = self.lock();
+            let was_head = state
+                .admission_queue
+                .front()
+                .is_some_and(|waiter| waiter.id == id);
+            let Some(index) = state
+                .admission_queue
+                .iter()
+                .position(|waiter| waiter.id == id)
+            else {
+                return;
+            };
+            state.admission_queue.remove(index);
+            restore_cache_policy_if_admission_idle(&mut state);
+            was_head
+                .then(|| {
+                    state
+                        .admission_queue
+                        .front()
+                        .map(|waiter| Arc::clone(&waiter.notify))
+                })
+                .flatten()
+        };
+        if let Some(notify) = wake_next {
+            notify.notify_one();
+        }
+    }
+
+    fn release_reservation(&self, id: uuid::Uuid) {
+        let wake = {
+            let mut state = self.lock();
+            if state.active_reservations.remove(&id).is_none() {
+                return;
+            }
+            restore_cache_policy_if_admission_idle(&mut state);
+            state
+                .admission_queue
+                .front()
+                .map(|waiter| Arc::clone(&waiter.notify))
+        };
+        self.reservation_changed.notify_waiters();
+        if let Some(notify) = wake {
+            notify.notify_one();
+        }
+    }
+
+    #[must_use]
+    pub fn active_reservation_count(&self, model: &str) -> usize {
+        self.lock()
+            .active_reservations
+            .values()
+            .filter(|reservation| reservation.model == model)
+            .count()
+    }
+
+    #[must_use]
+    pub fn active_reservation_bytes(&self) -> u64 {
+        active_reservation_bytes(&self.lock()).unwrap_or(u64::MAX)
+    }
+
+    #[must_use]
+    pub fn queued_waiter_count(&self) -> usize {
+        self.lock().admission_queue.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admission_test_memory(&self) -> (MlxMemorySnapshot, u64) {
+        let state = self.lock();
+        (state.memory, state.memory_revision)
+    }
+
+    pub async fn wait_for_model_reservations(&self, model: &str) {
+        loop {
+            let notified = self.reservation_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.active_reservation_count(model) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Lower only desired optional cache budgets. Published accounting remains
+    /// unchanged until every engine acknowledges the returned plan revision.
+    pub(crate) fn request_cache_reclamation(&self, reclamation: CacheReclamation) -> bool {
+        let mut state = self.lock();
+        let frozen = state
+            .models
+            .iter()
+            .filter(|(_, entry)| entry.active.as_ref().is_some_and(|active| active.draining))
+            .map(|(model, _)| model.clone())
+            .collect::<BTreeSet<_>>();
+        let mut changed = false;
+        for (model, allocation) in &mut state.desired_cache_allocations {
+            if frozen.contains(model) {
+                continue;
+            }
+            match reclamation {
+                CacheReclamation::Prefix => {
+                    changed |= allocation.prefix_bytes != 0;
+                    allocation.prefix_bytes = 0;
+                }
+                CacheReclamation::Retained => {
+                    changed |= allocation.retained_bytes != 0;
+                    allocation.retained_bytes = 0;
+                }
+            }
+        }
+        if changed {
+            state.cache_revision = state.cache_revision.saturating_add(1);
+        }
+        let acknowledgement_pending =
+            state
+                .published_cache_allocations
+                .iter()
+                .any(|(model, published)| {
+                    if frozen.contains(model) {
+                        return false;
+                    }
+                    let desired = state
+                        .desired_cache_allocations
+                        .get(model)
+                        .copied()
+                        .unwrap_or_default();
+                    match reclamation {
+                        CacheReclamation::Prefix => published.prefix_bytes > desired.prefix_bytes,
+                        CacheReclamation::Retained => {
+                            published.retained_bytes > desired.retained_bytes
+                        }
+                    }
+                });
+        changed || acknowledgement_pending
     }
 
     pub fn snapshot(&self, model: &str) -> Result<CapacitySnapshot, RegistrationError> {
@@ -368,9 +794,46 @@ impl CapacityRegistry {
         );
         if apply_allocation_totals(&mut shared, &effective).is_err() {
             shared.active_reservation_bytes = u64::MAX;
+        } else {
+            shared.active_reservation_bytes = 0;
         }
         recompute_active_models(&mut state, shared, ZeroCapacityRecovery::Preserve);
+        let wake = state
+            .admission_queue
+            .front()
+            .map(|waiter| Arc::clone(&waiter.notify));
+        drop(state);
+        if let Some(notify) = wake {
+            notify.notify_one();
+        }
         true
+    }
+
+    /// Publish the exact retained residency left after every engine atomically
+    /// evicted only unleased entries for this policy revision.
+    pub(crate) fn acknowledge_retained_reclamation(
+        &self,
+        revision: u64,
+        retained_floors: &BTreeMap<String, u64>,
+    ) -> bool {
+        let publish_revision = {
+            let mut state = self.lock();
+            if state.cache_revision != revision {
+                return false;
+            }
+            let mut changed = false;
+            for (model, retained_bytes) in retained_floors {
+                if let Some(allocation) = state.desired_cache_allocations.get_mut(model) {
+                    changed |= allocation.retained_bytes != *retained_bytes;
+                    allocation.retained_bytes = *retained_bytes;
+                }
+            }
+            if changed {
+                state.cache_revision = state.cache_revision.saturating_add(1);
+            }
+            state.cache_revision
+        };
+        self.publish_cache_allocation_revision(publish_revision)
     }
 
     /// Commit registration and route visibility while the acknowledged cache
@@ -566,13 +1029,34 @@ impl CapacityRegistry {
         active.drain_nonce = Some(nonce);
         active.frozen_cache_allocation = Some(frozen_cache_allocation);
         entry.generation = entry.generation.saturating_add(1);
+        let mut removed_waiters = Vec::new();
+        state.admission_queue.retain(|waiter| {
+            if waiter.model == model {
+                removed_waiters.push(Arc::clone(&waiter.notify));
+                false
+            } else {
+                true
+            }
+        });
         recompute_registry(&mut state);
-        Ok(DrainRegistration {
+        let wake = state
+            .admission_queue
+            .front()
+            .map(|waiter| Arc::clone(&waiter.notify));
+        let registration = DrainRegistration {
             registry: Arc::downgrade(self),
             model: model.to_owned(),
             nonce,
             finished: false,
-        })
+        };
+        drop(state);
+        for notify in removed_waiters {
+            notify.notify_one();
+        }
+        if let Some(notify) = wake {
+            notify.notify_one();
+        }
+        Ok(registration)
     }
 
     pub fn finish_unregister(
@@ -584,6 +1068,16 @@ impl CapacityRegistry {
             return Ok(());
         }
         let mut state = self.lock();
+        if state
+            .active_reservations
+            .values()
+            .any(|reservation| reservation.model == drain.model)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "model still has active request reservations",
+            ));
+        }
         if let Some(measurement) = memory_after_release.as_ref()
             && (measurement.boot_id != self.boot_id || measurement.revision > state.memory_revision)
         {
@@ -663,6 +1157,14 @@ impl CapacityRegistry {
         }
         state.pressure = effective_pressure;
         recompute_registry(&mut state);
+        let wake = state
+            .admission_queue
+            .front()
+            .map(|waiter| Arc::clone(&waiter.notify));
+        drop(state);
+        if let Some(notify) = wake {
+            notify.notify_one();
+        }
     }
 
     pub fn refresh_memory(&self, memory: MlxMemorySnapshot) -> PublishedMemoryMeasurement {
@@ -679,14 +1181,73 @@ impl CapacityRegistry {
             ZeroCapacityRecovery::Preserve
         };
         recompute_registry_with(&mut state, zero_recovery);
-        PublishedMemoryMeasurement {
+        let measurement = PublishedMemoryMeasurement {
             boot_id: self.boot_id.clone(),
             previous_revision,
             revision: state.memory_revision,
             previous_active_bytes,
             active_bytes: memory.active_bytes,
             capacity_policy_revision: state.capacity_policy_revision,
+        };
+        let wake = state
+            .admission_queue
+            .front()
+            .map(|waiter| Arc::clone(&waiter.notify));
+        drop(state);
+        if let Some(notify) = wake {
+            notify.notify_one();
         }
+        measurement
+    }
+
+    /// Publish the post-eviction allocator measurement without immediately
+    /// recreating the optional cache budgets that admission just reclaimed.
+    pub(crate) fn refresh_memory_after_reclamation(
+        &self,
+        memory: MlxMemorySnapshot,
+    ) -> PublishedMemoryMeasurement {
+        let mut state = self.lock();
+        let previous_revision = state.memory_revision;
+        let previous_active_bytes = state.memory.active_bytes;
+        state.memory = memory;
+        state.memory_revision = state.memory_revision.saturating_add(1);
+        let zero_recovery = if previous_revision.checked_add(1) == Some(state.memory_revision)
+            && memory.active_bytes < previous_active_bytes
+        {
+            ZeroCapacityRecovery::BoundedMinimum
+        } else {
+            ZeroCapacityRecovery::Preserve
+        };
+        let mut shared = shared_ledger_with(&state, None, None).unwrap_or_default();
+        let effective = conservative_cache_allocations(
+            &state.desired_cache_allocations,
+            &state.published_cache_allocations,
+        );
+        if apply_allocation_totals(&mut shared, &effective).is_err() {
+            shared.active_reservation_bytes = u64::MAX;
+        } else {
+            // Reservations are checked transactionally by admission and must
+            // not shrink the client-visible semantic envelope while live.
+            shared.active_reservation_bytes = 0;
+        }
+        recompute_active_models(&mut state, shared, zero_recovery);
+        let measurement = PublishedMemoryMeasurement {
+            boot_id: self.boot_id.clone(),
+            previous_revision,
+            revision: state.memory_revision,
+            previous_active_bytes,
+            active_bytes: memory.active_bytes,
+            capacity_policy_revision: state.capacity_policy_revision,
+        };
+        let wake = state
+            .admission_queue
+            .front()
+            .map(|waiter| Arc::clone(&waiter.notify));
+        drop(state);
+        if let Some(notify) = wake {
+            notify.notify_one();
+        }
+        measurement
     }
 
     fn rollback_active(&self, model: &str, nonce: uuid::Uuid, remove_on_rollback: bool) {
@@ -750,6 +1311,14 @@ impl CapacityRegistry {
             active.frozen_cache_allocation = None;
             entry.generation = entry.generation.saturating_add(1);
             recompute_registry(&mut state);
+        }
+        let wake = state
+            .admission_queue
+            .front()
+            .map(|waiter| Arc::clone(&waiter.notify));
+        drop(state);
+        if let Some(notify) = wake {
+            notify.notify_one();
         }
     }
 
@@ -910,6 +1479,11 @@ impl DrainRegistration {
             .upgrade()
             .is_some_and(|owner| std::ptr::eq(Arc::as_ptr(&owner), registry))
     }
+
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
+    }
 }
 
 impl Drop for DrainRegistration {
@@ -929,6 +1503,7 @@ fn shared_ledger_with(
 ) -> Result<SharedLedger, RegistrationError> {
     let mut shared = SharedLedger {
         memory: state.memory,
+        active_reservation_bytes: active_reservation_bytes(state)?,
         ..SharedLedger::default()
     };
     for (name, entry) in &state.models {
@@ -973,6 +1548,56 @@ fn shared_ledger_with(
         }
     }
     Ok(shared)
+}
+
+fn active_reservation_bytes(state: &RegistryState) -> Result<u64, RegistrationError> {
+    state
+        .active_reservations
+        .values()
+        .try_fold(0_u64, |sum, reservation| {
+            sum.checked_add(reservation.bytes)
+                .ok_or(RegistrationError::ArithmeticOverflow)
+        })
+}
+
+fn effective_shared_ledger(state: &RegistryState) -> Result<SharedLedger, RegistrationError> {
+    let mut shared = shared_ledger_with(state, None, None)?;
+    let effective = conservative_cache_allocations(
+        &state.desired_cache_allocations,
+        &state.published_cache_allocations,
+    );
+    apply_allocation_totals(&mut shared, &effective)?;
+    Ok(shared)
+}
+
+fn request_reservation_bytes(ledger: super::ByteLedger, retained_growth_bytes: u64) -> Option<u64> {
+    ledger
+        .fixed_session_bytes
+        .checked_add(ledger.prompt_bytes)?
+        .checked_add(ledger.output_bytes)?
+        .checked_add(ledger.decode_bytes)?
+        .checked_add(retained_growth_bytes)?
+        .checked_add(ledger.learned_retained_bytes)?
+        .checked_add(ledger.transient_bytes)
+}
+
+fn admission_error(boot_id: &str, generation: u64, admission: Admission) -> CapacityAdmissionError {
+    match admission {
+        Admission::Exceeded(decision) => {
+            CapacityAdmissionError::Exceeded(CapacityExceededError::new(
+                decision.max_prompt_tokens,
+                decision.safe_total_tokens,
+                boot_id.to_owned(),
+                generation,
+            ))
+        }
+        Admission::FixedCostUnavailable | Admission::Unavailable | Admission::Admitted(_) => {
+            CapacityAdmissionError::Unavailable(CapacityUnavailableError::new(
+                boot_id.to_owned(),
+                generation,
+            ))
+        }
+    }
 }
 
 fn replace_shared_ledger(
@@ -1022,10 +1647,30 @@ fn recompute_registry(state: &mut RegistryState) {
     recompute_registry_with(state, ZeroCapacityRecovery::Preserve);
 }
 
+fn restore_cache_policy_if_admission_idle(state: &mut RegistryState) {
+    if state.active_reservations.is_empty() && state.admission_queue.is_empty() {
+        // Reclaimed caches stay capped through the whole FIFO handoff. The
+        // ordinary acknowledged policy may restore them only after the final
+        // worker and waiter are both gone.
+        recompute_registry(state);
+    }
+}
+
 fn recompute_registry_with(state: &mut RegistryState, zero_recovery: ZeroCapacityRecovery) {
     let old_allocations = std::mem::take(&mut state.desired_cache_allocations);
     let allocations = cache_allocations_with(state, None);
-    state.desired_cache_allocations = allocations.as_ref().cloned().unwrap_or_default();
+    let mut desired = allocations.as_ref().cloned().unwrap_or_default();
+    if !state.active_reservations.is_empty() {
+        // A request was admitted against the current cache ceiling. Pressure
+        // and memory observations may lower that ceiling, but cannot restore
+        // reclaimed bytes until all worker-owned reservations have drained.
+        for (model, allocation) in &mut desired {
+            let ceiling = old_allocations.get(model).copied().unwrap_or_default();
+            allocation.retained_bytes = allocation.retained_bytes.min(ceiling.retained_bytes);
+            allocation.prefix_bytes = allocation.prefix_bytes.min(ceiling.prefix_bytes);
+        }
+    }
+    state.desired_cache_allocations = desired;
     if old_allocations != state.desired_cache_allocations
         || state.cache_plan_pressure != state.pressure
     {
@@ -1037,8 +1682,16 @@ fn recompute_registry_with(state: &mut RegistryState, zero_recovery: ZeroCapacit
         &state.desired_cache_allocations,
         &state.published_cache_allocations,
     );
-    if allocations.is_err() || apply_allocation_totals(&mut shared, &effective).is_err() {
+    let ledger_valid =
+        allocations.is_ok() && apply_allocation_totals(&mut shared, &effective).is_ok();
+    if !ledger_valid {
         shared.active_reservation_bytes = u64::MAX;
+    }
+    // Published limits describe semantic request shape. Live reservations are
+    // a contention term checked by admission and must queue, not tell clients
+    // to compact an otherwise safe request.
+    if ledger_valid {
+        shared.active_reservation_bytes = 0;
     }
     recompute_active_models(state, shared, zero_recovery);
 }
@@ -1563,6 +2216,424 @@ mod tests {
         registry.commit_active(ticket, facts).unwrap().publish();
         let plan = registry.cache_allocation_plan();
         assert!(registry.publish_cache_allocation_revision(plan.revision));
+    }
+
+    fn admission_facts(name: &str) -> ModelCapacityFacts {
+        let mut facts = facts(name, 2 * GIB);
+        facts.memory = MlxMemorySnapshot {
+            active_bytes: 2 * GIB,
+            peak_bytes: 2 * GIB,
+            memory_limit_bytes: Some(10 * GIB),
+            metal_recommended_working_set_bytes: Some(10 * GIB),
+        };
+        facts.costs = EngineCostDescription {
+            fixed_live_session_bytes: 0,
+            persistent_bytes_per_token: 1024 * 1024,
+            decode_workspace_bytes: 0,
+            transient_prefill: TransientPrefillEstimate {
+                base_bytes: 0,
+                bytes_per_prompt_token: 0,
+                bytes_per_chunk_token: 0,
+                max_prompt_tokens: 8_192,
+                max_chunk_tokens: 1_024,
+            },
+        };
+        facts.architectural_max_tokens = 8_192;
+        facts.retained_bytes_ceiling = 0;
+        facts.prefix_cache_bytes_ceiling = 0;
+        facts.configured_total_token_ceiling = Some(4_096);
+        facts.configured_output_token_ceiling = Some(2_048);
+        facts
+    }
+
+    const fn admission_request(prompt_tokens: u64, output_tokens: u64) -> super::RequestCost {
+        super::RequestCost {
+            execution_path: crate::capacity::ExecutionPath::Cold,
+            prompt_tokens,
+            suffix_tokens: prompt_tokens,
+            output_tokens,
+            retained_growth_bytes: 0,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_admission_requested_output_is_reserved_exactly() {
+        let registry = CapacityRegistry::new(["model".to_owned()]);
+        let mut facts = admission_facts("model");
+        facts.memory.memory_limit_bytes = Some(12 * GIB);
+        facts.memory.metal_recommended_working_set_bytes = Some(12 * GIB);
+        register(&registry, facts);
+
+        let zero_output = registry
+            .reserve_request("model", admission_request(1_024, 0))
+            .await
+            .unwrap();
+        assert_eq!(zero_output.bytes(), 2 * GIB);
+        drop(zero_output);
+
+        let requested_output = registry
+            .reserve_request("model", admission_request(1_024, 2_048))
+            .await
+            .unwrap();
+        assert_eq!(requested_output.bytes(), 3 * GIB);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_admission_two_requests_cannot_reserve_the_same_bytes() {
+        let registry = CapacityRegistry::new(["model".to_owned()]);
+        register(&registry, admission_facts("model"));
+        let first = registry
+            .reserve_request("model", admission_request(1_024, 1_024))
+            .await
+            .unwrap();
+        assert_eq!(registry.active_reservation_count("model"), 1);
+        assert_eq!(registry.active_reservation_bytes(), 2 * GIB);
+
+        let waiting_registry = Arc::clone(&registry);
+        let (acquired, mut acquired_rx) = tokio::sync::mpsc::unbounded_channel();
+        let waiter = tokio::spawn(async move {
+            let guard = waiting_registry
+                .reserve_request("model", admission_request(1_024, 1_024))
+                .await
+                .unwrap();
+            acquired.send(guard).unwrap();
+        });
+        while registry.queued_waiter_count() != 1 {
+            tokio::task::yield_now().await;
+        }
+        assert!(acquired_rx.try_recv().is_err());
+        assert_eq!(registry.active_reservation_count("model"), 1);
+
+        drop(first);
+        let second = acquired_rx.recv().await.unwrap();
+        assert_eq!(registry.active_reservation_count("model"), 1);
+        drop(second);
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_admission_contention_is_strict_fifo() {
+        let registry = CapacityRegistry::new(["model".to_owned()]);
+        register(&registry, admission_facts("model"));
+        let first = registry
+            .reserve_request("model", admission_request(1_024, 1_024))
+            .await
+            .unwrap();
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut releases = Vec::new();
+        let mut tasks = Vec::new();
+        for order in [2_u8, 3] {
+            let waiting_registry = Arc::clone(&registry);
+            let order_tx = order_tx.clone();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            releases.push(release_tx);
+            tasks.push(tokio::spawn(async move {
+                let guard = waiting_registry
+                    .reserve_request("model", admission_request(1_024, 1_024))
+                    .await
+                    .unwrap();
+                order_tx.send(order).unwrap();
+                let _ = release_rx.await;
+                drop(guard);
+            }));
+            while registry.queued_waiter_count() != usize::from(order - 1) {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        drop(first);
+        assert_eq!(order_rx.recv().await, Some(2));
+        assert!(order_rx.try_recv().is_err());
+        releases.remove(0).send(()).unwrap();
+        assert_eq!(order_rx.recv().await, Some(3));
+        releases.remove(0).send(()).unwrap();
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_admission_dropping_queued_waiter_removes_it_and_wakes_progress() {
+        let registry = CapacityRegistry::new(["model".to_owned()]);
+        register(&registry, admission_facts("model"));
+        let first = registry
+            .reserve_request("model", admission_request(1_024, 1_024))
+            .await
+            .unwrap();
+        let waiting_registry = Arc::clone(&registry);
+        let cancelled = tokio::spawn(async move {
+            waiting_registry
+                .reserve_request("model", admission_request(1_024, 1_024))
+                .await
+        });
+        while registry.queued_waiter_count() != 1 {
+            tokio::task::yield_now().await;
+        }
+        let follower_registry = Arc::clone(&registry);
+        let (acquired_tx, mut acquired_rx) = tokio::sync::mpsc::unbounded_channel();
+        let follower = tokio::spawn(async move {
+            let guard = follower_registry
+                .reserve_request("model", admission_request(1_024, 1_024))
+                .await
+                .unwrap();
+            acquired_tx.send(guard).unwrap();
+        });
+        while registry.queued_waiter_count() != 2 {
+            tokio::task::yield_now().await;
+        }
+        cancelled.abort();
+        while registry.queued_waiter_count() != 1 {
+            tokio::task::yield_now().await;
+        }
+
+        drop(first);
+        let replacement = acquired_rx.recv().await.unwrap();
+        assert_eq!(registry.active_reservation_count("model"), 1);
+        drop(replacement);
+        follower.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_admission_dequeue_revalidates_pressure_generation_memory_and_cost() {
+        let registry = CapacityRegistry::new(["model".to_owned()]);
+        register(&registry, admission_facts("model"));
+        let initial = registry.snapshot("model").unwrap();
+        let first = registry
+            .reserve_request("model", admission_request(1_024, 1_024))
+            .await
+            .unwrap();
+        let waiting_registry = Arc::clone(&registry);
+        let waiter = tokio::spawn(async move {
+            waiting_registry
+                .reserve_request("model", admission_request(1_024, 1_024))
+                .await
+        });
+        while registry.queued_waiter_count() != 1 {
+            tokio::task::yield_now().await;
+        }
+
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Constrained,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+        registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 2 * GIB,
+            peak_bytes: 2 * GIB,
+            memory_limit_bytes: Some(10 * GIB),
+            metal_recommended_working_set_bytes: Some(10 * GIB),
+        });
+        drop(first);
+        let error = waiter.await.unwrap().unwrap_err();
+        let current = registry.snapshot("model").unwrap();
+        assert_eq!(current.pressure, MemoryPressure::Constrained);
+        assert_eq!(error.boot_id(), initial.boot_id);
+        assert_eq!(error.generation(), current.generation);
+        assert!(current.generation > initial.generation);
+        assert_eq!(registry.queued_waiter_count(), 0);
+        assert_eq!(registry.active_reservation_count("model"), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_admission_cache_reclamation_is_not_counted_before_acknowledgement() {
+        let registry = CapacityRegistry::new(["model".to_owned()]);
+        let mut model_facts = admission_facts("model");
+        model_facts.loaded_model_bytes = GIB;
+        model_facts.memory.active_bytes = GIB;
+        model_facts.memory.peak_bytes = GIB;
+        model_facts.prefix_cache_bytes_ceiling = 2 * GIB;
+        register(&registry, model_facts);
+        let request = admission_request(2_048, 2_048);
+        assert!(matches!(
+            registry.try_reserve_request("model", request),
+            RequestReservationAttempt::Rejected(_)
+        ));
+
+        assert!(registry.request_cache_reclamation(CacheReclamation::Prefix));
+        assert!(matches!(
+            registry.try_reserve_request("model", request),
+            RequestReservationAttempt::Rejected(_)
+        ));
+        assert_eq!(
+            effective_shared_ledger(&registry.lock())
+                .unwrap()
+                .prefix_cache_bytes,
+            2 * GIB
+        );
+        let plan = registry.cache_allocation_plan();
+        assert_eq!(plan.allocations[0].2, 0);
+        assert!(registry.publish_cache_allocation_revision(plan.revision));
+        assert_eq!(
+            effective_shared_ledger(&registry.lock())
+                .unwrap()
+                .prefix_cache_bytes,
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_admission_reclaimed_cache_stays_capped_until_final_guard_release() {
+        let registry = CapacityRegistry::new(["model".to_owned()]);
+        let mut model_facts = admission_facts("model");
+        model_facts.loaded_model_bytes = GIB;
+        model_facts.memory.active_bytes = GIB;
+        model_facts.memory.peak_bytes = GIB;
+        model_facts.prefix_cache_bytes_ceiling = 2 * GIB;
+        register(&registry, model_facts);
+        registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 2 * GIB,
+            peak_bytes: 2 * GIB,
+            memory_limit_bytes: Some(10 * GIB),
+            metal_recommended_working_set_bytes: Some(10 * GIB),
+        });
+        let mut request = admission_request(1_024, 1_024);
+        request.retained_growth_bytes = GIB;
+
+        assert!(registry.request_cache_reclamation(CacheReclamation::Prefix));
+        let reclaimed = registry.cache_allocation_plan();
+        assert!(registry.publish_cache_allocation_revision(reclaimed.revision));
+        let guard = registry.reserve_request("model", request).await.unwrap();
+
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Normal,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+        assert_eq!(
+            registry.cache_allocation_plan().allocations[0].2,
+            0,
+            "pressure publication cannot restore cache while reserved bytes are live"
+        );
+        assert!(matches!(
+            registry.try_reserve_request("model", request),
+            RequestReservationAttempt::Contended
+        ));
+
+        let waiting_registry = Arc::clone(&registry);
+        let follower =
+            tokio::spawn(async move { waiting_registry.reserve_request("model", request).await });
+        while registry.queued_waiter_count() != 1 {
+            assert!(!follower.is_finished(), "follower did not enter FIFO");
+            tokio::task::yield_now().await;
+        }
+        drop(guard);
+        let follower_guard = follower.await.unwrap().unwrap();
+        assert_eq!(
+            registry.cache_allocation_plan().allocations[0].2,
+            0,
+            "the FIFO handoff retains the reclaimed ceiling"
+        );
+        drop(follower_guard);
+        assert!(
+            registry.cache_allocation_plan().allocations[0].2 > 0,
+            "the ordinary ACK path may propose restoration after the final guard"
+        );
+    }
+
+    #[test]
+    fn capacity_admission_reclamation_preserves_detached_draining_cache_floor() {
+        let registry = CapacityRegistry::new(["model".to_owned()]);
+        let mut model_facts = admission_facts("model");
+        model_facts.memory.memory_limit_bytes = Some(16 * GIB);
+        model_facts.memory.metal_recommended_working_set_bytes = Some(16 * GIB);
+        model_facts.retained_bytes_ceiling = 2 * GIB;
+        model_facts.prefix_cache_bytes_ceiling = 2 * GIB;
+        register(&registry, model_facts);
+        let before = registry.cache_allocation_plan().allocations[0].clone();
+        let drain = registry.begin_drain("model").unwrap();
+
+        assert!(!registry.request_cache_reclamation(CacheReclamation::Prefix));
+        assert!(!registry.request_cache_reclamation(CacheReclamation::Retained));
+        assert_eq!(registry.cache_allocation_plan().allocations[0], before);
+        drop(drain);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_admission_guard_releases_on_success_error_and_unwind() {
+        let registry = CapacityRegistry::new(["model".to_owned()]);
+        register(&registry, admission_facts("model"));
+
+        for outcome in ["success", "error", "unwind"] {
+            let guard = registry
+                .reserve_request("model", admission_request(1_024, 1_024))
+                .await
+                .unwrap();
+            let worker_registry = Arc::clone(&registry);
+            let joined = tokio::task::spawn_blocking(move || {
+                let _guard = guard;
+                assert_eq!(worker_registry.active_reservation_count("model"), 1);
+                match outcome {
+                    "success" => Ok::<(), &'static str>(()),
+                    "error" => Err("engine error"),
+                    "unwind" => panic!("engine unwind"),
+                    _ => unreachable!(),
+                }
+            })
+            .await;
+            match outcome {
+                "success" => assert!(joined.unwrap().is_ok()),
+                "error" => assert!(joined.unwrap().is_err()),
+                "unwind" => assert!(joined.is_err()),
+                _ => unreachable!(),
+            }
+            assert_eq!(registry.active_reservation_count("model"), 0);
+            assert_eq!(registry.active_reservation_bytes(), 0);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_admission_drain_waits_for_worker_owned_reservations() {
+        let registry = CapacityRegistry::new(["model".to_owned()]);
+        register(&registry, admission_facts("model"));
+        let guard = registry
+            .reserve_request("model", admission_request(1_024, 1_024))
+            .await
+            .unwrap();
+        let drain = registry.begin_drain("model").unwrap();
+        let waiting_registry = Arc::clone(&registry);
+        let (drained_tx, mut drained_rx) = tokio::sync::mpsc::unbounded_channel();
+        let wait = tokio::spawn(async move {
+            waiting_registry
+                .wait_for_model_reservations(drain.model())
+                .await;
+            drained_tx.send(drain).unwrap();
+        });
+        assert!(drained_rx.try_recv().is_err());
+        drop(guard);
+        let drain = drained_rx.recv().await.unwrap();
+        registry.finish_unregister(drain, None).unwrap();
+        wait.await.unwrap();
+        assert_eq!(
+            registry.snapshot("model").unwrap().availability,
+            CapacityAvailability::Unavailable
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_admission_drain_rejects_queued_work_with_current_generation() {
+        let registry = CapacityRegistry::new(["model".to_owned()]);
+        register(&registry, admission_facts("model"));
+        let first = registry
+            .reserve_request("model", admission_request(1_024, 1_024))
+            .await
+            .unwrap();
+        let waiting_registry = Arc::clone(&registry);
+        let waiter = tokio::spawn(async move {
+            waiting_registry
+                .reserve_request("model", admission_request(1_024, 1_024))
+                .await
+        });
+        while registry.queued_waiter_count() != 1 {
+            tokio::task::yield_now().await;
+        }
+        let drain = registry.begin_drain("model").unwrap();
+        let generation = registry.snapshot("model").unwrap().generation;
+        let error = waiter.await.unwrap().unwrap_err();
+        assert!(matches!(error, CapacityAdmissionError::Unavailable(_)));
+        assert_eq!(error.generation(), generation);
+        assert_eq!(registry.queued_waiter_count(), 0);
+        drop(first);
+        drop(drain);
     }
 
     /// Omitting current MLX residency from load headroom admits a second model

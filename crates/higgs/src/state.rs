@@ -358,7 +358,8 @@ impl Engine {
             Self::Stub(stub)
                 if stub.name().starts_with("zero-prefix-")
                     || stub.name() == "blocking-required-post-admission-evicted"
-                    || stub.name() == "session-prefill-render-spy" =>
+                    || stub.name() == "session-prefill-render-spy"
+                    || stub.name() == "prompt-limit-mutation-spy" =>
             {
                 route_test_tokenizer()
             }
@@ -1223,6 +1224,34 @@ impl Engine {
                 stub.wait_cache_apply_gate().await;
                 stub.set_capacity_cache_limits(retained_bytes, prefix_bytes);
                 Ok(())
+            }
+        }
+    }
+
+    pub async fn reclaim_unleased_retained_for_capacity(
+        &self,
+        revision: u64,
+        prefix_bytes: u64,
+    ) -> Result<u64, EngineError> {
+        let prefix_limit = usize::try_from(prefix_bytes).map_err(|_| {
+            EngineError::Generation("prefix cache allocation exceeds platform usize".to_owned())
+        })?;
+        match self {
+            Self::Simple(engine) => {
+                u64::try_from(engine.reclaim_unleased_retained_for_capacity(prefix_limit))
+                    .map_err(|_| EngineError::Generation("retained cache size overflow".to_owned()))
+            }
+            Self::Batch(engine) => {
+                engine
+                    .apply_capacity_cache_limit(revision, prefix_limit)
+                    .await?;
+                Ok(0)
+            }
+            #[cfg(test)]
+            Self::Stub(stub) => {
+                stub.wait_cache_apply_gate().await;
+                stub.set_capacity_cache_limits(0, prefix_bytes);
+                Ok(0)
             }
         }
     }

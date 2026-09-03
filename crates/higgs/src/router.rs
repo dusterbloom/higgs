@@ -397,6 +397,43 @@ impl Router {
         }
     }
 
+    /// Admission-only retained reclamation. Each engine removes unleased
+    /// entries under its retained-cache lock and reports the leased residency
+    /// that must remain accounted before the registry publishes the ACK.
+    pub(crate) async fn apply_capacity_retained_reclamation(
+        &self,
+        capacity: &CapacityRegistry,
+    ) -> Result<(), String> {
+        let _serialized = self.cache_policy.lock().await;
+        loop {
+            let plan = capacity.cache_allocation_plan();
+            let engines = {
+                let loaded = self.engines_read();
+                plan.allocations
+                    .iter()
+                    .filter_map(|(name, _, prefix)| {
+                        loaded
+                            .get(name)
+                            .map(|entry| (name.clone(), Arc::clone(&entry.engine), *prefix))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut retained_floors = std::collections::BTreeMap::new();
+            for (name, engine, prefix) in engines {
+                let retained = engine
+                    .reclaim_unleased_retained_for_capacity(plan.revision, prefix)
+                    .await
+                    .map_err(|error| {
+                        format!("failed to reclaim retained cache for '{name}': {error}")
+                    })?;
+                retained_floors.insert(name, retained);
+            }
+            if capacity.acknowledge_retained_reclamation(plan.revision, &retained_floors) {
+                return Ok(());
+            }
+        }
+    }
+
     /// Atomically apply one current cache policy to the loaded set and a
     /// provisional engine, then expose that engine before a newer publisher
     /// can overtake it.

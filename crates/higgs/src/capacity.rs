@@ -15,6 +15,9 @@ pub use registry::{
     DrainRegistration, LoadCapacitySnapshot, ModelCapacityFacts, ModelContentIdentity,
     PublishedMemoryMeasurement, RegistrationError, RegistrationTicket, fingerprint_model_artifacts,
 };
+pub(crate) use registry::{
+    CacheReclamation, CapacityAdmissionError, RequestReservation, RequestReservationAttempt,
+};
 
 /// Owned process observer; server shutdown must consume and join it.
 #[must_use = "the process pressure observer must be stopped and joined"]
@@ -65,6 +68,219 @@ impl CapacityPressureObserver {
             return Ok(());
         };
         handle.stop().await.map_err(|error| error.to_string())
+    }
+}
+
+/// Reserve one exact post-tokenization request peak. Optional caches are
+/// reclaimed and acknowledged before a terminal capacity response; only
+/// individually safe requests blocked by live reservations enter the FIFO.
+pub(crate) async fn admit_generation_request(
+    state: &crate::state::SharedState,
+    model: &str,
+    execution_path: ExecutionPath,
+    prompt_tokens: usize,
+    output_tokens: u32,
+) -> Result<RequestReservation, crate::error::ServerError> {
+    #[cfg(test)]
+    ensure_route_test_capacity(state, model);
+    let generation = || {
+        state
+            .capacity
+            .snapshot(model)
+            .map(|snapshot| snapshot.generation)
+            .unwrap_or(0)
+    };
+    let unavailable = || {
+        crate::error::ServerError::CapacityUnavailable(CapacityUnavailableError::new(
+            state.capacity.boot_id(),
+            generation(),
+        ))
+    };
+    let prompt_tokens = u64::try_from(prompt_tokens).map_err(|_| unavailable())?;
+    let request = RequestCost {
+        execution_path,
+        prompt_tokens,
+        suffix_tokens: prompt_tokens,
+        output_tokens: u64::from(output_tokens),
+        retained_growth_bytes: 0,
+    };
+
+    let mut attempt = state.capacity.try_reserve_request(model, request);
+    for reclamation in [CacheReclamation::Prefix, CacheReclamation::Retained] {
+        if !matches!(attempt, RequestReservationAttempt::Rejected(_)) {
+            break;
+        }
+        if state.capacity.request_cache_reclamation(reclamation) {
+            match reclamation {
+                CacheReclamation::Prefix => {
+                    state
+                        .router
+                        .apply_capacity_cache_allocations(&state.capacity)
+                        .await
+                }
+                CacheReclamation::Retained => {
+                    state
+                        .router
+                        .apply_capacity_retained_reclamation(&state.capacity)
+                        .await
+                }
+            }
+            .map_err(|_| unavailable())?;
+            #[cfg(test)]
+            let memory = state.capacity.admission_test_memory().0;
+            #[cfg(not(test))]
+            let memory = MlxMemorySnapshot::measure().map_err(|_| unavailable())?;
+            state.capacity.refresh_memory_after_reclamation(memory);
+            attempt = state.capacity.try_reserve_request(model, request);
+        }
+    }
+
+    match attempt {
+        RequestReservationAttempt::Reserved(reservation) => Ok(reservation),
+        RequestReservationAttempt::Contended => state
+            .capacity
+            .reserve_request(model, request)
+            .await
+            .map_err(capacity_server_error),
+        RequestReservationAttempt::Rejected(error) => Err(capacity_server_error(error)),
+    }
+}
+
+#[cfg(test)]
+fn ensure_route_test_capacity(state: &crate::state::SharedState, model: &str) {
+    if state.capacity.snapshot(model).is_ok() {
+        return;
+    }
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let memory = MlxMemorySnapshot {
+        active_bytes: GIB,
+        peak_bytes: GIB,
+        memory_limit_bytes: Some(64 * GIB),
+        metal_recommended_working_set_bytes: Some(64 * GIB),
+    };
+    let facts = route_test_facts(model, memory, 1, 1_048_576);
+    state.capacity.refresh_memory(memory);
+    if let Ok(ticket) = state.capacity.begin_registration(model.to_owned())
+        && let Ok(active) = state.capacity.commit_active(ticket, facts)
+    {
+        active.publish();
+        let plan = state.capacity.cache_allocation_plan();
+        let _ = state
+            .capacity
+            .publish_cache_allocation_revision(plan.revision);
+    }
+}
+
+#[cfg(test)]
+fn route_test_facts(
+    model: &str,
+    memory: MlxMemorySnapshot,
+    persistent_bytes_per_token: u64,
+    token_ceiling: u64,
+) -> ModelCapacityFacts {
+    ModelCapacityFacts {
+        model: model.to_owned(),
+        model_fingerprint: format!("sha256:test-{model}"),
+        memory,
+        costs: EngineCostDescription {
+            fixed_live_session_bytes: 0,
+            persistent_bytes_per_token,
+            decode_workspace_bytes: 0,
+            transient_prefill: higgs_engine::TransientPrefillEstimate {
+                base_bytes: 0,
+                bytes_per_prompt_token: 0,
+                bytes_per_chunk_token: 0,
+                max_prompt_tokens: 1_048_576,
+                max_chunk_tokens: 4_096,
+            },
+        },
+        loaded_model_bytes: memory.active_bytes,
+        architectural_max_tokens: 1_048_576,
+        prefill_chunk_tokens: 1_024,
+        retained_session_tokens: 0,
+        retained_resident_bytes: 0,
+        prefix_cache_resident_bytes: 0,
+        retained_bytes_ceiling: 0,
+        prefix_cache_bytes_ceiling: 0,
+        cache_capabilities: CacheCapabilities {
+            retained_sessions: false,
+            prefix_cache: false,
+        },
+        configured_total_token_ceiling: Some(token_ceiling),
+        configured_output_token_ceiling: Some(token_ceiling),
+        quantization: "test".to_owned(),
+        execution_mode: "test".to_owned(),
+        kv_representation: "test".to_owned(),
+        prefill_model_identity: None,
+        drafter_identity: None,
+        learned_profile_key: None,
+        startup_headroom_bytes: 0,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn rejecting_route_test_state(
+    model: &str,
+) -> (
+    crate::state::SharedState,
+    std::sync::Arc<crate::state::Engine>,
+) {
+    use std::collections::HashMap;
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    let engine = std::sync::Arc::new(crate::state::Engine::test_stub(model));
+    let dir = tempfile::tempdir().expect("test config directory");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[provider.stub]\nurl = \"http://127.0.0.1:1\"\n").expect("test config");
+    let config = crate::config::load_config_file(&path, None).expect("load test config");
+    let router = crate::router::Router::from_config(
+        &config,
+        HashMap::from([(model.to_owned(), std::sync::Arc::clone(&engine))]),
+    )
+    .expect("test router");
+    let state = std::sync::Arc::new(crate::state::AppState::new(
+        router,
+        config,
+        reqwest::Client::new(),
+        None,
+    ));
+    let memory = MlxMemorySnapshot {
+        active_bytes: 2 * GIB,
+        peak_bytes: 2 * GIB,
+        memory_limit_bytes: Some(24 * GIB),
+        metal_recommended_working_set_bytes: Some(24 * GIB),
+    };
+    state.capacity.refresh_memory(memory);
+    let ticket = state
+        .capacity
+        .begin_registration(model.to_owned())
+        .expect("begin test registration");
+    let mut facts = route_test_facts(model, memory, MIB, 4_096);
+    facts.cache_capabilities.prefix_cache = true;
+    facts.prefix_cache_bytes_ceiling = GIB;
+    state
+        .capacity
+        .commit_active(ticket, facts)
+        .expect("commit test registration")
+        .publish();
+    let plan = state.capacity.cache_allocation_plan();
+    assert!(
+        state
+            .capacity
+            .publish_cache_allocation_revision(plan.revision)
+    );
+    (state, engine)
+}
+
+fn capacity_server_error(error: CapacityAdmissionError) -> crate::error::ServerError {
+    match error {
+        CapacityAdmissionError::Exceeded(error) => {
+            crate::error::ServerError::CapacityExceeded(error)
+        }
+        CapacityAdmissionError::Unavailable(error) => {
+            crate::error::ServerError::CapacityUnavailable(error)
+        }
     }
 }
 
@@ -195,6 +411,16 @@ impl CapacityExceededError {
             generation,
         }
     }
+
+    #[must_use]
+    pub fn boot_id(&self) -> &str {
+        &self.boot_id
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 /// Temporary inability to fit even the minimum working request.
@@ -219,6 +445,16 @@ impl CapacityUnavailableError {
             generation,
             retry_after_ms: CAPACITY_RETRY_AFTER_MS,
         }
+    }
+
+    #[must_use]
+    pub fn boot_id(&self) -> &str {
+        &self.boot_id
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
     }
 }
 

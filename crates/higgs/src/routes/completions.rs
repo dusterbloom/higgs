@@ -35,7 +35,7 @@ pub async fn completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<axum::response::Response, ServerError> {
-    let req: CompletionRequest = serde_json::from_slice(&body)
+    let mut req: CompletionRequest = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
     request_metrics.set_requested_model(&req.model);
 
@@ -58,6 +58,7 @@ pub async fn completions(
             routing_method,
             ..
         } => {
+            req.model.clone_from(&model_name);
             if req.stream == Some(true) {
                 let metrics = state.metrics.clone();
                 let stream = completions_stream(
@@ -67,7 +68,8 @@ pub async fn completions(
                     model_name,
                     metrics,
                     routing_method,
-                )?;
+                )
+                .await?;
                 let sse = Sse::new(stream).keep_alive(KeepAlive::default());
                 if state.metrics.is_some() {
                     request_metrics.mark_recorded();
@@ -165,10 +167,19 @@ async fn completions_non_streaming(
         .encode(req.prompt.as_str(), false)
         .map_err(|e| ServerError::BadRequest(format!("Tokenization error: {e}")))?;
     let prompt_tokens = encoding.get_ids().to_vec();
+    let reservation = crate::capacity::admit_generation_request(
+        &state,
+        &req.model,
+        crate::capacity::ExecutionPath::Cold,
+        prompt_tokens.len(),
+        max_tokens,
+    )
+    .await?;
 
     let tokenizer = engine.tokenizer().clone();
     let checkpoint_id = req.checkpoint_id.clone();
     let output = tokio::task::spawn_blocking(move || {
+        let _reservation = reservation;
         engine.generate(
             &prompt_tokens,
             max_tokens,
@@ -208,7 +219,7 @@ async fn completions_non_streaming(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn completions_stream(
+async fn completions_stream(
     state: SharedState,
     req: CompletionRequest,
     engine: Arc<Engine>,
@@ -228,6 +239,14 @@ fn completions_stream(
         .map_err(|e| ServerError::BadRequest(format!("Tokenization error: {e}")))?;
     let prompt_tokens = encoding.get_ids().to_vec();
     let input_token_count = u64::try_from(prompt_tokens.len()).unwrap_or(u64::MAX);
+    let reservation = crate::capacity::admit_generation_request(
+        &state,
+        &req.model,
+        crate::capacity::ExecutionPath::Cold,
+        prompt_tokens.len(),
+        max_tokens,
+    )
+    .await?;
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp();
@@ -237,6 +256,7 @@ fn completions_stream(
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
 
     tokio::task::spawn_blocking(move || {
+        let _reservation = reservation;
         let result = engine.generate_streaming(
             &prompt_tokens,
             max_tokens,
@@ -344,4 +364,42 @@ fn logprobs_to_response(
         })
         .collect();
     ChoiceLogprobs { content }
+}
+
+#[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn capacity_admission_rejects_both_completion_variants_before_worker_mutation() {
+        let model = "prompt-limit-mutation-spy";
+        let (state, engine) = crate::capacity::rejecting_route_test_state(model);
+        let request = |stream| {
+            serde_json::from_value::<CompletionRequest>(serde_json::json!({
+                "model": model,
+                "prompt": "hi",
+                "max_tokens": 5120,
+                "stream": stream
+            }))
+            .unwrap()
+        };
+
+        let blocking =
+            completions_non_streaming(Arc::clone(&state), request(false), Arc::clone(&engine))
+                .await;
+        assert!(matches!(blocking, Err(ServerError::CapacityExceeded(_))));
+        let streaming = completions_stream(
+            Arc::clone(&state),
+            request(true),
+            Arc::clone(&engine),
+            model.to_owned(),
+            None,
+            crate::router::RoutingMethod::Direct,
+        )
+        .await;
+        assert!(matches!(streaming, Err(ServerError::CapacityExceeded(_))));
+        assert!(engine.route_test_mutation_sequence().is_empty());
+        assert_eq!(state.capacity.active_reservation_count(model), 0);
+    }
 }

@@ -359,16 +359,6 @@ async fn chat_completions_non_streaming(
         .map_err(ServerError::Engine)?;
     validate_prompt_limit(req.max_prompt_tokens, prompt_tokens.len())?;
     validate_session_lease_ttl(req.session_lease.map(|lease| lease.ttl_seconds))?;
-    drop_requested_retained_sessions(
-        Arc::clone(&engine),
-        req.drop_session_id,
-        req.drop_session_ids.as_deref(),
-    )
-    .await?;
-    let lease_active = req
-        .session_lease
-        .is_some_and(|lease| engine.lease_retained_session(lease.session_id, lease.ttl_seconds));
-
     // Multimodal requests: hand the raw decoded images to the engine, which
     // preprocesses them into a family-native `ImageBatch` (SimpleEngine under
     // its model lock; BatchEngine inside its worker thread) and expands each
@@ -409,6 +399,27 @@ async fn chat_completions_non_streaming(
             req.session_id.unwrap_or_default(),
         ));
     }
+    let reservation = crate::capacity::admit_generation_request(
+        &state,
+        &req.model,
+        if session_id.is_some() {
+            crate::capacity::ExecutionPath::RetainedSuffix
+        } else {
+            crate::capacity::ExecutionPath::Cold
+        },
+        prompt_tokens.len(),
+        max_tokens,
+    )
+    .await?;
+    drop_requested_retained_sessions(
+        Arc::clone(&engine),
+        req.drop_session_id,
+        req.drop_session_ids.as_deref(),
+    )
+    .await?;
+    let lease_active = req
+        .session_lease
+        .is_some_and(|lease| engine.lease_retained_session(lease.session_id, lease.ttl_seconds));
 
     let request_id = generate_request_id();
     let allow_prefix_cache = req.cache_mode.as_deref() != Some("bypass");
@@ -424,6 +435,7 @@ async fn chat_completions_non_streaming(
         let sampling_c = sampling.clone();
         let pflash_policy_c = pflash_policy.clone();
         let session_output = tokio::task::spawn_blocking(move || {
+            let _reservation = reservation;
             engine_c.generate_session_routed_with_thinking(
                 sid,
                 &prompt_tokens_c,
@@ -452,6 +464,7 @@ async fn chat_completions_non_streaming(
         ));
     } else {
         tokio::task::spawn_blocking(move || {
+            let _reservation = reservation;
             engine.generate_with_thinking_and_pflash_policy_with_cache(
                 &prompt_tokens,
                 max_tokens,
@@ -809,16 +822,6 @@ async fn chat_completions_stream(
         .map_err(ServerError::Engine)?;
     validate_prompt_limit(req.max_prompt_tokens, prompt_tokens.len())?;
     validate_session_lease_ttl(req.session_lease.map(|lease| lease.ttl_seconds))?;
-    drop_requested_retained_sessions(
-        Arc::clone(&engine),
-        req.drop_session_id,
-        req.drop_session_ids.as_deref(),
-    )
-    .await?;
-    let lease_active = req
-        .session_lease
-        .is_some_and(|lease| engine.lease_retained_session(lease.session_id, lease.ttl_seconds));
-
     // Multimodal requests: hand the raw decoded images to the engine, which
     // preprocesses them into a family-native `ImageBatch` (SimpleEngine under
     // its model lock; BatchEngine inside its worker thread) and expands each
@@ -865,6 +868,27 @@ async fn chat_completions_stream(
             request_session_id.unwrap_or_default(),
         ));
     }
+    let reservation = crate::capacity::admit_generation_request(
+        &state,
+        &model,
+        if stream_session_id.is_some() {
+            crate::capacity::ExecutionPath::RetainedSuffix
+        } else {
+            crate::capacity::ExecutionPath::Cold
+        },
+        prompt_tokens.len(),
+        max_tokens,
+    )
+    .await?;
+    drop_requested_retained_sessions(
+        Arc::clone(&engine),
+        req.drop_session_id,
+        req.drop_session_ids.as_deref(),
+    )
+    .await?;
+    let lease_active = req
+        .session_lease
+        .is_some_and(|lease| engine.lease_retained_session(lease.session_id, lease.ttl_seconds));
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
     let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
@@ -891,6 +915,7 @@ async fn chat_completions_stream(
         let messages_c = messages.clone();
         let pflash_policy_c = pflash_policy.clone();
         tokio::task::spawn_blocking(move || {
+            let _reservation = reservation;
             let result = worker_engine.generate_session_routed_streaming_with_thinking(
                 sid,
                 &prompt_tokens,
@@ -919,6 +944,7 @@ async fn chat_completions_stream(
     } else {
         let worker_engine = Arc::clone(&engine);
         tokio::task::spawn_blocking(move || {
+            let _reservation = reservation;
             let result = worker_engine
                 .generate_streaming_with_thinking_and_pflash_policy_with_cache(
                     &prompt_tokens,
@@ -2665,5 +2691,45 @@ mod tests {
             msg.contains("does not support vision"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn capacity_admission_rejects_both_chat_variants_before_worker_mutation() {
+        let model = "prompt-limit-mutation-spy";
+        let (state, engine) = crate::capacity::rejecting_route_test_state(model);
+        let initial_memory_revision = state.capacity.admission_test_memory().1;
+        let request = |stream| {
+            serde_json::from_value::<ChatCompletionRequest>(serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 5120,
+                "drop_session_id": 7,
+                "session_lease": {"session_id": 8, "ttl_seconds": 60},
+                "stream": stream
+            }))
+            .unwrap()
+        };
+
+        let blocking = chat_completions_non_streaming(
+            Arc::clone(&state),
+            request(false),
+            Arc::clone(&engine),
+            GenerationDefaults::default(),
+        )
+        .await;
+        assert!(matches!(blocking, Err(ServerError::CapacityExceeded(_))));
+        let streaming = chat_completions_stream(
+            Arc::clone(&state),
+            request(true),
+            Arc::clone(&engine),
+            GenerationDefaults::default(),
+            None,
+            crate::router::RoutingMethod::Direct,
+        )
+        .await;
+        assert!(matches!(streaming, Err(ServerError::CapacityExceeded(_))));
+        assert!(engine.route_test_mutation_sequence().is_empty());
+        assert_eq!(state.capacity.active_reservation_count(model), 0);
+        assert!(state.capacity.admission_test_memory().1 > initial_memory_revision);
     }
 }

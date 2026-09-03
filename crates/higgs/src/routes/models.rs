@@ -480,6 +480,13 @@ async fn drain_and_drop(
 
 /// Poll until the detached engine reference is sole-owned, then drop it.
 async fn drain_in_background(mut engine: Arc<Engine>, capacity_drain: Option<CapacityDrain>) {
+    if let Some(drain) = capacity_drain.as_ref() {
+        drain
+            .state
+            .capacity
+            .wait_for_model_reservations(drain.registration.model())
+            .await;
+    }
     loop {
         match Arc::try_unwrap(engine) {
             Ok(owned) => {
@@ -1126,6 +1133,46 @@ mod tests {
         );
         assert_eq!(after.model_fingerprint, before.model_fingerprint);
         assert!(after.generation > before.generation);
+    }
+
+    #[tokio::test]
+    async fn capacity_admission_unload_waits_for_active_worker_reservation() {
+        let state = build_state("[local]\nallow_runtime_model_load = true\n", HashMap::new());
+        publish_test_engine(
+            &state,
+            "reserved".to_owned(),
+            Engine::test_stub("reserved"),
+            crate::config::GenerationDefaults::default(),
+            capacity_facts("reserved"),
+        )
+        .await
+        .unwrap();
+        let reservation = state
+            .capacity
+            .reserve_request(
+                "reserved",
+                crate::capacity::RequestCost {
+                    execution_path: crate::capacity::ExecutionPath::Cold,
+                    prompt_tokens: 1,
+                    suffix_tokens: 1,
+                    output_tokens: 1,
+                    retained_growth_bytes: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let unload_state = Arc::clone(&state);
+        let unload = tokio::spawn(async move {
+            unload_model(State(unload_state), Path("reserved".to_owned())).await
+        });
+        while state.router.contains_engine("reserved") {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        assert!(!unload.is_finished());
+        drop(reservation);
+        assert_eq!(unload.await.unwrap().unwrap(), StatusCode::NO_CONTENT);
+        assert_eq!(state.capacity.active_reservation_count("reserved"), 0);
     }
 
     #[tokio::test]

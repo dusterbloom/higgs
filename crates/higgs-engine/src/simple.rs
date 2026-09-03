@@ -1215,11 +1215,12 @@ struct RetentionMutation {
     oversized: bool,
 }
 
-/// Registry pressure intent for cache enforcement. Normal reductions preserve
-/// leases whenever unleased eviction is sufficient; both policies revoke the
-/// minimum remaining leases required to honor the hard process allocation.
+/// Registry pressure intent for cache enforcement. Admission reclamation may
+/// only evict unleased entries; ordinary policy reductions honor their hard
+/// allocation and therefore revoke the minimum remaining leases when needed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CachePressurePolicy {
+    Admission,
     Normal,
     Critical,
 }
@@ -1227,7 +1228,7 @@ pub enum CachePressurePolicy {
 fn enforce_retained_byte_limit(
     map: &mut std::collections::HashMap<u64, RetainedKv>,
     max_bytes: usize,
-    _policy: CachePressurePolicy,
+    policy: CachePressurePolicy,
 ) -> RetentionMutation {
     let now = std::time::Instant::now();
     let mut result = RetentionMutation::default();
@@ -1254,7 +1255,7 @@ fn enforce_retained_byte_limit(
             result.evicted = result.evicted.saturating_add(1);
         }
     }
-    while total > max_bytes {
+    while total > max_bytes && policy != CachePressurePolicy::Admission {
         let Some(id) = map
             .iter()
             .filter_map(|(&id, entry)| entry.lease_expires_at.map(|expiry| (id, expiry)))
@@ -4191,20 +4192,45 @@ impl SimpleEngine {
                 retained_bytes,
                 policy,
             );
-            self.cache_metrics.sessions_evicted.fetch_add(
-                u64::try_from(mutation.evicted).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
-            self.cache_metrics.expired_leases.fetch_add(
-                u64::try_from(mutation.expired_leases).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
-            self.cache_metrics.broken_leases.fetch_add(
-                u64::try_from(mutation.broken_leases).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
+            self.record_retention_mutation(mutation);
         }
         lock_or_recover(&self.prefix_cache).set_capacity_max_bytes(prefix_bytes);
+    }
+
+    /// Admission-only reclamation holds the retained-cache lock across lease
+    /// observation and eviction, so a concurrent lease cannot be invalidated
+    /// between a snapshot and the actual removal. The returned byte count is
+    /// the live leased floor the registry must acknowledge before retrying.
+    pub fn reclaim_unleased_retained_for_capacity(&self, prefix_bytes: usize) -> usize {
+        let (mutation, retained_bytes) = {
+            let mut retained = lock_or_recover(&self.retained);
+            let mutation =
+                enforce_retained_byte_limit(&mut retained, 0, CachePressurePolicy::Admission);
+            let retained_bytes = retained.values().fold(0usize, |sum, entry| {
+                sum.saturating_add(entry.state.estimated_bytes())
+            });
+            self.capacity_retained_bytes
+                .store(retained_bytes, Ordering::Release);
+            (mutation, retained_bytes)
+        };
+        self.record_retention_mutation(mutation);
+        lock_or_recover(&self.prefix_cache).set_capacity_max_bytes(prefix_bytes);
+        retained_bytes
+    }
+
+    fn record_retention_mutation(&self, mutation: RetentionMutation) {
+        self.cache_metrics.sessions_evicted.fetch_add(
+            u64::try_from(mutation.evicted).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.expired_leases.fetch_add(
+            u64::try_from(mutation.expired_leases).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.cache_metrics.broken_leases.fetch_add(
+            u64::try_from(mutation.broken_leases).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     /// Drop every entry in the radix prefix cache, forcing the next generation
@@ -16975,6 +17001,45 @@ mod tests {
         let mutation = enforce_retained_byte_limit(&mut retained, 0, CachePressurePolicy::Critical);
         assert_eq!(mutation.broken_leases, 1);
         assert!(!retained.contains_key(&1));
+    }
+
+    #[test]
+    fn admission_reclamation_evicts_only_unleased_retained_entries() {
+        use super::{CachePressurePolicy, RetainedKv, enforce_retained_byte_limit};
+        use crate::cache::paired::RetainedState;
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        let state =
+            || RetainedState::target_only_unchecked_for_test(validated_session_target(1), vec![1]);
+        let now = Instant::now();
+        let mut retained = HashMap::from([
+            (
+                1,
+                RetainedKv {
+                    state: state(),
+                    last_used: now,
+                    lease_expires_at: Some(now + Duration::from_secs(60)),
+                    source: super::RetainedPromptSource::GeneratedAssistantReplay,
+                },
+            ),
+            (
+                2,
+                RetainedKv {
+                    state: state(),
+                    last_used: now - Duration::from_secs(10),
+                    lease_expires_at: None,
+                    source: super::RetainedPromptSource::GeneratedAssistantReplay,
+                },
+            ),
+        ]);
+
+        let mutation =
+            enforce_retained_byte_limit(&mut retained, 0, CachePressurePolicy::Admission);
+        assert_eq!(mutation.evicted, 1);
+        assert_eq!(mutation.broken_leases, 0);
+        assert!(retained.contains_key(&1), "live lease is the ACK floor");
+        assert!(!retained.contains_key(&2));
     }
 
     #[test]
