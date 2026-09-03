@@ -228,6 +228,7 @@ impl PressureEventSource for TokioCadence {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 mod platform {
     use std::sync::{Arc, Mutex as StdMutex};
 
@@ -330,32 +331,186 @@ mod platform {
         }
     }
 
-    pub(crate) struct SystemVmCounters;
+    type PortReleaser = Box<dyn FnOnce(libc::mach_port_t) + Send>;
+
+    /// Owns the send right returned by mach_host_self and balances it exactly
+    /// once when the process-wide sampler shuts down.
+    struct OwnedHostPort {
+        raw: libc::mach_port_t,
+        releaser: Option<PortReleaser>,
+    }
+
+    impl OwnedHostPort {
+        #[allow(deprecated)]
+        fn acquire() -> Self {
+            unsafe extern "C" {
+                fn mach_port_deallocate(
+                    task: libc::mach_port_t,
+                    name: libc::mach_port_t,
+                ) -> libc::kern_return_t;
+            }
+
+            // SAFETY: mach_host_self returns one owned send right for this call.
+            let raw = unsafe { libc::mach_host_self() };
+            Self::with_releaser(
+                raw,
+                Box::new(move |host| {
+                    // SAFETY: `host` is the still-owned right returned above;
+                    // mach_task_self is borrowed and must not itself be released.
+                    let _ = unsafe { mach_port_deallocate(libc::mach_task_self(), host) };
+                }),
+            )
+        }
+
+        fn with_releaser(raw: libc::mach_port_t, releaser: PortReleaser) -> Self {
+            Self {
+                raw,
+                releaser: Some(releaser),
+            }
+        }
+    }
+
+    impl Drop for OwnedHostPort {
+        fn drop(&mut self) {
+            if let Some(releaser) = self.releaser.take() {
+                releaser(self.raw);
+            }
+        }
+    }
+
+    fn field_is_covered<T>(returned_count: libc::mach_msg_type_number_t, offset: usize) -> bool {
+        usize::try_from(returned_count)
+            .ok()
+            .and_then(|count| count.checked_mul(std::mem::size_of::<libc::integer_t>()))
+            .zip(offset.checked_add(std::mem::size_of::<T>()))
+            .is_some_and(|(returned_bytes, field_end)| returned_bytes >= field_end)
+    }
+
+    fn decode_vm_counters(
+        result: libc::kern_return_t,
+        returned_count: libc::mach_msg_type_number_t,
+        statistics: &libc::vm_statistics64,
+    ) -> Option<VmCounters> {
+        if result != libc::KERN_SUCCESS
+            || !field_is_covered::<u64>(
+                returned_count,
+                std::mem::offset_of!(libc::vm_statistics64, compressions),
+            )
+            || !field_is_covered::<u64>(
+                returned_count,
+                std::mem::offset_of!(libc::vm_statistics64, swapouts),
+            )
+        {
+            return None;
+        }
+        Some(VmCounters {
+            swap_outs: statistics.swapouts,
+            compressions: statistics.compressions,
+        })
+    }
+
+    pub(crate) struct SystemVmCounters {
+        host: OwnedHostPort,
+    }
+
+    impl SystemVmCounters {
+        pub(super) fn new() -> Self {
+            Self {
+                host: OwnedHostPort::acquire(),
+            }
+        }
+    }
 
     impl CounterSampler for SystemVmCounters {
-        #[allow(deprecated, unsafe_code)]
         fn sample(&mut self) -> Option<VmCounters> {
-            let mut statistics = std::mem::MaybeUninit::<libc::vm_statistics64>::uninit();
+            // Zero initialization makes the whole buffer valid even when Darwin
+            // returns an error or writes fewer integer_t slots than requested.
+            let mut statistics = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
             let mut count = libc::HOST_VM_INFO64_COUNT;
-            // SAFETY: The output buffer is exactly vm_statistics64 and count is initialized
-            // to the Darwin-declared HOST_VM_INFO64_COUNT. We assume init only on success.
+            // SAFETY: The output buffer is exactly vm_statistics64 and count is
+            // initialized to the Darwin-declared HOST_VM_INFO64_COUNT.
             let result = unsafe {
                 libc::host_statistics64(
-                    libc::mach_host_self(),
+                    self.host.raw,
                     libc::HOST_VM_INFO64,
                     statistics.as_mut_ptr().cast(),
                     &raw mut count,
                 )
             };
-            if result != libc::KERN_SUCCESS {
-                return None;
-            }
-            // SAFETY: A successful host_statistics64 call initialized the whole structure.
+            // SAFETY: The allocation started fully zeroed, so all fields remain
+            // initialized even if Darwin wrote only a prefix or returned failure.
             let statistics = unsafe { statistics.assume_init() };
-            Some(VmCounters {
-                swap_outs: statistics.swapouts,
-                compressions: statistics.compressions,
-            })
+            decode_vm_counters(result, count, &statistics)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        use super::{OwnedHostPort, decode_vm_counters, field_is_covered};
+
+        #[allow(unsafe_code)]
+        fn statistics_with_counters(compressions: u64, swapouts: u64) -> libc::vm_statistics64 {
+            // SAFETY: Every field in vm_statistics64 is an integer, for which
+            // the all-zero bit pattern is valid.
+            let mut statistics =
+                unsafe { std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed().assume_init() };
+            statistics.compressions = compressions;
+            statistics.swapouts = swapouts;
+            statistics
+        }
+
+        #[test]
+        fn decoder_requires_both_counter_fields_and_a_successful_call() {
+            let statistics = statistics_with_counters(7, 11);
+
+            assert_eq!(
+                decode_vm_counters(libc::KERN_SUCCESS, 27, &statistics),
+                None
+            );
+            assert_eq!(
+                decode_vm_counters(libc::KERN_SUCCESS, 31, &statistics),
+                None
+            );
+            assert_eq!(
+                decode_vm_counters(libc::KERN_SUCCESS, 32, &statistics),
+                Some(super::VmCounters {
+                    swap_outs: 11,
+                    compressions: 7,
+                })
+            );
+            assert_eq!(decode_vm_counters(5, 32, &statistics), None);
+        }
+
+        #[test]
+        fn returned_count_is_interpreted_as_integer_slots_for_each_field() {
+            let compressions = std::mem::offset_of!(libc::vm_statistics64, compressions);
+            let swapouts = std::mem::offset_of!(libc::vm_statistics64, swapouts);
+
+            assert!(!field_is_covered::<u64>(27, compressions));
+            assert!(field_is_covered::<u64>(28, compressions));
+            assert!(!field_is_covered::<u64>(31, swapouts));
+            assert!(field_is_covered::<u64>(32, swapouts));
+        }
+
+        #[test]
+        fn owned_host_port_releases_exactly_once() {
+            let releases = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&releases);
+            {
+                let _port = OwnedHostPort::with_releaser(
+                    41,
+                    Box::new(move |port| {
+                        assert_eq!(port, 41);
+                        observed.fetch_add(1, Ordering::Relaxed);
+                    }),
+                );
+            }
+            assert_eq!(releases.load(Ordering::Relaxed), 1);
         }
     }
 }
@@ -380,6 +535,12 @@ mod platform {
 
     pub(crate) struct SystemVmCounters;
 
+    impl SystemVmCounters {
+        pub(super) fn new() -> Self {
+            Self
+        }
+    }
+
     impl CounterSampler for SystemVmCounters {
         fn sample(&mut self) -> Option<VmCounters> {
             None
@@ -393,7 +554,7 @@ pub(crate) fn system_observer_config()
 -> PressureObserverConfig<SystemPressureSource, SystemVmCounters, TokioCadence> {
     PressureObserverConfig::new(
         SystemPressureSource,
-        SystemVmCounters,
+        SystemVmCounters::new(),
         TokioCadence::default(),
     )
 }
@@ -512,6 +673,68 @@ mod tests {
         assert_eq!(first.safe_total_tokens, floor_1024(initial * 50 / 100));
         assert_eq!(second, first);
         assert_eq!(first.availability, CapacityAvailability::Unavailable);
+    }
+
+    #[test]
+    fn critical_to_constrained_to_normal_recovers_without_another_downshift() {
+        let clock = TestClock::new();
+        let mut controller = CapacityController::with_clock(controller_inputs(), clock);
+        let critical = controller.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Critical,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+
+        let constrained = controller.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Constrained,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+        assert_eq!(constrained.safe_total_tokens, critical.safe_total_tokens);
+        assert_eq!(constrained.availability, CapacityAvailability::Available);
+
+        let normal = controller.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Normal,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+        assert_eq!(normal.safe_total_tokens, critical.safe_total_tokens);
+        assert_eq!(normal.availability, CapacityAvailability::Available);
+    }
+
+    #[test]
+    fn warning_critical_oscillation_does_not_ratchet_the_envelope() {
+        let clock = TestClock::new();
+        let mut controller = CapacityController::with_clock(controller_inputs(), clock);
+        controller.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Constrained,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+        let first_critical = controller.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Critical,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+
+        for _ in 0..3 {
+            let constrained = controller.apply_pressure_observation(PressureObservation {
+                pressure: MemoryPressure::Constrained,
+                swap_out_delta: 0,
+                compressor_delta: 0,
+            });
+            assert_eq!(
+                constrained.safe_total_tokens,
+                first_critical.safe_total_tokens
+            );
+            let critical = controller.apply_pressure_observation(PressureObservation {
+                pressure: MemoryPressure::Critical,
+                swap_out_delta: 0,
+                compressor_delta: 0,
+            });
+            assert_eq!(critical.safe_total_tokens, first_critical.safe_total_tokens);
+            assert_eq!(critical.availability, CapacityAvailability::Unavailable);
+        }
     }
 
     #[test]

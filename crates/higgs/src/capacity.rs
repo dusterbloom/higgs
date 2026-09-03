@@ -455,6 +455,7 @@ pub struct CapacityController<C: Clock = SystemClock> {
     decision: CapacityDecision,
     evidence: BTreeMap<u64, RuntimeBandEvidence>,
     last_swap_out_millis: Option<u64>,
+    strongest_pressure_since_normal: MemoryPressure,
 }
 
 impl CapacityController<SystemClock> {
@@ -467,6 +468,7 @@ impl CapacityController<SystemClock> {
 impl<C: Clock> CapacityController<C> {
     #[must_use]
     pub fn with_clock(inputs: CapacityInputs, clock: C) -> Self {
+        let initial_pressure = inputs.pressure;
         let mut controller = Self {
             inputs,
             clock,
@@ -474,6 +476,7 @@ impl<C: Clock> CapacityController<C> {
             decision: unavailable_decision(),
             evidence: BTreeMap::new(),
             last_swap_out_millis: None,
+            strongest_pressure_since_normal: initial_pressure,
         };
         controller.decision = controller.solve_static();
         controller
@@ -534,7 +537,33 @@ impl<C: Clock> CapacityController<C> {
         if effective_pressure == self.inputs.pressure {
             return self.decision;
         }
-        self.recompute_for_pressure(effective_pressure, None)
+        if effective_pressure == MemoryPressure::Normal {
+            self.strongest_pressure_since_normal = MemoryPressure::Normal;
+            return self.recompute_for_pressure(effective_pressure, None);
+        }
+        if pressure_severity(effective_pressure)
+            > pressure_severity(self.strongest_pressure_since_normal)
+        {
+            self.strongest_pressure_since_normal = effective_pressure;
+            return self.recompute_for_pressure(effective_pressure, None);
+        }
+
+        // Warning and critical use the same 30% protected reserve. Moving to a
+        // less severe state, or revisiting a severity already applied during the
+        // same pressure episode, updates availability without multiplying the
+        // already-downshifted token envelope again.
+        let previous_total = self.decision.safe_total_tokens;
+        let recomputed = self.recompute_for_pressure(effective_pressure, None);
+        let mut transition = self.decision_for_total(
+            previous_total,
+            recomputed.usable_bytes,
+            recomputed.recommended_output_tokens,
+        );
+        if effective_pressure == MemoryPressure::Critical {
+            transition.availability = CapacityAvailability::Unavailable;
+        }
+        self.decision = transition;
+        self.decision
     }
 
     #[must_use]
@@ -1064,6 +1093,14 @@ fn add_ten_percent_ceiling(bytes: u64) -> Option<u64> {
     let tenth = bytes / 10;
     let remainder = u64::from(bytes % 10 != 0);
     bytes.checked_add(tenth)?.checked_add(remainder)
+}
+
+const fn pressure_severity(pressure: MemoryPressure) -> u8 {
+    match pressure {
+        MemoryPressure::Normal => 0,
+        MemoryPressure::Constrained => 1,
+        MemoryPressure::Critical => 2,
+    }
 }
 
 #[cfg(test)]
