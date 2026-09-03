@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::future::{Future, IntoFuture};
 use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -11,13 +12,17 @@ use clap::Parser;
 
 use higgs::{
     build_router,
+    capacity::{ActiveRegistration, CapacityRegistry, start_capacity_pressure_observer},
     config::{
         self, Cli, Commands, ConfigAction, HiggsConfig, MetricsLogConfig, ServeArgs, StartArgs,
         StopArgs,
     },
     model_download, model_resolver,
     router::Router,
-    state::{AppState, Engine, build_engine},
+    state::{
+        AppState, Engine, build_engine_with_capacity, refresh_after_engine_drop,
+        release_failed_engine,
+    },
 };
 
 #[tokio::main]
@@ -187,9 +192,37 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
         );
     }
 
-    // Load all local models and build router
-    let engines = load_engines(&higgs_config)?;
-    let router = Router::from_config(&higgs_config, engines)?;
+    // One registry owns shared residency and pressure across every local model.
+    let capacity = CapacityRegistry::new_with_profile_dir(
+        higgs_config
+            .models
+            .iter()
+            .map(|model| model.name.clone().unwrap_or_else(|| model.path.clone())),
+        capacity_profile_dir(cli),
+    );
+
+    // Loaded models remain provisional until the router accepts the complete set.
+    let (engines, registrations) = load_engines(&higgs_config, &capacity)?;
+    let cleanup_engines = engines.clone();
+    let router = match Router::from_config(&higgs_config, engines) {
+        Ok(router) => router,
+        Err(error) => {
+            drop(registrations);
+            for engine in cleanup_engines.into_values() {
+                if let Ok(engine) = Arc::try_unwrap(engine)
+                    && let Err(shutdown_error) = engine.shutdown()
+                {
+                    tracing::warn!(%shutdown_error, "failed to join engine after router construction failure");
+                }
+            }
+            let _ = refresh_after_engine_drop(&capacity, "failed router construction");
+            return Err(error.into());
+        }
+    };
+    drop(cleanup_engines);
+    for registration in registrations {
+        registration.publish();
+    }
 
     // Validate timeout
     let timeout_secs = higgs_config.server.timeout;
@@ -214,16 +247,17 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
 
     // Create shared state
     let http_client = reqwest::Client::new();
-    let shared_state = Arc::new(AppState {
+    let shared_state = Arc::new(AppState::with_capacity_registry(
         router,
-        config: higgs_config,
+        higgs_config,
         http_client,
         metrics,
-    });
+        Arc::clone(&capacity),
+    ));
 
     // Build router with middleware
     let app = build_router(
-        shared_state,
+        Arc::clone(&shared_state),
         timeout_secs,
         api_key,
         rate_limit,
@@ -234,25 +268,44 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
     // Start server
     tracing::info!(addr = %bind_addr, "Starting server");
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    let pressure_observer = start_capacity_pressure_observer(shared_state).await?;
 
     // Write PID file after bind succeeds so it's never stale on bind errors
     higgs::daemon::write_pid_file(profile);
 
-    axum::serve(
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(higgs::daemon::await_shutdown_signal())
-    .await?;
-
+    .with_graceful_shutdown(higgs::daemon::await_shutdown_signal());
+    let (server_result, observer_result) =
+        await_server_then_stop(server, || pressure_observer.stop()).await;
+    let persist_result = capacity.persist_profiles();
     higgs::daemon::remove_pid_file(profile);
+    server_result?;
+    observer_result?;
+    persist_result?;
     Ok(())
+}
+
+fn capacity_profile_dir(cli: &Cli) -> PathBuf {
+    let config_path = cli.config.clone().unwrap_or_else(|| {
+        cli.profile
+            .as_deref()
+            .map_or_else(config::default_config_path, config::profile_config_path)
+    });
+    config_path
+        .parent()
+        .map_or_else(config::config_dir, Path::to_path_buf)
+        .join("capacity")
 }
 
 fn load_engines(
     config: &HiggsConfig,
-) -> Result<HashMap<String, Arc<Engine>>, Box<dyn std::error::Error>> {
-    let mut engines = HashMap::new();
+    capacity: &Arc<CapacityRegistry>,
+) -> Result<(HashMap<String, Arc<Engine>>, Vec<ActiveRegistration>), Box<dyn std::error::Error>> {
+    let mut engines: HashMap<String, Arc<Engine>> = HashMap::new();
+    let mut registrations = Vec::new();
 
     for model_cfg in &config.models {
         let model_path = &model_cfg.path;
@@ -275,20 +328,86 @@ fn load_engines(
         };
 
         tracing::info!(model = %model_path, resolved = %resolved.display(), "Loading model");
-        // nightly: dynamic-model-loading refactored engine construction into
-        // build_engine(); DFlash's draft_model wiring is carried inside it.
-        let (name, engine) = build_engine(&resolved, model_cfg, &config.local)?;
-        tracing::info!(model_name = %name, "Model loaded");
-
-        if engines.insert(name.clone(), Arc::new(engine)).is_some() {
+        let (name, engine, facts) =
+            build_engine_with_capacity(&resolved, model_cfg, config, capacity)?;
+        if engines.contains_key(&name) {
+            release_failed_engine(engine, capacity);
             return Err(format!(
                 "model name collision: two model paths resolve to the same name '{name}'"
             )
             .into());
         }
+        let ticket = match capacity.begin_registration(name.clone()) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                release_failed_engine(engine, capacity);
+                return Err(error.into());
+            }
+        };
+        let registration = match capacity.commit_active(ticket, facts) {
+            Ok(registration) => registration,
+            Err(error) => {
+                release_failed_engine(engine, capacity);
+                return Err(error.into());
+            }
+        };
+        let allocation = match capacity.snapshot(&name) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                drop(registration);
+                release_failed_engine(engine, capacity);
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = engine
+            .apply_capacity_cache_limits(allocation.retained_bytes, allocation.prefix_cache_bytes)
+        {
+            drop(registration);
+            release_failed_engine(engine, capacity);
+            return Err(format!("failed to apply cache allocation for '{name}': {error}").into());
+        }
+        for (loaded_name, loaded_engine) in &engines {
+            let allocation = match capacity.snapshot(loaded_name) {
+                Ok(allocation) => allocation,
+                Err(error) => {
+                    drop(registration);
+                    release_failed_engine(engine, capacity);
+                    return Err(error.into());
+                }
+            };
+            if let Err(error) = loaded_engine.apply_capacity_cache_limits(
+                allocation.retained_bytes,
+                allocation.prefix_cache_bytes,
+            ) {
+                drop(registration);
+                release_failed_engine(engine, capacity);
+                return Err(format!(
+                    "failed to apply cache allocation for '{loaded_name}': {error}"
+                )
+                .into());
+            }
+        }
+        tracing::info!(model_name = %name, "Model loaded");
+
+        engines.insert(name.clone(), Arc::new(engine));
+        registrations.push(registration);
     }
 
-    Ok(engines)
+    Ok((engines, registrations))
+}
+
+async fn await_server_then_stop<ServerFuture, Stop, StopFuture, ServerError>(
+    server: ServerFuture,
+    stop: Stop,
+) -> (Result<(), ServerError>, Result<(), String>)
+where
+    ServerFuture: IntoFuture<Output = Result<(), ServerError>>,
+    Stop: FnOnce() -> StopFuture,
+    StopFuture: Future<Output = Result<(), String>>,
+{
+    let server_result = server.into_future().await;
+    let observer_result = stop().await;
+    (server_result, observer_result)
 }
 
 fn ensure_local_runtime_ready(config: &HiggsConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -463,5 +582,23 @@ mod tests {
             select_latest_metallib_candidate(vec![(None, first), (None, second.clone())]);
 
         assert_eq!(selected, Some(second));
+    }
+
+    #[tokio::test]
+    async fn observer_stop_is_awaited_when_server_returns_error() {
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stopped);
+        let (server, observer) = await_server_then_stop(
+            async { Err::<(), _>("server failed") },
+            move || async move {
+                stop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<(), String>(())
+            },
+        )
+        .await;
+
+        assert_eq!(server, Err("server failed"));
+        assert_eq!(observer, Ok(()));
+        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

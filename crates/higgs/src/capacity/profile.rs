@@ -257,6 +257,77 @@ mod tests {
         settings_mismatch.execution_cache_fingerprint = "affine;kv=q8".into();
         assert_eq!(store.load(&settings_mismatch, 12 * GIB).unwrap(), None);
 
+        let mismatches = [
+            {
+                let mut key = profile_key();
+                key.hardware_identifier = "Mac99,1".into();
+                key
+            },
+            {
+                let mut key = profile_key();
+                key.physical_memory_bytes += GIB;
+                key
+            },
+            {
+                let mut key = profile_key();
+                key.os_version = "16.0".into();
+                key
+            },
+            {
+                let mut key = profile_key();
+                key.os_build = "different".into();
+                key
+            },
+            {
+                let mut key = profile_key();
+                key.backend_authority_bytes -= GIB;
+                key
+            },
+            {
+                let mut key = profile_key();
+                key.higgs_build = "different".into();
+                key
+            },
+            {
+                let mut key = profile_key();
+                key.model_fingerprint = "sha256:different".into();
+                key
+            },
+            {
+                let mut key = profile_key();
+                key.quantization = "4bit".into();
+                key
+            },
+            {
+                let mut key = profile_key();
+                key.execution_mode = "affine".into();
+                key
+            },
+            {
+                let mut key = profile_key();
+                key.kv_representation = "q8".into();
+                key
+            },
+            {
+                let mut key = profile_key();
+                key.prefill_model_identity = None;
+                key
+            },
+            {
+                let mut key = profile_key();
+                key.execution_cache_fingerprint = "different".into();
+                key
+            },
+            {
+                let mut key = profile_key();
+                key.drafter_identity = Some("draft-v2".into());
+                key
+            },
+        ];
+        for mismatch in mismatches {
+            assert_eq!(store.load(&mismatch, 12 * GIB).unwrap(), None);
+        }
+
         let mut wrong_schema = json;
         wrong_schema["schemaVersion"] = 2.into();
         std::fs::write(&path, serde_json::to_vec(&wrong_schema).unwrap()).unwrap();

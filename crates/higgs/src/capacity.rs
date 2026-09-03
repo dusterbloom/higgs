@@ -7,8 +7,36 @@ use serde::{Deserialize, Serialize};
 #[allow(dead_code)] // Task 5 attaches this completed lifecycle to AppState.
 pub(crate) mod pressure;
 mod profile;
+mod registry;
 
 pub use profile::{LearnedBandEvidence, LearnedProfile, LearnedProfileKey, LearnedProfileStore};
+pub use registry::{
+    ActiveRegistration, CapacityRegistry, DrainRegistration, ModelCapacityFacts,
+    ModelContentIdentity, RegistrationError, RegistrationTicket, fingerprint_model_artifacts,
+};
+
+/// Owned process observer; server shutdown must consume and join it.
+#[must_use = "the process pressure observer must be stopped and joined"]
+pub struct CapacityPressureObserver(Option<pressure::PressureObserverHandle>);
+
+pub async fn start_capacity_pressure_observer(
+    state: crate::state::SharedState,
+) -> Result<CapacityPressureObserver, String> {
+    pressure::system_observer_config()
+        .start(state)
+        .await
+        .map(|handle| CapacityPressureObserver(Some(handle)))
+        .map_err(|error| error.to_string())
+}
+
+impl CapacityPressureObserver {
+    pub async fn stop(mut self) -> Result<(), String> {
+        let Some(handle) = self.0.take() else {
+            return Ok(());
+        };
+        handle.stop().await.map_err(|error| error.to_string())
+    }
+}
 
 pub const CAPACITY_SCHEMA_VERSION: u32 = 1;
 pub const CAPACITY_RETRY_AFTER_MS: u64 = 5_000;
@@ -437,7 +465,7 @@ impl Clock for SystemClock {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct RuntimeBandEvidence {
     cold_high_water_bytes: u64,
     cold_replacement_qualified: bool,
@@ -466,6 +494,18 @@ impl CapacityController<SystemClock> {
 }
 
 impl<C: Clock> CapacityController<C> {
+    pub(crate) fn transactional_copy(&self) -> Self {
+        Self {
+            inputs: self.inputs,
+            clock: self.clock.clone(),
+            boot_id: self.boot_id.clone(),
+            decision: self.decision,
+            evidence: self.evidence.clone(),
+            last_swap_out_millis: self.last_swap_out_millis,
+            strongest_pressure_since_normal: self.strongest_pressure_since_normal,
+        }
+    }
+
     #[must_use]
     pub fn with_clock(inputs: CapacityInputs, clock: C) -> Self {
         let initial_pressure = inputs.pressure;

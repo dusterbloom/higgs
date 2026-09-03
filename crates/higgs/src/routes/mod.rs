@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod cache;
+pub mod capacity;
 pub mod chat;
 pub mod completions;
 pub mod embeddings;

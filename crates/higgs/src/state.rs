@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -6,7 +8,9 @@ use higgs_engine::cache::DiskPrefixCacheConfig;
 use higgs_engine::chat_template::{ChatMessage, ChatPromptMode};
 use higgs_engine::engine::{GenerationOutput, StreamingOutput};
 use higgs_engine::error::EngineError;
-use higgs_engine::mlx_tuning::{MlxRuntimeTuning, resolve_runtime_tuning};
+use higgs_engine::mlx_tuning::{
+    MlxRuntimeTuning, ModelFootprint, TransientPrefillEstimate, resolve_runtime_tuning,
+};
 use higgs_engine::simple::{
     CacheStats, PFlashPromptPolicy, PrefillCompressionMode as EnginePrefillCompressionMode,
     SessionContinuationPolicy, SessionGeneration, SessionPromptTracePayloadStats,
@@ -17,6 +21,13 @@ use higgs_models::SamplingParams;
 use higgs_models::turboquant::KvCacheConfig;
 use higgs_models::vision::{ImageBatch, ImageInput, VisionCapabilities, VisionError};
 
+use sha2::{Digest, Sha256};
+
+use crate::capacity::CapacityRegistry;
+use crate::capacity::{
+    CAPACITY_SCHEMA_VERSION, LearnedProfileKey, ModelCapacityFacts, ModelContentIdentity,
+    fingerprint_model_artifacts,
+};
 use crate::config::{
     HiggsConfig, LocalConfig, ModelConfig, PrefillCompressionMode, resolved_model_supports_batch,
     validate_pflash_settings,
@@ -47,6 +58,7 @@ pub struct RouteTestStub {
     mutations: std::sync::atomic::AtomicU64,
     mutation_sequence: std::sync::Mutex<Vec<String>>,
     retained_sessions: std::sync::Mutex<std::collections::HashSet<u64>>,
+    capacity_cache_limits: std::sync::Mutex<(u64, u64)>,
 }
 
 #[cfg(test)]
@@ -57,6 +69,7 @@ impl RouteTestStub {
             mutations: std::sync::atomic::AtomicU64::new(0),
             mutation_sequence: std::sync::Mutex::new(Vec::new()),
             retained_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
+            capacity_cache_limits: std::sync::Mutex::new((0, 0)),
         }
     }
 
@@ -119,6 +132,14 @@ impl RouteTestStub {
     fn mutation_sequence(&self) -> Vec<String> {
         self.mutation_sequence.lock().unwrap().clone()
     }
+
+    fn set_capacity_cache_limits(&self, retained_bytes: u64, prefix_bytes: u64) {
+        *self.capacity_cache_limits.lock().unwrap() = (retained_bytes, prefix_bytes);
+    }
+
+    fn capacity_cache_limits(&self) -> (u64, u64) {
+        *self.capacity_cache_limits.lock().unwrap()
+    }
 }
 
 #[cfg(test)]
@@ -152,6 +173,11 @@ fn gpu_gate() -> std::sync::MutexGuard<'static, ()> {
     GPU_GATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn with_serialized_mlx_load<T>(operation: impl FnOnce() -> T) -> T {
+    let _gpu = gpu_gate();
+    operation()
 }
 
 /// Unified engine interface wrapping either the simple (serialized) or batch
@@ -242,6 +268,14 @@ impl Engine {
         match self {
             Self::Stub(stub) => stub.mutation_count(),
             _ => 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn route_test_capacity_cache_limits(&self) -> (u64, u64) {
+        match self {
+            Self::Stub(stub) => stub.capacity_cache_limits(),
+            _ => (0, 0),
         }
     }
 
@@ -1105,6 +1139,49 @@ impl Engine {
             Self::Stub(_) => Ok(Vec::new()),
         }
     }
+
+    /// Apply the process registry's effective cache allocation. Batch engines
+    /// acknowledge the worker-side eviction before this returns.
+    pub fn apply_capacity_cache_limits(
+        &self,
+        retained_bytes: u64,
+        prefix_bytes: u64,
+    ) -> Result<(), EngineError> {
+        let retained_limit = usize::try_from(retained_bytes).map_err(|_| {
+            EngineError::Generation("retained cache allocation exceeds platform usize".to_owned())
+        })?;
+        let prefix_limit = usize::try_from(prefix_bytes).map_err(|_| {
+            EngineError::Generation("prefix cache allocation exceeds platform usize".to_owned())
+        })?;
+        match self {
+            Self::Simple(engine) => {
+                engine.apply_capacity_cache_limits(retained_limit, prefix_limit);
+                Ok(())
+            }
+            Self::Batch(engine) => engine.apply_capacity_cache_limit(prefix_limit),
+            #[cfg(test)]
+            Self::Stub(stub) => {
+                stub.set_capacity_cache_limits(retained_bytes, prefix_bytes);
+                Ok(())
+            }
+        }
+    }
+
+    /// Destroy any worker-owned model before allocator cleanup/measurement.
+    pub fn shutdown(self) -> Result<(), EngineError> {
+        match self {
+            Self::Batch(engine) => (*engine).shutdown(),
+            Self::Simple(engine) => {
+                drop(engine);
+                Ok(())
+            }
+            #[cfg(test)]
+            Self::Stub(engine) => {
+                drop(engine);
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Build an engine from an already-resolved model directory and its config.
@@ -1164,6 +1241,515 @@ pub fn build_engine(
     Ok((name, engine))
 }
 
+/// Build one engine while capturing exact artifact identity and serialized MLX residency.
+pub fn build_engine_with_capacity(
+    resolved: &Path,
+    model_cfg: &ModelConfig,
+    config: &HiggsConfig,
+    capacity: &CapacityRegistry,
+) -> Result<(String, Engine, ModelCapacityFacts), String> {
+    let identity = fingerprint_model_artifacts(resolved)
+        .map_err(|error| format!("failed to fingerprint model artifacts: {error}"))?;
+    let (name, engine, before, after) = with_serialized_mlx_load(|| {
+        let before = higgs_engine::MlxMemorySnapshot::measure()
+            .map_err(|error| format!("failed to measure MLX before model load: {error}"))?;
+        let (name, engine) = match build_engine(resolved, model_cfg, &config.local) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                higgs_engine::simple::maybe_clear_mlx_cache(true, "failed model load");
+                if let Ok(memory) = higgs_engine::MlxMemorySnapshot::measure() {
+                    capacity.refresh_memory(memory);
+                }
+                return Err(error);
+            }
+        };
+        let after = match higgs_engine::MlxMemorySnapshot::measure() {
+            Ok(memory) => memory,
+            Err(error) => {
+                if let Err(shutdown_error) = engine.shutdown() {
+                    tracing::warn!(%shutdown_error, "failed to join engine after load measurement failure");
+                }
+                higgs_engine::simple::maybe_clear_mlx_cache(true, "failed model load measurement");
+                if let Ok(memory) = higgs_engine::MlxMemorySnapshot::measure() {
+                    capacity.refresh_memory(memory);
+                }
+                return Err(format!("failed to measure MLX after model load: {error}"));
+            }
+        };
+        Ok((name, engine, before, after))
+    })?;
+    let facts = match build_capacity_facts_from_measurements(
+        &name, resolved, model_cfg, config, identity, before, after,
+    ) {
+        Ok(facts) => facts,
+        Err(error) => {
+            release_failed_engine(engine, capacity);
+            return Err(error);
+        }
+    };
+    Ok((name, engine, facts))
+}
+
+#[doc(hidden)]
+pub fn release_failed_engine(engine: Engine, capacity: &CapacityRegistry) {
+    #[cfg(test)]
+    if matches!(engine, Engine::Stub(_)) {
+        drop(engine);
+        return;
+    }
+    with_serialized_mlx_load(|| {
+        if let Err(error) = engine.shutdown() {
+            tracing::warn!(%error, "failed to join engine during failed publication cleanup");
+        }
+        refresh_after_engine_drop_locked(capacity, "failed model publication");
+    });
+}
+
+#[doc(hidden)]
+pub fn refresh_after_engine_drop(
+    capacity: &CapacityRegistry,
+    reason: &'static str,
+) -> Option<higgs_engine::MlxMemorySnapshot> {
+    #[cfg(test)]
+    {
+        let _ = (capacity, reason);
+        None
+    }
+    #[cfg(not(test))]
+    with_serialized_mlx_load(|| refresh_after_engine_drop_locked(capacity, reason))
+}
+
+pub(crate) fn measure_after_engine_drop(
+    reason: &'static str,
+) -> Option<higgs_engine::MlxMemorySnapshot> {
+    #[cfg(test)]
+    {
+        // Unit-test stub engines do not initialize an MLX allocator; entering
+        // its Objective-C cleanup path would raise an uncatchable foreign
+        // exception. Integration/release builds always execute the real seam.
+        let _ = reason;
+        None
+    }
+    #[cfg(not(test))]
+    with_serialized_mlx_load(|| measure_after_engine_drop_locked(reason))
+}
+
+fn refresh_after_engine_drop_locked(
+    capacity: &CapacityRegistry,
+    reason: &'static str,
+) -> Option<higgs_engine::MlxMemorySnapshot> {
+    let memory = measure_after_engine_drop_locked(reason)?;
+    capacity.refresh_memory(memory);
+    Some(memory)
+}
+
+fn measure_after_engine_drop_locked(
+    reason: &'static str,
+) -> Option<higgs_engine::MlxMemorySnapshot> {
+    higgs_engine::simple::maybe_clear_mlx_cache(true, reason);
+    higgs_engine::MlxMemorySnapshot::measure().ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_capacity_facts_from_measurements(
+    name: &str,
+    resolved: &Path,
+    model_cfg: &ModelConfig,
+    config: &HiggsConfig,
+    identity: ModelContentIdentity,
+    before: higgs_engine::MlxMemorySnapshot,
+    after: higgs_engine::MlxMemorySnapshot,
+) -> Result<ModelCapacityFacts, String> {
+    const MIB: u64 = 1024 * 1024;
+    let footprint = ModelFootprint::from_load_measurements(resolved, before, after)
+        .ok_or_else(|| "model residency or artifact measurement was invalid".to_owned())?;
+    let model_json = std::fs::read(resolved.join("config.json"))
+        .map_err(|error| format!("failed to read model config for capacity: {error}"))?;
+    let model_json: serde_json::Value = serde_json::from_slice(&model_json)
+        .map_err(|error| format!("failed to parse model config for capacity: {error}"))?;
+    let architectural_max_tokens = config_u64(&model_json, "max_position_embeddings")
+        .ok_or_else(|| "model config lacks max_position_embeddings".to_owned())?;
+    let tuning = resolve_runtime_tuning(resolved, model_cfg.requested_mlx_profile(&config.local));
+    let prefill_chunk_tokens = u64::try_from(tuning.chunked_prefill_chunk_size())
+        .map_err(|_| "prefill chunk size is negative".to_owned())?;
+    let transient_base = (identity.artifact_bytes / 3).max(512 * MIB);
+    let transient = TransientPrefillEstimate {
+        base_bytes: transient_base,
+        bytes_per_prompt_token: 0,
+        bytes_per_chunk_token: 0,
+        max_prompt_tokens: architectural_max_tokens,
+        max_chunk_tokens: prefill_chunk_tokens,
+    };
+    let costs = higgs_engine::EngineCostDescription::fp16_from_model_dir(
+        resolved,
+        256 * MIB,
+        256 * MIB,
+        transient,
+    )
+    .ok_or_else(|| "model config lacks safe KV geometry".to_owned())?;
+    let quantize_json = read_optional_json(&resolved.join("quantize_config.json"))?;
+    let quantization = quantize_json
+        .as_ref()
+        .or_else(|| model_json.get("quantization"))
+        .or_else(|| model_json.get("quantization_config"))
+        .map_or_else(|| "unquantized".to_owned(), serde_json::Value::to_string);
+    let quantization_mode = model_json
+        .get("quantization")
+        .and_then(|value| value.get("mode"))
+        .and_then(serde_json::Value::as_str);
+    let is_eschamoe = higgs_models::eschamoe::is_eschamoe_checkpoint(resolved)
+        .map_err(|error| format!("failed to identify model execution mode: {error}"))?;
+    let weight_execution = if is_eschamoe && higgs_models::eschamoe::native_mode() {
+        "eschamoe-native"
+    } else if is_eschamoe {
+        "eschamoe-affine"
+    } else {
+        quantization_mode.unwrap_or("standard")
+    };
+    let execution_mode = format!(
+        "{}:{weight_execution}",
+        if model_cfg.batch { "batch" } else { "simple" }
+    );
+    let kv_representation = match model_cfg.kv_cache {
+        higgs_models::turboquant::KvCacheMode::Off => "fp16".to_owned(),
+        higgs_models::turboquant::KvCacheMode::Turboquant => format!(
+            "turboquant:k{}:v{}:dense{}",
+            model_cfg
+                .kv_key_bits
+                .unwrap_or(model_cfg.kv_bits.saturating_sub(1)),
+            model_cfg.kv_value_bits.unwrap_or(model_cfg.kv_bits),
+            model_cfg.kv_adaptive_dense_layers
+        ),
+    };
+    let prefill_model_identity = optional_artifact_identity(model_cfg.prefill_drafter.as_deref())?;
+    let effective_drafter_path = model_cfg
+        .draft_model
+        .clone()
+        .or_else(|| std::env::var("HIGGS_DFLASH_PATH").ok());
+    let drafter_identity = optional_artifact_identity(effective_drafter_path.as_deref())?;
+    let startup_headroom_bytes = smaller_nonzero_memory_authority(before)
+        .map_or(0, |authority| authority.saturating_sub(before.active_bytes));
+    let learned_profile_key = learned_profile_key(
+        model_cfg,
+        config,
+        &tuning,
+        &identity.fingerprint,
+        &quantization,
+        &execution_mode,
+        &kv_representation,
+        prefill_model_identity.clone(),
+        drafter_identity.clone(),
+        is_eschamoe,
+        after,
+    );
+
+    Ok(ModelCapacityFacts {
+        model: name.to_owned(),
+        model_fingerprint: identity.fingerprint,
+        memory: after,
+        costs,
+        loaded_model_bytes: footprint.loaded_mlx_bytes,
+        architectural_max_tokens,
+        prefill_chunk_tokens,
+        retained_session_tokens: u64::try_from(model_cfg.kv_max_session_tokens)
+            .map_err(|_| "retained-session token ceiling overflows u64".to_owned())?,
+        retained_resident_bytes: 0,
+        prefix_cache_resident_bytes: 0,
+        retained_bytes_ceiling: u64::try_from(model_cfg.kv_max_retained_bytes)
+            .map_err(|_| "retained byte ceiling overflows u64".to_owned())?,
+        prefix_cache_bytes_ceiling: u64::try_from(model_cfg.kv_cache_bytes)
+            .map_err(|_| "prefix-cache byte ceiling overflows u64".to_owned())?,
+        configured_total_token_ceiling: None,
+        configured_output_token_ceiling: Some(u64::from(config.server.max_tokens)),
+        quantization,
+        execution_mode,
+        kv_representation,
+        prefill_model_identity,
+        drafter_identity,
+        learned_profile_key,
+        startup_headroom_bytes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn learned_profile_key(
+    model_cfg: &ModelConfig,
+    config: &HiggsConfig,
+    tuning: &MlxRuntimeTuning,
+    model_fingerprint: &str,
+    quantization: &str,
+    execution_mode: &str,
+    kv_representation: &str,
+    prefill_model_identity: Option<String>,
+    drafter_identity: Option<String>,
+    is_eschamoe: bool,
+    memory: higgs_engine::MlxMemorySnapshot,
+) -> Option<LearnedProfileKey> {
+    let platform = platform_identity()?;
+    let backend_authority_bytes = smaller_nonzero_memory_authority(memory)?;
+    let higgs_build = executable_build_identity()?;
+    let runtime_environment = resolved_capacity_environment(model_cfg, is_eschamoe);
+    let settings = serde_json::json!({
+        "capacitySchema": CAPACITY_SCHEMA_VERSION,
+        "batch": model_cfg.batch,
+        "raiseWiredLimit": config.local.raise_wired_limit,
+        "requestedMlxProfile": format!("{:?}", tuning.requested_profile()),
+        "resolvedMlxProfile": format!("{:?}", tuning.resolved_profile()),
+        "chunkedPrefillThreshold": tuning.chunked_prefill_threshold(),
+        "chunkedPrefillChunkSize": tuning.chunked_prefill_chunk_size(),
+        "clearCacheAfterPrefill": tuning.clear_cache_after_prefill(),
+        "enableMtp": tuning.enable_mtp(),
+        "mtpDraftNMax": tuning.mtp_draft_n_max(),
+        "pagedKvTargetBytes": tuning.paged_kv_target_bytes(),
+        "prefillYieldTokens": model_cfg.prefill_yield_tokens,
+        "prefillCompression": format!("{:?}", model_cfg.prefill_compression),
+        "prefillThreshold": model_cfg.prefill_threshold,
+        "prefillKeepRatioBits": model_cfg.prefill_keep_ratio.to_bits(),
+        "prefillChunk": model_cfg.prefill_chunk,
+        "prefillAvgpool": model_cfg.prefill_avgpool,
+        "prefillLookahead": model_cfg.prefill_lookahead,
+        "prefillScoreMode": format!("{:?}", model_cfg.prefill_score_mode),
+        "prefillExitLayer": model_cfg.prefill_exit_layer,
+        "prefillKeepRatioMaxBits": model_cfg.prefill_keep_ratio_max.to_bits(),
+        "prefillMaxAutoRatioBits": model_cfg.prefill_max_auto_prefill_ratio.to_bits(),
+        "prefillPlanCache": model_cfg.prefill_plan_cache,
+        "prefillPlanCacheEntries": model_cfg.prefill_plan_cache_entries,
+        "prefillSuffixIdentityThreshold": model_cfg.prefill_suffix_identity_threshold,
+        "diskCacheEnabled": model_cfg.disk_cache_enabled,
+        "maxDiskBlocks": model_cfg.max_disk_blocks,
+        "minTokensToPersist": model_cfg.min_tokens_to_persist,
+        "kvMaxSessions": model_cfg.kv_max_sessions,
+        "kvMaxSessionTokens": model_cfg.kv_max_session_tokens,
+        "kvRetainedIdleSecs": model_cfg.kv_retained_idle_secs,
+        "kvMaxRetainedBytes": model_cfg.kv_max_retained_bytes,
+        "kvMaxSuffixPrefillTokens": model_cfg.kv_max_suffix_prefill_tokens,
+        "kvCacheBytes": model_cfg.kv_cache_bytes,
+        "kvDiskSpaceMb": model_cfg.kv_disk_space_mb,
+        "runtimeEnvironment": runtime_environment,
+    });
+    let execution_cache_fingerprint = sha256_identity(
+        b"higgs:capacity-execution-cache:v1\0",
+        serde_json::to_vec(&settings).ok()?.as_slice(),
+    );
+    Some(LearnedProfileKey {
+        hardware_identifier: platform.hardware_identifier,
+        physical_memory_bytes: platform.physical_memory_bytes,
+        os_version: platform.os_version,
+        os_build: platform.os_build,
+        backend_authority_bytes,
+        higgs_build,
+        model_fingerprint: model_fingerprint.to_owned(),
+        quantization: quantization.to_owned(),
+        execution_mode: execution_mode.to_owned(),
+        kv_representation: kv_representation.to_owned(),
+        prefill_model_identity,
+        execution_cache_fingerprint,
+        drafter_identity,
+    })
+}
+
+fn resolved_capacity_environment(model_cfg: &ModelConfig, is_eschamoe: bool) -> serde_json::Value {
+    resolved_capacity_environment_with(model_cfg, is_eschamoe, |name| std::env::var(name).ok())
+}
+
+fn resolved_capacity_environment_with(
+    model_cfg: &ModelConfig,
+    is_eschamoe: bool,
+    env: impl Fn(&str) -> Option<String>,
+) -> serde_json::Value {
+    let flag = |name: &str, default: bool| {
+        env(name)
+            .as_deref()
+            .and_then(parse_enabled_flag)
+            .unwrap_or(default)
+    };
+    let nonzero = |name: &str, default: bool| env(name).map_or(default, |value| value != "0");
+    let optional_usize =
+        |name: &str| env(name).and_then(|value| value.trim().parse::<usize>().ok());
+    let dflash_verify_mode = env("HIGGS_DFLASH_VERIFY_MODE")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .map_or("default", |value| match value.as_str() {
+            "block" | "batched" | "batched-tape" => "batched_tape",
+            "canonical" | "sequential" | "s1" => "canonical_s1",
+            _ => "canonical_s1",
+        });
+    let prompt_defaults = higgs_engine::mtp::PromptLookupConfig::default();
+    let dflash_confidence_bits = env("HIGGS_DFLASH_CONF_TRUNC")
+        .map_or(Some(0.5_f32), |value| {
+            value
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|threshold| *threshold > 0.0 && *threshold <= 1.0)
+        })
+        .map(f32::to_bits);
+    let mla_latent =
+        higgs_models::cache::resolve_mla_latent_cache(model_cfg.mla_latent_cache.unwrap_or(false));
+    serde_json::json!({
+        "eschamoeNative": is_eschamoe && higgs_models::eschamoe::native_mode(),
+        "eschamoeTrellisGemm": is_eschamoe && higgs_models::eschamoe::trellis_gemm_mode(),
+        "eschamoeQgemmSimd": is_eschamoe && higgs_models::eschamoe::qgemm_simd_mode(),
+        "mlaLatentCache": mla_latent,
+        "prefixCache": flag("HIGGS_PREFIX_CACHE", true),
+        "experimentalPagedKv": flag("HIGGS_EXPERIMENTAL_PAGED_KV", false),
+        "promptLookup": flag("HIGGS_PROMPT_LOOKUP", false),
+        "promptLookupUnchecked": flag("HIGGS_PROMPT_LOOKUP_UNCHECKED", false),
+        "promptLookupDraftMax": optional_usize("HIGGS_PROMPT_LOOKUP_DRAFT_N_MAX").unwrap_or(prompt_defaults.max_drafts),
+        "promptLookupNgramMax": optional_usize("HIGGS_PROMPT_LOOKUP_NGRAM_MAX").unwrap_or(prompt_defaults.max_ngram),
+        "promptLookupWindow": optional_usize("HIGGS_PROMPT_LOOKUP_WINDOW").unwrap_or(prompt_defaults.max_window),
+        "pflashFullScoreMaxTokens": higgs_engine::simple::resolve_pflash_full_score_max_tokens(env("HIGGS_PREFLASH_FULL_SCORE_MAX_TOKENS").as_deref()),
+        "pflashMinimumFreeMb": higgs_engine::simple::resolve_pflash_min_free_memory_mb(env("HIGGS_PREFLASH_MIN_FREE_MB").as_deref()),
+        "mtpAdaptiveDraft": flag("HIGGS_MTP_ADAPTIVE_DRAFT", false),
+        "mtpPromptLookup": flag("HIGGS_MTP_PROMPT_LOOKUP", false),
+        "mtpPrimePrefill": flag("HIGGS_MTP_PRIME_PREFILL", true),
+        "dflashBlockSize": higgs_engine::simple::resolve_dflash_block_size_override(env("HIGGS_DFLASH_BLOCK_SIZE").as_deref()),
+        "dsparkDraftCapOverride": higgs_engine::simple::resolve_dspark_draft_cap_override(env("HIGGS_DSPARK_DRAFT_CAP").as_deref()),
+        "dflashVerifyMode": dflash_verify_mode,
+        "dflashTargetHead": nonzero("HIGGS_DSPARK_TARGET_HEAD", false),
+        "dflashAdaptive": nonzero("HIGGS_DFLASH_ADAPTIVE", true),
+        "dflashGate": nonzero("HIGGS_DFLASH_GATE", true),
+        "dflashMinimumBlock": higgs_engine::simple::resolve_dflash_min_block_override(env("HIGGS_DFLASH_MIN_BLOCK").as_deref()),
+        "dflashConfidenceBits": dflash_confidence_bits,
+        "dflashFusedConvolution": flag("HIGGS_DFLASH_FUSED_CONV", false),
+        "dflashGdnConfigCache": flag("HIGGS_DFLASH_GDN_CONFIG_CACHE", false),
+    })
+}
+
+fn parse_enabled_flag(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn smaller_nonzero_memory_authority(memory: higgs_engine::MlxMemorySnapshot) -> Option<u64> {
+    [
+        memory.memory_limit_bytes,
+        memory.metal_recommended_working_set_bytes,
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|bytes| *bytes > 0)
+    .min()
+}
+
+struct PlatformIdentity {
+    hardware_identifier: String,
+    physical_memory_bytes: u64,
+    os_version: String,
+    os_build: String,
+}
+
+#[cfg(target_os = "macos")]
+fn platform_identity() -> Option<PlatformIdentity> {
+    fn sysctl(name: &str) -> Option<String> {
+        let output = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", name])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+        (!value.is_empty()).then_some(value)
+    }
+    Some(PlatformIdentity {
+        hardware_identifier: sysctl("hw.model")?,
+        physical_memory_bytes: sysctl("hw.memsize")?
+            .parse()
+            .ok()
+            .filter(|bytes| *bytes > 0)?,
+        os_version: sysctl("kern.osproductversion")?,
+        os_build: sysctl("kern.osversion")?,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_identity() -> Option<PlatformIdentity> {
+    None
+}
+
+fn executable_build_identity() -> Option<String> {
+    let path = std::env::current_exe().ok()?;
+    let mut file = File::open(&path).ok()?;
+    let mut hash = Sha256::new();
+    hash.update(b"higgs:executable-build:v1\0");
+    hash.update(CAPACITY_SCHEMA_VERSION.to_le_bytes());
+    hash.update(file.metadata().ok()?.len().to_le_bytes());
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).ok()?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    if cfg!(target_os = "macos") {
+        let metallib_path = path.with_file_name("mlx.metallib");
+        let mut metallib = File::open(metallib_path).ok()?;
+        hash.update(b"\0mlx.metallib\0");
+        hash.update(metallib.metadata().ok()?.len().to_le_bytes());
+        loop {
+            let count = metallib.read(&mut buffer).ok()?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+        }
+    }
+    Some(encode_sha256(hash.finalize()))
+}
+
+fn sha256_identity(domain: &[u8], bytes: &[u8]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    hash.update(bytes);
+    encode_sha256(hash.finalize())
+}
+
+fn encode_sha256(digest: impl IntoIterator<Item = u8>) -> String {
+    let mut encoded = String::with_capacity(71);
+    encoded.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
+fn config_u64(config: &serde_json::Value, key: &str) -> Option<u64> {
+    config
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|text| text.get(key))
+                .and_then(serde_json::Value::as_u64)
+        })
+}
+
+fn read_optional_json(path: &Path) -> Result<Option<serde_json::Value>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))
+}
+
+fn optional_artifact_identity(path: Option<&str>) -> Result<Option<String>, String> {
+    path.map(|path| {
+        fingerprint_model_artifacts(Path::new(path))
+            .map(|identity| identity.fingerprint)
+            .map_err(|error| format!("failed to fingerprint sidecar '{path}': {error}"))
+    })
+    .transpose()
+}
+
 /// Shared application state available to all route handlers.
 pub struct AppState {
     /// Routes model names to local engines or remote providers.
@@ -1174,6 +1760,42 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     /// Request metrics (present in config mode, absent in simple mode).
     pub metrics: Option<Arc<MetricsStore>>,
+    /// Sole process-wide authority for local-model capacity and lifecycle state.
+    pub capacity: Arc<CapacityRegistry>,
+}
+
+impl AppState {
+    #[must_use]
+    pub fn new(
+        router: Router,
+        config: HiggsConfig,
+        http_client: reqwest::Client,
+        metrics: Option<Arc<MetricsStore>>,
+    ) -> Self {
+        let known_models = config
+            .models
+            .iter()
+            .map(|model| model.name.clone().unwrap_or_else(|| model.path.clone()));
+        let capacity = CapacityRegistry::new(known_models);
+        Self::with_capacity_registry(router, config, http_client, metrics, capacity)
+    }
+
+    #[must_use]
+    pub fn with_capacity_registry(
+        router: Router,
+        config: HiggsConfig,
+        http_client: reqwest::Client,
+        metrics: Option<Arc<MetricsStore>>,
+        capacity: Arc<CapacityRegistry>,
+    ) -> Self {
+        Self {
+            router,
+            config,
+            http_client,
+            metrics,
+            capacity,
+        }
+    }
 }
 
 /// Type alias for the shared state used by Axum handlers.
@@ -1192,18 +1814,34 @@ pub(crate) fn test_state_with_stub_engine(model: &str) -> SharedState {
     engines.insert(model.to_owned(), Arc::new(Engine::test_stub(model)));
     let router = crate::router::Router::from_config(&config, engines)
         .expect("default config builds a router");
-    Arc::new(AppState {
-        router,
-        config,
-        http_client: reqwest::Client::new(),
-        metrics: None,
-    })
+    Arc::new(AppState::new(router, config, reqwest::Client::new(), None))
 }
 
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_profile_environment_matches_untrimmed_engine_numeric_parsing() {
+        let environment =
+            resolved_capacity_environment_with(&ModelConfig::default(), false, |name| {
+                matches!(
+                    name,
+                    "HIGGS_PREFLASH_FULL_SCORE_MAX_TOKENS"
+                        | "HIGGS_PREFLASH_MIN_FREE_MB"
+                        | "HIGGS_DFLASH_BLOCK_SIZE"
+                        | "HIGGS_DSPARK_DRAFT_CAP"
+                        | "HIGGS_DFLASH_MIN_BLOCK"
+                )
+                .then(|| " 4096 ".to_owned())
+            });
+        assert_eq!(environment["pflashFullScoreMaxTokens"], 8192);
+        assert_eq!(environment["pflashMinimumFreeMb"], 2048);
+        assert!(environment["dflashBlockSize"].is_null());
+        assert!(environment["dsparkDraftCapOverride"].is_null());
+        assert!(environment["dflashMinimumBlock"].is_null());
+    }
 
     #[test]
     fn build_engine_rejects_invalid_pflash_before_model_load() {
@@ -1240,5 +1878,144 @@ mod tests {
         let engine = Engine::test_stub("test-stub");
         let err = engine.preprocess_images(&[]).unwrap_err();
         assert!(err.to_string().contains("stub"));
+    }
+
+    #[test]
+    fn model_load_measurement_window_is_serialized_by_the_inference_gate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let barrier = Arc::clone(&barrier);
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                with_serialized_mlx_load(|| {
+                    let concurrent = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(concurrent, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                });
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let loader = std::thread::spawn(move || {
+            with_serialized_mlx_load(|| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        entered_rx.recv().unwrap();
+        let (inference_done_tx, inference_done_rx) = std::sync::mpsc::channel();
+        let inference = std::thread::spawn(move || {
+            let engine = Engine::test_stub("contention");
+            let _ = engine.generate_continued(1, &[], 1, &SamplingParams::default());
+            inference_done_tx.send(()).unwrap();
+        });
+        assert!(
+            inference_done_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "inference must wait until the measured load window releases the GPU gate"
+        );
+        release_tx.send(()).unwrap();
+        inference_done_rx.recv().unwrap();
+        loader.join().unwrap();
+        inference.join().unwrap();
+    }
+
+    #[test]
+    fn post_load_facts_bind_content_and_execution_identity_to_measured_residency() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let model = tempfile::tempdir().unwrap();
+        std::fs::write(
+            model.path().join("config.json"),
+            br#"{
+                "model_type":"qwen3_5_moe",
+                "max_position_embeddings":131072,
+                "num_hidden_layers":40,
+                "num_key_value_heads":2,
+                "head_dim":256,
+                "full_attention_interval":4
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(model.path().join("model.safetensors"), b"w").unwrap();
+        std::fs::write(
+            model.path().join("quantize_config.json"),
+            br#"{"quant_method":"eschamoe","bits":3}"#,
+        )
+        .unwrap();
+        let identity = crate::capacity::ModelContentIdentity {
+            fingerprint: "sha256:exact".to_owned(),
+            artifact_bytes: 12 * GIB,
+        };
+        let before = higgs_engine::MlxMemorySnapshot {
+            active_bytes: GIB,
+            peak_bytes: GIB,
+            memory_limit_bytes: Some(40 * GIB),
+            metal_recommended_working_set_bytes: Some(48 * GIB),
+        };
+        let after = higgs_engine::MlxMemorySnapshot {
+            active_bytes: 12 * GIB,
+            peak_bytes: 12 * GIB,
+            ..before
+        };
+        let model_config = ModelConfig {
+            path: model.path().display().to_string(),
+            name: Some("escha".to_owned()),
+            kv_max_session_tokens: 49_152,
+            kv_max_retained_bytes: 2 * GIB as usize,
+            kv_cache_bytes: GIB as usize,
+            ..ModelConfig::default()
+        };
+        let config = HiggsConfig {
+            models: vec![model_config.clone()],
+            ..HiggsConfig::default()
+        };
+
+        let facts = build_capacity_facts_from_measurements(
+            "escha",
+            model.path(),
+            &model_config,
+            &config,
+            identity,
+            before,
+            after,
+        )
+        .unwrap();
+
+        assert_eq!(facts.model_fingerprint, "sha256:exact");
+        assert_eq!(facts.loaded_model_bytes, 11 * GIB);
+        assert_eq!(facts.architectural_max_tokens, 131_072);
+        assert_eq!(facts.costs.persistent_bytes_per_token, 20_480);
+        assert_eq!(
+            facts.quantization,
+            r#"{"quant_method":"eschamoe","bits":3}"#
+        );
+        let escha_mode = if higgs_models::eschamoe::native_mode() {
+            "simple:eschamoe-native"
+        } else {
+            "simple:eschamoe-affine"
+        };
+        assert_eq!(facts.execution_mode, escha_mode);
+        assert_eq!(facts.retained_session_tokens, 49_152);
+        assert_eq!(facts.retained_bytes_ceiling, 2 * GIB);
+        assert_eq!(facts.prefix_cache_bytes_ceiling, GIB);
+        assert_eq!(facts.startup_headroom_bytes, 39 * GIB);
+        if let Some(key) = facts.learned_profile_key {
+            assert_eq!(key.backend_authority_bytes, 40 * GIB);
+        }
     }
 }

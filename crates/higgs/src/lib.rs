@@ -82,6 +82,7 @@ pub fn build_router(
             "/v1/models",
             get(routes::models::list_models).post(routes::models::load_model),
         )
+        .route("/v1/capacity", get(routes::capacity::capacity))
         .route("/v1/models/{name}", delete(routes::models::unload_model))
         .route("/v1/chat/completions", post(routes::chat::chat_completions))
         .route("/v1/completions", post(routes::completions::completions))

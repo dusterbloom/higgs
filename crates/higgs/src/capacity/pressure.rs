@@ -5,7 +5,8 @@ use tokio::{
     task::JoinHandle,
 };
 
-use super::{CapacityController, Clock, MemoryPressure, PressureObservation};
+use super::{CapacityController, CapacityRegistry, Clock, MemoryPressure, PressureObservation};
+use crate::state::AppState;
 
 const VM_COUNTER_SAMPLE_PERIOD: Duration = Duration::from_secs(1);
 
@@ -36,6 +37,49 @@ pub(crate) trait PressureEventSource: Send + 'static {
         self,
         sender: mpsc::UnboundedSender<ObserverEvent>,
     ) -> Result<Box<dyn ProducerHandle>, PressureObserverError>;
+}
+
+pub(crate) trait PressureObservationSink: Send + Sync + 'static {
+    fn apply<'a>(
+        &'a self,
+        observation: PressureObservation,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+
+impl<C: Clock + Send + 'static> PressureObservationSink for Mutex<CapacityController<C>> {
+    fn apply<'a>(
+        &'a self,
+        observation: PressureObservation,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            self.lock().await.apply_pressure_observation(observation);
+        })
+    }
+}
+
+impl PressureObservationSink for CapacityRegistry {
+    fn apply<'a>(
+        &'a self,
+        observation: PressureObservation,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            self.apply_pressure_observation(observation);
+        })
+    }
+}
+
+impl PressureObservationSink for AppState {
+    fn apply<'a>(
+        &'a self,
+        observation: PressureObservation,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            self.capacity.apply_pressure_observation(observation);
+            if let Err(error) = self.router.apply_capacity_cache_allocations(&self.capacity) {
+                tracing::warn!(%error, "failed to apply pressure-adjusted cache allocations");
+            }
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -70,9 +114,9 @@ where
     S: CounterSampler,
     T: PressureEventSource,
 {
-    pub(crate) async fn start<C: Clock + Send + 'static>(
+    pub(crate) async fn start<Sink: PressureObservationSink>(
         self,
-        controller: Arc<Mutex<CapacityController<C>>>,
+        sink: Arc<Sink>,
     ) -> Result<PressureObserverHandle, PressureObserverError> {
         let Self {
             pressure_source,
@@ -108,14 +152,12 @@ where
                 if current.is_some() {
                     prior = current;
                 }
-                controller
-                    .lock()
-                    .await
-                    .apply_pressure_observation(PressureObservation {
-                        pressure: reported_pressure,
-                        swap_out_delta,
-                        compressor_delta,
-                    });
+                sink.apply(PressureObservation {
+                    pressure: reported_pressure,
+                    swap_out_delta,
+                    compressor_delta,
+                })
+                .await;
             }
         });
         Ok(PressureObserverHandle {
@@ -914,6 +956,17 @@ mod tests {
         }
     }
 
+    struct FailingProducer;
+
+    impl PressureEventSource for FailingProducer {
+        fn start(
+            self,
+            _sender: tokio::sync::mpsc::UnboundedSender<ObserverEvent>,
+        ) -> Result<Box<dyn ProducerHandle>, super::PressureObserverError> {
+            Err(super::PressureObserverError::UnsupportedPlatform)
+        }
+    }
+
     #[derive(Clone)]
     struct FakeCounters {
         samples: Arc<StdMutex<VecDeque<Option<VmCounters>>>>,
@@ -986,6 +1039,49 @@ mod tests {
         assert_eq!(cadence_cancels.load(Ordering::Relaxed), 1);
         pressure.emit(ObserverEvent::Pressure(MemoryPressure::Critical));
         assert_eq!(controller.lock().await.decision(), initial);
+    }
+
+    #[tokio::test]
+    async fn failed_observer_start_cancels_the_started_source_and_returns_no_handle() {
+        let registry = crate::capacity::CapacityRegistry::new(["escha".to_owned()]);
+        let (pressure_source, _pressure, starts, cancels) = FakeProducer::new();
+        let (counters, _calls) = FakeCounters::new([VmCounters::default()]);
+
+        let result = PressureObserverConfig::new(pressure_source, counters, FailingProducer)
+            .start(registry)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(super::PressureObserverError::UnsupportedPlatform)
+        ));
+        assert_eq!(starts.load(Ordering::Relaxed), 1);
+        assert_eq!(cancels.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn one_observer_feeds_the_process_registry_sink() {
+        let registry = crate::capacity::CapacityRegistry::new(["escha".to_owned()]);
+        let (pressure_source, pressure, starts, cancels) = FakeProducer::new();
+        let (cadence_source, _cadence, cadence_starts, cadence_cancels) = FakeProducer::new();
+        let (counters, calls) = FakeCounters::new([VmCounters::default(), VmCounters::default()]);
+
+        let handle = PressureObserverConfig::new(pressure_source, counters, cadence_source)
+            .start(Arc::clone(&registry))
+            .await
+            .unwrap();
+        pressure.emit(ObserverEvent::Pressure(MemoryPressure::Constrained));
+        wait_for_samples(&calls, 2).await;
+
+        assert_eq!(
+            registry.snapshot("escha").unwrap().pressure,
+            MemoryPressure::Constrained
+        );
+        assert_eq!(starts.load(Ordering::Relaxed), 1);
+        assert_eq!(cadence_starts.load(Ordering::Relaxed), 1);
+        handle.stop().await.unwrap();
+        assert_eq!(cancels.load(Ordering::Relaxed), 1);
+        assert_eq!(cadence_cancels.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

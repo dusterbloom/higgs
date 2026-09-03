@@ -71,6 +71,10 @@ impl DiskPrefixCache {
         self
     }
 
+    pub fn set_capacity_max_bytes(&mut self, max_bytes: usize) {
+        self.memory.set_capacity_max_bytes(max_bytes);
+    }
+
     pub fn new(
         max_entries: usize,
         block_size: usize,

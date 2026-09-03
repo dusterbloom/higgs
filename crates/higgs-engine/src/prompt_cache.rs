@@ -48,6 +48,7 @@ pub struct PrefixCache {
     root: RadixNode,
     num_cached: usize,
     max_cached: usize,
+    configured_max_cached: usize,
     /// Byte budget for the cached KV state. `0` disables the budget (pure
     /// count-based LRU, the historical behaviour).
     max_bytes: usize,
@@ -175,6 +176,7 @@ impl PrefixCache {
             root: RadixNode::empty(),
             num_cached: 0,
             max_cached: max_entries,
+            configured_max_cached: max_entries,
             max_bytes: 0,
             total_bytes: 0,
         }
@@ -186,6 +188,28 @@ impl PrefixCache {
     pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
         self.max_bytes = max_bytes;
         self
+    }
+
+    /// Apply a live process allocation. Zero disables and clears this model's
+    /// prefix cache; a later nonzero allocation restores its configured count.
+    pub fn set_capacity_max_bytes(&mut self, max_bytes: usize) {
+        let max_cached = if max_bytes == 0 {
+            0
+        } else {
+            self.configured_max_cached
+        };
+        if self.max_bytes == max_bytes && self.max_cached == max_cached {
+            return;
+        }
+        self.max_bytes = max_bytes;
+        self.max_cached = max_cached;
+        while self.num_cached > self.max_cached
+            || (self.max_bytes > 0 && self.total_bytes > self.max_bytes)
+        {
+            if !self.evict_lru() {
+                break;
+            }
+        }
     }
 
     /// Approximate resident bytes of all cached KV entries.
@@ -424,6 +448,23 @@ mod tests {
         cache.store(&[4, 5, 6], entry.clone());
         assert_eq!(cache.len(), 2);
         assert!(cache.total_bytes() > 0);
+    }
+
+    #[test]
+    fn live_zero_limit_disables_only_this_cache_and_nonzero_restores_it() {
+        let entry = make_sized_cache(2048);
+        let mut cache = PrefixCache::new(2);
+        cache.store(&[1, 2, 3], entry.clone());
+        assert_eq!(cache.len(), 1);
+
+        cache.set_capacity_max_bytes(0);
+        assert!(cache.is_empty());
+        cache.store(&[4, 5, 6], entry.clone());
+        assert!(cache.is_empty());
+
+        cache.set_capacity_max_bytes(4096);
+        cache.store(&[7, 8, 9], entry);
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

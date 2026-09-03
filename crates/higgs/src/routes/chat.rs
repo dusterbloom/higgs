@@ -1564,12 +1564,12 @@ mod tests {
         std::fs::write(&path, "[provider.stub]\nurl = \"http://127.0.0.1:1\"\n").unwrap();
         let config = crate::config::load_config_file(&path, None).unwrap();
         let router = crate::router::Router::from_config(&config, HashMap::new()).unwrap();
-        Arc::new(crate::state::AppState {
+        Arc::new(crate::state::AppState::new(
             router,
             config,
-            http_client: reqwest::Client::new(),
-            metrics: None,
-        })
+            reqwest::Client::new(),
+            None,
+        ))
     }
 
     fn axum_session_test_app(engine_name: &str) -> (axum::Router, Arc<Engine>) {
@@ -1583,12 +1583,12 @@ mod tests {
             HashMap::from([(engine_name.to_owned(), Arc::clone(&engine))]),
         )
         .unwrap();
-        let state = Arc::new(crate::state::AppState {
+        let state = Arc::new(crate::state::AppState::new(
             router,
             config,
-            http_client: reqwest::Client::new(),
-            metrics: None,
-        });
+            reqwest::Client::new(),
+            None,
+        ));
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(chat_completions))
             .with_state(state);

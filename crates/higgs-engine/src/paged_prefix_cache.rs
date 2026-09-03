@@ -609,6 +609,7 @@ pub struct PagedPrefixCache {
     num_cached: usize,
     num_paired: usize,
     max_cached: usize,
+    configured_max_cached: usize,
     max_paired: usize,
     /// Resident-byte budget for cached target state and paired dFlash sidecars.
     /// `0` disables the budget (pure count-based LRU, the historical behaviour).
@@ -1299,6 +1300,7 @@ impl PagedPrefixCache {
             num_cached: 0,
             num_paired: 0,
             max_cached: max_entries,
+            configured_max_cached: max_entries,
             max_paired: MAX_PAIRED_RADIX_ENTRIES,
             max_bytes: 0,
             total_bytes: 0,
@@ -1318,6 +1320,33 @@ impl PagedPrefixCache {
     pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
         self.max_bytes = max_bytes;
         self
+    }
+
+    /// Apply a live process allocation. Zero disables and clears this model's
+    /// in-memory radix; a later nonzero allocation restores its count ceiling.
+    pub fn set_capacity_max_bytes(&mut self, max_bytes: usize) {
+        let max_cached = if max_bytes == 0 {
+            0
+        } else {
+            self.configured_max_cached
+        };
+        if self.max_bytes == max_bytes && self.max_cached == max_cached {
+            return;
+        }
+        self.max_bytes = max_bytes;
+        self.max_cached = max_cached;
+        let mut invalidated = false;
+        while self.num_cached > self.max_cached
+            || (self.max_bytes > 0 && self.total_bytes > self.max_bytes)
+        {
+            if !self.evict_lru() {
+                break;
+            }
+            invalidated = true;
+        }
+        if invalidated {
+            self.advance_revision();
+        }
     }
 
     /// Conservative tracked bytes of all cached KV endpoints.
@@ -2943,6 +2972,15 @@ mod tests {
     }
 
     #[test]
+    fn live_zero_limit_disables_and_nonzero_restores_configured_count() {
+        let mut cache = PagedPrefixCache::new(7, 4);
+        cache.set_capacity_max_bytes(0);
+        assert_eq!(cache.max_cached, 0);
+        cache.set_capacity_max_bytes(4096);
+        assert_eq!(cache.max_cached, 7);
+    }
+
+    #[test]
     fn test_size_aware_eviction_disabled_by_default() {
         let mut cache = PagedPrefixCache::new(100, 4);
         for base in 0..5u32 {
@@ -4349,6 +4387,25 @@ mod tests {
             .find_longest_prefix(&query)
             .expect("the refreshed target-only endpoint must survive");
         assert_keys_eq_first_n(&cache_keys(&matched.cache, 0), &refreshed_keys, 8);
+    }
+
+    #[test]
+    fn unchanged_capacity_sample_preserves_a_prepared_pair_revision() {
+        let mut cache = PagedPrefixCache::new(10, 4);
+        let tokens: Vec<u32> = (0..8).collect();
+        let ticket = cache.paired_prepare_ticket();
+        let target = make_kv_cache(1, 8);
+        let snapshot = dflash_snapshot(8);
+        let prepared = {
+            let _exec = higgs_models::mlx_exec::acquire();
+            PagedPrefixCache::prepare_paired_prefix_from_parts(ticket, &tokens, &target, snapshot)
+                .unwrap()
+        };
+
+        cache.set_capacity_max_bytes(usize::MAX);
+        cache.set_capacity_max_bytes(usize::MAX);
+        cache.commit_prepared_pair(prepared).unwrap();
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

@@ -60,12 +60,12 @@ fn build_test_state(mock_url: &str, format: ApiFormat) -> Arc<AppState> {
     let router = Router::from_config(&config, HashMap::new()).unwrap();
     let metrics = Arc::new(MetricsStore::new(Duration::from_secs(METRICS_WINDOW_SECS)));
 
-    Arc::new(AppState {
+    Arc::new(AppState::new(
         router,
         config,
-        http_client: reqwest::Client::new(),
-        metrics: Some(metrics),
-    })
+        reqwest::Client::new(),
+        Some(metrics),
+    ))
 }
 
 fn openai_chat_response() -> serde_json::Value {
@@ -115,12 +115,12 @@ fn build_selective_test_state(mock_url: &str, metrics: Arc<MetricsStore>) -> Arc
     let config = higgs::config::load_config_file(&config_path, None).unwrap();
     let router = Router::from_config(&config, HashMap::new()).unwrap();
 
-    Arc::new(AppState {
+    Arc::new(AppState::new(
         router,
         config,
-        http_client: reqwest::Client::new(),
-        metrics: Some(metrics),
-    })
+        reqwest::Client::new(),
+        Some(metrics),
+    ))
 }
 
 fn post_json(uri: &str, body: &serde_json::Value) -> Request<Body> {
@@ -239,12 +239,12 @@ async fn proxy_model_rewrite() {
     let config = higgs::config::load_config_file(&config_path, None).unwrap();
     let router = Router::from_config(&config, HashMap::new()).unwrap();
     let metrics = Arc::new(MetricsStore::new(Duration::from_secs(METRICS_WINDOW_SECS)));
-    let state = Arc::new(AppState {
+    let state = Arc::new(AppState::new(
         router,
         config,
-        http_client: reqwest::Client::new(),
-        metrics: Some(metrics),
-    });
+        reqwest::Client::new(),
+        Some(metrics),
+    ));
     let app = build_app(state);
 
     let request_body = serde_json::json!({

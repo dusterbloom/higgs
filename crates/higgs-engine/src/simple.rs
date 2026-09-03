@@ -9,7 +9,7 @@
 use std::borrow::Cow;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use higgs_models::mlx_exec::{async_eval, eval};
@@ -236,12 +236,16 @@ fn pflash_auto_plan_worth_executing(
 
 const DEFAULT_PFLASH_FULL_SCORE_MAX_TOKENS: usize = 8192;
 
-fn pflash_full_score_max_tokens() -> usize {
-    std::env::var("HIGGS_PREFLASH_FULL_SCORE_MAX_TOKENS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
+#[must_use]
+pub fn resolve_pflash_full_score_max_tokens(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_PFLASH_FULL_SCORE_MAX_TOKENS)
+}
+
+fn pflash_full_score_max_tokens() -> usize {
+    let raw = std::env::var("HIGGS_PREFLASH_FULL_SCORE_MAX_TOKENS").ok();
+    resolve_pflash_full_score_max_tokens(raw.as_deref())
 }
 
 fn pflash_full_score_budget_exceeded(
@@ -252,12 +256,34 @@ fn pflash_full_score_budget_exceeded(
     score_mode == PrefillScoreMode::Full && source_tokens > max_score_tokens
 }
 
-fn prefill_min_free_memory_mb() -> usize {
-    std::env::var("HIGGS_PREFLASH_MIN_FREE_MB")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
+#[must_use]
+pub fn resolve_pflash_min_free_memory_mb(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(2048)
+}
+
+fn prefill_min_free_memory_mb() -> usize {
+    let raw = std::env::var("HIGGS_PREFLASH_MIN_FREE_MB").ok();
+    resolve_pflash_min_free_memory_mb(raw.as_deref())
+}
+
+#[must_use]
+pub fn resolve_dflash_block_size_override(raw: Option<&str>) -> Option<i32> {
+    raw.and_then(|value| value.parse::<i32>().ok())
+        .filter(|value| *value >= 1)
+}
+
+#[must_use]
+pub fn resolve_dspark_draft_cap_override(raw: Option<&str>) -> Option<i32> {
+    raw.and_then(|value| value.parse::<i32>().ok())
+        .filter(|value| *value >= 1)
+}
+
+#[must_use]
+pub fn resolve_dflash_min_block_override(raw: Option<&str>) -> Option<i32> {
+    raw.and_then(|value| value.parse::<i32>().ok())
+        .filter(|value| *value >= 1)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2745,6 +2771,7 @@ pub struct SimpleEngine {
     /// the request prompt ends in the corresponding proven suffix.
     gen_prompt_suffixes: GenerationPromptSuffixes,
     kv_cache_config: KvCacheConfig,
+    capacity_retained_bytes: AtomicUsize,
     tuning: MlxRuntimeTuning,
     /// Optional `DFlash` block-diffusion speculative decoding state, enabled
     /// when `HIGGS_DFLASH_PATH` points at a drafter checkpoint.
@@ -3361,10 +3388,8 @@ impl SimpleEngine {
                     // the checkpoint's fixed block; match the public runtime.
                     trained_block
                 } else {
-                    std::env::var("HIGGS_DFLASH_BLOCK_SIZE")
-                        .ok()
-                        .and_then(|v| v.parse::<i32>().ok())
-                        .filter(|&v| v >= 1)
+                    let raw = std::env::var("HIGGS_DFLASH_BLOCK_SIZE").ok();
+                    resolve_dflash_block_size_override(raw.as_deref())
                         .map_or(trained_block, |v| v.min(trained_block))
                 };
                 let draft_cap = if drafter.config.is_dspark() {
@@ -3373,10 +3398,8 @@ impl SimpleEngine {
                     // Q4 head and target-head sidecars. Any smaller cap is an
                     // explicit experiment, never an implicit Apple default.
                     let tuned_default = trained_block;
-                    std::env::var("HIGGS_DSPARK_DRAFT_CAP")
-                        .ok()
-                        .and_then(|v| v.parse::<i32>().ok())
-                        .filter(|&v| v >= 1)
+                    let raw = std::env::var("HIGGS_DSPARK_DRAFT_CAP").ok();
+                    resolve_dspark_draft_cap_override(raw.as_deref())
                         .map_or(tuned_default, |v| v.min(trained_block))
                 } else {
                     trained_block
@@ -3550,6 +3573,9 @@ impl SimpleEngine {
             enable_thinking,
             think_close_token,
             gen_prompt_suffixes,
+            capacity_retained_bytes: std::sync::atomic::AtomicUsize::new(
+                kv_cache_config.max_retained_bytes,
+            ),
             kv_cache_config,
             tuning,
             dflash,
@@ -3884,6 +3910,17 @@ impl SimpleEngine {
         lock_or_recover(&self.prefix_cache).len()
     }
 
+    /// Apply the registry's per-model shares of the process cache envelope.
+    pub fn apply_capacity_cache_limits(&self, retained_bytes: usize, prefix_bytes: usize) {
+        let previous = self
+            .capacity_retained_bytes
+            .swap(retained_bytes, Ordering::AcqRel);
+        if retained_bytes < previous {
+            lock_or_recover(&self.retained).clear();
+        }
+        lock_or_recover(&self.prefix_cache).set_capacity_max_bytes(prefix_bytes);
+    }
+
     /// Drop every entry in the radix prefix cache, forcing the next generation
     /// to prefill densely from scratch. Lets a caller establish a cold baseline.
     pub fn clear_prefix_cache(&self) {
@@ -4170,7 +4207,7 @@ impl SimpleEngine {
             RetentionLimits {
                 max_sessions: self.kv_cache_config.max_retained_sessions,
                 max_session_tokens: effective_cap,
-                max_bytes: self.kv_cache_config.max_retained_bytes,
+                max_bytes: self.capacity_retained_bytes.load(Ordering::Acquire),
             },
             source,
         );
@@ -10289,10 +10326,8 @@ impl SimpleEngine {
         // work. Disable with HIGGS_DFLASH_ADAPTIVE=0; floor via
         // HIGGS_DFLASH_MIN_BLOCK.
         let block_max = dflash.block_size;
-        let block_min = std::env::var("HIGGS_DFLASH_MIN_BLOCK")
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .filter(|&v| v >= 1)
+        let raw_block_min = std::env::var("HIGGS_DFLASH_MIN_BLOCK").ok();
+        let block_min = resolve_dflash_min_block_override(raw_block_min.as_deref())
             .map_or(2, |v| v.min(block_max));
         // dSpark's bidirectional trunk and log-SNR schedule are trained for a
         // fixed block. Its output/verify work may be capped independently, but
@@ -13518,10 +13553,26 @@ mod tests {
         pflash_actual_keep_ratio, pflash_auto_plan_worth_executing,
         pflash_cache_source_and_request_tail, pflash_cache_source_and_request_tail_with_boundary,
         pflash_full_score_budget_exceeded, prefill_sample_count, reset_prefill_sample_count,
-        resolve_speculation_route, retained_kv_storage_at, select_continuation_candidate,
-        session_prefill_strategy, session_prompt_trace_metrics, stateless_mtp_family_eligible,
-        with_chat_terminator,
+        resolve_dflash_block_size_override, resolve_dflash_min_block_override,
+        resolve_dspark_draft_cap_override, resolve_pflash_full_score_max_tokens,
+        resolve_pflash_min_free_memory_mb, resolve_speculation_route, retained_kv_storage_at,
+        select_continuation_candidate, session_prefill_strategy, session_prompt_trace_metrics,
+        stateless_mtp_family_eligible, with_chat_terminator,
     };
+
+    #[test]
+    fn numeric_runtime_knobs_use_exact_untrimmed_parsing() {
+        assert_eq!(resolve_pflash_full_score_max_tokens(Some("4096")), 4096);
+        assert_eq!(resolve_pflash_full_score_max_tokens(Some(" 4096 ")), 8192);
+        assert_eq!(resolve_pflash_min_free_memory_mb(Some("4096")), 4096);
+        assert_eq!(resolve_pflash_min_free_memory_mb(Some(" 4096 ")), 2048);
+        assert_eq!(resolve_dflash_block_size_override(Some("4")), Some(4));
+        assert_eq!(resolve_dflash_block_size_override(Some(" 4 ")), None);
+        assert_eq!(resolve_dspark_draft_cap_override(Some("4")), Some(4));
+        assert_eq!(resolve_dspark_draft_cap_override(Some(" 4 ")), None);
+        assert_eq!(resolve_dflash_min_block_override(Some("2")), Some(2));
+        assert_eq!(resolve_dflash_min_block_override(Some(" 2 ")), None);
+    }
     use crate::chat_template::{ChatMessage, ChatPromptMode, ChatTemplateRenderer};
     use crate::decode::token_ledger::TokenLedger;
     use crate::mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile};
@@ -14599,6 +14650,9 @@ mod tests {
             think_close_token: None,
             gen_prompt_suffixes: GenerationPromptSuffixes::default(),
             kv_cache_config,
+            capacity_retained_bytes: std::sync::atomic::AtomicUsize::new(
+                kv_cache_config.max_retained_bytes,
+            ),
             tuning: MlxRuntimeTuning::from_model_dir(
                 Path::new("/__higgs_missing_session_cache_fixture__"),
                 RequestedMlxProfile::Baseline,

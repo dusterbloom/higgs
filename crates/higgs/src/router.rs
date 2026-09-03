@@ -4,6 +4,7 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use regex::Regex;
 use tracing::warn;
 
+use crate::capacity::CapacityRegistry;
 use crate::config::{ApiFormat, GenerationDefaults, HiggsConfig};
 use crate::state::Engine;
 
@@ -287,6 +288,7 @@ impl Router {
     /// concurrent loads).
     pub fn insert_engine(&self, name: String, engine: Arc<Engine>) -> Result<(), String> {
         self.insert_engine_with_defaults(name, engine, GenerationDefaults::default())
+            .map_err(|(name, _engine)| name)
     }
 
     /// Register a freshly-loaded engine with per-model request defaults.
@@ -295,10 +297,10 @@ impl Router {
         name: String,
         engine: Arc<Engine>,
         generation_defaults: GenerationDefaults,
-    ) -> Result<(), String> {
+    ) -> Result<(), (String, Arc<Engine>)> {
         let mut engines = self.engines_write();
         if engines.contains_key(&name) {
-            return Err(name);
+            return Err((name, engine));
         }
         engines.insert(
             name,
@@ -327,6 +329,34 @@ impl Router {
             .values()
             .map(|entry| Arc::clone(&entry.engine))
             .collect()
+    }
+
+    /// Apply one coherent registry allocation snapshot without holding the
+    /// router lock while a batch worker acknowledges eviction.
+    pub fn apply_capacity_cache_allocations(
+        &self,
+        capacity: &CapacityRegistry,
+    ) -> Result<(), String> {
+        let allocations = capacity.cache_allocations();
+        let engines = {
+            let loaded = self.engines_read();
+            allocations
+                .into_iter()
+                .filter_map(|(name, retained, prefix)| {
+                    loaded
+                        .get(&name)
+                        .map(|entry| (name, Arc::clone(&entry.engine), retained, prefix))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (name, engine, retained, prefix) in engines {
+            engine
+                .apply_capacity_cache_limits(retained, prefix)
+                .map_err(|error| {
+                    format!("failed to apply cache allocation for '{name}': {error}")
+                })?;
+        }
+        Ok(())
     }
 
     // -- Private helpers ---------------------------------------------------
@@ -1037,6 +1067,7 @@ mod tests {
                 Arc::new(crate::state::Engine::test_stub("atomic")),
                 defaults,
             )
+            .map_err(|(name, _engine)| name)
             .unwrap();
 
         match router.resolve("atomic", None).await.unwrap() {

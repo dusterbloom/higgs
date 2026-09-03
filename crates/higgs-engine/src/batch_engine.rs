@@ -61,6 +61,14 @@ struct BatchRequest {
     response_tx: tokio::sync::mpsc::Sender<StreamingOutput>,
 }
 
+enum BatchCommand {
+    Generate(BatchRequest),
+    SetPrefixCacheBytes {
+        bytes: usize,
+        acknowledged: std::sync::mpsc::Sender<()>,
+    },
+}
+
 /// An in-flight request being actively decoded.
 struct ActiveRequest {
     cache: AnyCache,
@@ -117,7 +125,8 @@ fn prefill_chunk_ranges(token_count: usize, quantum: usize) -> Vec<std::ops::Ran
 /// dedicated background thread. Concurrent requests are interleaved at the
 /// token level instead of being fully serialized.
 pub struct BatchEngine {
-    request_tx: tokio::sync::mpsc::Sender<BatchRequest>,
+    request_tx: tokio::sync::mpsc::Sender<BatchCommand>,
+    worker: Option<std::thread::JoinHandle<()>>,
     tokenizer: Tokenizer,
     template: ChatTemplateRenderer,
     model_name: String,
@@ -177,7 +186,7 @@ impl BatchEngine {
         let eos_ids = eos_token_ids.clone();
         let tok = tokenizer.clone();
 
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("batch-engine".into())
             .spawn(move || {
                 worker_loop(
@@ -199,6 +208,7 @@ impl BatchEngine {
 
         Ok(Self {
             request_tx,
+            worker: Some(worker),
             tokenizer,
             template,
             model_name,
@@ -212,6 +222,50 @@ impl BatchEngine {
 
     pub fn model_name(&self) -> &str {
         &self.model_name
+    }
+
+    /// Close the request queue and wait until the worker-owned model is dropped.
+    pub fn shutdown(mut self) -> Result<(), EngineError> {
+        self.shutdown_worker()
+    }
+
+    fn shutdown_worker(&mut self) -> Result<(), EngineError> {
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
+        drop(closed_rx);
+        drop(std::mem::replace(&mut self.request_tx, closed_tx));
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker.join().map_err(|_| {
+            EngineError::Generation("batch engine worker panicked during shutdown".to_owned())
+        })
+    }
+
+    /// Apply the process registry's effective prefix-cache allocation and wait
+    /// until the worker has evicted entries above the new limit.
+    pub fn apply_capacity_cache_limit(&self, prefix_bytes: usize) -> Result<(), EngineError> {
+        let (acknowledged, wait) = std::sync::mpsc::channel();
+        let mut command = BatchCommand::SetPrefixCacheBytes {
+            bytes: prefix_bytes,
+            acknowledged,
+        };
+        loop {
+            match self.request_tx.try_send(command) {
+                Ok(()) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                    command = returned;
+                    std::thread::yield_now();
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(EngineError::Generation("Engine shut down".to_owned()));
+                }
+            }
+        }
+        wait.recv().map_err(|_| {
+            EngineError::Generation(
+                "batch engine stopped before applying its cache allocation".to_owned(),
+            )
+        })
     }
 
     pub const fn tokenizer(&self) -> &Tokenizer {
@@ -341,7 +395,7 @@ impl BatchEngine {
         let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel(32);
 
         self.request_tx
-            .blocking_send(BatchRequest {
+            .blocking_send(BatchCommand::Generate(BatchRequest {
                 prompt_tokens: prompt_tokens.to_vec(),
                 max_tokens,
                 params: params.clone(),
@@ -351,7 +405,7 @@ impl BatchEngine {
                 constraint,
                 image_inputs: image_inputs.unwrap_or_default(),
                 response_tx: internal_tx,
-            })
+            }))
             .map_err(|_| EngineError::Generation("Engine shut down".to_owned()))?;
 
         let mut full_text = String::new();
@@ -472,7 +526,7 @@ impl BatchEngine {
         let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel(32);
 
         self.request_tx
-            .blocking_send(BatchRequest {
+            .blocking_send(BatchCommand::Generate(BatchRequest {
                 prompt_tokens: prompt_tokens.to_vec(),
                 max_tokens,
                 params: params.clone(),
@@ -482,7 +536,7 @@ impl BatchEngine {
                 constraint,
                 image_inputs: image_inputs.unwrap_or_default(),
                 response_tx: internal_tx,
-            })
+            }))
             .map_err(|_| EngineError::Generation("Engine shut down".to_owned()))?;
 
         while let Some(output) = internal_rx.blocking_recv() {
@@ -517,6 +571,14 @@ impl BatchEngine {
     }
 }
 
+impl Drop for BatchEngine {
+    fn drop(&mut self) {
+        if let Err(error) = self.shutdown_worker() {
+            tracing::warn!(%error, "batch engine worker join failed during drop");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Background worker loop
 // ---------------------------------------------------------------------------
@@ -526,7 +588,7 @@ fn worker_loop(
     mut model: AnyModel,
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
-    mut request_rx: tokio::sync::mpsc::Receiver<BatchRequest>,
+    mut request_rx: tokio::sync::mpsc::Receiver<BatchCommand>,
     prefix_cache_bytes: usize,
     prefill_yield_tokens: u32,
 ) {
@@ -535,22 +597,19 @@ fn worker_loop(
     let mut active: Vec<ActiveRequest> = Vec::new();
     let mut pending_prefill: Option<PendingPrefill> = None;
 
-    // This dedicated worker thread is the sole owner of `model` (it was moved
-    // in), so it is already serialized by single-thread ownership. Hold the
-    // MLX-execution gate for its entire life anyway: it is uncontended here
-    // (no other thread evals while BatchEngine is the active engine — the two
-    // engines are mutually exclusive), so it is free, and it keeps the
-    // sanctioned-eval invariant uniform — the `eval`/`async_eval` wrappers'
-    // debug_assert holds without a BatchEngine carve-out.
-    let _mlx_gate = higgs_models::mlx_exec::acquire();
-
     loop {
         // 1. Prefill at most one pending request per iteration.
         //    This interleaves prefill with decode so long prefills don't
         //    starve active requests, keeping TTFT low for new arrivals
         //    while maintaining token throughput for in-flight requests.
         if pending_prefill.is_none() {
-            if let Ok(req) = request_rx.try_recv() {
+            if let Ok(command) = request_rx.try_recv()
+                && let Some(req) = apply_batch_command(command, &mut prefix_cache)
+            {
+                // The Higgs caller already owns its process GPU gate. Take the
+                // lower-level MLX gate only for this unit of work; holding it
+                // while idle would deadlock a co-resident Simple engine.
+                let _mlx_gate = higgs_models::mlx_exec::acquire();
                 if prefill_yield_tokens == 0 {
                     let response_tx = req.response_tx.clone();
                     match prefill_request(
@@ -581,6 +640,7 @@ fn worker_loop(
         }
 
         if let Some(prefill) = pending_prefill.take() {
+            let _mlx_gate = higgs_models::mlx_exec::acquire();
             let response_tx = prefill.req.response_tx.clone();
             match advance_prefill(
                 &mut model,
@@ -604,7 +664,8 @@ fn worker_loop(
 
         // 2. If no active requests, block until one arrives.
         if active.is_empty() && pending_prefill.is_none() {
-            if let Some(req) = request_rx.blocking_recv() {
+            if let Some(req) = blocking_next_request(&mut request_rx, &mut prefix_cache) {
+                let _mlx_gate = higgs_models::mlx_exec::acquire();
                 if prefill_yield_tokens == 0 {
                     let response_tx = req.response_tx.clone();
                     match prefill_request(
@@ -647,6 +708,7 @@ fn worker_loop(
         let use_batched = active.len() > 1
             && model.supports_batched_decode()
             && active.iter().all(|ar| ar.constraint.is_none());
+        let _mlx_gate = higgs_models::mlx_exec::acquire();
 
         if use_batched {
             if let Err(e) = with_new_default_stream(Stream::new(), || {
@@ -687,6 +749,36 @@ fn worker_loop(
         // 4. Remove finished requests (reverse order to preserve indices).
         for i in finished_indices.into_iter().rev() {
             active.swap_remove(i);
+        }
+    }
+}
+
+fn apply_batch_command(
+    command: BatchCommand,
+    prefix_cache: &mut PrefixCache,
+) -> Option<BatchRequest> {
+    match command {
+        BatchCommand::Generate(request) => Some(request),
+        BatchCommand::SetPrefixCacheBytes {
+            bytes,
+            acknowledged,
+        } => {
+            let _mlx_gate = higgs_models::mlx_exec::acquire();
+            prefix_cache.set_capacity_max_bytes(bytes);
+            let _ = acknowledged.send(());
+            None
+        }
+    }
+}
+
+fn blocking_next_request(
+    request_rx: &mut tokio::sync::mpsc::Receiver<BatchCommand>,
+    prefix_cache: &mut PrefixCache,
+) -> Option<BatchRequest> {
+    loop {
+        let command = request_rx.blocking_recv()?;
+        if let Some(request) = apply_batch_command(command, prefix_cache) {
+            return Some(request);
         }
     }
 }
@@ -1423,9 +1515,17 @@ mod tests {
 {% if add_generation_prompt %}<|im_start|> assistant{% endif %}"#,
         )
         .unwrap();
-        let (request_tx, _request_rx) = tokio::sync::mpsc::channel(1);
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let worker = std::thread::spawn(move || {
+            while let Some(command) = request_rx.blocking_recv() {
+                if let BatchCommand::SetPrefixCacheBytes { acknowledged, .. } = command {
+                    let _ = acknowledged.send(());
+                }
+            }
+        });
         BatchEngine {
             request_tx,
+            worker: Some(worker),
             tokenizer,
             template,
             model_name: "batch-prompt-test".to_owned(),
@@ -1464,6 +1564,69 @@ mod tests {
         assert_eq!(default, generation);
         assert!(generation.starts_with(&prefill));
         assert!(generation.len() > prefill.len());
+    }
+
+    #[test]
+    fn acknowledged_shutdown_joins_the_worker_before_returning() {
+        let engine = batch_prompt_test_engine();
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn cache_limit_update_is_acknowledged_by_worker_before_returning() {
+        let engine = batch_prompt_test_engine();
+        engine.apply_capacity_cache_limit(0).unwrap();
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn idle_batch_worker_releases_mlx_gate_and_control_updates_serialize() {
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let (worker_ready, wait_ready) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut cache = PrefixCache::new(1);
+            worker_ready.send(()).unwrap();
+            let _ = blocking_next_request(&mut request_rx, &mut cache);
+        });
+        wait_ready.recv().unwrap();
+
+        let (gate_acquired, wait_acquired) = std::sync::mpsc::channel();
+        let (release_gate, wait_release) = std::sync::mpsc::channel();
+        let gate_owner = std::thread::spawn(move || {
+            let _gate = higgs_models::mlx_exec::acquire();
+            gate_acquired.send(()).unwrap();
+            wait_release.recv().unwrap();
+        });
+        wait_acquired
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("an idle Batch worker must not own the process MLX gate");
+
+        let (control_done, wait_control) = std::sync::mpsc::channel();
+        let control = std::thread::spawn(move || {
+            let (acknowledged, wait) = std::sync::mpsc::channel();
+            request_tx
+                .blocking_send(BatchCommand::SetPrefixCacheBytes {
+                    bytes: 1024,
+                    acknowledged,
+                })
+                .unwrap();
+            wait.recv().unwrap();
+            control_done.send(()).unwrap();
+        });
+        assert!(
+            wait_control
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "a cache control operation must not overlap another MLX work unit"
+        );
+        release_gate.send(()).unwrap();
+        wait_control
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        gate_owner.join().unwrap();
+        control.join().unwrap();
+        worker.join().unwrap();
     }
 
     // -----------------------------------------------------------------------

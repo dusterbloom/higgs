@@ -43,12 +43,12 @@ fn build_test_state(metrics: Option<Arc<MetricsStore>>) -> Arc<AppState> {
     let config = higgs::config::load_config_file(&config_path, None).unwrap();
     let router = Router::from_config(&config, HashMap::new()).unwrap();
 
-    Arc::new(AppState {
+    Arc::new(AppState::new(
         router,
         config,
-        http_client: reqwest::Client::new(),
+        reqwest::Client::new(),
         metrics,
-    })
+    ))
 }
 
 #[tokio::test]
