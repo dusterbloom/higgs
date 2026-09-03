@@ -1,5 +1,47 @@
 # Task 5A report: bind model lifecycle
 
+## Controller review correction round 3/5
+
+- [x] Make measured allocator decrease the sole authority for zero-capacity
+  recovery.
+- [x] Preserve zero across unpublished-registration rollback and unregister
+  without a qualifying measurement.
+- [x] Reject equal, increased, stale, cross-boot, non-adjacent, and saturated
+  measurement epochs as recovery evidence.
+- [x] Re-run independent review, focused lifecycle tests, and the full serialized
+  release matrix.
+
+### Round 3 implementation evidence
+
+- `PublishedMemoryMeasurement` now carries its private boot identity, adjacent
+  previous/current measurement epochs, and exact previous/current MLX active
+  bytes. Bounded recovery requires the same boot, an exact `+1` epoch, the
+  registry's current epoch and active-byte value, and a strict active-byte
+  decrease. Epoch saturation fails closed.
+- Dropping an unpublished `ActiveRegistration` only removes provisional
+  metadata and recomputes with `Preserve`; it cannot treat model removal as
+  proof that engine-owned allocations were released.
+- `finish_unregister` preserves zero for no measurement and for equal,
+  increased, or stale measurements. It permits the bounded minimum only when
+  the supplied token is the exact current decreased measurement produced after
+  engine shutdown and allocator-cache cleanup. Critical pressure remains
+  unavailable regardless of decrease evidence.
+
+### Round 3 TDD and mutation evidence
+
+- The provisional-cancellation regression failed with 1,024 tokens restored
+  immediately after registration rollback, before engine cleanup; it now stays
+  zero until a later authoritative decrease is published.
+- The unregister regression failed with 1,024 tokens restored by
+  `finish_unregister(None)` and now preserves zero for absent/equal/increased
+  evidence.
+- A stale decreased token initially restored 1,024 after a newer measurement;
+  exact-current epoch matching now keeps it at zero.
+- The large-envelope lifecycle case starts above 8,192 tokens, drives the
+  survivor to zero, then supplies a current 20 GiB to 5 GiB decrease after
+  drain. It recovers to exactly 8,192 tokens, proving bounded recovery rather
+  than a full-capacity jump.
+
 ## Controller review correction round 2/5
 
 - [x] Make active capacity registration and route visibility one externally
@@ -224,21 +266,21 @@ cancellation, and shutdown-order fixes, and reported no remaining findings.
 
 ## Release verification
 
-- Focused registry correction suite: 34 passed, 0 failed.
+- Focused registry correction suite: 37 passed, 0 failed.
 - Focused Qwen identity correction: 1 passed, 0 failed.
 - Focused route lifecycle correction suite: 21 passed, 0 failed.
 - `higgs-models` release library: 753 passed, 0 failed, 46 ignored.
 - `higgs-engine` release library: 596 passed, 0 failed, 5 ignored.
 - Runtime-identity integration: 3 passed, 0 failed.
-- Higgs release library: 720 passed, 0 failed.
+- Higgs release library: 723 passed, 0 failed.
 - Higgs release integration: 107 passed, 0 failed, 10 ignored.
 - Higgs release binary: 4 passed, 0 failed.
 - Higgs release build: passed.
-- GitNexus staged detection: 9 files, 50 changed symbols, 109
+- GitNexus staged detection: 2 files, 22 changed symbols, 53
   affected processes, CRITICAL as expected for the lifecycle/router surface.
-- GitNexus compare-to-`main` detection: 236 files, 4,627 changed symbols, 861
+- GitNexus compare-to-`main` detection: 236 files, 4,631 changed symbols, 862
   affected processes, CRITICAL across the complete multi-task branch; the
-  Task 5A staged set remains the bounded 9-file subset above.
+  Task 5A staged set remains the bounded 2-file subset above.
 
 The build emitted pre-existing `higgs-models` unused-code warnings and reported
 that `mlx.metallib` was absent from the local MLX build output. Production

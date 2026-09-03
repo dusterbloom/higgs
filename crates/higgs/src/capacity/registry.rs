@@ -170,7 +170,20 @@ pub struct CacheAllocationPlan {
 /// same serialized GPU/load window in which it was measured.
 pub struct PublishedMemoryMeasurement {
     boot_id: String,
+    previous_revision: u64,
     revision: u64,
+    previous_active_bytes: u64,
+    active_bytes: u64,
+}
+
+impl PublishedMemoryMeasurement {
+    fn authorizes_bounded_recovery(&self, boot_id: &str, state: &RegistryState) -> bool {
+        self.boot_id == boot_id
+            && self.previous_revision.checked_add(1) == Some(self.revision)
+            && self.revision == state.memory_revision
+            && self.active_bytes == state.memory.active_bytes
+            && self.active_bytes < self.previous_active_bytes
+    }
 }
 
 /// The single process-wide authority for model capacity and shared residency.
@@ -533,6 +546,16 @@ impl CapacityRegistry {
                 "unload memory measurement does not belong to this registry revision",
             ));
         }
+        let zero_recovery =
+            memory_after_release
+                .as_ref()
+                .map_or(ZeroCapacityRecovery::Preserve, |measurement| {
+                    if measurement.authorizes_bounded_recovery(&self.boot_id, &state) {
+                        ZeroCapacityRecovery::BoundedMinimum
+                    } else {
+                        ZeroCapacityRecovery::Preserve
+                    }
+                });
         let mut persisted = None;
         let mut removed = false;
         if let Some(entry) = state.models.get_mut(&drain.model)
@@ -548,7 +571,7 @@ impl CapacityRegistry {
         }
         if removed {
             state.published_cache_allocations.remove(&drain.model);
-            recompute_registry_with(&mut state, ZeroCapacityRecovery::BoundedMinimum);
+            recompute_registry_with(&mut state, zero_recovery);
         }
         drain.finished = true;
         drop(state);
@@ -598,19 +621,24 @@ impl CapacityRegistry {
 
     pub fn refresh_memory(&self, memory: MlxMemorySnapshot) -> PublishedMemoryMeasurement {
         let mut state = self.lock();
-        let zero_recovery = if memory.active_bytes < state.memory.active_bytes {
+        let previous_revision = state.memory_revision;
+        let previous_active_bytes = state.memory.active_bytes;
+        state.memory = memory;
+        state.memory_revision = state.memory_revision.saturating_add(1);
+        let measurement = PublishedMemoryMeasurement {
+            boot_id: self.boot_id.clone(),
+            previous_revision,
+            revision: state.memory_revision,
+            previous_active_bytes,
+            active_bytes: memory.active_bytes,
+        };
+        let zero_recovery = if measurement.authorizes_bounded_recovery(&self.boot_id, &state) {
             ZeroCapacityRecovery::BoundedMinimum
         } else {
             ZeroCapacityRecovery::Preserve
         };
-        state.memory = memory;
-        state.memory_revision = state.memory_revision.saturating_add(1);
-        let revision = state.memory_revision;
         recompute_registry_with(&mut state, zero_recovery);
-        PublishedMemoryMeasurement {
-            boot_id: self.boot_id.clone(),
-            revision,
-        }
+        measurement
     }
 
     fn rollback_active(&self, model: &str, nonce: uuid::Uuid, remove_on_rollback: bool) {
@@ -628,7 +656,7 @@ impl CapacityRegistry {
                 entry.active = None;
                 entry.generation = entry.generation.saturating_add(1);
             }
-            recompute_registry_with(&mut state, ZeroCapacityRecovery::BoundedMinimum);
+            recompute_registry(&mut state);
         }
     }
 
@@ -1783,6 +1811,57 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_provisional_needs_later_measured_decrease_to_recover_zero() {
+        for pressure in [MemoryPressure::Constrained, MemoryPressure::Critical] {
+            let registry = CapacityRegistry::new(["first".to_owned(), "second".to_owned()]);
+            let mut first = facts("first", 5 * GIB);
+            first.configured_total_token_ceiling = Some(1_024);
+            first.configured_output_token_ceiling = Some(1_024);
+            register(&registry, first);
+
+            let ticket = registry.begin_registration("second".to_owned()).unwrap();
+            let provisional = registry
+                .commit_active(ticket, facts("second", 5 * GIB))
+                .unwrap();
+            registry.apply_pressure_observation(PressureObservation {
+                pressure,
+                swap_out_delta: u64::from(pressure == MemoryPressure::Critical),
+                compressor_delta: 1,
+            });
+            assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
+
+            drop(provisional);
+            assert_eq!(
+                registry.snapshot("first").unwrap().safe_total_tokens,
+                0,
+                "rolling back metadata before engine cleanup is not recovery evidence"
+            );
+
+            let expected_after_decrease = if pressure == MemoryPressure::Critical {
+                registry.apply_pressure_observation(PressureObservation {
+                    pressure: MemoryPressure::Normal,
+                    swap_out_delta: 0,
+                    compressor_delta: 0,
+                });
+                0
+            } else {
+                1_024
+            };
+            registry.refresh_memory(MlxMemorySnapshot {
+                active_bytes: 4 * GIB,
+                peak_bytes: 5 * GIB,
+                memory_limit_bytes: Some(24 * GIB),
+                metal_recommended_working_set_bytes: Some(24 * GIB),
+            });
+            assert_eq!(
+                registry.snapshot("first").unwrap().safe_total_tokens,
+                expected_after_decrease,
+                "a later authoritative decrease may seed only when pressure policy permits it"
+            );
+        }
+    }
+
+    #[test]
     fn pressure_seed_before_boot_registration_controls_first_policy() {
         let registry = CapacityRegistry::new(["escha".to_owned()]);
         registry.apply_pressure_observation(PressureObservation {
@@ -1951,6 +2030,108 @@ mod tests {
             .unwrap();
 
         assert!(registry.snapshot("second").unwrap().safe_total_tokens <= constrained);
+    }
+
+    fn draining_registry_with_zero_survivor() -> (Arc<CapacityRegistry>, DrainRegistration) {
+        let registry = CapacityRegistry::new(["first".to_owned(), "second".to_owned()]);
+        let mut first = facts("first", 5 * GIB);
+        first.configured_total_token_ceiling = Some(1_024);
+        first.configured_output_token_ceiling = Some(1_024);
+        register(&registry, first);
+        register(&registry, facts("second", 5 * GIB));
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Constrained,
+            swap_out_delta: 0,
+            compressor_delta: 1,
+        });
+        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
+        let drain = registry.begin_drain("second").unwrap();
+        (registry, drain)
+    }
+
+    #[test]
+    fn finish_unregister_requires_current_decreased_measurement_to_recover_zero() {
+        let (registry, drain) = draining_registry_with_zero_survivor();
+        registry.finish_unregister(drain, None).unwrap();
+        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
+
+        for active_bytes in [5 * GIB, 6 * GIB] {
+            let (registry, drain) = draining_registry_with_zero_survivor();
+            let measurement = registry.refresh_memory(MlxMemorySnapshot {
+                active_bytes,
+                peak_bytes: active_bytes,
+                memory_limit_bytes: Some(24 * GIB),
+                metal_recommended_working_set_bytes: Some(24 * GIB),
+            });
+            registry
+                .finish_unregister(drain, Some(measurement))
+                .unwrap();
+            assert_eq!(
+                registry.snapshot("first").unwrap().safe_total_tokens,
+                0,
+                "an equal or increased measurement is not recovery evidence"
+            );
+        }
+
+        let (registry, drain) = draining_registry_with_zero_survivor();
+        let decreased = registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 4 * GIB,
+            peak_bytes: 5 * GIB,
+            memory_limit_bytes: Some(24 * GIB),
+            metal_recommended_working_set_bytes: Some(24 * GIB),
+        });
+        registry.finish_unregister(drain, Some(decreased)).unwrap();
+        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 1_024);
+
+        let registry = CapacityRegistry::new(["first".to_owned(), "second".to_owned()]);
+        register(&registry, facts("first", 5 * GIB));
+        register(&registry, facts("second", 5 * GIB));
+        let full = registry.snapshot("first").unwrap().safe_total_tokens;
+        assert!(full > 8_192);
+        registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 20 * GIB,
+            peak_bytes: 20 * GIB,
+            memory_limit_bytes: Some(24 * GIB),
+            metal_recommended_working_set_bytes: Some(24 * GIB),
+        });
+        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
+        let drain = registry.begin_drain("second").unwrap();
+        let decreased = registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 5 * GIB,
+            peak_bytes: 20 * GIB,
+            memory_limit_bytes: Some(24 * GIB),
+            metal_recommended_working_set_bytes: Some(24 * GIB),
+        });
+        registry.finish_unregister(drain, Some(decreased)).unwrap();
+        let recovered = registry.snapshot("first").unwrap().safe_total_tokens;
+        assert_eq!(recovered, 8_192);
+        assert!(recovered < full, "measured recovery must not jump to full");
+    }
+
+    #[test]
+    fn stale_decreased_measurement_cannot_authorize_unregister_recovery() {
+        let (registry, drain) = draining_registry_with_zero_survivor();
+        let stale_decrease = registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 4 * GIB,
+            peak_bytes: 5 * GIB,
+            memory_limit_bytes: Some(24 * GIB),
+            metal_recommended_working_set_bytes: Some(24 * GIB),
+        });
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Constrained,
+            swap_out_delta: 0,
+            compressor_delta: 1,
+        });
+        registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 5 * GIB,
+            peak_bytes: 5 * GIB,
+            memory_limit_bytes: Some(24 * GIB),
+            metal_recommended_working_set_bytes: Some(24 * GIB),
+        });
+        registry
+            .finish_unregister(drain, Some(stale_decrease))
+            .unwrap();
+        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
     }
 
     #[test]
