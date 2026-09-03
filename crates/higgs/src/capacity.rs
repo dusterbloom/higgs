@@ -430,7 +430,70 @@ pub enum CapacityBasis {
     Learned,
 }
 
-/// Versioned capacity advertised for one model by this Higgs process.
+/// Process-wide adaptive-capacity diagnostics exposed by `/metrics`.
+/// Numbers and identities only — never prompt or request content.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapacityDiagnostics {
+    pub boot_id: String,
+    pub active_reservations: usize,
+    pub active_reservation_bytes: u64,
+    pub oldest_reservation_age_ms: Option<u64>,
+    pub queued_waiters: usize,
+    pub pressure: MemoryPressure,
+    pub mlx_active_bytes: u64,
+    pub mlx_peak_bytes: u64,
+    pub swap_out_delta: u64,
+    pub compressor_delta: u64,
+    pub downshifts: u64,
+    pub rejections: CapacityRejectionDiagnostics,
+    pub stop_outcomes: std::collections::BTreeMap<String, u64>,
+    pub models: Vec<CapacityModelDiagnostics>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapacityRejectionDiagnostics {
+    pub exceeded: u64,
+    pub unavailable: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapacityModelDiagnostics {
+    pub model: String,
+    pub generation: u64,
+    pub available: bool,
+    pub basis: CapacityBasis,
+    pub pressure: MemoryPressure,
+    pub safe_total_tokens: u64,
+    pub recommended_output_tokens: u64,
+    pub max_prompt_tokens: u64,
+    pub usable_bytes: u64,
+}
+
+impl Default for CapacityDiagnostics {
+    fn default() -> Self {
+        Self {
+            boot_id: String::new(),
+            active_reservations: 0,
+            active_reservation_bytes: 0,
+            oldest_reservation_age_ms: None,
+            queued_waiters: 0,
+            pressure: MemoryPressure::Normal,
+            mlx_active_bytes: 0,
+            mlx_peak_bytes: 0,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+            downshifts: 0,
+            rejections: CapacityRejectionDiagnostics::default(),
+            stop_outcomes: std::collections::BTreeMap::new(),
+            models: Vec::new(),
+        }
+    }
+}
+
+/// Versioned capacity advertised for one model by this Higgs process./// Versioned capacity advertised for one model by this Higgs process.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapacitySnapshot {

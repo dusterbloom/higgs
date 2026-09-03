@@ -462,6 +462,19 @@ fn check_mla_latent_cache_adapter(
 fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
     for model in &config.models {
         let label = model_label(model);
+        // The uncached suffix a continued turn prefills can never usefully
+        // exceed the retained-session cap it is served from.
+        if model.kv_max_suffix_prefill_tokens > model.kv_max_session_tokens {
+            warn(
+                &format!(
+                    "model {label} sets kv_max_suffix_prefill_tokens={} above \
+                     kv_max_session_tokens={}; the session cap binds first, so the suffix \
+                     value can never take effect — lower it",
+                    model.kv_max_suffix_prefill_tokens, model.kv_max_session_tokens
+                ),
+                result,
+            );
+        }
         if let Err(error) = model.validate_disk_prefix_store() {
             fail(&format!("model {label} disk prefix store: {error}"), result);
         } else if model.kv_disk_dir.is_some() {
@@ -734,10 +747,18 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
 /// The check validates the quantization declaration, estimates the resident
 /// size after conversion, and warns about the slow CPU-bound load.
 fn check_eschamoe_checkpoint(model_dir: &std::path::Path, label: &str, result: &mut DoctorResult) {
+    // Measured Metal/MLX facts: the GPU-recommended working set is the real
+    // ceiling for resident MLX memory; total RAM is only the fallback when
+    // the accessor is unavailable (non-macOS, MLX not initialized).
+    let metal_recommended = higgs_engine::MlxMemorySnapshot::measure()
+        .ok()
+        .and_then(|snapshot| snapshot.metal_recommended_working_set_bytes)
+        .filter(|bytes| *bytes > 0);
     check_eschamoe_checkpoint_with_ram(
         model_dir,
         label,
         total_system_ram_bytes(),
+        metal_recommended,
         higgs_models::eschamoe::native_mode(),
         result,
     );
@@ -747,6 +768,7 @@ fn check_eschamoe_checkpoint_with_ram(
     model_dir: &std::path::Path,
     label: &str,
     ram_bytes: Option<u64>,
+    metal_recommended_bytes: Option<u64>,
     native: bool,
     result: &mut DoctorResult,
 ) {
@@ -803,7 +825,9 @@ fn check_eschamoe_checkpoint_with_ram(
         );
     }
     match eschamoe_resident_estimate_bytes(model_dir, native) {
-        Some(estimate) => check_eschamoe_memory(estimate, ram_bytes, label, result),
+        Some(estimate) => {
+            check_eschamoe_memory(estimate, ram_bytes, metal_recommended_bytes, label, result);
+        }
         None => warn(
             &format!(
                 "model {label} config.json lacks size fields (num_hidden_layers, num_experts, \
@@ -951,34 +975,64 @@ fn trellis_expert_bytes(config: &serde_json::Value) -> Option<u64> {
 fn check_eschamoe_memory(
     estimate: u64,
     ram_bytes: Option<u64>,
+    metal_recommended_bytes: Option<u64>,
     label: &str,
     result: &mut DoctorResult,
 ) {
-    let Some(ram) = ram_bytes else { return };
-    let threshold = ram / 4 * 3;
-    if estimate > threshold {
-        warn(
-            &format!(
-                "model {label} needs an estimated {:.1} GiB resident after eschamoe conversion — \
-                 far more than the on-disk size suggests (the 35B release is 12.3 GB on disk but \
-                 ~20 GB resident). That exceeds 75% of system RAM ({:.1} GiB). No Metal \
-                 working-set accessor is available to doctor, so total RAM is the reference; the \
-                 real Metal limit is lower. Expect memory pressure or an OOM kill",
-                gib(estimate),
-                gib(ram)
-            ),
-            result,
-        );
-    } else {
-        pass(
-            &format!(
-                "model {label} estimated resident size after eschamoe conversion (~{:.1} GiB \
-                 weights) fits in system RAM ({:.1} GiB)",
-                gib(estimate),
-                gib(ram)
-            ),
-            result,
-        );
+    let ram = ram_bytes.unwrap_or(u64::MAX);
+    let ram_threshold = ram / 4 * 3;
+    match metal_recommended_bytes {
+        Some(metal) if estimate > metal && metal <= ram_threshold => {
+            warn(
+                &format!(
+                    "model {label} needs an estimated {:.1} GiB resident after eschamoe \
+                     conversion, above the measured Metal recommended working set ({:.1} GiB). \
+                     Expect adaptive capacity to constrain or reject requests under pressure; \
+                     consider a smaller quantization",
+                    gib(estimate),
+                    gib(metal)
+                ),
+                result,
+            );
+        }
+        Some(metal) if estimate <= metal => {
+            pass(
+                &format!(
+                    "model {label} estimated resident size after eschamoe conversion \
+                     (~{:.1} GiB weights) fits the measured Metal recommended working set \
+                     ({:.1} GiB)",
+                    gib(estimate),
+                    gib(metal)
+                ),
+                result,
+            );
+        }
+        _ if estimate > ram_threshold => {
+            warn(
+                &format!(
+                    "model {label} needs an estimated {:.1} GiB resident after eschamoe \
+                     conversion — far more than the on-disk size suggests (the 35B release is \
+                     12.3 GB on disk but ~20 GB resident). That exceeds 75% of system RAM \
+                     ({:.1} GiB). No measured Metal working set is available, so total RAM is \
+                     the reference; the real Metal limit is lower. Expect memory pressure or \
+                     an OOM kill",
+                    gib(estimate),
+                    gib(ram)
+                ),
+                result,
+            );
+        }
+        _ => {
+            pass(
+                &format!(
+                    "model {label} estimated resident size after eschamoe conversion \
+                     (~{:.1} GiB weights) fits in system RAM ({:.1} GiB)",
+                    gib(estimate),
+                    gib(ram)
+                ),
+                result,
+            );
+        }
     }
 }
 
@@ -2038,7 +2092,14 @@ mod tests {
             ),
         ]);
         let mut result = empty_result();
-        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1 << 40), true, &mut result);
+        check_eschamoe_checkpoint_with_ram(
+            dir.path(),
+            "test",
+            Some(1 << 40),
+            None,
+            true,
+            &mut result,
+        );
         assert_eq!(result.failures, 1);
         assert_eq!(result.passes, 0);
     }
@@ -2047,7 +2108,14 @@ mod tests {
     fn test_eschamoe_malformed_quantize_config_fails() {
         let dir = write_model_dir(&[("quantize_config.json", "not json")]);
         let mut result = empty_result();
-        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1 << 40), true, &mut result);
+        check_eschamoe_checkpoint_with_ram(
+            dir.path(),
+            "test",
+            Some(1 << 40),
+            None,
+            true,
+            &mut result,
+        );
         assert_eq!(result.failures, 1);
     }
 
@@ -2056,14 +2124,21 @@ mod tests {
         let dir = eschamoe_model_dir();
         // 2304 estimate bytes exceed 75% of 1024 bytes of injected RAM.
         let mut native = empty_result();
-        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1024), true, &mut native);
+        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1024), None, true, &mut native);
         assert_eq!(native.failures, 0);
         assert_eq!(native.passes, 1);
         // The native path warns about the memory estimate and nothing else.
         assert_eq!(native.warnings, 1);
 
         let mut affine = empty_result();
-        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1024), false, &mut affine);
+        check_eschamoe_checkpoint_with_ram(
+            dir.path(),
+            "test",
+            Some(1024),
+            None,
+            false,
+            &mut affine,
+        );
         assert_eq!(affine.failures, 0);
         assert_eq!(affine.passes, 1);
         // The affine path adds the slow CPU load warning.
@@ -2071,17 +2146,80 @@ mod tests {
     }
 
     #[test]
+    fn test_kv_suffix_above_session_cap_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_config_json(dir.path(), "qwen2");
+        let mut model = model_with_path(dir.path().to_str().unwrap().to_owned());
+        model.kv_max_session_tokens = 4_096;
+        model.kv_max_suffix_prefill_tokens = 8_192;
+        let config = HiggsConfig {
+            models: vec![model],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_models(&config, &mut result);
+        assert_eq!(result.failures, 0);
+        assert_eq!(result.warnings, 1, "the ineffective suffix cap must warn");
+    }
+
+    #[test]
+    fn test_eschamoe_measured_metal_working_set_drives_the_memory_check() {
+        let dir = eschamoe_model_dir();
+        // Estimate (2304 bytes) exceeds a measured 2048-byte Metal working
+        // set even though 75% of the injected RAM is far larger: the warning
+        // must cite the measured Metal limit.
+        let mut result = empty_result();
+        check_eschamoe_checkpoint_with_ram(
+            dir.path(),
+            "test",
+            Some(1 << 40),
+            Some(2048),
+            true,
+            &mut result,
+        );
+        assert_eq!(result.failures, 0);
+        assert_eq!(result.warnings, 1);
+
+        // Under the measured working set: pass citing Metal, not RAM.
+        let mut result = empty_result();
+        check_eschamoe_checkpoint_with_ram(
+            dir.path(),
+            "test",
+            Some(1 << 40),
+            Some(1 << 40),
+            true,
+            &mut result,
+        );
+        assert_eq!(result.warnings, 0);
+        assert_eq!(result.passes, 2);
+    }
+
+    #[test]
     fn test_eschamoe_fits_ram_passes_memory_check() {
         let dir = eschamoe_model_dir();
         let mut native = empty_result();
-        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1 << 40), true, &mut native);
+        check_eschamoe_checkpoint_with_ram(
+            dir.path(),
+            "test",
+            Some(1 << 40),
+            None,
+            true,
+            &mut native,
+        );
         assert_eq!(native.failures, 0);
         // Detection pass plus memory-fit pass, and no warning.
         assert_eq!(native.passes, 2);
         assert_eq!(native.warnings, 0);
 
         let mut affine = empty_result();
-        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1 << 40), false, &mut affine);
+        check_eschamoe_checkpoint_with_ram(
+            dir.path(),
+            "test",
+            Some(1 << 40),
+            None,
+            false,
+            &mut affine,
+        );
         assert_eq!(affine.passes, 2);
         assert_eq!(affine.warnings, 1);
     }
@@ -2156,7 +2294,14 @@ mod tests {
     fn test_non_eschamoe_dir_is_silent() {
         let dir = write_model_dir(&[("config.json", r#"{"model_type":"llama"}"#)]);
         let mut result = empty_result();
-        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1 << 40), true, &mut result);
+        check_eschamoe_checkpoint_with_ram(
+            dir.path(),
+            "test",
+            Some(1 << 40),
+            None,
+            true,
+            &mut result,
+        );
         assert_eq!(result.passes, 0);
         assert_eq!(result.warnings, 0);
         assert_eq!(result.failures, 0);

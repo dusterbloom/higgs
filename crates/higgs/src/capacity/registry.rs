@@ -139,6 +139,53 @@ impl Default for ModelEntry {
     }
 }
 
+/// One structured record per capacity transition: old/new envelope and
+/// cause. Reductions additionally count as downshifts for diagnostics.
+fn record_capacity_transition(
+    state: &mut RegistryState,
+    model: &str,
+    before: crate::capacity::CapacityDecision,
+    after: crate::capacity::CapacityDecision,
+    cause: &'static str,
+) {
+    if after == before {
+        return;
+    }
+    if after.safe_total_tokens < before.safe_total_tokens {
+        state.counters.downshifts = state.counters.downshifts.saturating_add(1);
+    }
+    tracing::info!(
+        model = %model,
+        from_tokens = before.safe_total_tokens,
+        to_tokens = after.safe_total_tokens,
+        availability = ?after.availability,
+        cause,
+        "capacity envelope transition"
+    );
+}
+
+fn stop_reason_label(reason: &higgs_engine::stop::StopReason) -> &'static str {
+    match reason {
+        higgs_engine::stop::StopReason::ClientDisconnect => "client_disconnect",
+        higgs_engine::stop::StopReason::NoProgressWatchdog => "no_progress_watchdog",
+        higgs_engine::stop::StopReason::CriticalPressure { .. } => "critical_pressure",
+        higgs_engine::stop::StopReason::ModelDrain => "model_drain",
+    }
+}
+
+/// Process-wide capacity diagnostics counters. Numbers only — no prompt or
+/// request content.
+#[derive(Debug, Default)]
+struct CapacityCounters {
+    rejections_exceeded: u64,
+    rejections_unavailable: u64,
+    /// Stop-reason label -> released-reservation count.
+    stop_outcomes: BTreeMap<String, u64>,
+    downshifts: u64,
+    last_swap_out_delta: u64,
+    last_compressor_delta: u64,
+}
+
 #[derive(Debug)]
 struct RegistryState {
     models: BTreeMap<String, ModelEntry>,
@@ -155,12 +202,14 @@ struct RegistryState {
     cache_plan_pressure: MemoryPressure,
     active_reservations: BTreeMap<uuid::Uuid, ActiveReservation>,
     admission_queue: VecDeque<AdmissionWaiter>,
+    counters: CapacityCounters,
 }
 
 #[derive(Debug)]
 struct ActiveReservation {
     model: String,
     bytes: u64,
+    created: std::time::Instant,
     /// Stop signal shared with the owning worker. Critical pressure and model
     /// drain interrupt live reservations through it; the worker acknowledges
     /// at its next allocation boundary and releases the guard only after
@@ -362,9 +411,71 @@ impl CapacityRegistry {
                 cache_plan_pressure: MemoryPressure::Normal,
                 active_reservations: BTreeMap::new(),
                 admission_queue: VecDeque::new(),
+                counters: CapacityCounters::default(),
             }),
             reservation_changed: tokio::sync::Notify::new(),
         })
+    }
+
+    /// Process-wide adaptive-capacity diagnostics for `/metrics`: live
+    /// reservation state, FIFO depth, pressure with swap/compressor deltas,
+    /// rejection and cancellation outcome counters, downshift count, peak
+    /// MLX allocation, and one row per model. No prompt content.
+    #[must_use]
+    pub fn diagnostics(&self) -> crate::capacity::CapacityDiagnostics {
+        let state = self.lock();
+        let now = std::time::Instant::now();
+        let oldest = state
+            .active_reservations
+            .values()
+            .map(|reservation| reservation.created)
+            .min()
+            .map(|created| {
+                u64::try_from(now.saturating_duration_since(created).as_millis())
+                    .unwrap_or(u64::MAX)
+            });
+        let models = state
+            .models
+            .iter()
+            .filter_map(|(model, entry)| {
+                let active = entry
+                    .active
+                    .as_ref()
+                    .filter(|active| active.published && !active.draining)?;
+                let decision = active.controller.decision();
+                Some(crate::capacity::CapacityModelDiagnostics {
+                    model: model.clone(),
+                    generation: entry.generation,
+                    available: decision.availability
+                        == crate::capacity::CapacityAvailability::Available,
+                    basis: active.basis,
+                    pressure: state.pressure,
+                    safe_total_tokens: decision.safe_total_tokens,
+                    recommended_output_tokens: decision.recommended_output_tokens,
+                    max_prompt_tokens: decision.max_prompt_tokens,
+                    usable_bytes: decision.usable_bytes,
+                })
+            })
+            .collect();
+        crate::capacity::CapacityDiagnostics {
+            boot_id: self.boot_id.clone(),
+            active_reservations: state.active_reservations.len(),
+            active_reservation_bytes: active_reservation_bytes(&state).unwrap_or(u64::MAX),
+            oldest_reservation_age_ms: oldest,
+            queued_waiters: state.admission_queue.len(),
+            pressure: state.pressure,
+            mlx_active_bytes: state.memory.active_bytes,
+            mlx_peak_bytes: state.memory.peak_bytes,
+            swap_out_delta: state.counters.last_swap_out_delta,
+            compressor_delta: state.counters.last_compressor_delta,
+            downshifts: state.counters.downshifts,
+            rejections: crate::capacity::CapacityRejectionDiagnostics {
+                exceeded: state.counters.rejections_exceeded,
+                unavailable: state.counters.rejections_unavailable,
+            },
+            stop_outcomes: state.counters.stop_outcomes.clone(),
+            models,
+        }
     }
 
     #[must_use]
@@ -457,6 +568,7 @@ impl CapacityRegistry {
         queue_head: bool,
     ) -> RequestReservationAttempt {
         let Some(entry) = state.models.get(model) else {
+            state.counters.rejections_unavailable += 1;
             return RequestReservationAttempt::Rejected(CapacityAdmissionError::Unavailable(
                 CapacityUnavailableError::new(self.boot_id.clone(), 0),
             ));
@@ -467,6 +579,7 @@ impl CapacityRegistry {
             .as_ref()
             .filter(|active| active.published && !active.draining)
         else {
+            state.counters.rejections_unavailable += 1;
             return RequestReservationAttempt::Rejected(CapacityAdmissionError::Unavailable(
                 CapacityUnavailableError::new(self.boot_id.clone(), generation),
             ));
@@ -475,6 +588,7 @@ impl CapacityRegistry {
         let shared = match effective_shared_ledger(state) {
             Ok(shared) => shared,
             Err(_) => {
+                state.counters.rejections_unavailable += 1;
                 return RequestReservationAttempt::Rejected(CapacityAdmissionError::Unavailable(
                     CapacityUnavailableError::new(self.boot_id.clone(), generation),
                 ));
@@ -484,11 +598,16 @@ impl CapacityRegistry {
         let individual_ledger = match individual.admit(request) {
             Admission::Admitted(ledger) => ledger,
             other => {
-                return RequestReservationAttempt::Rejected(admission_error(
-                    &self.boot_id,
-                    generation,
-                    other,
-                ));
+                let error = admission_error(&self.boot_id, generation, other);
+                match error {
+                    CapacityAdmissionError::Exceeded(_) => {
+                        state.counters.rejections_exceeded += 1;
+                    }
+                    CapacityAdmissionError::Unavailable(_) => {
+                        state.counters.rejections_unavailable += 1;
+                    }
+                }
+                return RequestReservationAttempt::Rejected(error);
             }
         };
 
@@ -504,6 +623,7 @@ impl CapacityRegistry {
         let Some(bytes) =
             request_reservation_bytes(individual_ledger, request.retained_growth_bytes)
         else {
+            state.counters.rejections_unavailable += 1;
             return RequestReservationAttempt::Rejected(CapacityAdmissionError::Unavailable(
                 CapacityUnavailableError::new(self.boot_id.clone(), generation),
             ));
@@ -515,6 +635,7 @@ impl CapacityRegistry {
             ActiveReservation {
                 model: model.to_owned(),
                 bytes,
+                created: std::time::Instant::now(),
                 stop: stop.clone(),
             },
         );
@@ -613,8 +734,12 @@ impl CapacityRegistry {
     fn release_reservation(&self, id: uuid::Uuid) {
         let wake = {
             let mut state = self.lock();
-            if state.active_reservations.remove(&id).is_none() {
+            let Some(released) = state.active_reservations.remove(&id) else {
                 return;
+            };
+            if let Some(reason) = released.stop.reason() {
+                let label = stop_reason_label(&reason).to_owned();
+                *state.counters.stop_outcomes.entry(label).or_default() += 1;
             }
             restore_cache_policy_if_admission_idle(&mut state);
             state
@@ -832,7 +957,12 @@ impl CapacityRegistry {
         } else {
             shared.active_reservation_bytes = 0;
         }
-        recompute_active_models(&mut state, shared, ZeroCapacityRecovery::Preserve);
+        recompute_active_models(
+            &mut state,
+            shared,
+            ZeroCapacityRecovery::Preserve,
+            "cache reclamation remeasure",
+        );
         let wake = state
             .admission_queue
             .front()
@@ -1019,7 +1149,7 @@ impl CapacityRegistry {
         }
         state.registering.remove(&ticket.model);
         ticket.pending = false;
-        recompute_registry(&mut state);
+        recompute_registry(&mut state, "model registration");
 
         Ok(ActiveRegistration {
             registry: Arc::downgrade(self),
@@ -1084,7 +1214,7 @@ impl CapacityRegistry {
                 true
             }
         });
-        recompute_registry(&mut state);
+        recompute_registry(&mut state, "model drain");
         let wake = state
             .admission_queue
             .front()
@@ -1157,7 +1287,7 @@ impl CapacityRegistry {
         }
         if removed {
             state.published_cache_allocations.remove(&drain.model);
-            recompute_registry_with(&mut state, zero_recovery);
+            recompute_registry_with(&mut state, zero_recovery, "model unload");
         }
         drain.finished = true;
         drop(state);
@@ -1192,16 +1322,24 @@ impl CapacityRegistry {
             pressure: effective_pressure,
             ..observation
         };
-        for entry in state.models.values_mut() {
+        let mut transitions = Vec::new();
+        for (model_name, entry) in state.models.iter_mut() {
             if let Some(active) = entry.active.as_mut() {
                 let before = active.controller.decision();
                 active.controller.apply_pressure_observation(normalized);
-                if active.controller.decision() != before {
+                let after = active.controller.decision();
+                if after != before {
                     entry.generation = entry.generation.saturating_add(1);
+                    transitions.push((model_name.to_owned(), before, after));
                 }
             }
         }
+        for (model_name, before, after) in transitions {
+            record_capacity_transition(&mut state, &model_name, before, after, "memory pressure");
+        }
         state.pressure = effective_pressure;
+        state.counters.last_swap_out_delta = observation.swap_out_delta;
+        state.counters.last_compressor_delta = observation.compressor_delta;
         if effective_pressure == MemoryPressure::Critical {
             // Interrupt every live reservation: each worker acknowledges at
             // its next allocation boundary and surfaces the typed capacity
@@ -1220,7 +1358,7 @@ impl CapacityRegistry {
                     });
             }
         }
-        recompute_registry(&mut state);
+        recompute_registry(&mut state, "memory pressure");
         let wake = state
             .admission_queue
             .front()
@@ -1244,7 +1382,7 @@ impl CapacityRegistry {
         } else {
             ZeroCapacityRecovery::Preserve
         };
-        recompute_registry_with(&mut state, zero_recovery);
+        recompute_registry_with(&mut state, zero_recovery, "allocator memory");
         let measurement = PublishedMemoryMeasurement {
             boot_id: self.boot_id.clone(),
             previous_revision,
@@ -1294,7 +1432,12 @@ impl CapacityRegistry {
             // not shrink the client-visible semantic envelope while live.
             shared.active_reservation_bytes = 0;
         }
-        recompute_active_models(&mut state, shared, zero_recovery);
+        recompute_active_models(
+            &mut state,
+            shared,
+            zero_recovery,
+            "cache reclamation remeasure",
+        );
         let measurement = PublishedMemoryMeasurement {
             boot_id: self.boot_id.clone(),
             previous_revision,
@@ -1329,7 +1472,7 @@ impl CapacityRegistry {
                 entry.active = None;
                 entry.generation = entry.generation.saturating_add(1);
             }
-            recompute_registry(&mut state);
+            recompute_registry(&mut state, "registration rollback");
         }
     }
 
@@ -1374,7 +1517,7 @@ impl CapacityRegistry {
             active.drain_nonce = None;
             active.frozen_cache_allocation = None;
             entry.generation = entry.generation.saturating_add(1);
-            recompute_registry(&mut state);
+            recompute_registry(&mut state, "drain cancelled");
         }
         let wake = state
             .admission_queue
@@ -1683,6 +1826,7 @@ fn recompute_active_models(
     state: &mut RegistryState,
     shared: SharedLedger,
     zero_recovery: ZeroCapacityRecovery,
+    cause: &'static str,
 ) {
     advance_capacity_policy_revision(state);
     let zero_recovery = if state.capacity_policy_revision.is_some() {
@@ -1690,14 +1834,20 @@ fn recompute_active_models(
     } else {
         ZeroCapacityRecovery::Preserve
     };
-    for entry in state.models.values_mut() {
+    let mut transitions = Vec::new();
+    for (model_name, entry) in state.models.iter_mut() {
         if let Some(active) = entry.active.as_mut() {
             let before = active.controller.decision();
             replace_shared_ledger(&mut active.controller, shared, zero_recovery);
-            if active.controller.decision() != before {
+            let after = active.controller.decision();
+            if after != before {
                 entry.generation = entry.generation.saturating_add(1);
+                transitions.push((model_name.to_owned(), before, after));
             }
         }
+    }
+    for (model_name, before, after) in transitions {
+        record_capacity_transition(state, &model_name, before, after, cause);
     }
 }
 
@@ -1707,8 +1857,8 @@ fn advance_capacity_policy_revision(state: &mut RegistryState) {
         .and_then(|revision| revision.checked_add(1));
 }
 
-fn recompute_registry(state: &mut RegistryState) {
-    recompute_registry_with(state, ZeroCapacityRecovery::Preserve);
+fn recompute_registry(state: &mut RegistryState, cause: &'static str) {
+    recompute_registry_with(state, ZeroCapacityRecovery::Preserve, cause);
 }
 
 fn restore_cache_policy_if_admission_idle(state: &mut RegistryState) {
@@ -1716,11 +1866,15 @@ fn restore_cache_policy_if_admission_idle(state: &mut RegistryState) {
         // Reclaimed caches stay capped through the whole FIFO handoff. The
         // ordinary acknowledged policy may restore them only after the final
         // worker and waiter are both gone.
-        recompute_registry(state);
+        recompute_registry(state, "admission idle restore");
     }
 }
 
-fn recompute_registry_with(state: &mut RegistryState, zero_recovery: ZeroCapacityRecovery) {
+fn recompute_registry_with(
+    state: &mut RegistryState,
+    zero_recovery: ZeroCapacityRecovery,
+    cause: &'static str,
+) {
     let old_allocations = std::mem::take(&mut state.desired_cache_allocations);
     let allocations = cache_allocations_with(state, None);
     let mut desired = allocations.as_ref().cloned().unwrap_or_default();
@@ -1760,7 +1914,7 @@ fn recompute_registry_with(state: &mut RegistryState, zero_recovery: ZeroCapacit
     if ledger_valid {
         shared.active_reservation_bytes = 0;
     }
-    recompute_active_models(state, shared, zero_recovery);
+    recompute_active_models(state, shared, zero_recovery, cause);
 }
 
 fn max_cache_allocation(left: CacheAllocation, right: CacheAllocation) -> CacheAllocation {
@@ -2462,6 +2616,103 @@ mod tests {
         assert_eq!(registry.active_reservation_count("model"), 1);
         drop(replacement);
         follower.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_diagnostics_expose_reservation_waiter_rejection_and_outcome_counters() {
+        let registry = CapacityRegistry::new(["model".to_owned()]);
+        register(&registry, admission_facts("model"));
+        // 2 GiB per request against the byte-bound envelope: one fits, a
+        // second contends in the FIFO, and a later allocator rise lowers the
+        // published envelope.
+        let base = admission_request(1_024, 1_024);
+
+        // Semantic oversize is counted as a typed rejection.
+        assert!(matches!(
+            registry.try_reserve_request("model", admission_request(8_192, 8_192)),
+            RequestReservationAttempt::Rejected(_)
+        ));
+        let diagnostics = registry.diagnostics();
+        assert_eq!(diagnostics.rejections.exceeded, 1);
+
+        // One live reservation with bytes and an oldest-age sample.
+        let reservation = registry.reserve_request("model", base).await.unwrap();
+        let diagnostics = registry.diagnostics();
+        assert_eq!(diagnostics.active_reservations, 1);
+        assert_eq!(diagnostics.active_reservation_bytes, 2 * GIB);
+        assert!(diagnostics.oldest_reservation_age_ms.is_some());
+        assert_eq!(diagnostics.queued_waiters, 0);
+
+        // A contended follower is visible as a queued waiter.
+        let waiting_registry = Arc::clone(&registry);
+        let waiter =
+            tokio::spawn(async move { waiting_registry.reserve_request("model", base).await });
+        while registry.diagnostics().queued_waiters != 1 {
+            assert!(!waiter.is_finished(), "follower did not enter FIFO");
+            tokio::task::yield_now().await;
+        }
+
+        // Pressure observations expose the effective level; nonzero
+        // swap/compressor deltas escalate the level, so the level assert and
+        // the delta assert use separate observations.
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Constrained,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+        assert_eq!(registry.diagnostics().pressure, MemoryPressure::Constrained);
+
+        // An envelope reduction from a measured allocator change is counted
+        // as a downshift.
+        registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 7 * GIB / 2,
+            peak_bytes: 7 * GIB / 2,
+            memory_limit_bytes: Some(10 * GIB),
+            metal_recommended_working_set_bytes: Some(10 * GIB),
+        });
+        let diagnostics = registry.diagnostics();
+        assert!(
+            diagnostics.downshifts >= 1,
+            "a measured envelope reduction must be counted: {diagnostics:#?}"
+        );
+
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Constrained,
+            swap_out_delta: 42,
+            compressor_delta: 7,
+        });
+        let diagnostics = registry.diagnostics();
+        assert_eq!(diagnostics.swap_out_delta, 42);
+        assert_eq!(diagnostics.compressor_delta, 7);
+
+        // A stopped worker releases with its outcome counted. The critical
+        // escalation from the delta observation marked the live reservation
+        // first (first reason wins), so the recorded outcome is the pressure
+        // interrupt — a later ModelDrain signal cannot rewrite it.
+        drop(reservation);
+        let diagnostics = registry.diagnostics();
+        assert_eq!(diagnostics.active_reservations, 0);
+        assert_eq!(diagnostics.stop_outcomes.get("critical_pressure"), Some(&1));
+        assert_eq!(
+            diagnostics.stop_outcomes.values().sum::<u64>(),
+            1,
+            "exactly one released-with-reason outcome: {:?}",
+            diagnostics.stop_outcomes
+        );
+
+        // Unavailability rejections are counted separately.
+        assert!(matches!(
+            registry.try_reserve_request("missing-model", base),
+            RequestReservationAttempt::Rejected(_)
+        ));
+        assert!(
+            registry.diagnostics().rejections.unavailable >= 1,
+            "{:?}",
+            registry.diagnostics().rejections
+        );
+        let drain = registry.begin_drain("model").unwrap();
+        let _ = drain;
+        let _ = waiter.await;
     }
 
     #[tokio::test(flavor = "current_thread")]
