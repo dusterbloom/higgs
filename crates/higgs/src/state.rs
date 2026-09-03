@@ -1510,6 +1510,7 @@ struct LoadCapacityLedger {
     target: higgs_engine::ModelLoadEstimate,
     retained_optional_resident_bytes: u64,
     active_optional: Option<(higgs_models::progress::OptionalModelKind, u64, u64)>,
+    active_shard: Option<(usize, u64)>,
     full_artifact_workspace_active: bool,
 }
 
@@ -1519,6 +1520,7 @@ impl LoadCapacityLedger {
             target: estimate,
             retained_optional_resident_bytes: 0,
             active_optional: None,
+            active_shard: None,
             full_artifact_workspace_active: false,
         }
     }
@@ -1572,6 +1574,7 @@ impl LoadCapacityLedger {
             return Ok(());
         }
 
+        let mut started_shard = None;
         let additional_bytes = match boundary {
             LoadBoundary::BeforeOptionalModel {
                 artifact_bytes,
@@ -1615,8 +1618,14 @@ impl LoadCapacityLedger {
                 }
                 return Ok(());
             }
-            LoadBoundary::BeforeShard { bytes, .. } => {
+            LoadBoundary::BeforeShard { index, bytes } => {
+                if self.active_shard.is_some() {
+                    return Err(higgs_models::error::ModelError::LoadCapacity(
+                        "nested model shard load".to_owned(),
+                    ));
+                }
                 let (_, workspace) = self.resident_and_workspace()?;
+                started_shard = Some((index, bytes));
                 if self.full_artifact_workspace_active
                     || self.active_optional.is_some()
                     || self.target.workspace_kind
@@ -1634,6 +1643,20 @@ impl LoadCapacityLedger {
                     ConversionKind::NativeEscha
                     | ConversionKind::AffineEscha
                     | ConversionKind::QwenMaterialization => workspace.max(bytes),
+                    ConversionKind::GemmaExpertReshape => self
+                        .active_shard
+                        .map(|(_, shard_bytes)| shard_bytes)
+                        .ok_or_else(|| {
+                            higgs_models::error::ModelError::LoadCapacity(
+                                "Gemma expert reshape without active shard".to_owned(),
+                            )
+                        })?
+                        .checked_add(bytes)
+                        .ok_or_else(|| {
+                            higgs_models::error::ModelError::LoadCapacity(
+                                "Gemma expert workspace byte ledger overflow".to_owned(),
+                            )
+                        })?,
                     ConversionKind::FullArtifact => {
                         self.full_artifact_workspace_active = true;
                         workspace.max(bytes)
@@ -1648,7 +1671,20 @@ impl LoadCapacityLedger {
                 self.full_artifact_workspace_active = false;
                 return Ok(());
             }
-            LoadBoundary::AfterShard { .. } | LoadBoundary::AfterConversion { .. } => {
+            LoadBoundary::AfterShard { index } => {
+                let Some((active_index, _)) = self.active_shard.take() else {
+                    return Err(higgs_models::error::ModelError::LoadCapacity(
+                        "model shard end without start".to_owned(),
+                    ));
+                };
+                if active_index != index {
+                    return Err(higgs_models::error::ModelError::LoadCapacity(
+                        "model shard boundary identity mismatch".to_owned(),
+                    ));
+                }
+                return Ok(());
+            }
+            LoadBoundary::AfterConversion { .. } => {
                 return Ok(());
             }
         };
@@ -1665,6 +1701,9 @@ impl LoadCapacityLedger {
                 "insufficient_capacity at load boundary: {required} bytes required, {} safe",
                 snapshot.headroom_bytes
             )));
+        }
+        if let Some(shard) = started_shard {
+            self.active_shard = Some(shard);
         }
         Ok(())
     }
@@ -2306,6 +2345,51 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    /// Gemma's second pass keeps the whole loaded shard map alive while each
+    /// expert tensor is reshaped. A pressure transition between those two
+    /// boundaries must therefore retain the shard charge.
+    #[test]
+    fn gemma_expert_reshape_retains_live_shard_across_pressure_transition() {
+        let estimate = higgs_engine::ModelLoadEstimate {
+            artifact_bytes: 100,
+            largest_selected_shard_bytes: 60,
+            workspace_kind: higgs_engine::LoaderWorkspaceKind::StandardStream,
+            workspace_upper_bound_bytes: 60,
+            required_process_bytes: 160,
+        };
+        let mut ledger = LoadCapacityLedger::new(estimate);
+        ledger
+            .enforce(
+                crate::capacity::LoadCapacitySnapshot {
+                    pressure: crate::capacity::MemoryPressure::Normal,
+                    headroom_bytes: 190,
+                },
+                higgs_models::progress::LoadBoundary::BeforeShard {
+                    index: 3,
+                    bytes: 60,
+                },
+            )
+            .unwrap();
+
+        let error = ledger
+            .enforce(
+                crate::capacity::LoadCapacitySnapshot {
+                    pressure: crate::capacity::MemoryPressure::Constrained,
+                    headroom_bytes: 189,
+                },
+                higgs_models::progress::LoadBoundary::BeforeConversion {
+                    index: 7,
+                    bytes: 30,
+                    kind: higgs_models::progress::ConversionKind::GemmaExpertReshape,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            higgs_models::error::ModelError::LoadCapacity(_)
+        ));
     }
 
     #[test]

@@ -11874,6 +11874,29 @@ fn apply_escha_natives(
     Ok(())
 }
 
+fn retry_after_failed_model<T, U, E>(
+    failed_model: T,
+    release_allocator: impl FnOnce(),
+    retry: impl FnOnce() -> Result<U, E>,
+) -> Result<U, E> {
+    drop(failed_model);
+    release_allocator();
+    retry()
+}
+
+#[allow(unsafe_code)]
+fn clear_mlx_cache_for_gdn_retry() {
+    let rc = unsafe { mlx_sys::mlx_clear_cache() };
+    if rc == 0 {
+        tracing::debug!("Cleared MLX allocator cache before separate GDN retry");
+    } else {
+        tracing::warn!(
+            rc,
+            "Failed to clear MLX allocator cache before separate GDN retry"
+        );
+    }
+}
+
 fn load_qwen3_5_model_with_gdn_fallback(
     model_path: &Path,
     mut args: Qwen3NextModelArgs,
@@ -11914,17 +11937,19 @@ fn load_qwen3_5_model_with_gdn_fallback(
                 "Detected mixed-bit GDN BA projection shapes; retrying with separate GDN projections"
             );
             args.use_separate_gdn_projections = true;
-            let mut separate_model = Qwen3NextCausalLM::new(args)?;
-            load_qwen3_5_moe_weights_direct(
-                &mut separate_model,
-                model_path,
-                compact_symmetric_q1,
-                quantization.as_ref(),
-            )?;
-            tracing::info!(
-                "Using SEPARATE GDN projections (4 dispatches per layer, mixed-bit fallback)"
-            );
-            Ok(separate_model)
+            retry_after_failed_model(fused_model, clear_mlx_cache_for_gdn_retry, || {
+                let mut separate_model = Qwen3NextCausalLM::new(args)?;
+                load_qwen3_5_moe_weights_direct(
+                    &mut separate_model,
+                    model_path,
+                    compact_symmetric_q1,
+                    quantization.as_ref(),
+                )?;
+                tracing::info!(
+                    "Using SEPARATE GDN projections (4 dispatches per layer, mixed-bit fallback)"
+                );
+                Ok(separate_model)
+            })
         }
         Err(err) => Err(err),
     }
@@ -12746,6 +12771,41 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
 mod tests {
     use super::*;
     use crate::cache::KeyValueCache;
+
+    #[test]
+    fn mixed_bit_retry_releases_failed_model_and_allocator_before_allocation() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct FailedModel(Rc<RefCell<Vec<&'static str>>>);
+        impl Drop for FailedModel {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push("drop-failed-model");
+            }
+        }
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let release_events = Rc::clone(&events);
+        let retry_events = Rc::clone(&events);
+        retry_after_failed_model(
+            FailedModel(Rc::clone(&events)),
+            move || release_events.borrow_mut().push("clear-allocator-cache"),
+            move || {
+                retry_events.borrow_mut().push("retry-allocation");
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "drop-failed-model",
+                "clear-allocator-cache",
+                "retry-allocation"
+            ]
+        );
+    }
 
     #[test]
     fn crossrow_qmv_error_uses_stock_fallback() {
