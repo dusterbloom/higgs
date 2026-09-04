@@ -1701,6 +1701,82 @@ pub fn is_eschamoe_checkpoint(model_dir: &std::path::Path) -> Result<bool, Model
     Ok(false)
 }
 
+/// Architecture-derived resident-size estimate for one eschamoe checkpoint
+/// after conversion. Native trellis keeps the experts in their packed code
+/// form (the released 35B lands ~9-10 GiB resident); the affine path decodes
+/// every expert to affine 4-bit (~2x the native resident size). Shared by
+/// doctor's memory check and the engine's load-admission bound so the two can
+/// never disagree. `None` when the config lacks the architecture fields.
+pub fn resident_estimate_bytes(model_dir: &std::path::Path, native: bool) -> Option<u64> {
+    let raw = std::fs::read_to_string(model_dir.join("config.json")).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    // A checkpoint with a vision tower nests the text fields under
+    // `text_config`. The released 35B escha checkpoint has that shape, so a
+    // top-level read alone finds nothing and the estimate never runs.
+    let field = |key: &str| -> Option<u64> {
+        config
+            .get(key)
+            .or_else(|| config.get("text_config").and_then(|text| text.get(key)))?
+            .as_u64()
+    };
+    let layers = field("num_hidden_layers")?;
+    let experts = field("num_experts")?;
+    let moe_intermediate = field("moe_intermediate_size")?;
+    let hidden = field("hidden_size")?;
+    let vocab = field("vocab_size")?;
+
+    let target = CONVERSION_TARGET;
+    let bits = u64::try_from(target.bits).ok()?;
+    let group_size = u64::try_from(target.group_size).ok()?;
+    let affine_bytes = |params: u64| {
+        let packed = params.checked_mul(bits)?.div_ceil(8);
+        let metadata = params.div_ceil(group_size).checked_mul(4)?;
+        packed.checked_add(metadata)
+    };
+
+    // Three projections per expert: gate, up, and down.
+    let expert_params = layers
+        .checked_mul(3)?
+        .checked_mul(experts)?
+        .checked_mul(moe_intermediate)?
+        .checked_mul(hidden)?;
+    let expert_bytes = if native {
+        trellis_expert_bytes(&config).or_else(|| affine_bytes(expert_params))?
+    } else {
+        affine_bytes(expert_params)?
+    };
+
+    // The embedding table and the output head.
+    let vocabulary_params = 2_u64.checked_mul(vocab)?.checked_mul(hidden)?;
+    expert_bytes.checked_add(affine_bytes(vocabulary_params)?)
+}
+
+/// Sum the trellis code bytes of every expert projection.
+///
+/// Each entry of `quantization_config.layer_meta` gives the expert count, the
+/// two feature lengths, and the rate `K`. The code holds `K` bits for each
+/// weight. Give `None` when the block is absent or an entry lacks a field, so
+/// the caller can fall back.
+fn trellis_expert_bytes(config: &serde_json::Value) -> Option<u64> {
+    let meta = config
+        .get("quantization_config")?
+        .get("layer_meta")?
+        .as_object()?;
+    if meta.is_empty() {
+        return None;
+    }
+    let mut bits = 0u64;
+    for entry in meta.values() {
+        let field = |key: &str| entry.get(key)?.as_u64();
+        let entry_bits = field("num_experts")?
+            .checked_mul(field("in_features")?)?
+            .checked_mul(field("out_features")?)?
+            .checked_mul(field("K")?)?;
+        bits = bits.checked_add(entry_bits)?;
+    }
+    Some(bits.div_ceil(8))
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1711,7 +1787,6 @@ pub fn is_eschamoe_checkpoint(model_dir: &std::path::Path) -> Result<bool, Model
 mod tests {
     use mlx_rs::ops::indexing::IndexOp;
     use mlx_rs::{Array, Dtype};
-    use std::collections::HashMap;
 
     use super::*;
     use crate::mlx_exec::eval;
@@ -1777,7 +1852,9 @@ mod tests {
         let (ck, cn) = c_spec.tiles();
         let cw = c_spec.words_per_tile();
         let c_code_len = C_EXPERTS as usize * ck * cn * cw;
-        let c_code_data: Vec<i16> = (0..c_code_len).map(|i| (i % 251) as i16 * 7 - 130).collect();
+        let c_code_data: Vec<i16> = (0..c_code_len)
+            .map(|i| (i % 251) as i16 * 7 - 130)
+            .collect();
         let c_code = Array::from_slice(
             &c_code_data,
             &[
@@ -1799,8 +1876,9 @@ mod tests {
 
         const C_ROWS: i32 = 256;
         let c_ids_data: Vec<u32> = (0..C_ROWS as u32).map(|i| i % C_EXPERTS as u32).collect();
-        let c_x_data: Vec<f32> =
-            (0..(C_ROWS * C_IN) as usize).map(|i| (i % 13) as f32 - 6.0).collect();
+        let c_x_data: Vec<f32> = (0..(C_ROWS * C_IN) as usize)
+            .map(|i| (i % 13) as f32 - 6.0)
+            .collect();
         let c_x = Array::from_slice(&c_x_data, &[C_ROWS, C_IN]);
         let c_eids = Array::from_slice(&c_ids_data, &[C_ROWS]);
 
@@ -1833,39 +1911,40 @@ mod tests {
         // (production sorts by expert — pass count collapses). ----
         for &rows in &ROW_SET {
             for sorted in [false, true] {
-            let mut ids_data: Vec<u32> = (0..rows as u32).map(|i| i % EXPERTS as u32).collect();
-            if sorted {
-                ids_data.sort_unstable();
-            }
-            let tag = if sorted { "sorted" } else { "mixed  " };
-            let x_data: Vec<f32> =
-                (0..(rows * IN) as usize).map(|i| (i % 13) as f32 - 6.0).collect();
-            let x = Array::from_slice(&x_data, &[rows, IN]);
-            let eids = Array::from_slice(&ids_data, &[rows]);
-
-            let time_path = |gemm: bool| {
-                let mut samples = Vec::with_capacity(ITERS + 1);
-                for i in 0..=ITERS {
-                    let t0 = std::time::Instant::now();
-                    let out = proj.gather_forward_mode(&x, &eids, gemm).unwrap();
-                    eval(std::slice::from_ref(&out)).unwrap();
-                    if i > 0 {
-                        samples.push(t0.elapsed().as_secs_f64());
-                    }
+                let mut ids_data: Vec<u32> = (0..rows as u32).map(|i| i % EXPERTS as u32).collect();
+                if sorted {
+                    ids_data.sort_unstable();
                 }
-                samples.sort_by(|a, b| a.total_cmp(b));
-                samples[ITERS / 2]
-            };
-            let scratch_s = time_path(false);
-            let gemm_s = time_path(true);
-            let flops = 2.0 * rows as f64 * IN as f64 * OUT as f64;
-            println!(
-                "rows={rows} {tag}: scratch {:.1} ms ({:.0} GFLOP/s) | qgemm {:.1} ms ({:.0} GFLOP/s)",
-                scratch_s * 1e3,
-                flops / scratch_s / 1e9,
-                gemm_s * 1e3,
-                flops / gemm_s / 1e9,
-            );
+                let tag = if sorted { "sorted" } else { "mixed  " };
+                let x_data: Vec<f32> = (0..(rows * IN) as usize)
+                    .map(|i| (i % 13) as f32 - 6.0)
+                    .collect();
+                let x = Array::from_slice(&x_data, &[rows, IN]);
+                let eids = Array::from_slice(&ids_data, &[rows]);
+
+                let time_path = |gemm: bool| {
+                    let mut samples = Vec::with_capacity(ITERS + 1);
+                    for i in 0..=ITERS {
+                        let t0 = std::time::Instant::now();
+                        let out = proj.gather_forward_mode(&x, &eids, gemm).unwrap();
+                        eval(std::slice::from_ref(&out)).unwrap();
+                        if i > 0 {
+                            samples.push(t0.elapsed().as_secs_f64());
+                        }
+                    }
+                    samples.sort_by(|a, b| a.total_cmp(b));
+                    samples[ITERS / 2]
+                };
+                let scratch_s = time_path(false);
+                let gemm_s = time_path(true);
+                let flops = 2.0 * rows as f64 * IN as f64 * OUT as f64;
+                println!(
+                    "rows={rows} {tag}: scratch {:.1} ms ({:.0} GFLOP/s) | qgemm {:.1} ms ({:.0} GFLOP/s)",
+                    scratch_s * 1e3,
+                    flops / scratch_s / 1e9,
+                    gemm_s * 1e3,
+                    flops / gemm_s / 1e9,
+                );
             }
         }
     }
@@ -2480,6 +2559,61 @@ mod tests {
         .unwrap();
 
         assert!(is_eschamoe_checkpoint(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn resident_estimate_reads_flat_and_nested_architecture() {
+        let flat = tempfile::tempdir().unwrap();
+        let nested = tempfile::tempdir().unwrap();
+        let architecture = r#""num_hidden_layers":2,"num_experts":4,
+            "moe_intermediate_size":8,"hidden_size":16,"vocab_size":32"#;
+        std::fs::write(
+            flat.path().join("config.json"),
+            format!(r#"{{{architecture}}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            nested.path().join("config.json"),
+            format!(r#"{{"text_config":{{{architecture}}}}}"#),
+        )
+        .unwrap();
+
+        assert_eq!(resident_estimate_bytes(flat.path(), false), Some(2_304));
+        assert_eq!(resident_estimate_bytes(nested.path(), false), Some(2_304));
+    }
+
+    #[test]
+    fn resident_estimate_uses_native_trellis_codes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"num_hidden_layers":2,"num_experts":4,"moe_intermediate_size":8,
+                "hidden_size":16,"vocab_size":32,"quantization_config":{"layer_meta":{
+                  "layers.0.gate_up":{"K":2,"num_experts":4,"in_features":8,"out_features":16},
+                  "layers.0.down":{"K":3,"num_experts":4,"in_features":16,"out_features":8},
+                  "layers.1.gate_up":{"K":2,"num_experts":4,"in_features":8,"out_features":16},
+                  "layers.1.down":{"K":3,"num_experts":4,"in_features":16,"out_features":8}}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(resident_estimate_bytes(dir.path(), true), Some(1_216));
+        assert_eq!(resident_estimate_bytes(dir.path(), false), Some(2_304));
+    }
+
+    #[test]
+    fn resident_estimate_overflow_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            format!(
+                r#"{{"num_hidden_layers":{},"num_experts":2,"moe_intermediate_size":2,
+                    "hidden_size":2,"vocab_size":2}}"#,
+                u64::MAX
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(resident_estimate_bytes(dir.path(), false), None);
     }
 
     #[test]

@@ -198,6 +198,25 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
     // One registry owns shared residency and pressure across every local model.
     let capacity =
         CapacityRegistry::new_with_profile_dir(std::iter::empty(), capacity_profile_dir(cli));
+    // Boot-time memory authority: engines load (and admit against capacity)
+    // BEFORE any AppState exists, so the registry needs one measured snapshot
+    // here. Without it the first startup load fails closed with "no safe
+    // process memory authority" because the fresh registry's memory state is
+    // empty.
+    match higgs_engine::MlxMemorySnapshot::measure() {
+        Ok(memory) => {
+            tracing::info!(
+                limit = ?memory.memory_limit_bytes,
+                working_set = ?memory.metal_recommended_working_set_bytes,
+                active = memory.active_bytes,
+                "boot_capacity_memory_authority"
+            );
+            capacity.refresh_memory(memory);
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to measure boot capacity memory authority");
+        }
+    }
     let pressure_coordinator = CapacityPressureCoordinator::new(Arc::clone(&capacity));
     let pressure_observer =
         start_capacity_pressure_observer(Arc::clone(&pressure_coordinator)).await?;

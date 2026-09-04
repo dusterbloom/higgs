@@ -2043,7 +2043,38 @@ fn cache_allocations_with(
             added.map_or_else(|| "process".to_owned(), |facts| facts.model.clone()),
         ));
     }
-    let available_envelope = cache_envelope.saturating_sub(frozen_total);
+    let requested_total = requested_retained
+        .values()
+        .chain(requested_prefix.values())
+        .try_fold(0_u64, |sum, requested| {
+            sum.checked_add(*requested)
+                .ok_or(RegistrationError::ArithmeticOverflow)
+        })?;
+    let mut low = 0_u64;
+    let mut high = cache_envelope
+        .saturating_sub(frozen_total)
+        .min(requested_total);
+    if !minimum_requests_fit_with_cache_bytes(state, added, frozen_total)? {
+        if let Some(facts) = added {
+            return Err(RegistrationError::InsufficientCapacity(facts.model.clone()));
+        }
+        high = 0;
+    }
+    while low < high {
+        let midpoint = low + (high - low).div_ceil(2);
+        let cache_bytes = frozen_total
+            .checked_add(midpoint)
+            .ok_or(RegistrationError::ArithmeticOverflow)?;
+        if minimum_requests_fit_with_cache_bytes(state, added, cache_bytes)? {
+            low = midpoint;
+        } else {
+            high = midpoint - 1;
+        }
+    }
+    // Optional transport caches consume only the bytes left after every live
+    // model can still serve its minimum semantic request. This uses the same
+    // controller as publication/admission instead of a parallel cache rule.
+    let available_envelope = low;
     let mut retained = fair_cache_allocations(&requested_retained, available_envelope / 2);
     let mut prefix = fair_cache_allocations(
         &requested_prefix,
@@ -2063,6 +2094,33 @@ fn cache_allocations_with(
         });
     }
     Ok(allocations)
+}
+
+fn minimum_requests_fit_with_cache_bytes(
+    state: &RegistryState,
+    added: Option<&ModelCapacityFacts>,
+    cache_bytes: u64,
+) -> Result<bool, RegistrationError> {
+    let mut shared = shared_ledger_with(state, added, None)?;
+    shared.retained_bytes = cache_bytes;
+    shared.prefix_cache_bytes = 0;
+    // Live reservations are a contention term, not part of the published
+    // semantic envelope whose minimum the cache plan must preserve.
+    shared.active_reservation_bytes = 0;
+    let fits = |facts: &ModelCapacityFacts| {
+        facts
+            .controller(shared, state.pressure)
+            .decision()
+            .availability
+            == CapacityAvailability::Available
+    };
+    Ok(added.is_none_or(&fits)
+        && state.models.values().all(|entry| {
+            entry
+                .active
+                .as_ref()
+                .is_none_or(|active| active.draining || fits(&active.facts))
+        }))
 }
 
 fn fair_cache_allocations(
@@ -3513,6 +3571,65 @@ mod tests {
         let process_envelope = 24 * GIB - (24 * GIB * 20 / 100) - 5 * GIB;
         assert!(total <= process_envelope);
         assert_eq!(allocations.len(), 2);
+    }
+
+    #[test]
+    fn registration_reduces_optional_caches_to_preserve_minimum_request() {
+        let registry = CapacityRegistry::new(["escha".to_owned()]);
+        let mut model = facts("escha", 12 * GIB);
+        model.costs.transient_prefill.base_bytes = 4 * GIB;
+        model.configured_total_token_ceiling = Some(1_024);
+        model.configured_output_token_ceiling = Some(1_024);
+        registry.refresh_memory(model.memory);
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Constrained,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+
+        let ticket = registry.begin_registration(model.model.clone()).unwrap();
+        registry.commit_active(ticket, model).unwrap().publish();
+        let plan = registry.cache_allocation_plan();
+        let allocated_cache = plan.allocations[0]
+            .1
+            .checked_add(plan.allocations[0].2)
+            .unwrap();
+        assert!(registry.publish_cache_allocation_revision(plan.revision));
+        let snapshot = registry.snapshot("escha").unwrap();
+
+        assert_eq!(snapshot.availability, CapacityAvailability::Available);
+        assert_eq!(snapshot.safe_total_tokens, 1_024);
+        assert!(allocated_cache > 0);
+        assert!(allocated_cache < 3 * GIB);
+    }
+
+    #[test]
+    fn minimum_request_fit_is_monotonic_in_total_cache_bytes() {
+        let registry = CapacityRegistry::new(["escha".to_owned()]);
+        let mut model = facts("escha", 12 * GIB);
+        model.costs.transient_prefill.base_bytes = 4 * GIB;
+        model.configured_total_token_ceiling = Some(1_024);
+        model.configured_output_token_ceiling = Some(1_024);
+        registry.refresh_memory(model.memory);
+        registry.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Constrained,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+
+        assert!(minimum_requests_fit_with_cache_bytes(&registry.lock(), Some(&model), 0).unwrap());
+        assert!(
+            minimum_requests_fit_with_cache_bytes(
+                &registry.lock(),
+                Some(&model),
+                128 * 1024 * 1024,
+            )
+            .unwrap()
+        );
+        assert!(
+            !minimum_requests_fit_with_cache_bytes(&registry.lock(), Some(&model), 3 * GIB,)
+                .unwrap()
+        );
     }
 
     #[test]

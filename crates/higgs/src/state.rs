@@ -1539,6 +1539,17 @@ pub fn build_engine_with_capacity(
             },
         )?;
         let optional_load_outcome = higgs_models::progress::optional_load_outcome();
+        // The conversion (trellis packing, affine decode, projection fusion)
+        // leaves large freed transients inside MLX's allocator cache. They
+        // are reclaimable but count as active bytes, so the post-load
+        // measurement — and with it the published envelope — would charge a
+        // model that just loaded successfully as if its transients were
+        // permanent residency. Release the cache first; the live model
+        // arrays stay referenced and resident.
+        higgs_engine::simple::maybe_clear_mlx_cache(
+            true,
+            "model loaded: release conversion transients",
+        );
         let after = match higgs_engine::MlxMemorySnapshot::measure() {
             Ok(memory) => memory,
             Err(error) => {
@@ -1664,13 +1675,30 @@ impl LoadCapacityLedger {
     }
 
     fn resident_and_workspace(&self) -> Result<(u64, u64), higgs_models::error::ModelError> {
-        let target_resident_bytes =
-            if self.active_optional.is_some() || self.retained_optional_resident_bytes != 0 {
+        // Native Escha's preload estimate replaces the file-sized resident
+        // floor with the packed trellis resident while keeping one streaming
+        // shard as workspace. Derive that exact floor here so admission and
+        // every allocation boundary enforce the same upper bound. The
+        // estimator's missing-metadata fallback still derives to the full
+        // artifact size.
+        let main_resident_bytes =
+            if self.target.workspace_kind == higgs_engine::LoaderWorkspaceKind::NativeEscha {
                 self.target
-                    .artifact_bytes
-                    .max(self.target.workspace_upper_bound_bytes)
+                    .required_process_bytes
+                    .checked_sub(self.target.workspace_upper_bound_bytes)
+                    .ok_or_else(|| {
+                        higgs_models::error::ModelError::LoadCapacity(
+                            "native Escha resident byte ledger underflow".to_owned(),
+                        )
+                    })?
             } else {
                 self.target.artifact_bytes
+            };
+        let target_resident_bytes =
+            if self.active_optional.is_some() || self.retained_optional_resident_bytes != 0 {
+                main_resident_bytes.max(self.target.workspace_upper_bound_bytes)
+            } else {
+                main_resident_bytes
             };
         let resident = target_resident_bytes
             .checked_add(self.retained_optional_resident_bytes)
@@ -2475,6 +2503,48 @@ mod tests {
                     crate::capacity::LoadCapacitySnapshot {
                         pressure: crate::capacity::MemoryPressure::Normal,
                         headroom_bytes: 200,
+                    },
+                    boundary,
+                )
+                .is_ok()
+        );
+    }
+
+    /// Once architecture metadata yields a smaller packed resident floor,
+    /// allocation boundaries must use the same resident-plus-workspace bound
+    /// that preload admission accepted.
+    #[test]
+    fn load_boundary_policy_uses_native_resident_floor() {
+        let estimate = higgs_engine::ModelLoadEstimate {
+            artifact_bytes: 100,
+            largest_selected_shard_bytes: 60,
+            workspace_kind: higgs_engine::LoaderWorkspaceKind::NativeEscha,
+            workspace_upper_bound_bytes: 60,
+            required_process_bytes: 140,
+        };
+        let boundary = higgs_models::progress::LoadBoundary::BeforeConversion {
+            index: 2,
+            bytes: 31,
+            kind: higgs_models::progress::ConversionKind::NativeEscha,
+        };
+
+        assert!(
+            LoadCapacityLedger::new(estimate)
+                .enforce(
+                    crate::capacity::LoadCapacitySnapshot {
+                        pressure: crate::capacity::MemoryPressure::Normal,
+                        headroom_bytes: 139,
+                    },
+                    boundary,
+                )
+                .is_err()
+        );
+        assert!(
+            LoadCapacityLedger::new(estimate)
+                .enforce(
+                    crate::capacity::LoadCapacitySnapshot {
+                        pressure: crate::capacity::MemoryPressure::Normal,
+                        headroom_bytes: 140,
                     },
                     boundary,
                 )

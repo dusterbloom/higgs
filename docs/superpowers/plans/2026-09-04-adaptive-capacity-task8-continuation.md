@@ -44,7 +44,7 @@
 
   Expected before the fix: panic on `InsufficientCapacity("escha")`.
 
-- [ ] **Step 3: Add the monotonic budget test before production code**
+- [x] **Step 3: Add the monotonic budget test before production code**
 
   Add this second test beside the registration regression. `CapacityController` receives retained and prefix allocations as one summed byte charge, so reducing their total must never change a failed minimum request into a larger failure:
 
@@ -67,7 +67,7 @@
       assert!(minimum_requests_fit_with_cache_bytes(
           &registry.lock(),
           Some(&model),
-          512 * 1024 * 1024
+          128 * 1024 * 1024
       ).unwrap());
       assert!(!minimum_requests_fit_with_cache_bytes(
           &registry.lock(),
@@ -79,7 +79,7 @@
 
   Run the existing draining-cache, stale-revision, FIFO handoff, and live-reservation tests unchanged as the hard-floor and acknowledgement regressions; do not duplicate those fixtures.
 
-- [ ] **Step 4: Implement byte-budget search inside the existing cache path**
+- [x] **Step 4: Implement byte-budget search inside the existing cache path**
 
   After the existing raw cache envelope and frozen-total checks, binary-search `0..=min(raw_flexible_envelope, requested_flexible_total)`. Each tested `cache_bytes` is `frozen_total + flexible_midpoint`; the search never scales or redistributes the frozen portion. Apply the total to a copied `SharedLedger`, set `active_reservation_bytes = 0`, and require a fresh conservative controller to report `Available` for `added` plus each non-draining active model.
 
@@ -97,7 +97,7 @@
 
   Use checked arithmetic. `Ok(false)` moves the binary-search bound, arithmetic errors abort, and a frozen-floor failure for an added model becomes `RegistrationError::InsufficientCapacity`. Ordinary recomputation may publish zero flexible bytes without changing the frozen floor. Do not mutate active controllers during the search.
 
-- [ ] **Step 5: Prove targeted and registry behavior**
+- [x] **Step 5: Prove targeted and registry behavior**
 
   Run:
 
@@ -122,15 +122,17 @@
 - Consumes: `higgs_models::eschamoe::native_mode`, `resident_estimate_bytes`, `model_load_estimate`, `MlxMemorySnapshot::measure`, `CapacityRegistry::refresh_memory`.
 - Produces: one native-Escha load estimate shared with doctor, one boot measurement, and a post-conversion allocator snapshot without diagnostic-only tracing.
 
-- [ ] **Step 1: Add/retain native-estimator regression coverage**
+- [x] **Step 1: Add/retain native-estimator regression coverage**
 
   Test flat and nested `text_config`, `qwen3_5_vl` classification, native trellis `layer_meta`, affine fallback math, and fail-closed fallback when architecture fields are missing. Compare the estimator with the observed load peak during Task 4 rather than making a unit test depend on a user-local model path or a fixed machine-specific byte count.
 
-- [ ] **Step 2: Remove interrupted-session debris**
+  Keep preload and in-load accounting identical: a native estimate's resident floor is `required_process_bytes - workspace_upper_bound_bytes`, while missing/overflowing architecture metadata retains the full-artifact fallback. Cover that bound directly and keep the existing Gemma full-artifact regression unchanged.
 
-  Remove `HIGGS_TRACE_CAPACITY_LOAD` instrumentation from `build_engine_with_capacity`, eliminate the duplicate non-boot memory refresh in `AppState::with_capacity_registry`, and restore exactly one `#[cfg(test)]`/lint attribute block before `mod tests` and `mod convert_dump` in `eschamoe.rs`.
+- [x] **Step 2: Remove interrupted-session debris**
 
-- [ ] **Step 3: Keep native execution explicit and fail observable**
+  Remove `HIGGS_TRACE_CAPACITY_LOAD` instrumentation from `build_engine_with_capacity`, eliminate the duplicate non-boot memory refresh in `AppState::with_capacity_registry`, restore exactly one `#[cfg(test)]`/lint attribute block before `mod tests` and `mod convert_dump` in `eschamoe.rs`, and warn if the one boot authority measurement fails before the existing fail-closed rejection.
+
+- [x] **Step 3: Keep native execution explicit and fail observable**
 
   Preserve the default-native implementation:
 
@@ -142,7 +144,7 @@
 
   Keep `execution_mode` equal to `simple:eschamoe-native` for native Escha. Do not introduce automatic affine fallback.
 
-- [ ] **Step 4: Run focused release checks**
+- [x] **Step 4: Run focused release checks**
 
   ```bash
   cargo fmt --all -- --check
@@ -163,7 +165,7 @@
 - Consumes: completed Tasks 1-2.
 - Produces: release binaries and fresh correctness evidence.
 
-- [ ] **Step 1: Run full release tests and build serially in tmux**
+- [x] **Step 1: Run full release tests and build serially in tmux**
 
   ```bash
   tmux new-session -d -s higgs-cap-release 'cd /private/tmp/higgs-adaptive-capacity && set -o pipefail && cargo test --release 2>&1 | tee /private/tmp/higgs-cap-release-test.log; code=$?; echo __HIGGS_TEST_EXIT__=$code | tee -a /private/tmp/higgs-cap-release-test.log; exit $code'
@@ -172,7 +174,7 @@
 
   Start `higgs-cap-build-final` only after `higgs-cap-release` exits successfully. Inspect the final `test result`/`Finished release` lines and require both exit markers to equal zero.
 
-- [ ] **Step 2: Run Git hygiene checks**
+- [x] **Step 2: Run Git hygiene checks**
 
   ```bash
   git diff --check
@@ -191,7 +193,7 @@
 - Consumes: `target/release/higgs`, real Escha checkpoint, production Higgs config.
 - Produces: native runtime identity, capacity JSON, metrics, request results, and before/after VM counters.
 
-- [ ] **Step 1: Start server and monitor in tmux**
+- [x] **Step 1: Start server and monitor in tmux**
 
   ```bash
   tmux new-session -d -s higgs-cap-native 'cd /private/tmp/higgs-adaptive-capacity && HIGGS_ESCHA_NATIVE=1 RUST_LOG=info target/release/higgs serve -c /Users/peppi/.config/higgs/config.toml 2>&1 | tee /private/tmp/higgs-cap-native.log'
@@ -199,11 +201,11 @@
 
   Record `memory_pressure`, `vm_stat` swap-outs, compressor pages, and Higgs RSS before load, at peak, after publication, and after the replay. The replay fails and no commit is allowed if swap-outs increase, pressure reaches critical, or constrained pressure persists for more than 60 seconds after the load completes.
 
-- [ ] **Step 2: Verify publication and native identity**
+- [x] **Step 2: Verify publication and native identity**
 
   Query authenticated `/v1/capacity?model=escha-35b-a3b` and `/metrics`. Require `schemaVersion == 1`, `availability: available`, `recommendedOutputTokens >= 1024`, nonnegative fair cache budgets, `pressure != critical`, and logs containing `Installed native trellis expert weights`. Unit coverage must assert `execution_mode == "simple:eschamoe-native"`.
 
-- [ ] **Step 3: Exercise genuine capacity bands**
+- [x] **Step 3: Exercise genuine capacity bands**
 
   Run progressively larger cold requests, one retained warm session with tool-shaped turns, a cache-only control, and three cold starts near the published prompt boundary. Require zero new swap-outs, no sustained constrained/critical pressure, no typed 413 below the published envelope, and the expected typed response above it.
 
@@ -217,11 +219,11 @@
 - Consumes: running Higgs server and Nanobot commit `9c3975f`.
 - Produces: cross-binary schema/error/retry evidence, release test/build logs, and matched turn benchmark results.
 
-- [ ] **Step 1: Pin the synchronized branch and run real HTTP conformance**
+- [x] **Step 1: Pin the synchronized branch and run real HTTP conformance**
 
   Confirm `/private/tmp/nac` is at Nanobot commit `9c3975f` before testing. Validate `schemaVersion == 1`, all capacity fields, exact 413 fields, typed 503 behavior, retained-session rotation after compaction, one retry for one logical turn, and no duplicated tool calls/results. Keep the same Higgs `bootId`/generation evidence with each case.
 
-- [ ] **Step 2: Run Nanobot compatibility and release gates**
+- [x] **Step 2: Run Nanobot compatibility and release gates**
 
   From `/private/tmp/nac`:
 
@@ -235,11 +237,11 @@
 
   Run long commands in named tmux sessions and retain their logs.
 
-- [ ] **Step 3: Request OpenCode Muse/Spark review**
+- [x] **Step 3: Request OpenCode Muse/Spark review**
 
   Use `opencode/muse-spark-1.3-contributor-free` in read-only plan/review mode. Give it the final diff, the original adaptive-capacity spec, the failing/passing regression output, native replay evidence, and cross-binary results. Resolve correctness findings; do not accept stylistic expansion or affine fallback.
 
-- [ ] **Step 4: Run final GitNexus scope checks and commit**
+- [x] **Step 4: Run final GitNexus scope checks and commit**
 
   In each changed repository prefer the checked-in runner required by `AGENTS.md`:
 

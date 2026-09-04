@@ -22,8 +22,8 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::OnceLock;
 
-use mlx_rs::{Array, Dtype, Stream, error::Exception};
 use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::{Array, Dtype, Stream, error::Exception};
 
 use crate::eschamoe::EschaSpec;
 
@@ -1211,7 +1211,8 @@ pub fn eschamoe_gather_qgemm_simd(
         .map_err(|_| Exception::custom("eschamoe_gather_qgemm_simd: negative padded rows"))?;
 
     let stream = Stream::task_local_or_default();
-    let cached = ESCHA_QGEMM_SIMD_KERNEL.get_or_init(|| CachedMetalKernel(create_escha_qgemm_simd_kernel()));
+    let cached =
+        ESCHA_QGEMM_SIMD_KERNEL.get_or_init(|| CachedMetalKernel(create_escha_qgemm_simd_kernel()));
     let out_shape = [rows_pad, spec.out_features];
     let cb_arr = Array::from_slice(&[mul, add, mask, xor, row_count], &[5]);
 
@@ -1223,11 +1224,7 @@ pub fn eschamoe_gather_qgemm_simd(
             c"E".as_ptr(),
             spec.num_experts,
         );
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config,
-            c"K".as_ptr(),
-            k,
-        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"K".as_ptr(), k);
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
             config,
             c"TK".as_ptr(),
@@ -1238,31 +1235,14 @@ pub fn eschamoe_gather_qgemm_simd(
             c"TN".as_ptr(),
             tile_dims[1],
         );
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config,
-            c"NT".as_ptr(),
-            nt,
-        );
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config,
-            c"BM".as_ptr(),
-            bm,
-        );
-        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
-            config,
-            c"XP".as_ptr(),
-            xp,
-        );
-        let blocks_n = spec.out_features.div_euclid(128)
-            + i32::from(spec.out_features.rem_euclid(128) != 0);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"NT".as_ptr(), nt);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"BM".as_ptr(), bm);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"XP".as_ptr(), xp);
+        let blocks_n =
+            spec.out_features.div_euclid(128) + i32::from(spec.out_features.rem_euclid(128) != 0);
         let blocks_m = rows_pad.div_euclid(bm);
         // Grid is in threads: one column block per NT-thread threadgroup.
-        mlx_sys::mlx_fast_metal_kernel_config_set_grid(
-            config,
-            blocks_n * nt,
-            blocks_m,
-            1,
-        );
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, blocks_n * nt, blocks_m, 1);
         mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, nt, 1, 1);
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
             config,
@@ -1305,8 +1285,7 @@ pub fn eschamoe_gather_qgemm_simd(
 
         result.map(|padded| {
             use mlx_rs::ops::indexing::IndexOp;
-            padded
-                .index((0..rows as i32, ..))
+            padded.index((0..rows as i32, ..))
         })
     }
 }
@@ -1478,7 +1457,10 @@ fn simd_semantics_dump() {
             let vals = out.as_slice::<f32>().to_vec();
             println!(
                 "tr={tr} ox={ox} oy={oy}: {}",
-                vals.iter().map(|v| format!("{}", *v as u32)).collect::<Vec<_>>().join(",")
+                vals.iter()
+                    .map(|v| format!("{}", *v as u32))
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
         }
     }

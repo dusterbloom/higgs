@@ -911,61 +911,7 @@ fn check_quant_method_declarations(
 /// projection from `quantization_config.layer_meta` and falls back to the
 /// affine estimate when that block is absent.
 fn eschamoe_resident_estimate_bytes(model_dir: &std::path::Path, native: bool) -> Option<u64> {
-    let raw = std::fs::read_to_string(model_dir.join("config.json")).ok()?;
-    let config: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    // A checkpoint with a vision tower nests the text fields under
-    // `text_config`. The released 35B escha checkpoint has that shape, so a
-    // top-level read alone finds nothing and the estimate never runs.
-    let field = |key: &str| -> Option<u64> {
-        config
-            .get(key)
-            .or_else(|| config.get("text_config").and_then(|text| text.get(key)))?
-            .as_u64()
-    };
-    let layers = field("num_hidden_layers")?;
-    let experts = field("num_experts")?;
-    let moe_intermediate = field("moe_intermediate_size")?;
-    let hidden = field("hidden_size")?;
-    let vocab = field("vocab_size")?;
-
-    let target = higgs_models::eschamoe::CONVERSION_TARGET;
-    let bits = u64::try_from(target.bits).ok()?;
-    let group_size = u64::try_from(target.group_size).ok()?;
-    let affine_bytes = |params: u64| params * bits / 8 + params * 4 / group_size;
-
-    // Three projections per expert: gate, up, and down.
-    let expert_params = layers * 3 * experts * moe_intermediate * hidden;
-    let expert_bytes = if native {
-        trellis_expert_bytes(&config).unwrap_or_else(|| affine_bytes(expert_params))
-    } else {
-        affine_bytes(expert_params)
-    };
-
-    // The embedding table and the output head.
-    Some(expert_bytes + affine_bytes(2 * vocab * hidden))
-}
-
-/// Sum the trellis code bytes of every expert projection.
-///
-/// Each entry of `quantization_config.layer_meta` gives the expert count, the
-/// two feature lengths, and the rate `K`. The code holds `K` bits for each
-/// weight. Give `None` when the block is absent or an entry lacks a field, so
-/// the caller can fall back.
-fn trellis_expert_bytes(config: &serde_json::Value) -> Option<u64> {
-    let meta = config
-        .get("quantization_config")?
-        .get("layer_meta")?
-        .as_object()?;
-    if meta.is_empty() {
-        return None;
-    }
-    let mut bits = 0u64;
-    for entry in meta.values() {
-        let field = |key: &str| entry.get(key)?.as_u64();
-        bits +=
-            field("num_experts")? * field("in_features")? * field("out_features")? * field("K")?;
-    }
-    Some(bits / 8)
+    higgs_models::eschamoe::resident_estimate_bytes(model_dir, native)
 }
 
 /// Warn when the resident estimate crowds the memory of the machine.

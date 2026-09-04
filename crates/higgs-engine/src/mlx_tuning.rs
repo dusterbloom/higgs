@@ -316,7 +316,11 @@ pub fn model_load_estimate(
         .map(|(_, bytes)| *bytes)
         .max()
         .ok_or(ModelLoadEstimateError::InvalidArtifact)?;
-    let is_escha = matches!(model_type, "qwen3_5" | "qwen3_5_moe")
+    // The released 35B escha checkpoint is a VLM wrapper (vision_config +
+    // text_config): the loader classifies it qwen3_5_vl while the eschamoe
+    // trellis path serves its text backbone. The VL type must reach the same
+    // escha workspace classification or the load bound double-charges.
+    let is_escha = matches!(model_type, "qwen3_5" | "qwen3_5_moe" | "qwen3_5_vl")
         && higgs_models::eschamoe::is_eschamoe_checkpoint(model_dir)
             .map_err(|error| ModelLoadEstimateError::Loader(error.to_string()))?;
     let workspace_kind = if is_bonsai {
@@ -335,7 +339,31 @@ pub fn model_load_estimate(
             _ => LoaderWorkspaceKind::Unknown,
         }
     };
-    finish_load_estimate(artifact_bytes, largest_selected_shard_bytes, workspace_kind)
+    let mut estimate =
+        finish_load_estimate(artifact_bytes, largest_selected_shard_bytes, workspace_kind)?;
+    // Native trellis resident memory is the architecture-derived estimate
+    // (experts stay packed: ~9-10 GiB for the released 35B, shared with
+    // doctor so the two can never disagree); the safetensors side is an
+    // mmap of file-backed (evictable) pages, so only the largest streaming
+    // shard counts as hot. Charging artifact + full artifact as unevictable
+    // double-counted evictable page cache and rejected a model the shipped
+    // doctor math says fits on this hardware class. The hardware replay gate
+    // (Task 8 step 5) measures the real load peak to validate this bound; a
+    // checkpoint without the architecture fields keeps the fallback bound.
+    if workspace_kind == LoaderWorkspaceKind::NativeEscha
+        && let Some(resident) = higgs_models::eschamoe::resident_estimate_bytes(model_dir, true)
+        && let Some(required) = resident.checked_add(largest_selected_shard_bytes)
+    {
+        estimate.required_process_bytes = required;
+        // The load ledger composes resident floor + workspace upper bound;
+        // both must reflect the packed-trellis reality (resident ~9-10 GiB,
+        // streaming workspace one shard) or admission still double-charges
+        // the evictable mmap side.
+        estimate.workspace_upper_bound_bytes = estimate
+            .workspace_upper_bound_bytes
+            .min(largest_selected_shard_bytes);
+    }
+    Ok(estimate)
 }
 
 fn finish_load_estimate(
@@ -1372,6 +1400,30 @@ mod tests {
     }
 
     #[test]
+    fn model_load_estimate_vlm_escha_uses_native_resident_and_one_shard() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"text_config":{"num_hidden_layers":2,"num_experts":4,
+                "moe_intermediate_size":8,"hidden_size":16,"vocab_size":32},
+                "quantization_config":{"quant_method":"eschamoe","layer_meta":{
+                  "gate_up":{"K":2,"num_experts":4,"in_features":8,"out_features":16},
+                  "down":{"K":3,"num_experts":4,"in_features":16,"out_features":8}}}}"#,
+        )
+        .unwrap();
+        write_tiny_safetensor(&dir.path().join("model.safetensors"), 17);
+        let artifact = fs::metadata(dir.path().join("model.safetensors"))
+            .unwrap()
+            .len();
+
+        let estimate = model_load_estimate(dir.path(), "qwen3_5_vl").unwrap();
+
+        assert_eq!(estimate.workspace_kind, LoaderWorkspaceKind::NativeEscha);
+        assert_eq!(estimate.workspace_upper_bound_bytes, artifact);
+        assert_eq!(estimate.required_process_bytes, 896 + artifact);
+    }
+
+    #[test]
     fn model_load_estimate_gemma_text_charges_full_artifact_workspace() {
         let dir = TempDir::new().unwrap();
         write_tiny_safetensor(&dir.path().join("model.safetensors"), 17);
@@ -1541,10 +1593,12 @@ mod tests {
         assert_eq!(estimate.required_process_bytes, 300);
     }
 
-    /// Native Escha retains the full packed artifact and one bounded conversion
-    /// group whose conservative upper bound is the artifact itself.
+    /// Fallback bound for a native-escha checkpoint without architecture
+    /// fields: artifact + full-artifact workspace stays fail-closed.
+    /// Checkpoints WITH config fields get the architecture-derived resident
+    /// override in `model_load_estimate` (resident + one streaming shard).
     #[test]
-    fn native_escha_estimate_is_raw_artifact_plus_one_group() {
+    fn native_escha_estimate_fallback_charges_artifact_plus_workspace() {
         let estimate = finish_load_estimate(100, 40, LoaderWorkspaceKind::NativeEscha).unwrap();
         assert_eq!(estimate.workspace_upper_bound_bytes, 100);
         assert_eq!(estimate.required_process_bytes, 200);
