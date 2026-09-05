@@ -1,0 +1,14 @@
+{
+  "title": "Higgs nightly",
+  "intro": "A shared HTTP surface connects routing, capacity admission, and model execution.",
+  "note": "Local requests reserve capacity before inference; remote routes proxy to providers. Responses return through the API. Defaults follow validated model paths.",
+  "nodes": [
+    {"id":"api","label":"HTTP API","description":"Chat requests and streaming","path":"crates/higgs/src/routes/chat.rs","column":0,"row":0},
+    {"id":"capacity","label":"Capacity","description":"Admission and measured learning","path":"crates/higgs/src/capacity/registry.rs","column":1,"row":0},
+    {"id":"engine","label":"Inference engine","description":"Prefill, decode, retained cache","path":"crates/higgs-engine/src/simple.rs","column":2,"row":0},
+    {"id":"remote","label":"Remote routing","description":"Configured provider selection","path":"crates/higgs/src/auto_router.rs","column":0,"row":1},
+    {"id":"models","label":"Models + Metal","description":"Model kernels through MLX","path":"crates/higgs-models/src/lib.rs","column":1,"row":1},
+    {"id":"cache","label":"Session state","description":"Cache and server coordination","path":"crates/higgs/src/state.rs","column":2,"row":1}
+  ],
+  "edges": [["api","capacity"],["capacity","engine"],["api","remote"],["engine","models"],["engine","cache"]]
+}
