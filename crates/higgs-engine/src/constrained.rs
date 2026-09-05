@@ -5,7 +5,7 @@
 //! are valid at the current state, and `apply_mask` zeros out disallowed
 //! logits before sampling.
 
-use mlx_rs::{Array, error::Exception};
+use mlx_rs::{error::Exception, Array};
 use outlines_core::index::Index;
 use outlines_core::json_schema;
 use outlines_core::vocabulary::Vocabulary;
@@ -35,6 +35,20 @@ impl ConstrainedGenerator {
         let index = Index::new(&regex, vocabulary)
             .map_err(|e| EngineError::Generation(format!("Failed to build FSM index: {e}")))?;
         Ok(Self::new(index))
+    }
+
+    /// Build a JSON-schema constraint inside the tool-call envelope understood
+    /// by the response parsers.
+    pub fn from_tagged_json_schema(
+        schema: &str,
+        vocabulary: &Vocabulary,
+    ) -> Result<Self, EngineError> {
+        let json_regex = json_schema::regex_from_str(schema, None, None)
+            .map_err(|e| EngineError::Generation(format!("Invalid tool JSON schema: {e}")))?;
+        Self::from_regex(
+            &format!(r"<tool_call>\n{json_regex}\n</tool_call>"),
+            vocabulary,
+        )
     }
 
     /// Build for `json_object` mode (any valid JSON object).
@@ -315,6 +329,57 @@ mod tests {
             assert!(allowed.unwrap().contains(&1)); // 'a' should be allowed
         }
         // If it fails due to EOS handling, that's OK for this minimal vocab
+    }
+
+    #[test]
+    fn tagged_json_schema_accepts_a_parser_visible_tool_call() {
+        let output =
+            "<tool_call>\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Rome\"}}\n</tool_call>";
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"const": "get_weather"},
+                "arguments": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["name", "arguments"],
+            "additionalProperties": false
+        });
+        let mut vocabulary = Vocabulary::new(0);
+        let mut token_ids = std::collections::HashMap::new();
+        for byte in output.bytes() {
+            if token_ids.contains_key(&byte) {
+                continue;
+            }
+            let token_id = u32::try_from(token_ids.len() + 1).unwrap();
+            vocabulary.try_insert(vec![byte], token_id).unwrap();
+            token_ids.insert(byte, token_id);
+        }
+
+        let mut generator =
+            ConstrainedGenerator::from_tagged_json_schema(&schema.to_string(), &vocabulary)
+                .unwrap();
+        for byte in output.bytes() {
+            let token_id = token_ids[&byte];
+            assert!(
+                generator
+                    .allowed_token_ids()
+                    .is_some_and(|allowed| allowed.contains(&token_id)),
+                "byte {byte:?} should be allowed"
+            );
+            assert!(generator.advance(token_id));
+        }
+        assert!(generator.is_finished());
+
+        let parsed = crate::tool_parser::parse_tool_calls(output, None);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "get_weather");
+        assert_eq!(parsed.tool_calls[0].arguments["city"], "Rome");
+        assert!(parsed.text.is_empty());
     }
 
     #[test]

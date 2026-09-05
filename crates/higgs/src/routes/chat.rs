@@ -4,13 +4,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
-    Json,
     extract::{Extension, State},
     http::HeaderMap,
     response::{
-        IntoResponse, Sse,
         sse::{Event, KeepAlive},
+        IntoResponse, Sse,
     },
+    Json,
 };
 use bytes::Bytes;
 use higgs_engine::chat_template::ChatPromptMode;
@@ -25,15 +25,141 @@ use crate::{
     router::ResolvedRoute,
     state::{Engine, SharedState},
     types::openai::{
-        ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage, ChatCompletionRequest,
-        ChatCompletionResponse, ChoiceLogprobs, CompletionUsage, ContentPart, MessageContent,
-        SessionCachePolicy, StopSequence, TokenLogprob, ToolCall, ToolCallDelta, ToolCallFunction,
-        ToolCallFunctionDelta, TopLogprob, merge_repetition_penalty,
+        merge_repetition_penalty, ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage,
+        ChatCompletionRequest, ChatCompletionResponse, ChoiceLogprobs, CompletionUsage,
+        ContentPart, MessageContent, SessionCachePolicy, StopSequence, TokenLogprob, ToolCall,
+        ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta, ToolChoice, ToolChoiceMode,
+        TopLogprob,
     },
 };
 use higgs_models::SamplingParams;
 
 const TOOL_RESULT_PROMPT_WARN_BYTES: usize = 16 * 1024;
+
+struct ToolChoicePlan<'a> {
+    prompt_tools: Option<&'a [serde_json::Value]>,
+    constraint_schema: Option<serde_json::Value>,
+}
+
+impl ToolChoicePlan<'_> {
+    fn requires_call(&self) -> bool {
+        self.constraint_schema.is_some()
+    }
+}
+
+fn resolve_tool_choice<'a>(
+    choice: Option<&ToolChoice>,
+    tools: Option<&'a [serde_json::Value]>,
+    response_format: Option<&crate::types::openai::ResponseFormat>,
+) -> Result<ToolChoicePlan<'a>, ServerError> {
+    let tools = tools.filter(|tools| !tools.is_empty());
+    let required_name = match choice {
+        None | Some(ToolChoice::Mode(ToolChoiceMode::Auto)) => {
+            return Ok(ToolChoicePlan {
+                prompt_tools: tools,
+                constraint_schema: None,
+            });
+        }
+        Some(ToolChoice::Mode(ToolChoiceMode::None)) => {
+            return Ok(ToolChoicePlan {
+                prompt_tools: None,
+                constraint_schema: None,
+            });
+        }
+        Some(ToolChoice::Mode(ToolChoiceMode::Required)) => None,
+        Some(ToolChoice::Named(named)) => {
+            if named.r#type != "function" {
+                return Err(ServerError::BadRequest(format!(
+                    "Unsupported tool_choice type: {}",
+                    named.r#type
+                )));
+            }
+            Some(named.function.name.as_str())
+        }
+    };
+
+    if response_format.is_some_and(|format| format.r#type != "text") {
+        return Err(ServerError::BadRequest(
+            "tool_choice required/function cannot be combined with a JSON response_format"
+                .to_owned(),
+        ));
+    }
+    let tools = tools.ok_or_else(|| {
+        ServerError::BadRequest("tool_choice requires at least one declared tool".to_owned())
+    })?;
+    let constraint_schema = tool_call_schema(tools, required_name)?;
+    Ok(ToolChoicePlan {
+        prompt_tools: Some(tools),
+        constraint_schema: Some(constraint_schema),
+    })
+}
+
+fn tool_call_schema(
+    tools: &[serde_json::Value],
+    required_name: Option<&str>,
+) -> Result<serde_json::Value, ServerError> {
+    let mut variants = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    for tool in tools {
+        let function = tool
+            .get("function")
+            .and_then(serde_json::Value::as_object)
+            .filter(|_| tool.get("type").and_then(serde_json::Value::as_str) == Some("function"))
+            .ok_or_else(|| {
+                ServerError::BadRequest(
+                    "tool_choice requires OpenAI function tool declarations".to_owned(),
+                )
+            })?;
+        let name = function
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                ServerError::BadRequest("tool function name must not be empty".to_owned())
+            })?;
+        if !names.insert(name) {
+            return Err(ServerError::BadRequest(format!(
+                "duplicate tool function name: {name}"
+            )));
+        }
+        if required_name.is_some_and(|required| required != name) {
+            continue;
+        }
+        let parameters = function.get("parameters").cloned().unwrap_or_else(|| {
+            serde_json::json!({
+                "type": "object"
+            })
+        });
+        if parameters
+            .get("type")
+            .is_some_and(|kind| kind.as_str() != Some("object"))
+        {
+            return Err(ServerError::BadRequest(format!(
+                "tool function '{name}' parameters must describe an object"
+            )));
+        }
+        variants.push(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"const": name},
+                "arguments": parameters
+            },
+            "required": ["name", "arguments"],
+            "additionalProperties": false
+        }));
+    }
+
+    if variants.is_empty() {
+        return Err(ServerError::BadRequest(format!(
+            "tool_choice function '{}' was not declared",
+            required_name.unwrap_or_default()
+        )));
+    }
+    if let [variant] = variants.as_slice() {
+        return Ok(variant.clone());
+    }
+    Ok(serde_json::json!({"oneOf": variants}))
+}
 
 fn continuation_policy(policy: Option<SessionCachePolicy>) -> SessionContinuationPolicy {
     match policy.unwrap_or(SessionCachePolicy::BestEffort) {
@@ -342,7 +468,12 @@ async fn chat_completions_non_streaming(
     let messages = convert_messages(&effective_messages);
     // Treat an empty `tools: []` as absent (mirrors the streaming path) so it
     // doesn't define `tools` in the template context or trigger tool parsing.
-    let tools = req.tools.as_deref().filter(|t| !t.is_empty());
+    let tool_choice = resolve_tool_choice(
+        req.tool_choice.as_ref(),
+        req.tools.as_deref(),
+        req.response_format.as_ref(),
+    )?;
+    let tools = tool_choice.prompt_tools;
     let thinking_enabled = crate::reasoning::effective_thinking_enabled(
         engine.enable_thinking(),
         &[engine.model_name(), req.model.as_str()],
@@ -352,7 +483,9 @@ async fn chat_completions_non_streaming(
             .and_then(|k| k.enable_thinking)
             .or(req.enable_thinking)
             .or(generation_defaults.enable_thinking),
-    );
+        // A required-call grammar starts with visible `<tool_call>` text. Leaving
+        // the template inside `<think>` would classify the entire call as reasoning.
+    ) && !tool_choice.requires_call();
 
     let (prompt_tokens, pflash_policy) = engine
         .prepare_chat_prompt_with_pflash_policy(&messages, tools, thinking_enabled, prompt_mode)
@@ -371,7 +504,11 @@ async fn chat_completions_non_streaming(
     let image_inputs = (!media.is_empty() && engine.is_vlm())
         .then(|| media.into_iter().map(MediaItem::into).collect());
 
-    let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
+    let constraint = build_constraint(
+        req.response_format.as_ref(),
+        tool_choice.constraint_schema.as_ref(),
+        &engine,
+    )?;
 
     // Opt-in multi-turn KV-cache reuse. Only honored for request shapes the
     // continued path can preserve; unsupported features fall back to normal
@@ -766,16 +903,22 @@ async fn chat_completions_stream(
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>, ServerError> {
-    let stream_includes_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+    let tool_choice = resolve_tool_choice(
+        req.tool_choice.as_ref(),
+        req.tools.as_deref(),
+        req.response_format.as_ref(),
+    )?;
+    let prompt_tools = tool_choice.prompt_tools;
+    let stream_includes_tools = prompt_tools.is_some();
     // Built here (before the `async_stream::stream!` block, which captures by
     // move) so the tracker can coerce XML-format tool-call values to their
     // declared JSON types.
-    let tool_schema = higgs_engine::tool_parser::ToolSchema::from_tools(req.tools.as_deref());
+    let tool_schema = higgs_engine::tool_parser::ToolSchema::from_tools(prompt_tools);
 
     if stream_includes_tools {
         tracing::debug!(
             request_model = req.model,
-            tool_count = req.tools.as_ref().map_or(0, Vec::len),
+            tool_count = prompt_tools.map_or(0, <[serde_json::Value]>::len),
             "Streaming with tool-calls enabled; will emit tool_calls deltas via StreamingToolCallTracker",
         );
     }
@@ -818,17 +961,14 @@ async fn chat_completions_stream(
             .and_then(|k| k.enable_thinking)
             .or(req.enable_thinking)
             .or(generation_defaults.enable_thinking),
-    );
+        // Keep the forced envelope in visible output for the streaming parser too.
+    ) && !tool_choice.requires_call();
 
     // Pass tools into prompt rendering so the chat template emits the
     // tool spec the model recognises. The on-the-fly
     // [`StreamingToolCallTracker`] below intercepts `<tool_call>…
     // </tool_call>` blocks the model produces and turns them into
     // structured `ToolCallDelta` SSE events.
-    let prompt_tools = req
-        .tools
-        .as_deref()
-        .and_then(|t| if t.is_empty() { None } else { Some(t) });
     let (prompt_tokens, pflash_policy) = engine
         .prepare_chat_prompt_with_pflash_policy(
             &messages,
@@ -850,7 +990,11 @@ async fn chat_completions_stream(
     let image_inputs = (!media.is_empty() && engine.is_vlm())
         .then(|| media.into_iter().map(MediaItem::into).collect());
 
-    let constraint = build_constraint(req.response_format.as_ref(), &engine)?;
+    let constraint = build_constraint(
+        req.response_format.as_ref(),
+        tool_choice.constraint_schema.as_ref(),
+        &engine,
+    )?;
 
     let request_id = generate_request_id();
     let include_usage = req
@@ -1458,13 +1602,27 @@ const fn chat_prompt_mode(session_id: Option<u64>, max_tokens: u32) -> ChatPromp
     }
 }
 
-/// Build a constrained generator from the request's `response_format`.
+/// Build a constrained generator from the request's response or tool format.
 ///
 /// Returns `None` if no constraint is needed (text mode or absent).
 fn build_constraint(
     response_format: Option<&crate::types::openai::ResponseFormat>,
+    tool_call_schema: Option<&serde_json::Value>,
     engine: &std::sync::Arc<crate::state::Engine>,
 ) -> Result<Option<higgs_engine::constrained::ConstrainedGenerator>, ServerError> {
+    if let Some(schema) = tool_call_schema {
+        let eos_id = engine.eos_token_ids().first().copied().unwrap_or(0);
+        let vocab = higgs_engine::constrained::build_vocabulary(engine.tokenizer(), eos_id)
+            .map_err(ServerError::Engine)?;
+        return higgs_engine::constrained::ConstrainedGenerator::from_tagged_json_schema(
+            &schema.to_string(),
+            &vocab,
+        )
+        .map(Some)
+        .map_err(|error| {
+            ServerError::BadRequest(format!("Unsupported tool parameter schema: {error}"))
+        });
+    }
     let Some(fmt) = response_format else {
         return Ok(None);
     };
@@ -1734,6 +1892,152 @@ mod tests {
         assert_eq!(value["error"]["type"], "server_error");
         assert_eq!(value["error"]["code"], "generation_error");
         assert_ne!(value, serde_json::json!("[DONE]"));
+    }
+
+    fn weather_and_shell_tools() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "shell",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+        ]
+    }
+
+    #[test]
+    fn required_tool_choice_builds_one_schema_variant_per_function() {
+        let tools = weather_and_shell_tools();
+        let choice =
+            crate::types::openai::ToolChoice::Mode(crate::types::openai::ToolChoiceMode::Required);
+        let plan = resolve_tool_choice(Some(&choice), Some(&tools), None).unwrap();
+
+        assert_eq!(plan.prompt_tools.unwrap().len(), 2);
+        let variants = plan.constraint_schema.unwrap()["oneOf"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0]["properties"]["name"]["const"], "weather");
+        assert_eq!(
+            variants[1]["properties"]["arguments"]["required"][0],
+            "command"
+        );
+    }
+
+    #[test]
+    fn named_tool_choice_restricts_schema_and_validates_name() {
+        let tools = weather_and_shell_tools();
+        let named =
+            crate::types::openai::ToolChoice::Named(crate::types::openai::NamedToolChoice {
+                r#type: "function".to_owned(),
+                function: crate::types::openai::NamedToolChoiceFunction {
+                    name: "shell".to_owned(),
+                },
+            });
+        let plan = resolve_tool_choice(Some(&named), Some(&tools), None).unwrap();
+        assert_eq!(
+            plan.constraint_schema.unwrap()["properties"]["name"]["const"],
+            "shell"
+        );
+
+        let missing =
+            crate::types::openai::ToolChoice::Named(crate::types::openai::NamedToolChoice {
+                r#type: "function".to_owned(),
+                function: crate::types::openai::NamedToolChoiceFunction {
+                    name: "missing".to_owned(),
+                },
+            });
+        assert!(matches!(
+            resolve_tool_choice(Some(&missing), Some(&tools), None),
+            Err(ServerError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn automatic_and_none_tool_choices_do_not_add_constraints() {
+        let tools = weather_and_shell_tools();
+        let automatic =
+            crate::types::openai::ToolChoice::Mode(crate::types::openai::ToolChoiceMode::Auto);
+        let auto_plan = resolve_tool_choice(Some(&automatic), Some(&tools), None).unwrap();
+        assert_eq!(auto_plan.prompt_tools.unwrap().len(), 2);
+        assert!(auto_plan.constraint_schema.is_none());
+
+        let none =
+            crate::types::openai::ToolChoice::Mode(crate::types::openai::ToolChoiceMode::None);
+        let none_plan = resolve_tool_choice(Some(&none), Some(&tools), None).unwrap();
+        assert!(none_plan.prompt_tools.is_none());
+        assert!(none_plan.constraint_schema.is_none());
+    }
+
+    #[test]
+    fn required_tool_choice_rejects_missing_tools_and_json_response_format() {
+        let required =
+            crate::types::openai::ToolChoice::Mode(crate::types::openai::ToolChoiceMode::Required);
+        assert!(matches!(
+            resolve_tool_choice(Some(&required), None, None),
+            Err(ServerError::BadRequest(_))
+        ));
+
+        let tools = weather_and_shell_tools();
+        let response_format = crate::types::openai::ResponseFormat {
+            r#type: "json_schema".to_owned(),
+            json_schema: Some(serde_json::json!({"schema": {"type": "object"}})),
+        };
+        assert!(matches!(
+            resolve_tool_choice(Some(&required), Some(&tools), Some(&response_format)),
+            Err(ServerError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn required_tool_choice_rejects_non_object_arguments_and_duplicate_names() {
+        let required =
+            crate::types::openai::ToolChoice::Mode(crate::types::openai::ToolChoiceMode::Required);
+        let non_object = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "bad",
+                "parameters": {"type": "array", "items": {"type": "string"}}
+            }
+        })];
+        assert!(matches!(
+            resolve_tool_choice(Some(&required), Some(&non_object), None),
+            Err(ServerError::BadRequest(_))
+        ));
+
+        let duplicate = vec![
+            serde_json::json!({
+                "type": "function",
+                "function": {"name": "same", "parameters": {"type": "object"}}
+            }),
+            serde_json::json!({
+                "type": "function",
+                "function": {"name": "same", "parameters": {"type": "object"}}
+            }),
+        ];
+        assert!(matches!(
+            resolve_tool_choice(Some(&required), Some(&duplicate), None),
+            Err(ServerError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -2070,21 +2374,17 @@ mod tests {
         let seed_body: serde_json::Value = serde_json::from_slice(&seed_body).unwrap();
         assert_eq!(seed_body["choices"].as_array().unwrap().len(), 1);
         assert_eq!(seed_body["choices"][0]["message"]["content"], "");
-        assert!(
-            seed_body["choices"][0]["message"]
-                .get("tool_calls")
-                .is_none()
-        );
+        assert!(seed_body["choices"][0]["message"]
+            .get("tool_calls")
+            .is_none());
         assert_eq!(seed_body["choices"][0]["finish_reason"], "length");
         assert_eq!(seed_body["usage"]["prompt_tokens"], 1);
         assert_eq!(seed_body["usage"]["completion_tokens"], 0);
         assert_eq!(seed_body["usage"]["total_tokens"], 1);
         assert!(seed_body["usage"].get("prompt_tokens_details").is_none());
-        assert!(
-            seed_body["usage"]
-                .get("higgs_session_lease_active")
-                .is_none()
-        );
+        assert!(seed_body["usage"]
+            .get("higgs_session_lease_active")
+            .is_none());
 
         let leased = accepted_app
             .clone()

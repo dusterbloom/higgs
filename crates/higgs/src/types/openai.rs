@@ -53,6 +53,8 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub tools: Option<Vec<serde_json::Value>>,
     #[serde(default)]
+    pub tool_choice: Option<ToolChoice>,
+    #[serde(default)]
     pub response_format: Option<ResponseFormat>,
     #[serde(default)]
     pub logprobs: Option<bool>,
@@ -132,6 +134,33 @@ pub struct ChatTemplateKwargs {
     /// Per-request override for the model's reasoning mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_thinking: Option<bool>,
+}
+
+/// OpenAI-compatible policy for whether the model may or must call a tool.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    Mode(ToolChoiceMode),
+    Named(NamedToolChoice),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoiceMode {
+    Auto,
+    None,
+    Required,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NamedToolChoice {
+    pub r#type: String,
+    pub function: NamedToolChoiceFunction,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NamedToolChoiceFunction {
+    pub name: String,
 }
 
 /// Optional request-level controls for streaming responses.
@@ -688,6 +717,33 @@ mod tests {
             "session_cache_policy": "cold_fallback"
         }"#;
         assert!(serde_json::from_str::<ChatCompletionRequest>(json).is_err());
+    }
+
+    #[test]
+    fn chat_request_parses_tool_choice_modes_and_named_function() {
+        let required = chat_request_with(r#""tool_choice": "required""#);
+        assert!(matches!(
+            required.tool_choice,
+            Some(ToolChoice::Mode(ToolChoiceMode::Required))
+        ));
+
+        let named = chat_request_with(
+            r#""tool_choice": {"type": "function", "function": {"name": "shell"}}"#,
+        );
+        assert!(matches!(
+            named.tool_choice,
+            Some(ToolChoice::Named(NamedToolChoice {
+                r#type,
+                function: NamedToolChoiceFunction { name }
+            })) if r#type == "function" && name == "shell"
+        ));
+
+        let invalid = r#"{
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "sometimes"
+        }"#;
+        assert!(serde_json::from_str::<ChatCompletionRequest>(invalid).is_err());
     }
 
     #[test]
