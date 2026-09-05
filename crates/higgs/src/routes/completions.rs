@@ -181,19 +181,19 @@ async fn completions_non_streaming(
     let checkpoint_id = req.checkpoint_id.clone();
     let watchdog = crate::capacity::request_watchdog(&state);
     let output = tokio::task::spawn_blocking(move || {
-        let _stop_guard = crate::capacity::install_reservation_stop(&reservation, watchdog);
-        let _reservation = reservation;
-        engine.generate(
-            &prompt_tokens,
-            max_tokens,
-            &sampling,
-            &stop_sequences,
-            want_logprobs,
-            top_logprobs,
-            None,
-            None,
-            checkpoint_id.as_deref(),
-        )
+        crate::capacity::run_reserved_generation(reservation, watchdog, || {
+            engine.generate(
+                &prompt_tokens,
+                max_tokens,
+                &sampling,
+                &stop_sequences,
+                want_logprobs,
+                top_logprobs,
+                None,
+                None,
+                checkpoint_id.as_deref(),
+            )
+        })
     })
     .await
     .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
@@ -262,20 +262,20 @@ async fn completions_stream(
     let watchdog = crate::capacity::request_watchdog(&state);
 
     tokio::task::spawn_blocking(move || {
-        let _stop_guard = crate::capacity::install_reservation_stop(&reservation, watchdog);
-        let _reservation = reservation;
-        let result = engine.generate_streaming(
-            &prompt_tokens,
-            max_tokens,
-            &sampling,
-            &stop_sequences,
-            want_logprobs,
-            top_logprobs,
-            &tx,
-            None,
-            None,
-            checkpoint_id.as_deref(),
-        );
+        let result = crate::capacity::run_reserved_generation(reservation, watchdog, || {
+            engine.generate_streaming(
+                &prompt_tokens,
+                max_tokens,
+                &sampling,
+                &stop_sequences,
+                want_logprobs,
+                top_logprobs,
+                &tx,
+                None,
+                None,
+                checkpoint_id.as_deref(),
+            )
+        });
         if let Err(e) = &result {
             tracing::error!(error = %e, "Generation error during streaming");
         }

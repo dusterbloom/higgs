@@ -96,6 +96,14 @@ pub struct CacheMetricsView {
     pub session_last_tool_result_largest_bytes: u64,
     /// Retained sessions evicted (count cap + idle TTL).
     pub sessions_evicted: u64,
+    /// Retained states rejected because one entry exceeded a live hard limit.
+    pub retention_oversized_drops: u64,
+    /// Maximum of each model's latest rejected size (not global chronology).
+    pub retention_last_oversized_bytes: u64,
+    /// Maximum of each model's latest rejected token count.
+    pub retention_last_oversized_tokens: u64,
+    /// Sum of live registry-published retained-state byte ceilings.
+    pub retained_bytes_limit: u64,
     /// Currently retained per-session caches.
     pub retained_sessions: u64,
     /// Conservative total bytes owned by retained per-session cache state.
@@ -218,6 +226,18 @@ impl CacheMetricsView {
             .session_last_tool_result_largest_bytes
             .max(stats.session_last_tool_result_largest_bytes);
         self.sessions_evicted = self.sessions_evicted.saturating_add(stats.sessions_evicted);
+        self.retention_oversized_drops = self
+            .retention_oversized_drops
+            .saturating_add(stats.retention_oversized_drops);
+        self.retention_last_oversized_bytes = self
+            .retention_last_oversized_bytes
+            .max(u64::try_from(stats.retention_last_oversized_bytes).unwrap_or(u64::MAX));
+        self.retention_last_oversized_tokens = self
+            .retention_last_oversized_tokens
+            .max(u64::try_from(stats.retention_last_oversized_tokens).unwrap_or(u64::MAX));
+        self.retained_bytes_limit = self
+            .retained_bytes_limit
+            .saturating_add(u64::try_from(stats.retained_bytes_limit).unwrap_or(u64::MAX));
         self.retained_sessions = self
             .retained_sessions
             .saturating_add(u64::try_from(stats.retained_sessions).unwrap_or(u64::MAX));
@@ -389,10 +409,24 @@ mod tests {
             oldest_reservation_age_ms: Some(17),
             queued_waiters: 1,
             pressure: crate::capacity::MemoryPressure::Constrained,
+            raw_pressure: crate::capacity::MemoryPressure::Constrained,
             mlx_active_bytes: 100,
             mlx_peak_bytes: 200,
+            mlx_cached_bytes: None,
+            mlx_measured_at_unix_ms: None,
             swap_out_delta: 3,
             compressor_delta: 4,
+            swap_outs_total: None,
+            compressions_total: None,
+            pressure_sampled_at_unix_ms: None,
+            pressure_sample_epoch: None,
+            non_normal_pressure_event_epoch: 0,
+            allocation_observations: 0,
+            clean_allocation_observations: 0,
+            skipped_allocation_observations: 0,
+            last_observed_prefill_peak_bytes: None,
+            last_observed_decode_peak_bytes: None,
+            last_observed_retained_bytes: None,
             downshifts: 5,
             rejections: crate::capacity::CapacityRejectionDiagnostics {
                 exceeded: 6,
@@ -412,6 +446,7 @@ mod tests {
                 recommended_output_tokens: 11,
                 max_prompt_tokens: 12,
                 usable_bytes: 13,
+                qualified_cold_bands: 0,
             }],
         };
 
@@ -474,6 +509,10 @@ mod tests {
             session_last_tool_result_bytes: 34,
             session_last_tool_result_largest_bytes: 35,
             sessions_evicted: 36,
+            retention_oversized_drops: 1,
+            retention_last_oversized_bytes: 2,
+            retention_last_oversized_tokens: 3,
+            retained_bytes_limit: 4,
             retained_sessions: 37,
             retained_bytes: 38,
             active_leases: 39,
@@ -546,6 +585,10 @@ mod tests {
         assert_eq!(view.session_prompt_boundary_splices, 46);
         assert_eq!(view.session_bootstrap_exact, 48);
         assert_eq!(view.session_bootstrap_pflash, 50);
+        assert_eq!(view.retention_oversized_drops, 2);
+        assert_eq!(view.retention_last_oversized_bytes, 2);
+        assert_eq!(view.retention_last_oversized_tokens, 3);
+        assert_eq!(view.retained_bytes_limit, 8);
         assert_eq!(view.retained_bytes, 76);
         assert_eq!(view.active_leases, 78);
         assert_eq!(view.expired_leases, 80);
@@ -597,6 +640,10 @@ mod tests {
             ("session_last_tool_result_messages", 33),
             ("session_last_tool_result_bytes", 34),
             ("session_last_tool_result_largest_bytes", 35),
+            ("retention_oversized_drops", 1),
+            ("retention_last_oversized_bytes", 2),
+            ("retention_last_oversized_tokens", 3),
+            ("retained_bytes_limit", 4),
             ("retained_bytes", 38),
             ("active_leases", 39),
             ("expired_leases", 40),

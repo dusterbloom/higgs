@@ -7,7 +7,7 @@
 )]
 
 use std::borrow::Cow;
-use std::ops::Range;
+use std::ops::{Deref, DerefMut, Range};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -43,9 +43,16 @@ use crate::{
     },
     chat_template::{ChatMessage, ChatPromptMode, ChatTemplateRenderer},
     decode::token_ledger::{LedgerError, RetentionAction, SpeculativeTicket, TokenLedger},
-    engine::{GenerationOutput, StreamingOutput},
+    engine::{
+        GenerationOutput, RequestExecutionPath, StreamingOutput,
+        invalidate_request_allocation_capture, record_request_execution,
+        record_request_memory_high_water, record_request_radix_growth_bytes,
+        record_request_retained_bytes,
+    },
     error::EngineError,
-    mlx_tuning::{MlxRuntimeTuning, metal_recommended_working_set_bytes},
+    mlx_tuning::{
+        MemoryPhase, MlxRuntimeTuning, RequestMemorySampler, metal_recommended_working_set_bytes,
+    },
     model_loader,
     paged_prefix_cache::{
         DEFAULT_BLOCK_SIZE, PagedPairedLookupPlan, PairedPrepareTicket, PairedTouchToken,
@@ -1940,6 +1947,9 @@ struct CacheMetrics {
     session_last_tool_result_bytes: AtomicU64,
     session_last_tool_result_largest_bytes: AtomicU64,
     sessions_evicted: AtomicU64,
+    retention_oversized_drops: AtomicU64,
+    retention_last_oversized_bytes: AtomicU64,
+    retention_last_oversized_tokens: AtomicU64,
     expired_leases: AtomicU64,
     broken_leases: AtomicU64,
     prefill_only_requests: AtomicU64,
@@ -2121,6 +2131,12 @@ pub struct CacheStats {
     pub session_last_tool_result_largest_bytes: u64,
     /// Retained sessions evicted (count cap + idle TTL).
     pub sessions_evicted: u64,
+    /// Retained states rejected because one entry exceeded a live hard limit.
+    pub retention_oversized_drops: u64,
+    pub retention_last_oversized_bytes: usize,
+    pub retention_last_oversized_tokens: usize,
+    /// Current registry-published retained-state byte ceiling.
+    pub retained_bytes_limit: usize,
     /// Currently retained per-session caches.
     pub retained_sessions: usize,
     /// Conservative total bytes owned by retained per-session cache state.
@@ -3020,6 +3036,79 @@ fn retained_paired_stats(
 }
 
 /// Intermediate state after prefix cache lookup and model locking.
+struct RequestMlxExecution {
+    gate: higgs_models::mlx_exec::MlxExecToken,
+    sampler: Option<RequestMemorySampler>,
+    phase: MemoryPhase,
+}
+
+impl RequestMlxExecution {
+    fn acquire() -> Self {
+        let mut gate = higgs_models::mlx_exec::acquire();
+        let sampler = match RequestMemorySampler::start(MemoryPhase::Prefill, &mut gate) {
+            Ok(sampler) => Some(sampler),
+            Err(error) => {
+                tracing::warn!(%error, "request prefill allocation sampling unavailable");
+                invalidate_request_allocation_capture();
+                None
+            }
+        };
+        Self {
+            gate,
+            sampler,
+            phase: MemoryPhase::Prefill,
+        }
+    }
+
+    fn begin_decode(&mut self) {
+        if self.phase == MemoryPhase::Decode {
+            return;
+        }
+        self.finish_phase();
+        self.phase = MemoryPhase::Decode;
+        self.sampler = match RequestMemorySampler::start(MemoryPhase::Decode, &mut self.gate) {
+            Ok(sampler) => Some(sampler),
+            Err(error) => {
+                tracing::warn!(%error, "request decode allocation sampling unavailable");
+                invalidate_request_allocation_capture();
+                None
+            }
+        };
+    }
+
+    fn finish_phase(&mut self) {
+        if let Some(sampler) = self.sampler.take() {
+            match sampler.finish(&mut self.gate) {
+                Ok(sample) => record_request_memory_high_water(sample),
+                Err(error) => {
+                    tracing::warn!(%error, ?self.phase, "request allocation sample discarded");
+                    invalidate_request_allocation_capture();
+                }
+            }
+        }
+    }
+}
+
+impl Deref for RequestMlxExecution {
+    type Target = higgs_models::mlx_exec::MlxExecToken;
+
+    fn deref(&self) -> &Self::Target {
+        &self.gate
+    }
+}
+
+impl DerefMut for RequestMlxExecution {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.gate
+    }
+}
+
+impl Drop for RequestMlxExecution {
+    fn drop(&mut self) {
+        self.finish_phase();
+    }
+}
+
 struct PreparedGeneration<'a> {
     model: MutexGuard<'a, AnyModel>,
     cache: AnyCache,
@@ -3053,7 +3142,7 @@ struct PreparedGeneration<'a> {
     /// `eval` / `async_eval` on this path pass the gate's `debug_assert`. Declared
     /// last so it is dropped *after* the model guard — the gate is released only
     /// once no more eval can occur on this generation.
-    _mlx_gate: higgs_models::mlx_exec::MlxExecToken,
+    _mlx_gate: RequestMlxExecution,
 }
 
 /// Result of [`SimpleEngine::generate_with_prune`], carrying the sweep metrics
@@ -4070,6 +4159,23 @@ impl SimpleEngine {
                 .session_last_tool_result_largest_bytes
                 .load(Ordering::Relaxed),
             sessions_evicted: self.cache_metrics.sessions_evicted.load(Ordering::Relaxed),
+            retention_oversized_drops: self
+                .cache_metrics
+                .retention_oversized_drops
+                .load(Ordering::Relaxed),
+            retention_last_oversized_bytes: usize::try_from(
+                self.cache_metrics
+                    .retention_last_oversized_bytes
+                    .load(Ordering::Relaxed),
+            )
+            .unwrap_or(usize::MAX),
+            retention_last_oversized_tokens: usize::try_from(
+                self.cache_metrics
+                    .retention_last_oversized_tokens
+                    .load(Ordering::Relaxed),
+            )
+            .unwrap_or(usize::MAX),
+            retained_bytes_limit: self.capacity_retained_bytes.load(Ordering::Acquire),
             retained_sessions,
             retained_bytes,
             active_leases,
@@ -4525,6 +4631,7 @@ impl SimpleEngine {
         let effective_cap =
             retention_token_cap(self.kv_cache_config, target_only_cap_exempt, &state);
         let token_len = state.tokens().len();
+        let state_bytes = state.estimated_bytes();
         #[allow(clippy::print_stderr)] // env-gated diagnostic
         if effective_cap > 0
             && token_len > effective_cap
@@ -4535,8 +4642,9 @@ impl SimpleEngine {
                 token_len, effective_cap
             );
         }
+        let mut retained = lock_or_recover(&self.retained);
         let mutation = stash_into_bounded_with_source(
-            &mut lock_or_recover(&self.retained),
+            &mut retained,
             session_id,
             state,
             RetentionLimits {
@@ -4546,6 +4654,24 @@ impl SimpleEngine {
             },
             source,
         );
+        let retained_bytes = retained
+            .get(&session_id)
+            .map_or(0, |entry| entry.state.estimated_bytes());
+        drop(retained);
+        record_request_retained_bytes(u64::try_from(retained_bytes).unwrap_or(u64::MAX));
+        if mutation.oversized {
+            self.cache_metrics
+                .retention_oversized_drops
+                .fetch_add(1, Ordering::Relaxed);
+            self.cache_metrics.retention_last_oversized_bytes.store(
+                u64::try_from(state_bytes).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            self.cache_metrics.retention_last_oversized_tokens.store(
+                u64::try_from(token_len).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
         if mutation.evicted > 0 {
             self.cache_metrics.sessions_evicted.fetch_add(
                 u64::try_from(mutation.evicted).unwrap_or(0),
@@ -4950,7 +5076,7 @@ impl SimpleEngine {
 
         // Acquire the MLX-execution gate the moment we own the model, before any
         // forward/eval. Held via PreparedGeneration for the entire generation.
-        let mlx_gate = higgs_models::mlx_exec::acquire();
+        let mlx_gate = RequestMlxExecution::acquire();
 
         // Skip prefix caching for multimodal requests: different images
         // produce different KV states even with identical token sequences.
@@ -5043,6 +5169,16 @@ impl SimpleEngine {
         };
 
         let prompt_array = Array::from(actual_prompt_tokens.as_slice()).index(NewAxis);
+        let actual_suffix_tokens = u64::try_from(actual_prompt_tokens.len()).unwrap_or(u64::MAX);
+        record_request_execution(
+            if actual_prompt_tokens.len() < prompt_tokens.len() {
+                RequestExecutionPath::RadixHit
+            } else {
+                RequestExecutionPath::Cold
+            },
+            u64::from(prompt_len),
+            actual_suffix_tokens,
+        );
 
         Ok(PreparedGeneration {
             model,
@@ -5313,6 +5449,7 @@ impl SimpleEngine {
                 .prefix_cache
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
+            let radix_bytes_before = pc.radix_byte_stats().resident_bytes;
             // Strip the generation-prompt suffix from the key so multi-turn
             // conversations share their common history prefix (the suffix tokens
             // `<|im_start|>assistant\n…` change between turns).
@@ -5353,6 +5490,11 @@ impl SimpleEngine {
             // store is intentionally omitted, not attempted and rejected.
             if !is_hybrid || prepared.stored_clone.is_some() {
                 pc.store(stripped, cache_to_store, checkpoint_id);
+                let radix_bytes_after = pc.radix_byte_stats().resident_bytes;
+                record_request_radix_growth_bytes(
+                    u64::try_from(radix_bytes_after.saturating_sub(radix_bytes_before))
+                        .unwrap_or(u64::MAX),
+                );
             }
         }
         maybe_clear_mlx_cache(
@@ -5414,6 +5556,7 @@ impl SimpleEngine {
             eval_targets.extend(lp.eval_targets());
         }
         eval(eval_targets).map_err(EngineError::Mlx)?;
+        prepared._mlx_gate.begin_decode();
         Ok((current_token, logprob_data, prefill_hidden))
     }
 
@@ -6859,7 +7002,7 @@ impl SimpleEngine {
                     .model
                     .lock()
                     .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
-                let mlx_gate = higgs_models::mlx_exec::acquire();
+                let mlx_gate = RequestMlxExecution::acquire();
                 let cache = if continuation_policy == SessionContinuationPolicy::RequireContinuation
                 {
                     match self.fork_target_continuable(session_id, run_prompt, run_mode, &mlx_gate)
@@ -6919,6 +7062,15 @@ impl SimpleEngine {
                     },
                 )?;
             }
+            record_request_execution(
+                if continued {
+                    RequestExecutionPath::RetainedSuffix
+                } else {
+                    RequestExecutionPath::Cold
+                },
+                u64::from(total),
+                0,
+            );
             return Ok(SessionGeneration {
                 text: String::new(),
                 completion_tokens: 0,
@@ -6986,7 +7138,7 @@ impl SimpleEngine {
                 .model
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
-            let mlx_gate = higgs_models::mlx_exec::acquire();
+            let mlx_gate = RequestMlxExecution::acquire();
 
             let forked =
                 match self.fork_target_continuable(session_id, run_prompt, run_mode, &mlx_gate) {
@@ -7052,6 +7204,17 @@ impl SimpleEngine {
                 (prepared, prefilled, false)
             }
         };
+        record_request_execution(
+            if continued {
+                RequestExecutionPath::RetainedSuffix
+            } else if prepared.actual_prompt_tokens.len() < run_prompt.len() {
+                RequestExecutionPath::RadixHit
+            } else {
+                RequestExecutionPath::Cold
+            },
+            u64::from(run_total),
+            u64::from(prefilled),
+        );
 
         if let Some(acceptance) = acceptance.take() {
             let _ = acceptance.send(Ok(()));
@@ -7794,7 +7957,7 @@ impl SimpleEngine {
             .model
             .lock()
             .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
-        let mlx_gate = higgs_models::mlx_exec::acquire();
+        let mut mlx_gate = RequestMlxExecution::acquire();
         let mut drafter = lock_or_recover(&dflash.drafter);
 
         let expected_taps = dflash.tap_layers.len();
@@ -7861,6 +8024,15 @@ impl SimpleEngine {
                         ));
                     }
                     let prefilled = u32::try_from(prefill_tokens.len()).unwrap_or(u32::MAX);
+                    record_request_execution(
+                        if continued {
+                            RequestExecutionPath::RetainedSuffix
+                        } else {
+                            RequestExecutionPath::Cold
+                        },
+                        u64::from(total),
+                        u64::from(prefilled),
+                    );
                     let continuation_metrics =
                         PendingContinuationMetrics::new(continued, total, prefilled);
 
@@ -7891,6 +8063,7 @@ impl SimpleEngine {
                         .map_err(EngineError::Mlx)?;
                     eval([&first_token]).map_err(EngineError::Mlx)?;
                     let prefill_elapsed = prefill_start.elapsed();
+                    mlx_gate.begin_decode();
 
                     let first_id: u32 = first_token.item();
                     let mut decode = SessionDsparkDecodeState::begin(pair, first_id)?;
@@ -10573,7 +10746,7 @@ impl SimpleEngine {
         // prefill, draft, verify, rollback, and sink finalization. Without it,
         // the first sanctioned eval panics in debug and concurrent release
         // requests can race MLX's process-global Metal command buffer.
-        let mlx_gate = higgs_models::mlx_exec::acquire();
+        let mut mlx_gate = RequestMlxExecution::acquire();
         debug_assert!(higgs_models::mlx_exec::held());
         let mut drafter = lock_or_recover(&dflash.drafter);
         let is_dspark = drafter.config.is_dspark();
@@ -10613,6 +10786,16 @@ impl SimpleEngine {
                 "Paired dSpark radix hit"
             );
         }
+        record_request_execution(
+            if reused_prefix_len > 0 {
+                RequestExecutionPath::RadixHit
+            } else {
+                RequestExecutionPath::Cold
+            },
+            u64::from(prompt_len),
+            u64::try_from(prompt_tokens.len().saturating_sub(reused_prefix_len))
+                .unwrap_or(u64::MAX),
+        );
 
         // Sample first token.
         let last_logits = prefill_logits.index((.., -1, ..));
@@ -10621,6 +10804,7 @@ impl SimpleEngine {
 
         let first_token_id: u32 = first_token.item();
         let prefill_elapsed = request_t0.elapsed();
+        mlx_gate.begin_decode();
         let mut tokens: Vec<u32> = vec![first_token_id];
         let think_close_token = if enable_thinking {
             self.think_close_token
@@ -13959,6 +14143,8 @@ impl SimpleEngine {
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::{
         CanonicalDflashRound, DEFAULT_PFLASH_FULL_SCORE_MAX_TOKENS, DEFAULT_PFLASH_KEEP_RATIO_MAX,
         DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO, DEFAULT_PFLASH_PLAN_CACHE,
@@ -15929,6 +16115,31 @@ mod tests {
         engine.stash_retained_checkpoint(SESSION_ID, oversized_checkpoint);
 
         assert_eq!(engine.retained_session_tokens(SESSION_ID), Some(vec![1]));
+    }
+
+    #[test]
+    fn oversized_retention_drop_reports_actual_bytes_tokens_and_live_ceiling() {
+        const SESSION_ID: u64 = 0xCACE_B17E;
+        let engine = session_cache_test_engine();
+        let state = crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+            validated_session_target(1),
+            vec![1, 2, 3],
+        );
+        let state_bytes = state.estimated_bytes();
+        assert!(state_bytes > 0);
+        let byte_limit = state_bytes.saturating_sub(1);
+        engine
+            .capacity_retained_bytes
+            .store(byte_limit, Ordering::Release);
+
+        engine.stash_retained(SESSION_ID, state, false);
+
+        let stats = engine.cache_stats();
+        assert_eq!(stats.retention_oversized_drops, 1);
+        assert_eq!(stats.retention_last_oversized_bytes, state_bytes);
+        assert_eq!(stats.retention_last_oversized_tokens, 3);
+        assert_eq!(stats.retained_bytes_limit, byte_limit);
+        assert_eq!(stats.retained_sessions, 0);
     }
 
     #[test]

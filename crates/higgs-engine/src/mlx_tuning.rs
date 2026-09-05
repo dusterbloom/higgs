@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Conservative default for chunked prefill on 27B-class models.
 const DEFAULT_CHUNKED_PREFILL_THRESHOLD: i32 = 512;
@@ -23,6 +24,41 @@ pub struct MlxMemorySnapshot {
     pub metal_recommended_working_set_bytes: Option<u64>,
 }
 
+/// Fresh diagnostic allocator counters. This is not a policy publication:
+/// polling it must not invalidate admission/reclamation revision tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MlxAllocatorTelemetry {
+    pub memory: MlxMemorySnapshot,
+    pub cached_bytes: u64,
+    pub measured_at_unix_ms: u64,
+}
+
+impl MlxAllocatorTelemetry {
+    #[allow(unsafe_code)]
+    pub fn measure() -> Result<Self, MlxMemoryProbeError> {
+        let memory = MlxMemorySnapshot::measure()?;
+        let mut cached_bytes = 0_usize;
+        if unsafe { mlx_sys::mlx_get_cache_memory(&raw mut cached_bytes) } != 0 {
+            return Err(MlxMemoryProbeError::QueryFailed("cached memory"));
+        }
+        let measured_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| MlxMemoryProbeError::QueryFailed("measurement clock"))?
+            .as_millis();
+        Ok(Self {
+            memory,
+            cached_bytes: checked_raw_memory_bytes(
+                cached_bytes as u128,
+                "cached memory conversion",
+            )?,
+            measured_at_unix_ms: checked_raw_memory_bytes(
+                measured_at_unix_ms,
+                "measurement clock conversion",
+            )?,
+        })
+    }
+}
+
 /// A content-free allocator observation for one bounded inference phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestMemoryHighWater {
@@ -43,6 +79,7 @@ pub enum MemoryPhase {
 pub enum MlxMemoryProbeError {
     QueryFailed(&'static str),
     ResetPeakFailed,
+    InvalidatedSample,
 }
 
 impl std::fmt::Display for MlxMemoryProbeError {
@@ -52,6 +89,9 @@ impl std::fmt::Display for MlxMemoryProbeError {
                 write!(formatter, "MLX memory query failed: {operation}")
             }
             Self::ResetPeakFailed => formatter.write_str("MLX peak-memory reset failed"),
+            Self::InvalidatedSample => {
+                formatter.write_str("MLX request-memory sample was invalidated by another reset")
+            }
         }
     }
 }
@@ -174,54 +214,71 @@ impl MlxMemorySnapshot {
 ///
 /// Starting a sample resets MLX's process-global peak counter. Callers must
 /// therefore hold Higgs's process-global MLX execution gate until `finish`.
-/// The mutable borrow prevents nested samplers from resetting the same global
-/// counter while an earlier phase is still being measured.
+/// Each boundary requires the live gate token. A monotonically increasing
+/// generation rejects a window if another reset superseded it, so a nested or
+/// stale sampler can never publish a polluted peak.
 ///
-/// ```compile_fail
+/// ```no_run
 /// use higgs_engine::{MemoryPhase, RequestMemorySampler};
 ///
 /// let mut gate = higgs_models::mlx_exec::acquire();
 /// let prefill = RequestMemorySampler::start(MemoryPhase::Prefill, &mut gate).unwrap();
-/// let decode = RequestMemorySampler::start(MemoryPhase::Decode, &mut gate).unwrap();
-/// drop(prefill);
-/// drop(decode);
+/// let _sample = prefill.finish(&mut gate).unwrap();
 /// ```
-pub struct RequestMemorySampler<'gate> {
+pub struct RequestMemorySampler {
     phase: MemoryPhase,
     before: MlxMemorySnapshot,
-    _mlx_gate: &'gate mut higgs_models::mlx_exec::MlxExecToken,
+    generation: u64,
+    gate_generation: u64,
 }
 
-impl<'gate> RequestMemorySampler<'gate> {
+static REQUEST_MEMORY_SAMPLE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+impl RequestMemorySampler {
     pub fn start(
         phase: MemoryPhase,
-        mlx_gate: &'gate mut higgs_models::mlx_exec::MlxExecToken,
+        mlx_gate: &mut higgs_models::mlx_exec::MlxExecToken,
     ) -> Result<Self, MlxMemoryProbeError> {
         Self::start_with_probe(phase, mlx_gate, &SystemMlxMemoryProbe)
     }
 
     fn start_with_probe(
         phase: MemoryPhase,
-        mlx_gate: &'gate mut higgs_models::mlx_exec::MlxExecToken,
+        mlx_gate: &mut higgs_models::mlx_exec::MlxExecToken,
         probe: &impl MlxMemoryProbe,
     ) -> Result<Self, MlxMemoryProbeError> {
         let before = measure_mlx_memory(probe)?;
+        let generation = REQUEST_MEMORY_SAMPLE_GENERATION
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        // Invalidate any prior window before attempting the process-global
+        // reset. A failed reset leaves the counter's state unknown.
         probe.reset_peak_memory()?;
         Ok(Self {
             phase,
             before,
-            _mlx_gate: mlx_gate,
+            generation,
+            gate_generation: mlx_gate.acquisition_generation(),
         })
     }
 
-    pub fn finish(self) -> Result<RequestMemoryHighWater, MlxMemoryProbeError> {
-        self.finish_with_probe(&SystemMlxMemoryProbe)
+    pub fn finish(
+        self,
+        mlx_gate: &mut higgs_models::mlx_exec::MlxExecToken,
+    ) -> Result<RequestMemoryHighWater, MlxMemoryProbeError> {
+        self.finish_with_probe(mlx_gate, &SystemMlxMemoryProbe)
     }
 
     fn finish_with_probe(
         self,
+        mlx_gate: &mut higgs_models::mlx_exec::MlxExecToken,
         probe: &impl MlxMemoryProbe,
     ) -> Result<RequestMemoryHighWater, MlxMemoryProbeError> {
+        if REQUEST_MEMORY_SAMPLE_GENERATION.load(Ordering::Acquire) != self.generation
+            || mlx_gate.acquisition_generation() != self.gate_generation
+        {
+            return Err(MlxMemoryProbeError::InvalidatedSample);
+        }
         let after = measure_mlx_memory(probe)?;
         Ok(RequestMemoryHighWater {
             phase: self.phase,
@@ -437,6 +494,35 @@ pub struct EngineCostDescription {
 }
 
 impl EngineCostDescription {
+    /// Charge the cache dtype produced by the selected model execution path.
+    /// Native Escha projections return FP32 and promote subsequent K/V arrays;
+    /// the checkpoint's BF16 label therefore cannot describe runtime KV storage.
+    /// Preserve that numerical behavior and charge its bytes instead of casting.
+    pub fn runtime_from_model_dir(
+        model_dir: &Path,
+        fixed_live_session_bytes: u64,
+        decode_workspace_bytes: u64,
+        transient_prefill: TransientPrefillEstimate,
+    ) -> Option<Self> {
+        let mut cost = Self::fp16_from_model_dir(
+            model_dir,
+            fixed_live_session_bytes,
+            decode_workspace_bytes,
+            transient_prefill,
+        )?;
+        if higgs_models::eschamoe::is_eschamoe_checkpoint(model_dir).ok()?
+            && higgs_models::eschamoe::native_mode()
+        {
+            cost.persistent_bytes_per_token = cost.persistent_bytes_per_token.checked_mul(2)?;
+        }
+        // Dense caches grow in 256-slot blocks. Reserve the largest rounding
+        // slack once per live session; the token slope then remains linear.
+        cost.fixed_live_session_bytes = cost
+            .fixed_live_session_bytes
+            .checked_add(cost.persistent_bytes_per_token.checked_mul(255)?)?;
+        Some(cost)
+    }
+
     /// Derive the fp16 dense-KV term from model metadata without exposing the
     /// loader's private model representation.
     pub fn fp16_from_model_dir(
@@ -1826,7 +1912,7 @@ mod tests {
         let sampler =
             RequestMemorySampler::start_with_probe(MemoryPhase::Prefill, &mut mlx_gate, &probe)
                 .unwrap();
-        let sample = sampler.finish_with_probe(&probe).unwrap();
+        let sample = sampler.finish_with_probe(&mut mlx_gate, &probe).unwrap();
 
         assert_eq!(sample.phase, MemoryPhase::Prefill);
         assert_eq!(sample.active_before_bytes, 100);
@@ -1856,7 +1942,7 @@ mod tests {
         let sampler =
             RequestMemorySampler::start_with_probe(MemoryPhase::Decode, &mut mlx_gate, &probe)
                 .unwrap();
-        let sample = sampler.finish_with_probe(&probe).unwrap();
+        let sample = sampler.finish_with_probe(&mut mlx_gate, &probe).unwrap();
 
         assert_eq!(sample.phase, MemoryPhase::Decode);
         assert_eq!(sample.peak_bytes, 300);
@@ -1872,17 +1958,53 @@ mod tests {
         let prefill =
             RequestMemorySampler::start_with_probe(MemoryPhase::Prefill, &mut mlx_gate, &probe)
                 .unwrap()
-                .finish_with_probe(&probe)
+                .finish_with_probe(&mut mlx_gate, &probe)
                 .unwrap();
         let decode =
             RequestMemorySampler::start_with_probe(MemoryPhase::Decode, &mut mlx_gate, &probe)
                 .unwrap()
-                .finish_with_probe(&probe)
+                .finish_with_probe(&mut mlx_gate, &probe)
                 .unwrap();
 
         assert_eq!(prefill.phase, MemoryPhase::Prefill);
         assert_eq!(decode.phase, MemoryPhase::Decode);
         assert_eq!(*probe.resets.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn nested_request_memory_sample_invalidates_outer_window() {
+        let snapshot = MlxMemorySnapshot::default();
+        let probe = FakeMemoryProbe::new([snapshot; 4]);
+        let mut mlx_gate = higgs_models::mlx_exec::acquire();
+
+        let outer =
+            RequestMemorySampler::start_with_probe(MemoryPhase::Prefill, &mut mlx_gate, &probe)
+                .unwrap();
+        let inner =
+            RequestMemorySampler::start_with_probe(MemoryPhase::Decode, &mut mlx_gate, &probe)
+                .unwrap();
+        assert!(inner.finish_with_probe(&mut mlx_gate, &probe).is_ok());
+        assert_eq!(
+            outer.finish_with_probe(&mut mlx_gate, &probe),
+            Err(MlxMemoryProbeError::InvalidatedSample)
+        );
+    }
+
+    #[test]
+    fn reacquiring_mlx_gate_invalidates_old_sample_window() {
+        let snapshot = MlxMemorySnapshot::default();
+        let probe = FakeMemoryProbe::new([snapshot; 2]);
+        let mut first_gate = higgs_models::mlx_exec::acquire();
+        let sample =
+            RequestMemorySampler::start_with_probe(MemoryPhase::Prefill, &mut first_gate, &probe)
+                .unwrap();
+
+        drop(first_gate);
+        let mut next_gate = higgs_models::mlx_exec::acquire();
+        assert_eq!(
+            sample.finish_with_probe(&mut next_gate, &probe),
+            Err(MlxMemoryProbeError::InvalidatedSample)
+        );
     }
 
     #[test]
@@ -2029,6 +2151,41 @@ mod tests {
 
         assert_eq!(cost.persistent_bytes_per_token, 20_480);
         assert_eq!(cost.persistent_bytes(49_152), Some(960 * 1024 * 1024));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_native_escha_charges_fp32_cache_and_allocation_slack() -> std::io::Result<()> {
+        let temp = TempDir::new().map_err(std::io::Error::other)?;
+        write_json(
+            &temp.path().join("config.json"),
+            &serde_json::json!({
+                "model_type": "qwen3_5_moe", "num_hidden_layers": 40,
+                "num_key_value_heads": 2, "head_dim": 256, "full_attention_interval": 4,
+                "quantization_config": {"quant_method": "eschamoe"}
+            }),
+        )?;
+        let transient = TransientPrefillEstimate {
+            base_bytes: 0,
+            bytes_per_prompt_token: 0,
+            bytes_per_chunk_token: 0,
+            max_prompt_tokens: 131_072,
+            max_chunk_tokens: 1024,
+        };
+        let cost =
+            EngineCostDescription::runtime_from_model_dir(temp.path(), 65_863_680, 0, transient)
+                .expect("native runtime geometry");
+        assert_eq!(cost.persistent_bytes_per_token, 40_960);
+        // Capacity rounds dense KV storage to 256 slots. The bound covers any
+        // position in the bucket without changing the actual cache precision.
+        for tokens in [5085_u64, 7007, 9129, 11202, 11265, 16384] {
+            let actual = 65_863_680 + tokens.div_ceil(256) * 256 * 40_960;
+            assert!(
+                cost.fixed_live_session_bytes + cost.persistent_bytes(tokens).unwrap() >= actual
+            );
+        }
+        assert!(65_863_680 + 11_264_u64 * 40_960 <= 512 * 1024 * 1024);
+        assert!(65_863_680 + 11_520_u64 * 40_960 > 512 * 1024 * 1024);
         Ok(())
     }
 

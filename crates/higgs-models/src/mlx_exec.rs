@@ -43,6 +43,7 @@
 //! `debug_assert` behind a `mlx-exec-checks` cfg and run it in a release CI job.
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use mlx_rs::Array;
@@ -52,6 +53,7 @@ use mlx_rs::error::Exception;
 /// `eval` / `async_eval` so the shared Metal command buffer has a single
 /// writer at a time.
 static MLX_GATE: Mutex<()> = Mutex::new(());
+static MLX_GATE_ACQUISITION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     /// True while *this* thread holds a live [`MlxExecToken`].
@@ -66,6 +68,15 @@ thread_local! {
 #[must_use = "the MLX gate is released as soon as the token is dropped"]
 pub struct MlxExecToken {
     _guard: MutexGuard<'static, ()>,
+    acquisition_generation: u64,
+}
+
+impl MlxExecToken {
+    /// Identity of this uninterrupted gate ownership window.
+    #[must_use]
+    pub const fn acquisition_generation(&self) -> u64 {
+        self.acquisition_generation
+    }
 }
 
 impl Drop for MlxExecToken {
@@ -85,7 +96,13 @@ pub fn acquire() -> MlxExecToken {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     HELD.with(|h| h.set(true));
-    MlxExecToken { _guard: guard }
+    let acquisition_generation = MLX_GATE_ACQUISITION_GENERATION
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    MlxExecToken {
+        _guard: guard,
+        acquisition_generation,
+    }
 }
 
 /// Whether the current thread holds a live [`MlxExecToken`].
@@ -159,6 +176,15 @@ mod tests {
             assert!(held(), "held() must be true while the token is alive");
         }
         assert!(!held(), "held() must be false after the token drops");
+    }
+
+    #[test]
+    fn each_gate_acquisition_has_a_distinct_generation() {
+        let first = acquire();
+        let first_generation = first.acquisition_generation();
+        drop(first);
+        let second = acquire();
+        assert_ne!(second.acquisition_generation(), first_generation);
     }
 
     #[test]

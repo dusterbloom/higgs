@@ -4,17 +4,29 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-use higgs_engine::{EngineCostDescription, MlxMemorySnapshot, TransientPrefillEstimate};
+use higgs_engine::{
+    EngineCostDescription, MlxAllocatorTelemetry, MlxMemorySnapshot, RequestAllocationReceipt,
+    TransientPrefillEstimate,
+};
 use sha2::{Digest, Sha256};
 
 use super::{
-    Admission, CAPACITY_SCHEMA_VERSION, CapacityAvailability, CapacityBasis, CapacityController,
-    CapacityExceededError, CapacityInputs, CapacitySnapshot, CapacityUnavailableError,
-    LearnedProfile, LearnedProfileKey, LearnedProfileStore, MemoryPressure, PressureObservation,
-    RequestCost, ZeroCapacityRecovery,
+    Admission, AllocationObservation, CAPACITY_SCHEMA_VERSION, CapacityAvailability, CapacityBasis,
+    CapacityController, CapacityExceededError, CapacityInputs, CapacitySnapshot,
+    CapacityUnavailableError, LearnedProfile, LearnedProfileKey, LearnedProfileStore,
+    MemoryPressure, PressureObservation, PressureTelemetry, RequestCost, ZeroCapacityRecovery,
 };
 
 const FINGERPRINT_DOMAIN: &[u8] = b"higgs:model-content:v1\0";
+const PRESSURE_SAMPLE_MAX_AGE_MS: u64 = 2_500;
+
+fn unix_time_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
 
 /// Exact, content-addressed identity and byte count for one model artifact tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -184,6 +196,12 @@ struct CapacityCounters {
     downshifts: u64,
     last_swap_out_delta: u64,
     last_compressor_delta: u64,
+    allocation_observations: u64,
+    clean_allocation_observations: u64,
+    skipped_allocation_observations: u64,
+    last_observed_prefill_peak_bytes: Option<u64>,
+    last_observed_decode_peak_bytes: Option<u64>,
+    last_observed_retained_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -192,6 +210,7 @@ struct RegistryState {
     registering: BTreeSet<String>,
     pressure_controller: CapacityController,
     pressure: MemoryPressure,
+    pressure_telemetry: PressureTelemetry,
     memory: MlxMemorySnapshot,
     memory_revision: u64,
     capacity_policy_revision: Option<u64>,
@@ -209,6 +228,11 @@ struct RegistryState {
 struct ActiveReservation {
     model: String,
     bytes: u64,
+    request: RequestCost,
+    predicted_peak_bytes: u64,
+    pressure_at_admission: PressureTelemetry,
+    effective_pressure_at_admission: MemoryPressure,
+    admitted_at_unix_ms: u64,
     created: std::time::Instant,
     /// Stop signal shared with the owning worker. Critical pressure and model
     /// drain interrupt live reservations through it; the worker acknowledges
@@ -320,6 +344,7 @@ pub struct RequestReservation {
     id: uuid::Uuid,
     bytes: u64,
     released: bool,
+    observed: bool,
     stop: higgs_engine::stop::GenerationStop,
 }
 
@@ -335,6 +360,34 @@ impl RequestReservation {
     #[must_use]
     pub const fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Deliver one completed, content-free execution receipt while this
+    /// reservation still owns its process-wide bytes.
+    pub fn observe(&mut self, receipt: RequestAllocationReceipt) -> bool {
+        if self.observed {
+            return false;
+        }
+        let observed = self
+            .registry
+            .upgrade()
+            .is_some_and(|registry| registry.observe_reservation(self.id, receipt));
+        self.observed = observed;
+        observed
+    }
+
+    pub(crate) fn skip_observation(&mut self) {
+        if self.observed {
+            return;
+        }
+        if let Some(registry) = self.registry.upgrade() {
+            let mut state = registry.lock();
+            state.counters.skipped_allocation_observations = state
+                .counters
+                .skipped_allocation_observations
+                .saturating_add(1);
+        }
+        self.observed = true;
     }
 }
 
@@ -401,6 +454,7 @@ impl CapacityRegistry {
                 registering: BTreeSet::new(),
                 pressure_controller: registry_pressure_controller(),
                 pressure: MemoryPressure::Normal,
+                pressure_telemetry: PressureTelemetry::default(),
                 memory: MlxMemorySnapshot::default(),
                 memory_revision: 0,
                 capacity_policy_revision: Some(0),
@@ -423,6 +477,7 @@ impl CapacityRegistry {
     /// MLX allocation, and one row per model. No prompt content.
     #[must_use]
     pub fn diagnostics(&self) -> crate::capacity::CapacityDiagnostics {
+        let live_allocator = MlxAllocatorTelemetry::measure().ok();
         let state = self.lock();
         let now = std::time::Instant::now();
         let oldest = state
@@ -454,6 +509,7 @@ impl CapacityRegistry {
                     recommended_output_tokens: decision.recommended_output_tokens,
                     max_prompt_tokens: decision.max_prompt_tokens,
                     usable_bytes: decision.usable_bytes,
+                    qualified_cold_bands: active.controller.qualified_cold_band_count(),
                 })
             })
             .collect();
@@ -464,10 +520,27 @@ impl CapacityRegistry {
             oldest_reservation_age_ms: oldest,
             queued_waiters: state.admission_queue.len(),
             pressure: state.pressure,
-            mlx_active_bytes: state.memory.active_bytes,
-            mlx_peak_bytes: state.memory.peak_bytes,
+            raw_pressure: state.pressure_telemetry.raw_pressure,
+            mlx_active_bytes: live_allocator
+                .map_or(state.memory.active_bytes, |m| m.memory.active_bytes),
+            mlx_peak_bytes: live_allocator.map_or(state.memory.peak_bytes, |m| m.memory.peak_bytes),
+            mlx_cached_bytes: live_allocator.map(|m| m.cached_bytes),
+            mlx_measured_at_unix_ms: live_allocator.map(|m| m.measured_at_unix_ms),
             swap_out_delta: state.counters.last_swap_out_delta,
             compressor_delta: state.counters.last_compressor_delta,
+            swap_outs_total: state.pressure_telemetry.swap_outs_total,
+            compressions_total: state.pressure_telemetry.compressions_total,
+            pressure_sampled_at_unix_ms: state.pressure_telemetry.sampled_at_unix_ms,
+            pressure_sample_epoch: state.pressure_telemetry.sample_epoch,
+            non_normal_pressure_event_epoch: state
+                .pressure_telemetry
+                .non_normal_pressure_event_epoch,
+            allocation_observations: state.counters.allocation_observations,
+            clean_allocation_observations: state.counters.clean_allocation_observations,
+            skipped_allocation_observations: state.counters.skipped_allocation_observations,
+            last_observed_prefill_peak_bytes: state.counters.last_observed_prefill_peak_bytes,
+            last_observed_decode_peak_bytes: state.counters.last_observed_decode_peak_bytes,
+            last_observed_retained_bytes: state.counters.last_observed_retained_bytes,
             downshifts: state.counters.downshifts,
             rejections: crate::capacity::CapacityRejectionDiagnostics {
                 exceeded: state.counters.rejections_exceeded,
@@ -616,10 +689,10 @@ impl CapacityRegistry {
         }
         let mut current = active.controller.transactional_copy();
         replace_shared_ledger(&mut current, shared, ZeroCapacityRecovery::Preserve);
-        let current = current.admit(request);
-        if !matches!(current, Admission::Admitted(_)) {
-            return RequestReservationAttempt::Contended;
-        }
+        let current_ledger = match current.admit(request) {
+            Admission::Admitted(ledger) => ledger,
+            _ => return RequestReservationAttempt::Contended,
+        };
         let Some(bytes) =
             request_reservation_bytes(individual_ledger, request.retained_growth_bytes)
         else {
@@ -630,11 +703,17 @@ impl CapacityRegistry {
         };
         let id = uuid::Uuid::new_v4();
         let stop = higgs_engine::stop::GenerationStop::default();
+        let predicted_peak_bytes = current_ledger.total_bytes().unwrap_or(u64::MAX);
         state.active_reservations.insert(
             id,
             ActiveReservation {
                 model: model.to_owned(),
                 bytes,
+                request,
+                predicted_peak_bytes,
+                pressure_at_admission: state.pressure_telemetry,
+                effective_pressure_at_admission: state.pressure,
+                admitted_at_unix_ms: unix_time_millis(),
                 created: std::time::Instant::now(),
                 stop: stop.clone(),
             },
@@ -644,6 +723,7 @@ impl CapacityRegistry {
             id,
             bytes,
             released: false,
+            observed: false,
             stop,
         })
     }
@@ -751,6 +831,121 @@ impl CapacityRegistry {
         if let Some(notify) = wake {
             notify.notify_one();
         }
+    }
+
+    fn observe_reservation(&self, id: uuid::Uuid, receipt: RequestAllocationReceipt) -> bool {
+        let mut state = self.lock();
+        let Some(reservation) = state.active_reservations.get(&id) else {
+            return false;
+        };
+        let model = reservation.model.clone();
+        let request = reservation.request;
+        let predicted_peak_bytes = reservation.predicted_peak_bytes;
+        let pressure_at_admission = reservation.pressure_at_admission;
+        let effective_pressure_at_admission = reservation.effective_pressure_at_admission;
+        let admitted_at_unix_ms = reservation.admitted_at_unix_ms;
+        let pressure_at_completion = state.pressure_telemetry;
+        let completed_at_unix_ms = unix_time_millis();
+
+        let activity = match (
+            pressure_at_admission.sample_epoch,
+            pressure_at_completion.sample_epoch,
+            pressure_at_admission.swap_outs_total,
+            pressure_at_completion.swap_outs_total,
+            pressure_at_admission.compressions_total,
+            pressure_at_completion.compressions_total,
+        ) {
+            (
+                Some(start_epoch),
+                Some(end_epoch),
+                Some(start_swap),
+                Some(end_swap),
+                Some(start_compression),
+                Some(end_compression),
+            ) if end_epoch > start_epoch
+                && end_swap >= start_swap
+                && end_compression >= start_compression =>
+            {
+                Some((end_swap - start_swap, end_compression - start_compression))
+            }
+            _ => None,
+        };
+        let uninterrupted_normal = pressure_at_admission.raw_pressure == MemoryPressure::Normal
+            && pressure_at_completion.raw_pressure == MemoryPressure::Normal
+            && pressure_at_admission.non_normal_pressure_event_epoch
+                == pressure_at_completion.non_normal_pressure_event_epoch
+            && effective_pressure_at_admission == MemoryPressure::Normal
+            && state.pressure == MemoryPressure::Normal;
+        let fresh_at_completion =
+            pressure_at_completion
+                .sampled_at_unix_ms
+                .is_some_and(|sampled| {
+                    sampled >= admitted_at_unix_ms
+                        && completed_at_unix_ms.saturating_sub(sampled)
+                            <= PRESSURE_SAMPLE_MAX_AGE_MS
+                });
+        let (swap_out_delta, compression_activity_delta) = activity.unwrap_or((0, 0));
+        // Unknown pressure activity and transient warnings must remain dirty.
+        // The controller's existing compression field is a cleanliness guard;
+        // this value is an activity count, deliberately used only as nonzero.
+        let pressure = if activity.is_some() && uninterrupted_normal && fresh_at_completion {
+            MemoryPressure::Normal
+        } else {
+            MemoryPressure::Constrained
+        };
+        let observation = AllocationObservation {
+            path: match receipt.execution_path() {
+                higgs_engine::RequestExecutionPath::Cold => super::ExecutionPath::Cold,
+                higgs_engine::RequestExecutionPath::RetainedSuffix => {
+                    super::ExecutionPath::RetainedSuffix
+                }
+                higgs_engine::RequestExecutionPath::RadixHit => super::ExecutionPath::RadixHit,
+            },
+            full_prompt_tokens: receipt.full_prompt_tokens(),
+            suffix_tokens: receipt.suffix_tokens(),
+            predicted_peak_bytes,
+            observed_peak_bytes: receipt.observed_peak_bytes(),
+            observed_retained_bytes: receipt.observed_retained_bytes(),
+            // Active allocator growth includes persistent KV and cannot be
+            // represented as transient suffix workspace without decomposition.
+            observed_suffix_transient_bytes: 0,
+            pressure,
+            swap_out_delta,
+            compressor_growth_bytes: compression_activity_delta,
+            allocation_bearing: receipt.allocation_bearing() && request.output_tokens > 0,
+        };
+        let transition = {
+            let Some(entry) = state.models.get_mut(&model) else {
+                return false;
+            };
+            let Some(active) = entry.active.as_mut() else {
+                return false;
+            };
+            let before = active.controller.decision();
+            active.controller.observe(observation);
+            let after = active.controller.decision();
+            (after != before).then(|| {
+                entry.generation = entry.generation.saturating_add(1);
+                (before, after)
+            })
+        };
+        state.counters.allocation_observations =
+            state.counters.allocation_observations.saturating_add(1);
+        if observation.is_clean() {
+            state.counters.clean_allocation_observations = state
+                .counters
+                .clean_allocation_observations
+                .saturating_add(1);
+        }
+        state.counters.last_observed_prefill_peak_bytes = Some(receipt.prefill().peak_bytes);
+        state.counters.last_observed_decode_peak_bytes =
+            receipt.decode().map(|sample| sample.peak_bytes);
+        state.counters.last_observed_retained_bytes = Some(receipt.observed_retained_bytes());
+        if let Some((before, after)) = transition {
+            record_capacity_transition(&mut state, &model, before, after, "allocation observation");
+            recompute_registry(&mut state, "allocation observation");
+        }
+        true
     }
 
     #[must_use]
@@ -1313,7 +1508,26 @@ impl CapacityRegistry {
     }
 
     pub fn apply_pressure_observation(&self, observation: PressureObservation) {
+        self.apply_pressure_observation_inner(observation, None);
+    }
+
+    pub fn apply_pressure_observation_with_telemetry(
+        &self,
+        observation: PressureObservation,
+        telemetry: PressureTelemetry,
+    ) {
+        self.apply_pressure_observation_inner(observation, Some(telemetry));
+    }
+
+    fn apply_pressure_observation_inner(
+        &self,
+        observation: PressureObservation,
+        telemetry: Option<PressureTelemetry>,
+    ) {
         let mut state = self.lock();
+        if let Some(telemetry) = telemetry {
+            state.pressure_telemetry = telemetry;
+        }
         state
             .pressure_controller
             .apply_pressure_observation(observation);
@@ -2559,6 +2773,143 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(requested_output.bytes(), 3 * GIB);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_request_observation_trains_before_reservation_release() {
+        let registry = CapacityRegistry::new(["model".to_owned()]);
+        register(&registry, admission_facts("model"));
+        registry.apply_pressure_observation_with_telemetry(
+            PressureObservation {
+                pressure: MemoryPressure::Normal,
+                swap_out_delta: 0,
+                compressor_delta: 0,
+            },
+            crate::capacity::PressureTelemetry {
+                swap_outs_total: Some(10),
+                compressions_total: Some(20),
+                sampled_at_unix_ms: Some(unix_time_millis()),
+                sample_epoch: Some(1),
+                ..crate::capacity::PressureTelemetry::default()
+            },
+        );
+        let mut reservation = registry
+            .reserve_request("model", admission_request(1_024, 1_024))
+            .await
+            .unwrap();
+        registry.apply_pressure_observation_with_telemetry(
+            PressureObservation {
+                pressure: MemoryPressure::Normal,
+                swap_out_delta: 0,
+                compressor_delta: 0,
+            },
+            crate::capacity::PressureTelemetry {
+                swap_outs_total: Some(10),
+                compressions_total: Some(20),
+                sampled_at_unix_ms: Some(unix_time_millis()),
+                sample_epoch: Some(2),
+                ..crate::capacity::PressureTelemetry::default()
+            },
+        );
+        let receipt = higgs_engine::RequestAllocationReceipt::new(
+            higgs_engine::RequestMemoryHighWater {
+                phase: higgs_engine::MemoryPhase::Prefill,
+                active_before_bytes: 2 * GIB,
+                active_after_bytes: 2 * GIB + 64,
+                peak_bytes: 2 * GIB + 128,
+                active_growth_bytes: 64,
+            },
+            None,
+            256,
+            128,
+            higgs_engine::RequestExecutionPath::Cold,
+            1_024,
+            1_024,
+        );
+
+        assert!(reservation.observe(receipt));
+        assert_eq!(registry.active_reservation_count("model"), 1);
+        let diagnostics = registry.diagnostics();
+        assert_eq!(diagnostics.allocation_observations, 1);
+        assert_eq!(diagnostics.clean_allocation_observations, 1);
+        assert_eq!(
+            diagnostics.last_observed_prefill_peak_bytes,
+            Some(2 * GIB + 128)
+        );
+        assert_eq!(diagnostics.last_observed_decode_peak_bytes, None);
+        assert_eq!(diagnostics.last_observed_retained_bytes, Some(384));
+
+        drop(reservation);
+        assert_eq!(registry.active_reservation_count("model"), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_observation_is_dirty_when_pressure_activity_is_unknown_or_grows() {
+        let receipt = higgs_engine::RequestAllocationReceipt::new(
+            higgs_engine::RequestMemoryHighWater {
+                phase: higgs_engine::MemoryPhase::Prefill,
+                active_before_bytes: 2 * GIB,
+                active_after_bytes: 2 * GIB + 1,
+                peak_bytes: 2 * GIB + 2,
+                active_growth_bytes: 1,
+            },
+            None,
+            0,
+            0,
+            higgs_engine::RequestExecutionPath::Cold,
+            1_024,
+            1_024,
+        );
+        for (start, finish) in [
+            (
+                crate::capacity::PressureTelemetry::default(),
+                crate::capacity::PressureTelemetry::default(),
+            ),
+            (
+                crate::capacity::PressureTelemetry {
+                    swap_outs_total: Some(1),
+                    compressions_total: Some(2),
+                    sampled_at_unix_ms: Some(1),
+                    sample_epoch: Some(1),
+                    ..crate::capacity::PressureTelemetry::default()
+                },
+                crate::capacity::PressureTelemetry {
+                    swap_outs_total: Some(2),
+                    compressions_total: Some(2),
+                    sampled_at_unix_ms: Some(2),
+                    sample_epoch: Some(2),
+                    ..crate::capacity::PressureTelemetry::default()
+                },
+            ),
+        ] {
+            let registry = CapacityRegistry::new(["model".to_owned()]);
+            register(&registry, admission_facts("model"));
+            registry.apply_pressure_observation_with_telemetry(
+                PressureObservation {
+                    pressure: MemoryPressure::Normal,
+                    swap_out_delta: 0,
+                    compressor_delta: 0,
+                },
+                start,
+            );
+            let mut reservation = registry
+                .reserve_request("model", admission_request(1_024, 1_024))
+                .await
+                .unwrap();
+            registry.apply_pressure_observation_with_telemetry(
+                PressureObservation {
+                    pressure: MemoryPressure::Normal,
+                    swap_out_delta: 0,
+                    compressor_delta: 0,
+                },
+                finish,
+            );
+
+            assert!(reservation.observe(receipt));
+            let diagnostics = registry.diagnostics();
+            assert_eq!(diagnostics.allocation_observations, 1);
+            assert_eq!(diagnostics.clean_allocation_observations, 0);
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

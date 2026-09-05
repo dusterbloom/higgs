@@ -1,4 +1,9 @@
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
@@ -7,7 +12,7 @@ use tokio::{
 
 use super::{
     CapacityController, CapacityPressureCoordinator, CapacityRegistry, Clock, MemoryPressure,
-    PressureObservation,
+    PressureObservation, PressureTelemetry,
 };
 
 const VM_COUNTER_SAMPLE_PERIOD: Duration = Duration::from_secs(1);
@@ -68,6 +73,7 @@ pub(crate) trait PressureObservationSink: Send + Sync + 'static {
     fn apply<'a>(
         &'a self,
         observation: PressureObservation,
+        telemetry: PressureTelemetry,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
@@ -75,6 +81,7 @@ impl<C: Clock + Send + 'static> PressureObservationSink for Mutex<CapacityContro
     fn apply<'a>(
         &'a self,
         observation: PressureObservation,
+        _telemetry: PressureTelemetry,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             self.lock().await.apply_pressure_observation(observation);
@@ -86,9 +93,10 @@ impl PressureObservationSink for CapacityRegistry {
     fn apply<'a>(
         &'a self,
         observation: PressureObservation,
+        telemetry: PressureTelemetry,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            self.apply_pressure_observation(observation);
+            self.apply_pressure_observation_with_telemetry(observation, telemetry);
         })
     }
 }
@@ -97,9 +105,11 @@ impl PressureObservationSink for CapacityPressureCoordinator {
     fn apply<'a>(
         &'a self,
         observation: PressureObservation,
+        telemetry: PressureTelemetry,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            self.capacity.apply_pressure_observation(observation);
+            self.capacity
+                .apply_pressure_observation_with_telemetry(observation, telemetry);
             let state = self
                 .state
                 .read()
@@ -116,6 +126,13 @@ impl PressureObservationSink for CapacityPressureCoordinator {
             }
         })
     }
+}
+
+fn unix_time_millis() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -162,6 +179,12 @@ where
         // Seed before producers start. Historical cumulative totals therefore
         // establish a baseline and can never masquerade as new activity.
         let mut prior = counters.sample();
+        let mut sample_epoch = 0_u64;
+        let mut latest_sample = prior.and_then(|sample| {
+            let sampled_at_unix_ms = unix_time_millis()?;
+            sample_epoch = 1;
+            Some((sample, sampled_at_unix_ms, sample_epoch))
+        });
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let pressure = pressure_source.start(sender.clone())?;
         let cadence = match cadence.start(sender.clone()) {
@@ -173,9 +196,14 @@ where
         };
         let consumer = tokio::spawn(async move {
             let mut reported_pressure = MemoryPressure::Normal;
+            let mut non_normal_pressure_event_epoch = 0_u64;
             while let Some(event) = receiver.recv().await {
                 if let ObserverEvent::Pressure(pressure) = event {
                     reported_pressure = pressure;
+                    if pressure != MemoryPressure::Normal {
+                        non_normal_pressure_event_epoch =
+                            non_normal_pressure_event_epoch.saturating_add(1);
+                    }
                 }
                 let current = counters.sample();
                 let (swap_out_delta, compressor_delta) = match (prior, current) {
@@ -185,14 +213,36 @@ where
                     ),
                     _ => (0, 0),
                 };
-                if current.is_some() {
-                    prior = current;
+                if let Some(current) = current {
+                    prior = Some(current);
+                    if let Some(sampled_at_unix_ms) = unix_time_millis() {
+                        sample_epoch = sample_epoch.saturating_add(1);
+                        latest_sample = Some((current, sampled_at_unix_ms, sample_epoch));
+                    }
                 }
-                sink.apply(PressureObservation {
-                    pressure: reported_pressure,
-                    swap_out_delta,
-                    compressor_delta,
-                })
+                let telemetry = latest_sample.map_or_else(
+                    || PressureTelemetry {
+                        raw_pressure: reported_pressure,
+                        non_normal_pressure_event_epoch,
+                        ..PressureTelemetry::default()
+                    },
+                    |(sample, sampled_at_unix_ms, sample_epoch)| PressureTelemetry {
+                        raw_pressure: reported_pressure,
+                        swap_outs_total: Some(sample.swap_outs),
+                        compressions_total: Some(sample.compressions),
+                        sampled_at_unix_ms: Some(sampled_at_unix_ms),
+                        sample_epoch: Some(sample_epoch),
+                        non_normal_pressure_event_epoch,
+                    },
+                );
+                sink.apply(
+                    PressureObservation {
+                        pressure: reported_pressure,
+                        swap_out_delta,
+                        compressor_delta,
+                    },
+                    telemetry,
+                )
                 .await;
             }
         });
@@ -642,11 +692,11 @@ mod tests {
 
     use super::super::{
         CapacityAvailability, CapacityController, CapacityInputs, Clock, MemoryPressure,
-        PressureObservation, floor_1024,
+        PressureObservation, PressureTelemetry, floor_1024,
     };
     use super::{
         CounterSampler, NoopPressureSource, ObserverEvent, PressureEventSource,
-        PressureObserverConfig, ProducerHandle, VmCounters,
+        PressureObservationSink, PressureObserverConfig, ProducerHandle, VmCounters,
     };
 
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -1022,10 +1072,16 @@ mod tests {
 
     impl FakeCounters {
         fn new(samples: impl IntoIterator<Item = VmCounters>) -> (Self, Arc<AtomicUsize>) {
+            Self::with_results(samples.into_iter().map(Some))
+        }
+
+        fn with_results(
+            samples: impl IntoIterator<Item = Option<VmCounters>>,
+        ) -> (Self, Arc<AtomicUsize>) {
             let calls = Arc::new(AtomicUsize::new(0));
             (
                 Self {
-                    samples: Arc::new(StdMutex::new(samples.into_iter().map(Some).collect())),
+                    samples: Arc::new(StdMutex::new(samples.into_iter().collect())),
                     calls: Arc::clone(&calls),
                 },
                 calls,
@@ -1048,6 +1104,109 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(calls.load(Ordering::Relaxed), expected);
+    }
+
+    async fn wait_for_observations(sink: &RecordingSink, expected: usize) {
+        for _ in 0..1_000 {
+            if sink.0.lock().unwrap().len() >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sink.0.lock().unwrap().len(), expected);
+    }
+
+    #[derive(Default)]
+    struct RecordingSink(StdMutex<Vec<(PressureObservation, PressureTelemetry)>>);
+
+    impl PressureObservationSink for RecordingSink {
+        fn apply<'a>(
+            &'a self,
+            observation: PressureObservation,
+            telemetry: PressureTelemetry,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            Box::pin(async move {
+                self.0.lock().unwrap().push((observation, telemetry));
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn observer_publishes_raw_pressure_counters_and_event_epoch() {
+        let sink = Arc::new(RecordingSink::default());
+        let (pressure_source, pressure, _starts, _cancels) = FakeProducer::new();
+        let (cadence_source, _cadence, _starts, _cancels) = FakeProducer::new();
+        let (counters, calls) = FakeCounters::new([
+            VmCounters {
+                swap_outs: 900,
+                compressions: 4_000,
+            },
+            VmCounters {
+                swap_outs: 901,
+                compressions: 4_003,
+            },
+            VmCounters {
+                swap_outs: 901,
+                compressions: 4_003,
+            },
+        ]);
+        let handle = PressureObserverConfig::new(pressure_source, counters, cadence_source)
+            .start(Arc::clone(&sink))
+            .await
+            .unwrap();
+
+        pressure.emit(ObserverEvent::Pressure(MemoryPressure::Constrained));
+        wait_for_samples(&calls, 2).await;
+        pressure.emit(ObserverEvent::Pressure(MemoryPressure::Normal));
+        wait_for_samples(&calls, 3).await;
+        wait_for_observations(&sink, 2).await;
+
+        let observations = sink.0.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        let (policy, telemetry) = observations[1];
+        assert_eq!(policy.pressure, MemoryPressure::Normal);
+        assert_eq!(policy.swap_out_delta, 0);
+        assert_eq!(policy.compressor_delta, 0);
+        assert_eq!(telemetry.raw_pressure, MemoryPressure::Normal);
+        assert_eq!(telemetry.swap_outs_total, Some(901));
+        assert_eq!(telemetry.compressions_total, Some(4_003));
+        assert!(telemetry.sampled_at_unix_ms.is_some_and(|value| value > 0));
+        assert_eq!(telemetry.sample_epoch, Some(3));
+        assert_eq!(telemetry.non_normal_pressure_event_epoch, 1);
+        drop(observations);
+        handle.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_probe_retains_last_valid_totals_and_sample_identity() {
+        let sink = Arc::new(RecordingSink::default());
+        let (pressure_source, _pressure, _starts, _cancels) = FakeProducer::new();
+        let (cadence_source, cadence, _starts, _cancels) = FakeProducer::new();
+        let (counters, calls) = FakeCounters::with_results([
+            Some(VmCounters {
+                swap_outs: 12,
+                compressions: 30,
+            }),
+            None,
+        ]);
+        let handle = PressureObserverConfig::new(pressure_source, counters, cadence_source)
+            .start(Arc::clone(&sink))
+            .await
+            .unwrap();
+
+        cadence.emit(ObserverEvent::Sample);
+        wait_for_samples(&calls, 2).await;
+        wait_for_observations(&sink, 1).await;
+
+        let observations = sink.0.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        let (_, telemetry) = observations[0];
+        assert_eq!(telemetry.swap_outs_total, Some(12));
+        assert_eq!(telemetry.compressions_total, Some(30));
+        assert!(telemetry.sampled_at_unix_ms.is_some_and(|value| value > 0));
+        assert_eq!(telemetry.sample_epoch, Some(1));
+        drop(observations);
+        handle.stop().await.unwrap();
     }
 
     #[tokio::test]

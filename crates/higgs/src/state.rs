@@ -1979,7 +1979,7 @@ fn build_capacity_facts_from_measurements(
         max_prompt_tokens: architectural_max_tokens,
         max_chunk_tokens: prefill_chunk_tokens,
     };
-    let costs = higgs_engine::EngineCostDescription::fp16_from_model_dir(
+    let costs = higgs_engine::EngineCostDescription::runtime_from_model_dir(
         resolved,
         256 * MIB,
         256 * MIB,
@@ -2054,6 +2054,33 @@ fn build_capacity_facts_from_measurements(
         drafter_identity.clone(),
         runtime_environment,
         after,
+    );
+
+    // Log resolved execution, not just ENV spelling: native Escha and direct
+    // trellis GEMM are separate choices, and version strings do not identify
+    // the executable/Metal-library pair used by learned capacity profiles.
+    let escha_prefill_kernel = if !is_eschamoe {
+        "not_applicable"
+    } else if !higgs_models::eschamoe::native_mode() {
+        "affine"
+    } else if higgs_models::eschamoe::trellis_gemm_mode() {
+        if higgs_models::eschamoe::qgemm_simd_mode() {
+            "trellis_qgemm_simd"
+        } else {
+            "trellis_qgemm_scalar"
+        }
+    } else {
+        "scratch_matmul"
+    };
+    tracing::info!(
+        model = name,
+        build_identity = ?learned_profile_key.as_ref().map(|key| &key.higgs_build),
+        escha_prefill_kernel,
+        execution_mode = %execution_mode,
+        persistent_cache_bytes_per_token = costs.persistent_bytes_per_token,
+        fixed_live_session_bytes = costs.fixed_live_session_bytes,
+        prefill_chunk_tokens,
+        "resolved capacity execution facts"
     );
 
     Ok(ModelCapacityFacts {
@@ -3000,7 +3027,14 @@ mod tests {
         assert_eq!(facts.model_fingerprint, "sha256:exact");
         assert_eq!(facts.loaded_model_bytes, 11 * GIB);
         assert_eq!(facts.architectural_max_tokens, 131_072);
-        assert_eq!(facts.costs.persistent_bytes_per_token, 20_480);
+        assert_eq!(
+            facts.costs.persistent_bytes_per_token,
+            if higgs_models::eschamoe::native_mode() {
+                40_960
+            } else {
+                20_480
+            },
+        );
         assert_eq!(
             facts.quantization,
             r#"{"quant_method":"eschamoe","bits":3}"#

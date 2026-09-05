@@ -399,21 +399,27 @@ async fn chat_completions_non_streaming(
             req.session_id.unwrap_or_default(),
         ));
     }
-    // Race-safe retained-prefix fact: admission charges only the uncached
-    // suffix; the session worker revalidates this fact at acceptance.
+    // Best-effort sessions may bootstrap cold if the retained branch changes;
+    // only required continuation can safely reserve the smaller suffix path.
     let retained_prefix = session_id
         .and_then(|sid| engine.retained_session_prefix_len(sid, &prompt_tokens))
         .unwrap_or(0);
+    let admitted_retained_prefix =
+        if continuation_policy == SessionContinuationPolicy::RequireContinuation {
+            retained_prefix
+        } else {
+            0
+        };
     let reservation = crate::capacity::admit_generation_request(
         &state,
         &req.model,
-        if session_id.is_some() {
+        if session_id.is_some() && admitted_retained_prefix > 0 {
             crate::capacity::ExecutionPath::RetainedSuffix
         } else {
             crate::capacity::ExecutionPath::Cold
         },
         prompt_tokens.len(),
-        prompt_tokens.len() - retained_prefix,
+        prompt_tokens.len() - admitted_retained_prefix,
         max_tokens,
     )
     .await?;
@@ -443,21 +449,21 @@ async fn chat_completions_non_streaming(
         let sampling_c = sampling.clone();
         let pflash_policy_c = pflash_policy.clone();
         let session_output = tokio::task::spawn_blocking(move || {
-            let _stop_guard = crate::capacity::install_reservation_stop(&reservation, watchdog);
-            let _reservation = reservation;
-            engine_c.generate_session_routed_with_thinking(
-                sid,
-                &prompt_tokens_c,
-                &messages_c,
-                tools_c.as_deref(),
-                max_tokens,
-                &sampling_c,
-                thinking_enabled,
-                tool_payload,
-                &pflash_policy_c,
-                continuation_policy,
-                assumed_retained_prefix,
-            )
+            crate::capacity::run_reserved_generation(reservation, watchdog, || {
+                engine_c.generate_session_routed_with_thinking(
+                    sid,
+                    &prompt_tokens_c,
+                    &messages_c,
+                    tools_c.as_deref(),
+                    max_tokens,
+                    &sampling_c,
+                    thinking_enabled,
+                    tool_payload,
+                    &pflash_policy_c,
+                    continuation_policy,
+                    assumed_retained_prefix,
+                )
+            })
         })
         .await
         .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
@@ -474,22 +480,22 @@ async fn chat_completions_non_streaming(
         ));
     } else {
         tokio::task::spawn_blocking(move || {
-            let _stop_guard = crate::capacity::install_reservation_stop(&reservation, watchdog);
-            let _reservation = reservation;
-            engine.generate_with_thinking_and_pflash_policy_with_cache(
-                &prompt_tokens,
-                max_tokens,
-                &sampling,
-                &stop_sequences,
-                want_logprobs,
-                top_logprobs,
-                thinking_enabled,
-                constraint,
-                image_inputs,
-                checkpoint_id.as_deref(),
-                &pflash_policy,
-                allow_prefix_cache,
-            )
+            crate::capacity::run_reserved_generation(reservation, watchdog, || {
+                engine.generate_with_thinking_and_pflash_policy_with_cache(
+                    &prompt_tokens,
+                    max_tokens,
+                    &sampling,
+                    &stop_sequences,
+                    want_logprobs,
+                    top_logprobs,
+                    thinking_enabled,
+                    constraint,
+                    image_inputs,
+                    checkpoint_id.as_deref(),
+                    &pflash_policy,
+                    allow_prefix_cache,
+                )
+            })
         })
         .await
         .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
@@ -879,21 +885,27 @@ async fn chat_completions_stream(
             request_session_id.unwrap_or_default(),
         ));
     }
-    // Race-safe retained-prefix fact: admission charges only the uncached
-    // suffix; the session worker revalidates this fact at acceptance.
+    // Best-effort sessions may bootstrap cold if the retained branch changes;
+    // only required continuation can safely reserve the smaller suffix path.
     let retained_prefix = stream_session_id
         .and_then(|sid| engine.retained_session_prefix_len(sid, &prompt_tokens))
         .unwrap_or(0);
+    let admitted_retained_prefix =
+        if continuation_policy == SessionContinuationPolicy::RequireContinuation {
+            retained_prefix
+        } else {
+            0
+        };
     let reservation = crate::capacity::admit_generation_request(
         &state,
         &model,
-        if stream_session_id.is_some() {
+        if stream_session_id.is_some() && admitted_retained_prefix > 0 {
             crate::capacity::ExecutionPath::RetainedSuffix
         } else {
             crate::capacity::ExecutionPath::Cold
         },
         prompt_tokens.len(),
-        prompt_tokens.len() - retained_prefix,
+        prompt_tokens.len() - admitted_retained_prefix,
         max_tokens,
     )
     .await?;
@@ -934,23 +946,23 @@ async fn chat_completions_stream(
         let messages_c = messages.clone();
         let pflash_policy_c = pflash_policy.clone();
         tokio::task::spawn_blocking(move || {
-            let _stop_guard = crate::capacity::install_reservation_stop(&reservation, watchdog);
-            let _reservation = reservation;
-            let result = worker_engine.generate_session_routed_streaming_with_thinking(
-                sid,
-                &prompt_tokens,
-                &messages_c,
-                prompt_tools_c.as_deref(),
-                max_tokens,
-                &sampling,
-                &tx,
-                thinking_enabled_stream,
-                tool_payload,
-                &pflash_policy_c,
-                continuation_policy,
-                acceptance,
-                assumed_retained_prefix,
-            );
+            let result = crate::capacity::run_reserved_generation(reservation, watchdog, || {
+                worker_engine.generate_session_routed_streaming_with_thinking(
+                    sid,
+                    &prompt_tokens,
+                    &messages_c,
+                    prompt_tools_c.as_deref(),
+                    max_tokens,
+                    &sampling,
+                    &tx,
+                    thinking_enabled_stream,
+                    tool_payload,
+                    &pflash_policy_c,
+                    continuation_policy,
+                    acceptance,
+                    assumed_retained_prefix,
+                )
+            });
             match &result {
                 Ok(()) => {}
                 Err(higgs_engine::error::EngineError::Cancelled) => {
@@ -965,10 +977,8 @@ async fn chat_completions_stream(
     } else {
         let worker_engine = Arc::clone(&engine);
         tokio::task::spawn_blocking(move || {
-            let _stop_guard = crate::capacity::install_reservation_stop(&reservation, watchdog);
-            let _reservation = reservation;
-            let result = worker_engine
-                .generate_streaming_with_thinking_and_pflash_policy_with_cache(
+            let result = crate::capacity::run_reserved_generation(reservation, watchdog, || {
+                worker_engine.generate_streaming_with_thinking_and_pflash_policy_with_cache(
                     &prompt_tokens,
                     max_tokens,
                     &sampling,
@@ -983,7 +993,8 @@ async fn chat_completions_stream(
                     checkpoint_id.as_deref(),
                     &pflash_policy,
                     allow_prefix_cache,
-                );
+                )
+            });
             if let Err(ref e) = result {
                 tracing::error!(error = %e, "Generation error during streaming");
             }
@@ -2834,11 +2845,26 @@ mod tests {
             serde_json::from_value::<ChatCompletionRequest>(request).unwrap()
         };
 
-        // Charging only the uncached 100-token suffix fits an envelope that a
-        // cold full-prompt transient charge cannot (subtest 2 proves that).
-        let admitted = chat_completions_non_streaming(
+        // Best-effort may lose the retained branch and bootstrap cold, so it
+        // must reserve the full prompt and reject under this narrow envelope.
+        let best_effort = chat_completions_non_streaming(
             Arc::clone(&state),
             request(serde_json::json!({"session_id": 42, "max_tokens": 16})),
+            Arc::clone(&engine),
+            GenerationDefaults::default(),
+        )
+        .await;
+        assert!(matches!(best_effort, Err(ServerError::CapacityExceeded(_))));
+
+        // Required continuation rejects instead of falling back, so charging
+        // only the validated uncached 100-token suffix is safe.
+        let admitted = chat_completions_non_streaming(
+            Arc::clone(&state),
+            request(serde_json::json!({
+                "session_id": 42,
+                "session_cache_policy": "require_continuation",
+                "max_tokens": 16
+            })),
             Arc::clone(&engine),
             GenerationDefaults::default(),
         )
@@ -2857,7 +2883,11 @@ mod tests {
         // the exact charge the pre-fix code applied to session turns.
         let cold = chat_completions_non_streaming(
             Arc::clone(&state),
-            request(serde_json::json!({"session_id": 43, "max_tokens": 16})),
+            request(serde_json::json!({
+                "session_id": 43,
+                "session_cache_policy": "require_continuation",
+                "max_tokens": 16
+            })),
             Arc::clone(&engine),
             GenerationDefaults::default(),
         )
@@ -2875,6 +2905,7 @@ mod tests {
             Arc::clone(&state),
             request(serde_json::json!({
                 "session_id": 42,
+                "session_cache_policy": "require_continuation",
                 "drop_session_ids": [42],
                 "max_tokens": 16
             })),

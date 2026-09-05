@@ -1397,8 +1397,10 @@ pub fn native_mode() -> bool {
 /// Set `HIGGS_ESCHA_TRELLIS_GEMM=1` to select the kernel. The default is the
 /// scratch path of [`EschaProj::scratch_matmul`]. The GEMM kernel drops the
 /// dense scratch weight and the host read of the expert ids, and the scratch
-/// path stays as the reference. The choice is read once and cached: the
-/// caller is the per-layer expert forward.
+/// path stays as the reference. Despite winning isolated synthetic kernels,
+/// GEMM was slower in full-model 1,024-token Escha W2 prefill. SIMD selection
+/// only applies after GEMM is explicitly enabled. The choice is read once and
+/// cached: the caller is the per-layer expert forward.
 pub fn trellis_gemm_mode() -> bool {
     static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| std::env::var("HIGGS_ESCHA_TRELLIS_GEMM").is_ok_and(|v| v == "1"))
@@ -3140,8 +3142,8 @@ mod tests {
     /// The native gather forward must match the oracle on both row paths.
     ///
     /// The matvec path takes six rows with unsorted ids. The scratch path
-    /// takes 40 sorted rows. Both compare against `dequant_expert` row by
-    /// row.
+    /// takes 40 sorted rows and guards the measured production default. Both
+    /// compare row by row against `dequant_expert`.
     #[test]
     fn escha_proj_gather_forward_matches_oracle() {
         let _exec = crate::mlx_exec::acquire();
@@ -3198,6 +3200,21 @@ mod tests {
             let scale = want.abs().unwrap().max(None).unwrap().item::<f32>();
             eprintln!("{label}: max |native - oracle| = {err} (scale {scale})");
             assert!(err <= 2e-3 * scale, "{label}: {err} vs scale {scale}");
+
+            if ids.len() > EschaProj::GATHER_QMV_MAX_ROWS as usize {
+                let scratch = proj.gather_forward_mode(&x, &eids, false).unwrap();
+                let got_bits: Vec<u32> = got
+                    .as_slice::<f32>()
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect();
+                let scratch_bits: Vec<u32> = scratch
+                    .as_slice::<f32>()
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect();
+                assert_eq!(got_bits, scratch_bits, "{label}: default scratch route");
+            }
         };
 
         // Six rows, unsorted ids: the matvec kernel path.

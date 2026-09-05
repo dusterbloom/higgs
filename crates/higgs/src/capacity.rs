@@ -358,6 +358,29 @@ pub(crate) fn install_reservation_stop(
     higgs_engine::stop::install_generation_stop(stop)
 }
 
+/// Run the one production generation path with allocator capture installed.
+/// A complete successful receipt is observed before the reservation releases;
+/// missing or invalid telemetry never changes the generation result.
+pub(crate) fn run_reserved_generation<T, E>(
+    mut reservation: RequestReservation,
+    watchdog: Option<std::time::Duration>,
+    generate: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let _stop_guard = install_reservation_stop(&reservation, watchdog);
+    let capture = higgs_engine::RequestAllocationCapture::start();
+    let result = generate();
+    if result.is_ok() {
+        if let Some(receipt) = capture.finish() {
+            let _ = reservation.observe(receipt);
+        } else {
+            reservation.skip_observation();
+        }
+    } else {
+        reservation.skip_observation();
+    }
+    result
+}
+
 /// The no-progress watchdog window: the configured server request timeout.
 pub(crate) fn request_watchdog(state: &crate::state::SharedState) -> Option<std::time::Duration> {
     let timeout = state.config.server.timeout;
@@ -413,7 +436,40 @@ pub enum MemoryPressure {
 pub struct PressureObservation {
     pub pressure: MemoryPressure,
     pub swap_out_delta: u64,
+    /// Delta of Darwin's cumulative compression-activity counter.
     pub compressor_delta: u64,
+}
+
+/// Latest content-free facts produced by the process pressure observer.
+///
+/// The cumulative compression counter measures compression activity, not the
+/// current size of the compressor. Optional fields remain unknown until a
+/// valid VM-counter sample exists and retain that sample's timestamp and epoch
+/// across transient probe failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PressureTelemetry {
+    pub raw_pressure: MemoryPressure,
+    pub swap_outs_total: Option<u64>,
+    pub compressions_total: Option<u64>,
+    /// Wall-clock time of the cumulative counters above.
+    pub sampled_at_unix_ms: Option<u64>,
+    /// Monotonic identity of the latest successful counter sample.
+    pub sample_epoch: Option<u64>,
+    /// Monotonic count of constrained or critical OS pressure events.
+    pub non_normal_pressure_event_epoch: u64,
+}
+
+impl Default for PressureTelemetry {
+    fn default() -> Self {
+        Self {
+            raw_pressure: MemoryPressure::Normal,
+            swap_outs_total: None,
+            compressions_total: None,
+            sampled_at_unix_ms: None,
+            sample_epoch: None,
+            non_normal_pressure_event_epoch: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -440,11 +496,34 @@ pub struct CapacityDiagnostics {
     pub active_reservation_bytes: u64,
     pub oldest_reservation_age_ms: Option<u64>,
     pub queued_waiters: usize,
+    /// Effective pressure after sticky swap/compression policy is applied.
     pub pressure: MemoryPressure,
+    /// Last pressure level reported by the operating-system event source.
+    pub raw_pressure: MemoryPressure,
     pub mlx_active_bytes: u64,
+    /// Process-global MLX peak since the latest serialized phase reset.
     pub mlx_peak_bytes: u64,
+    pub mlx_cached_bytes: Option<u64>,
+    pub mlx_measured_at_unix_ms: Option<u64>,
     pub swap_out_delta: u64,
+    /// Latest compression-activity delta; this is not compressor byte growth.
     pub compressor_delta: u64,
+    pub swap_outs_total: Option<u64>,
+    /// Cumulative compression activity, not current compressor residency.
+    pub compressions_total: Option<u64>,
+    /// Wall-clock time of the cumulative pressure counters above.
+    pub pressure_sampled_at_unix_ms: Option<u64>,
+    /// Monotonic identity of the latest successful pressure-counter sample.
+    pub pressure_sample_epoch: Option<u64>,
+    /// Monotonic count of constrained or critical raw OS pressure events.
+    pub non_normal_pressure_event_epoch: u64,
+    pub allocation_observations: u64,
+    pub clean_allocation_observations: u64,
+    /// Requests without a complete Simple-engine allocation receipt.
+    pub skipped_allocation_observations: u64,
+    pub last_observed_prefill_peak_bytes: Option<u64>,
+    pub last_observed_decode_peak_bytes: Option<u64>,
+    pub last_observed_retained_bytes: Option<u64>,
     pub downshifts: u64,
     pub rejections: CapacityRejectionDiagnostics,
     pub stop_outcomes: std::collections::BTreeMap<String, u64>,
@@ -470,6 +549,7 @@ pub struct CapacityModelDiagnostics {
     pub recommended_output_tokens: u64,
     pub max_prompt_tokens: u64,
     pub usable_bytes: u64,
+    pub qualified_cold_bands: usize,
 }
 
 impl Default for CapacityDiagnostics {
@@ -481,10 +561,24 @@ impl Default for CapacityDiagnostics {
             oldest_reservation_age_ms: None,
             queued_waiters: 0,
             pressure: MemoryPressure::Normal,
+            raw_pressure: MemoryPressure::Normal,
             mlx_active_bytes: 0,
             mlx_peak_bytes: 0,
+            mlx_cached_bytes: None,
+            mlx_measured_at_unix_ms: None,
             swap_out_delta: 0,
             compressor_delta: 0,
+            swap_outs_total: None,
+            compressions_total: None,
+            pressure_sampled_at_unix_ms: None,
+            pressure_sample_epoch: None,
+            non_normal_pressure_event_epoch: 0,
+            allocation_observations: 0,
+            clean_allocation_observations: 0,
+            skipped_allocation_observations: 0,
+            last_observed_prefill_peak_bytes: None,
+            last_observed_decode_peak_bytes: None,
+            last_observed_retained_bytes: None,
             downshifts: 0,
             rejections: CapacityRejectionDiagnostics::default(),
             stop_outcomes: std::collections::BTreeMap::new(),
@@ -827,6 +921,9 @@ pub struct AllocationObservation {
     pub observed_suffix_transient_bytes: u64,
     pub pressure: MemoryPressure,
     pub swap_out_delta: u64,
+    /// Legacy name for a nonzero compression-activity signal (count), not
+    /// measured resident-byte growth. This only disqualifies clean evidence
+    /// and is never charged to the allocation ledger.
     pub compressor_growth_bytes: u64,
     pub allocation_bearing: bool,
 }
@@ -920,6 +1017,16 @@ impl CapacityController<SystemClock> {
 }
 
 impl<C: Clock> CapacityController<C> {
+    /// Number of token bands backed by three clean cold samples spanning the
+    /// controller's five-minute qualification window.
+    #[must_use]
+    pub fn qualified_cold_band_count(&self) -> usize {
+        self.evidence
+            .values()
+            .filter(|evidence| evidence.cold_replacement_qualified)
+            .count()
+    }
+
     pub(crate) fn transactional_copy(&self) -> Self {
         Self {
             inputs: self.inputs,
@@ -1528,11 +1635,19 @@ impl<C: Clock> CapacityController<C> {
                 .cold_replacement_qualified
                 .then_some(evidence.cold_high_water_bytes)
         });
-        let cold_transient = qualified_cold.unwrap_or_else(|| {
-            static_transient.max(
+        // Cold evidence is an ABSOLUTE process peak, whereas this ledger's
+        // transient term is ADDITIONAL to loaded_model_bytes. Subtract only
+        // that same baseline before adding the evidence: counting the absolute
+        // peak as workspace would charge the model weights twice. Fixed/KV/
+        // output/cache terms remain separate conservative charges, so the
+        // resulting total can never fall below the learned absolute peak.
+        let additional_peak =
+            |absolute_peak: u64| absolute_peak.saturating_sub(self.inputs.loaded_model_bytes);
+        let cold_transient = qualified_cold.map(additional_peak).unwrap_or_else(|| {
+            static_transient.max(additional_peak(
                 self.learned_high_water_bytes(ExecutionPath::Cold, request.prompt_tokens)
                     .unwrap_or(0),
-            )
+            ))
         });
         let suffix_transient = self
             .evidence
@@ -2191,6 +2306,54 @@ mod tests {
     }
 
     #[test]
+    fn learned_absolute_peak_counts_model_weights_once() {
+        let clock = TestClock(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        let mut inputs = controller_inputs(25, 25);
+        inputs.loaded_model_bytes = 12 * GIB;
+        inputs.memory.active_bytes = 12 * GIB;
+        inputs.costs.transient_prefill.base_bytes = 4 * GIB;
+        inputs.costs.transient_prefill.bytes_per_chunk_token = 0;
+        inputs.costs.persistent_bytes_per_token = 40_960;
+        let mut controller = CapacityController::with_clock(inputs, clock.clone());
+        let probe = request(8192, 1024);
+        let predicted = controller
+            .byte_ledger(probe)
+            .unwrap()
+            .total_bytes()
+            .unwrap();
+        assert!(predicted > 14 * GIB && predicted < 20 * GIB);
+        for seconds in [0, 150, 300] {
+            clock.set_seconds(seconds);
+            controller.observe(AllocationObservation::clean(
+                ExecutionPath::Cold,
+                8192,
+                8192,
+                predicted,
+                14 * GIB,
+            ));
+        }
+        let learned_absolute = add_ten_percent_ceiling(14 * GIB).unwrap();
+        let ledger = controller.byte_ledger(probe).unwrap();
+        assert_eq!(ledger.loaded_baseline_bytes, 12 * GIB);
+        assert_eq!(ledger.transient_bytes, learned_absolute - 12 * GIB);
+        assert!(ledger.total_bytes().unwrap() >= learned_absolute);
+        assert!(ledger.total_bytes().unwrap() < 20 * GIB);
+
+        // Underprediction before qualification must use the same byte domain.
+        let mut controller = CapacityController::new(inputs);
+        controller.observe(AllocationObservation::clean(
+            ExecutionPath::Cold,
+            8192,
+            8192,
+            13 * GIB,
+            14 * GIB,
+        ));
+        let ledger = controller.byte_ledger(probe).unwrap();
+        assert_eq!(ledger.transient_bytes, 4 * GIB);
+        assert!(ledger.total_bytes().unwrap() < 20 * GIB);
+    }
+
+    #[test]
     fn learning_requires_three_clean_allocation_observations_over_five_minutes() {
         let clock = TestClock(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
         let mut inputs = controller_inputs(24, 24);
@@ -2209,8 +2372,8 @@ mod tests {
                 ExecutionPath::Cold,
                 band_prompt,
                 512,
-                6 * GIB,
-                2 * GIB,
+                17 * GIB,
+                13 * GIB,
             ));
             assert_eq!(controller.decision().safe_total_tokens, initial);
         }
@@ -2219,8 +2382,8 @@ mod tests {
             ExecutionPath::Cold,
             band_prompt,
             512,
-            6 * GIB,
-            2 * GIB,
+            17 * GIB,
+            13 * GIB,
         ));
         let raised = controller.decision().safe_total_tokens;
         assert!(raised > initial);
@@ -2230,7 +2393,7 @@ mod tests {
                 .byte_ledger(request(band_prompt, 4096))
                 .unwrap()
                 .transient_bytes,
-            2_362_232_013
+            3_543_348_020
         );
         assert!(raised - initial <= 4096);
         assert!(raised - initial <= floor_1024(initial / 8).max(1024));
@@ -2336,17 +2499,18 @@ mod tests {
     fn allocator_underprediction_raises_high_water_ten_percent_and_recomputes() {
         let mut controller = CapacityController::new(controller_inputs(24, 24));
         let before = controller.decision().safe_total_tokens;
-        let observed_peak = 6 * GIB;
+        // Absolute peak includes the 11 GiB resident model.
+        let observed_peak = 17 * GIB;
         controller.observe(AllocationObservation::clean(
             ExecutionPath::Cold,
             before,
             512,
-            GIB,
+            12 * GIB,
             observed_peak,
         ));
         assert_eq!(
             controller.learned_high_water_bytes(ExecutionPath::Cold, before),
-            Some(7_086_696_039)
+            Some(20_078_972_109)
         );
         assert!(controller.decision().safe_total_tokens < before);
     }

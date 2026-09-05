@@ -314,20 +314,20 @@ async fn create_message_non_streaming(
 
     let watchdog = crate::capacity::request_watchdog(&state);
     let output = tokio::task::spawn_blocking(move || {
-        let _stop_guard = crate::capacity::install_reservation_stop(&reservation, watchdog);
-        let _reservation = reservation;
-        engine.generate_with_thinking(
-            &prompt_tokens,
-            max_tokens,
-            &sampling,
-            &stop_sequences,
-            false,
-            None,
-            thinking_enabled,
-            None,
-            image_inputs,
-            None,
-        )
+        crate::capacity::run_reserved_generation(reservation, watchdog, || {
+            engine.generate_with_thinking(
+                &prompt_tokens,
+                max_tokens,
+                &sampling,
+                &stop_sequences,
+                false,
+                None,
+                thinking_enabled,
+                None,
+                image_inputs,
+                None,
+            )
+        })
     })
     .await
     .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
@@ -451,23 +451,23 @@ async fn create_message_stream(
     let watchdog = crate::capacity::request_watchdog(&state);
 
     tokio::task::spawn_blocking(move || {
-        let _stop_guard = crate::capacity::install_reservation_stop(&reservation, watchdog);
-        let _reservation = reservation;
-        let result = engine.generate_streaming_with_thinking(
-            &prompt_tokens,
-            max_tokens,
-            &sampling,
-            &stop_sequences,
-            false,
-            None,
-            &tx,
-            thinking_enabled,
-            // Anthropic streaming does not surface prefill progress.
-            false,
-            None,
-            image_inputs,
-            None,
-        );
+        let result = crate::capacity::run_reserved_generation(reservation, watchdog, || {
+            engine.generate_streaming_with_thinking(
+                &prompt_tokens,
+                max_tokens,
+                &sampling,
+                &stop_sequences,
+                false,
+                None,
+                &tx,
+                thinking_enabled,
+                // Anthropic streaming does not surface prefill progress.
+                false,
+                None,
+                image_inputs,
+                None,
+            )
+        });
         if let Err(e) = &result {
             tracing::error!(error = %e, "Generation error during Anthropic streaming");
         }

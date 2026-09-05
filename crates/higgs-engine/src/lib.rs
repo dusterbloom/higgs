@@ -22,10 +22,12 @@ pub mod simple;
 pub mod stop;
 pub mod tool_parser;
 
+pub use engine::{RequestAllocationCapture, RequestAllocationReceipt, RequestExecutionPath};
 pub use mlx_tuning::{
-    EngineCostDescription, LoaderWorkspaceKind, MemoryPhase, MlxMemoryProbeError,
-    MlxMemorySnapshot, ModelFootprint, ModelLoadEstimate, ModelLoadEstimateError,
-    RequestMemoryHighWater, RequestMemorySampler, TransientPrefillEstimate, model_load_estimate,
+    EngineCostDescription, LoaderWorkspaceKind, MemoryPhase, MlxAllocatorTelemetry,
+    MlxMemoryProbeError, MlxMemorySnapshot, ModelFootprint, ModelLoadEstimate,
+    ModelLoadEstimateError, RequestMemoryHighWater, RequestMemorySampler, TransientPrefillEstimate,
+    model_load_estimate,
 };
 pub use simple::CacheResidency;
 pub use tokenizers;
