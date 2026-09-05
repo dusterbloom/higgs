@@ -2016,6 +2016,11 @@ fn build_capacity_facts_from_measurements(
         if model_cfg.batch { "batch" } else { "simple" }
     );
     let kv_representation = match model_cfg.kv_cache {
+        // Native Escha keeps its unquantized KV in FP32. The profile identity
+        // must describe actual storage, not assume that quantization-off is FP16.
+        higgs_models::turboquant::KvCacheMode::Off if weight_execution == "eschamoe-native" => {
+            "fp32".to_owned()
+        }
         higgs_models::turboquant::KvCacheMode::Off => "fp16".to_owned(),
         higgs_models::turboquant::KvCacheMode::Turboquant => format!(
             "turboquant:k{}:v{}:dense{}",
@@ -3045,12 +3050,19 @@ mod tests {
             "simple:eschamoe-affine"
         };
         assert_eq!(facts.execution_mode, escha_mode);
+        let expected_kv = if higgs_models::eschamoe::native_mode() {
+            "fp32"
+        } else {
+            "fp16"
+        };
+        assert_eq!(facts.kv_representation, expected_kv);
         assert_eq!(facts.retained_session_tokens, 49_152);
         assert_eq!(facts.retained_bytes_ceiling, 2 * GIB);
         assert_eq!(facts.prefix_cache_bytes_ceiling, GIB);
         assert_eq!(facts.startup_headroom_bytes, 39 * GIB);
         if let Some(key) = facts.learned_profile_key {
             assert_eq!(key.backend_authority_bytes, 40 * GIB);
+            assert_eq!(key.kv_representation, expected_kv);
         }
     }
 }
