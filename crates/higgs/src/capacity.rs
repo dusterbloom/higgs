@@ -1123,13 +1123,10 @@ impl<C: Clock> CapacityController<C> {
         }
         let effective_pressure = if swap_is_sticky {
             MemoryPressure::Critical
-        } else if observation.pressure == MemoryPressure::Normal && observation.compressor_delta > 0
-        {
-            // Compressor growth is deterministic evidence that a nominally normal
-            // system is dirty. It freezes rises and uses the constrained reserve;
-            // no arbitrary compression-rate threshold is invented.
-            MemoryPressure::Constrained
         } else {
+            // Global compression activity is not an OS pressure verdict. It
+            // disqualifies clean learning below, but must not ratchet a healthy
+            // conversation's context down whenever macOS compresses a page.
             observation.pressure
         };
 
@@ -1671,8 +1668,15 @@ impl<C: Clock> CapacityController<C> {
         } else {
             cold_transient
         };
+        // Receipts report the complete retained session, not additional memory.
+        // Prompt/output KV and fixed session state are already charged below.
+        // Keep only observed excess (including its safety margin); adding the
+        // whole receipt makes each successful continuation shrink capacity.
+        let covered_session_bytes = prompt_bytes
+            .checked_add(output_bytes)?
+            .checked_add(self.inputs.costs.fixed_live_session_bytes)?;
         let learned_retained_bytes = if use_persisted_path {
-            retained_evidence
+            retained_evidence.saturating_sub(covered_session_bytes)
         } else {
             0
         };
@@ -2735,6 +2739,23 @@ mod tests {
                 Admission::Admitted(_)
             )),
             other => panic!("unexpected fixed-cost admission: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retained_kv_already_charged_does_not_shrink_long_context() {
+        let mut controller = CapacityController::new(controller_inputs(22, 22));
+        let before = controller.decision();
+        for prompt in [4096, 8192, 16384, 32768] {
+            let mut observation = AllocationObservation::clean(
+                ExecutionPath::RetainedSuffix, prompt, 4096, 16 * GIB, 16 * GIB,
+            );
+            // The engine receipt contains total retained KV, not extra workspace.
+            observation.observed_retained_bytes = controller.inputs.costs
+                .persistent_bytes(prompt).unwrap();
+            controller.observe(observation);
+            assert_eq!(controller.decision(), before,
+                "known KV at {prompt} tokens was charged a second time");
         }
     }
 

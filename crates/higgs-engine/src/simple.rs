@@ -1877,10 +1877,18 @@ pub(crate) fn set_wired_limit_to_max(enabled: bool) {
                 }
                 crate::runtime_identity::MlxAllocatorPolicy::WiredLimit => {
                     mlx_sys::mlx_set_wired_limit(&raw mut prev_wired, max_rec);
+                    // Unused allocator buffers are not KV/session state. Leaving
+                    // MLX's large default cache here lets changing prefill shapes
+                    // retain gigabytes and trigger OS pressure below the live
+                    // tensor budget. Bound reuse without limiting active arrays.
+                    let cache_limit = 256 * 1024 * 1024;
+                    mlx_sys::mlx_set_cache_limit(&raw mut prev_cache, cache_limit);
                     tracing::info!(
                         mode = "mlx_wired_limit",
                         max_recommended_mb = max_rec / (1024 * 1024),
                         wired_limit_mb = max_rec / (1024 * 1024),
+                        cache_limit_mb = cache_limit / (1024 * 1024),
+                        prev_cache_mb = prev_cache / (1024 * 1024),
                         prev_wired_mb = prev_wired / (1024 * 1024),
                         "Configured MLX wired limit",
                     );

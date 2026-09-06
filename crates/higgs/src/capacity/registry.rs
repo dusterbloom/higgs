@@ -2435,10 +2435,14 @@ fn snapshot_for(
     pressure: MemoryPressure,
     allocation: CacheAllocation,
 ) -> CapacitySnapshot {
-    let active = entry
-        .active
-        .as_ref()
-        .filter(|active| active.published && !active.draining);
+    let active = entry.active.as_ref().filter(|active| {
+        active.published
+                && !active.draining
+                && active.controller.decision().availability == CapacityAvailability::Available
+                // Internal zero-prompt decisions serve registration/admission
+                // calculations, but are not usable public chat envelopes.
+                && active.controller.decision().max_prompt_tokens > 0
+    });
     let (availability, safe_total_tokens, recommended_output_tokens, max_prompt_tokens) = active
         .map(|active| {
             let decision = active.controller.decision();
@@ -3638,6 +3642,22 @@ mod tests {
     }
 
     #[test]
+    fn active_output_only_snapshot_zeroes_unavailable_wire_limits() {
+        let registry = CapacityRegistry::new(["escha".to_owned()]);
+        let mut model = facts("escha", 5 * GIB);
+        model.configured_total_token_ceiling = Some(4096);
+        register(&registry, model);
+        let snapshot = registry.snapshot("escha").unwrap();
+        assert_eq!(snapshot.availability, CapacityAvailability::Unavailable);
+        assert_eq!(snapshot.safe_total_tokens, 0);
+        assert_eq!(snapshot.recommended_output_tokens, 0);
+        assert_eq!(snapshot.max_prompt_tokens, 0);
+        assert_eq!(snapshot.retained_session_tokens, 0);
+        assert_eq!(snapshot.retained_bytes, 0);
+        assert_eq!(snapshot.prefix_cache_bytes, 0);
+    }
+
+    #[test]
     fn known_unloaded_snapshot_is_zeroed_and_uses_process_boot_id() {
         let registry = CapacityRegistry::new(["escha".to_owned(), "draft".to_owned()]);
 
@@ -3802,7 +3822,16 @@ mod tests {
         first.configured_total_token_ceiling = Some(1_024);
         first.configured_output_token_ceiling = Some(1_024);
         register(&registry, first);
-        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 1_024);
+        assert_eq!(
+            registry.lock().models["first"]
+                .active
+                .as_ref()
+                .unwrap()
+                .controller
+                .decision()
+                .safe_total_tokens,
+            1_024
+        );
 
         registry.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Constrained,
@@ -3811,7 +3840,13 @@ mod tests {
         });
 
         assert_eq!(
-            registry.snapshot("first").unwrap().safe_total_tokens,
+            registry.lock().models["first"]
+                .active
+                .as_ref()
+                .unwrap()
+                .controller
+                .decision()
+                .safe_total_tokens,
             0,
             "the shared-ledger pass must preserve the pressure controller's zero downshift"
         );
@@ -3835,11 +3870,26 @@ mod tests {
                 swap_out_delta: u64::from(pressure == MemoryPressure::Critical),
                 compressor_delta: 1,
             });
-            assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
+            assert_eq!(
+                registry.lock().models["first"]
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .controller
+                    .decision()
+                    .safe_total_tokens,
+                0
+            );
 
             drop(provisional);
             assert_eq!(
-                registry.snapshot("first").unwrap().safe_total_tokens,
+                registry.lock().models["first"]
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .controller
+                    .decision()
+                    .safe_total_tokens,
                 0,
                 "rolling back metadata before engine cleanup is not recovery evidence"
             );
@@ -3861,7 +3911,13 @@ mod tests {
                 metal_recommended_working_set_bytes: Some(24 * GIB),
             });
             assert_eq!(
-                registry.snapshot("first").unwrap().safe_total_tokens,
+                registry.lock().models["first"]
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .controller
+                    .decision()
+                    .safe_total_tokens,
                 expected_after_decrease,
                 "a later authoritative decrease may seed only when pressure policy permits it"
             );
@@ -3948,8 +4004,20 @@ mod tests {
         assert!(registry.publish_cache_allocation_revision(plan.revision));
         let snapshot = registry.snapshot("escha").unwrap();
 
-        assert_eq!(snapshot.availability, CapacityAvailability::Available);
-        assert_eq!(snapshot.safe_total_tokens, 1_024);
+        // Registration can reserve an internal output-only minimum, but a
+        // public chat envelope must have room for a prompt.
+        assert_eq!(snapshot.availability, CapacityAvailability::Unavailable);
+        assert_eq!(snapshot.safe_total_tokens, 0);
+        assert_eq!(
+            registry.lock().models["escha"]
+                .active
+                .as_ref()
+                .unwrap()
+                .controller
+                .decision()
+                .safe_total_tokens,
+            1_024
+        );
         assert!(allocated_cache > 0);
         assert!(allocated_cache < 3 * GIB);
     }
@@ -4119,7 +4187,16 @@ mod tests {
     fn finish_unregister_requires_current_decreased_measurement_to_recover_zero() {
         let (registry, drain) = draining_registry_with_zero_survivor();
         registry.finish_unregister(drain, None).unwrap();
-        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
+        assert_eq!(
+            registry.lock().models["first"]
+                .active
+                .as_ref()
+                .unwrap()
+                .controller
+                .decision()
+                .safe_total_tokens,
+            0
+        );
 
         for active_bytes in [5 * GIB, 6 * GIB] {
             let (registry, drain) = draining_registry_with_zero_survivor();
@@ -4133,7 +4210,13 @@ mod tests {
                 .finish_unregister(drain, Some(measurement))
                 .unwrap();
             assert_eq!(
-                registry.snapshot("first").unwrap().safe_total_tokens,
+                registry.lock().models["first"]
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .controller
+                    .decision()
+                    .safe_total_tokens,
                 0,
                 "an equal or increased measurement is not recovery evidence"
             );
@@ -4147,12 +4230,27 @@ mod tests {
             metal_recommended_working_set_bytes: Some(24 * GIB),
         });
         registry.finish_unregister(drain, Some(decreased)).unwrap();
-        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 1_024);
+        assert_eq!(
+            registry.lock().models["first"]
+                .active
+                .as_ref()
+                .unwrap()
+                .controller
+                .decision()
+                .safe_total_tokens,
+            1_024
+        );
 
         let registry = CapacityRegistry::new(["first".to_owned(), "second".to_owned()]);
         register(&registry, facts("first", 5 * GIB));
         register(&registry, facts("second", 5 * GIB));
-        let full = registry.snapshot("first").unwrap().safe_total_tokens;
+        let full = registry.lock().models["first"]
+            .active
+            .as_ref()
+            .unwrap()
+            .controller
+            .decision()
+            .safe_total_tokens;
         assert!(full > 8_192);
         registry.refresh_memory(MlxMemorySnapshot {
             active_bytes: 20 * GIB,
@@ -4160,7 +4258,16 @@ mod tests {
             memory_limit_bytes: Some(24 * GIB),
             metal_recommended_working_set_bytes: Some(24 * GIB),
         });
-        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
+        assert_eq!(
+            registry.lock().models["first"]
+                .active
+                .as_ref()
+                .unwrap()
+                .controller
+                .decision()
+                .safe_total_tokens,
+            0
+        );
         let drain = registry.begin_drain("second").unwrap();
         let decreased = registry.refresh_memory(MlxMemorySnapshot {
             active_bytes: 5 * GIB,
@@ -4169,12 +4276,24 @@ mod tests {
             metal_recommended_working_set_bytes: Some(14 * GIB),
         });
         assert_eq!(
-            registry.snapshot("first").unwrap().safe_total_tokens,
+            registry.lock().models["first"]
+                .active
+                .as_ref()
+                .unwrap()
+                .controller
+                .decision()
+                .safe_total_tokens,
             0,
             "the measured decrease alone has no headroom while the draining model is reserved"
         );
         registry.finish_unregister(drain, Some(decreased)).unwrap();
-        let recovered = registry.snapshot("first").unwrap().safe_total_tokens;
+        let recovered = registry.lock().models["first"]
+            .active
+            .as_ref()
+            .unwrap()
+            .controller
+            .decision()
+            .safe_total_tokens;
         assert_eq!(recovered, 8_192);
         assert!(recovered < full, "measured recovery must not jump to full");
     }

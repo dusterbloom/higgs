@@ -974,11 +974,17 @@ mod tests {
             compressor_delta: 1,
         });
 
-        assert_eq!(controller.pressure(), MemoryPressure::Constrained);
-        assert_eq!(
-            constrained.safe_total_tokens,
-            floor_1024(initial * 75 / 100)
-        );
+        // A global compression counter is activity, not an OS pressure verdict.
+        assert_eq!(controller.pressure(), MemoryPressure::Normal);
+        assert_eq!(constrained.safe_total_tokens, initial);
+        for compressor_delta in [0, 1, 0, 100, 0] {
+            let decision = controller.apply_pressure_observation(PressureObservation {
+                pressure: MemoryPressure::Normal,
+                swap_out_delta: 0,
+                compressor_delta,
+            });
+            assert_eq!(decision.safe_total_tokens, initial);
+        }
     }
 
     #[derive(Clone)]
@@ -1355,7 +1361,9 @@ mod tests {
         wait_for_samples(&calls, 2).await;
 
         let controller = controller.lock().await;
-        assert_eq!(controller.pressure(), MemoryPressure::Constrained);
+        // Sampling compression still happens, but only the OS/swap signal
+        // may promote the pressure state.
+        assert_eq!(controller.pressure(), MemoryPressure::Normal);
         assert_eq!(
             controller.decision().availability,
             CapacityAvailability::Available

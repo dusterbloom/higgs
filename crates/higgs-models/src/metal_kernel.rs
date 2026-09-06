@@ -1273,6 +1273,7 @@ pub fn eschamoe_gather_qgemm_simd(
             if get_status == 0 {
                 Ok(Array::from_ptr(out_ptr))
             } else {
+                mlx_sys::mlx_array_free(out_ptr);
                 Err(Exception::custom(
                     "eschamoe_gather_qgemm_simd: output read failed",
                 ))
@@ -1283,6 +1284,11 @@ pub fn eschamoe_gather_qgemm_simd(
             ))
         };
 
+        // The extracted Array owns its reference. Release the temporary C
+        // containers on both success and failure so calls do not retain tensors.
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
         result.map(|padded| {
             use mlx_rs::ops::indexing::IndexOp;
             padded.index((0..rows as i32, ..))
@@ -8482,6 +8488,34 @@ mod tests {
         assert_eq!(output.dtype(), Dtype::Float32);
         eval([&output]).unwrap();
         assert!(output.as_slice::<f32>().iter().all(|&value| value == 0.0));
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn eschamoe_qgemm_simd_releases_call_arrays() {
+        let _exec = crate::mlx_exec::acquire();
+        let active_bytes = || {
+            let mut bytes = 0usize;
+            assert_eq!(unsafe { mlx_sys::mlx_get_active_memory(&raw mut bytes) }, 0);
+            bytes
+        };
+        // Warm the cached Metal program before measuring live arrays. Each
+        // subsequent call gets distinct inputs, like successive model layers.
+        {
+            let (xh, code, ids, spec) = gather_test_inputs(512);
+            let out = eschamoe_gather_qgemm_simd(&xh, &code, &ids, &spec).unwrap();
+            eval([&out]).unwrap();
+        }
+        let baseline = active_bytes();
+        for _ in 0..32 {
+            let (xh, code, ids, spec) = gather_test_inputs(512);
+            let out = eschamoe_gather_qgemm_simd(&xh, &code, &ids, &spec).unwrap();
+            eval([&out]).unwrap();
+            assert!(out.as_slice::<f32>().iter().all(|x| x.is_finite()));
+        }
+        let after = active_bytes();
+        assert!(after <= baseline + 65_536,
+            "dropped calls retained MLX arrays: before={baseline}, after={after}");
     }
 
     #[test]
