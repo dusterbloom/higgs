@@ -1162,3 +1162,31 @@ mod tests {
         );
     }
 }
+
+/// Cached hardware discovery shared by model dispatch and runtime identity.
+pub(crate) fn apple_cpu_brand() -> Option<&'static str> {
+    static APPLE_CPU_BRAND: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    APPLE_CPU_BRAND
+        .get_or_init(|| {
+            #[cfg(target_os = "macos")]
+            {
+                std::process::Command::new("/usr/sbin/sysctl")
+                    .args(["-n", "machdep.cpu.brand_string"])
+                    .output()
+                    .ok()
+                    .filter(|out| out.status.success())
+                    .and_then(|out| String::from_utf8(out.stdout).ok())
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                None
+            }
+        })
+        .as_deref()
+}
+
+pub(crate) fn is_base_m4(brand: Option<&str>) -> bool {
+    matches!(brand.map(str::trim), Some("Apple M4"))
+}

@@ -198,9 +198,15 @@ varies per projection, so a checkpoint named `W2` is not uniformly 2-bit — the
 trellis download is 12.3 GB for the 35B release; converted, it is roughly
 22 GB. Size the machine for the resident number, not the download.
 
-`HIGGS_ESCHA_TRELLIS_GEMM=1` selects an experimental large-prefill MoE kernel.
-It does not affect decode and remains opt-in until its full-model validation
-promotes it.
+Native Escha prefill uses packed trellis GEMM by default on base Apple M4.
+Matched AC tests with Escha W2 and 1024-token chunks reduced 16K requests from
+90–94 s to 82–83 s and a retained 45K request from 307.8 s to 286.7 s, with no
+new swapouts. Both 45K runs recalled the tested facts and reused 45,037 tokens
+on the follow-up. Seven behavior probes produced identical answers (six passed;
+both missed one inventory calculation). These checks do not establish universal
+numerical equivalence: GEMM and scratch round differently. Other hardware keeps
+scratch pending matched measurements. `HIGGS_ESCHA_TRELLIS_GEMM=0` selects scratch;
+`=1` selects GEMM on any host. Decode kernel selection is unchanged.
 
 **Limitations.**
 

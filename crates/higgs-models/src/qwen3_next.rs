@@ -36,6 +36,8 @@ use mlx_rs::{
 };
 use serde::Deserialize;
 
+use crate::utils::apple_cpu_brand;
+
 // ---------------------------------------------------------------------------
 // FFI error capture for gather_qmm
 // ---------------------------------------------------------------------------
@@ -1585,7 +1587,6 @@ fn silu_direct(x: &Array) -> Result<Array, Exception> {
 }
 
 static COMPILED_GATING_ENABLED: OnceLock<bool> = OnceLock::new();
-static APPLE_CPU_BRAND: OnceLock<Option<String>> = OnceLock::new();
 static COMPILED_GDN_DECODE_ENABLED: OnceLock<bool> = OnceLock::new();
 static ASYNC_LAYER_STATE_EVAL_ENABLED: OnceLock<bool> = OnceLock::new();
 
@@ -1596,30 +1597,8 @@ fn parse_compiled_gating_enabled(raw: Option<&str>) -> bool {
     )
 }
 
-fn apple_cpu_brand() -> Option<&'static str> {
-    APPLE_CPU_BRAND
-        .get_or_init(|| {
-            #[cfg(target_os = "macos")]
-            {
-                std::process::Command::new("sysctl")
-                    .args(["-n", "machdep.cpu.brand_string"])
-                    .output()
-                    .ok()
-                    .filter(|out| out.status.success())
-                    .and_then(|out| String::from_utf8(out.stdout).ok())
-                    .map(|s| s.trim().to_owned())
-                    .filter(|s| !s.is_empty())
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                None
-            }
-        })
-        .as_deref()
-}
-
 fn should_force_dense_decode_safe_defaults_for_brand(brand: Option<&str>) -> bool {
-    matches!(brand.map(str::trim), Some("Apple M4"))
+    crate::utils::is_base_m4(brand)
 }
 
 fn compiled_gating_enabled() -> bool {
@@ -4672,7 +4651,7 @@ impl Qwen3NextAttention {
 
         let tq_prof = tq_profile_enabled() && L == 1;
         let canonical_rows = L > 1 && row_schedule == DFlashRowSchedule::CanonicalS1;
-        let attn_t0 = tq_prof.then(std::time::Instant::now);
+        let mut attn_t0 = None;
         let output = if canonical_rows {
             // Preserve the useful batched Q/K/V projections, then execute the
             // stateful part as the exact S1 transition. Appending K/V one row
@@ -4690,15 +4669,22 @@ impl Qwen3NextAttention {
             }
             ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 1)?
         } else {
-            let append_t0 = tq_prof.then(|| {
-                let _ = mlx_rs::transforms::eval([&keys, &values]);
-                std::time::Instant::now()
-            });
+            // MLX is lazy: evaluate all projections before timing the cache
+            // append, then start the SDPA timer only after the append finishes.
+            // Otherwise "attn_ms" includes projections and cache writes and
+            // cannot identify the long-context attention bottleneck.
+            let append_t0 = if tq_prof {
+                mlx_rs::transforms::eval([&queries, &keys, &values])?;
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let view = cache.update_and_view(keys, values)?;
             if let Some(t0) = append_t0 {
-                let _ = mlx_rs::transforms::eval(cache.eval_targets());
+                mlx_rs::transforms::eval(cache.eval_targets())?;
                 PROF_TQ_APPEND_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
                 PROF_TQ_N.with(|c| c.set(c.get() + 1));
+                attn_t0 = Some(std::time::Instant::now());
             }
 
             if mask.is_none() && L == 1 {
@@ -4719,7 +4705,7 @@ impl Qwen3NextAttention {
             }
         };
         if let Some(t0) = attn_t0 {
-            let _ = mlx_rs::transforms::eval([&output]);
+            mlx_rs::transforms::eval([&output])?;
             PROF_TQ_ATTN_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
         }
         if diag_attn {
@@ -8803,11 +8789,11 @@ impl Qwen3NextCausalLM {
             None
         };
 
-        // HIGGS_PROFILE=1: instrument per-layer timing with eval barriers.
-        // Samples one full-attention cycle (the leading GDN layers plus the
-        // first FA layer) and extrapolates to this model's real layer counts,
-        // which depend on `full_attention_interval` and `num_hidden_layers`.
-        let profiling = std::env::var("HIGGS_PROFILE").is_ok_and(|v| v == "1") && T == 1;
+        // HIGGS_PROFILE=1: sample decode and bounded prefill chunks inside
+        // the serving path, retaining its allocator and cache policy. Eval
+        // barriers measure one full-attention cycle (leading GDN layers plus
+        // first FA layer); the extrapolation is diagnostic, not wall time.
+        let profiling = std::env::var("HIGGS_PROFILE").is_ok_and(|v| v == "1");
         let prof_fa_layers = self.model.layers.iter().filter(|l| !l.is_linear).count();
         let prof_gdn_layers = self.model.layers.len() - prof_fa_layers;
         // Sample through the first FA layer so both layer types are covered for
@@ -8944,6 +8930,7 @@ impl Qwen3NextCausalLM {
                     (fa_attn_avg + fa_mlp_avg) * prof_fa_layers as f64,
                 );
                 tracing::info!(
+                    query_tokens = T,
                     gdn_layers = prof_gdn_layers,
                     fa_layers = prof_fa_layers,
                     gdn_attn_ms = format!("{:.2}", gdn_attn_avg / 1e6),

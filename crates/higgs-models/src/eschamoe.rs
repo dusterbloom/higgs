@@ -1394,16 +1394,27 @@ pub fn native_mode() -> bool {
 
 /// Report whether the prefill path uses the trellis GEMM kernel.
 ///
-/// Set `HIGGS_ESCHA_TRELLIS_GEMM=1` to select the kernel. The default is the
-/// scratch path of [`EschaProj::scratch_matmul`]. The GEMM kernel drops the
-/// dense scratch weight and the host read of the expert ids, and the scratch
-/// path stays as the reference. Despite winning isolated synthetic kernels,
-/// GEMM was slower in full-model 1,024-token Escha W2 prefill. SIMD selection
-/// only applies after GEMM is explicitly enabled. The choice is read once and
-/// cached: the caller is the per-layer expert forward.
+/// Base M4 defaults to GEMM after matched Escha W2 16K/45K serving checks;
+/// other hardware retains [`EschaProj::scratch_matmul`] until measured.
+/// GEMM drops the dense scratch weight and host read of expert ids, but its
+/// accumulation rounds differently from scratch. Keep the reference available:
+/// `HIGGS_ESCHA_TRELLIS_GEMM=0` selects scratch, `=1` selects GEMM on any host.
+/// The choice is read once and cached in the per-layer expert forward.
 pub fn trellis_gemm_mode() -> bool {
     static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| std::env::var("HIGGS_ESCHA_TRELLIS_GEMM").is_ok_and(|v| v == "1"))
+    *MODE.get_or_init(|| {
+        resolve_trellis_gemm_mode(std::env::var("HIGGS_ESCHA_TRELLIS_GEMM").ok().as_deref())
+    })
+}
+
+/// Resolve the same expert kernel choice for execution and capacity identity.
+#[must_use]
+pub fn resolve_trellis_gemm_mode(raw: Option<&str>) -> bool {
+    trellis_gemm_mode_for_brand(raw, crate::utils::apple_cpu_brand())
+}
+
+fn trellis_gemm_mode_for_brand(raw: Option<&str>, brand: Option<&str>) -> bool {
+    raw.map_or_else(|| crate::utils::is_base_m4(brand), |value| value == "1")
 }
 
 /// Select the gather QGEMM kernel variant. Default: simdgroup fragments
@@ -1787,6 +1798,28 @@ fn trellis_expert_bytes(config: &serde_json::Value) -> Option<u64> {
     clippy::print_stderr
 )]
 mod tests {
+    #[test]
+    fn trellis_gemm_default_is_m4_only_and_preserves_explicit_overrides() {
+        for (raw, brand, expected) in [
+            (None, Some("Apple M4"), true),
+            (None, Some(" Apple M4 "), true),
+            (None, Some("Apple M4 Pro"), false),
+            (None, Some("Apple M4 Max"), false),
+            (None, Some("Apple M5"), false),
+            (None, None, false),
+            (Some("0"), Some("Apple M4"), false),
+            (Some("1"), Some("Apple M4 Pro"), true),
+            (Some("1"), None, true),
+            (Some("yes"), Some("Apple M4"), false),
+        ] {
+            assert_eq!(
+                super::trellis_gemm_mode_for_brand(raw, brand),
+                expected,
+                "override={raw:?}, brand={brand:?}"
+            );
+        }
+    }
+
     use mlx_rs::ops::indexing::IndexOp;
     use mlx_rs::{Array, Dtype};
 
@@ -3141,9 +3174,9 @@ mod tests {
 
     /// The native gather forward must match the oracle on both row paths.
     ///
-    /// The matvec path takes six rows with unsorted ids. The scratch path
-    /// takes 40 sorted rows and guards the measured production default. Both
-    /// compare row by row against `dequant_expert`.
+    /// Six unsorted rows exercise matvec; 40 sorted rows exercise prefill.
+    /// Both prefill kernels retain the same row-wise `dequant_expert` oracle
+    /// bound, and default dispatch must exactly match the selected kernel.
     #[test]
     fn escha_proj_gather_forward_matches_oracle() {
         let _exec = crate::mlx_exec::acquire();
@@ -3189,39 +3222,47 @@ mod tests {
             let got = proj.gather_forward(&x, &eids).unwrap();
             assert_eq!(got.shape(), [n, out_f], "{label}");
             let want = oracle(&x, ids);
-            let err = got
-                .subtract(&want)
-                .unwrap()
-                .abs()
-                .unwrap()
-                .max(None)
-                .unwrap()
-                .item::<f32>();
-            let scale = want.abs().unwrap().max(None).unwrap().item::<f32>();
-            eprintln!("{label}: max |native - oracle| = {err} (scale {scale})");
-            assert!(err <= 2e-3 * scale, "{label}: {err} vs scale {scale}");
+            let check_accuracy = |actual: &Array| {
+                let err = actual
+                    .subtract(&want)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max(None)
+                    .unwrap()
+                    .item::<f32>();
+                let scale = want.abs().unwrap().max(None).unwrap().item::<f32>();
+                assert!(err <= 2e-3 * scale, "{label}: {err} vs scale {scale}");
+            };
+            check_accuracy(&got);
 
             if ids.len() > EschaProj::GATHER_QMV_MAX_ROWS as usize {
-                let scratch = proj.gather_forward_mode(&x, &eids, false).unwrap();
-                let got_bits: Vec<u32> = got
-                    .as_slice::<f32>()
-                    .iter()
-                    .map(|value| value.to_bits())
-                    .collect();
-                let scratch_bits: Vec<u32> = scratch
-                    .as_slice::<f32>()
-                    .iter()
-                    .map(|value| value.to_bits())
-                    .collect();
-                assert_eq!(got_bits, scratch_bits, "{label}: default scratch route");
+                for gemm in [false, true] {
+                    let explicit = proj.gather_forward_mode(&x, &eids, gemm).unwrap();
+                    check_accuracy(&explicit);
+                    if gemm == trellis_gemm_mode() {
+                        for (row, (actual, expected)) in got
+                            .as_slice::<f32>()
+                            .iter()
+                            .zip(explicit.as_slice::<f32>())
+                            .enumerate()
+                        {
+                            assert_eq!(
+                                actual.to_bits(),
+                                expected.to_bits(),
+                                "{label}: default route, gemm={gemm}, element={row}"
+                            );
+                        }
+                    }
+                }
             }
         };
 
         // Six rows, unsorted ids: the matvec kernel path.
         check(&[2, 0, 3, 1, 2, 0], "matvec path");
-        // Forty sorted rows: the scratch decode path.
+        // Forty sorted rows: both prefill kernels.
         let sorted: Vec<u32> = (0..40u32).map(|i| i / 10).collect();
-        check(&sorted, "scratch path");
+        check(&sorted, "prefill path");
     }
 
     /// Compare the GPU tile decode with the CPU reference for one spec.

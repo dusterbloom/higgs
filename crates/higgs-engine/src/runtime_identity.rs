@@ -174,7 +174,7 @@ fn resolved_runtime_identity_with_selection(
         "mlxAllocatorPolicy": allocator_policy,
         "eschamoeNative": is_eschamoe && nonzero("HIGGS_ESCHA_NATIVE", true),
         "eschamoeAffineBitsOverride": escha_affine_bits,
-        "eschamoeTrellisGemm": is_eschamoe && env("HIGGS_ESCHA_TRELLIS_GEMM").as_deref() == Some("1"),
+        "eschamoeTrellisGemm": is_eschamoe && higgs_models::eschamoe::resolve_trellis_gemm_mode(env("HIGGS_ESCHA_TRELLIS_GEMM").as_deref()),
         "eschamoeQgemmSimd": is_eschamoe && nonzero("HIGGS_ESCHA_QGEMM_SIMD", true),
         "eschamoeQgemmBlockRows": if env("HIGGS_ESCHA_QGEMM_BM").as_deref() == Some("64") { 64 } else { 32 },
         "mlaLatentCache": mla_latent_cache,
@@ -268,6 +268,24 @@ fn is_truthy(raw: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escha_identity_describes_the_executing_kernel_default() {
+        let identity = serde_json::to_value(resolved_runtime_identity(true, false)).unwrap();
+        assert_eq!(
+            identity["eschamoeTrellisGemm"],
+            serde_json::json!(higgs_models::eschamoe::trellis_gemm_mode())
+        );
+        for (raw, expected) in [("0", false), ("1", true)] {
+            let env = |name: &str| (name == "HIGGS_ESCHA_TRELLIS_GEMM").then(|| raw.to_owned());
+            let escha =
+                serde_json::to_value(resolved_runtime_identity_with(true, false, env)).unwrap();
+            let other =
+                serde_json::to_value(resolved_runtime_identity_with(false, false, env)).unwrap();
+            assert_eq!(escha["eschamoeTrellisGemm"], expected);
+            assert_eq!(other["eschamoeTrellisGemm"], false);
+        }
+    }
 
     #[test]
     fn identity_serializes_the_typed_selection_without_auto_placeholders() {

@@ -72,7 +72,14 @@ fn every_runtime_or_layout_mutation_changes_the_capacity_identity() {
         ("HIGGS_DSPARK_TOPK_MARKOV_KERNEL", "1"),
         ("HIGGS_ESCHA_NATIVE", "0"),
         ("HIGGS_ESCHA_AFFINE_BITS", "3"),
-        ("HIGGS_ESCHA_TRELLIS_GEMM", "1"),
+        (
+            "HIGGS_ESCHA_TRELLIS_GEMM",
+            if higgs_models::eschamoe::resolve_trellis_gemm_mode(None) {
+                "0"
+            } else {
+                "1"
+            },
+        ),
         ("HIGGS_ESCHA_QGEMM_SIMD", "0"),
         ("HIGGS_ESCHA_QGEMM_BM", "64"),
         ("HIGGS_NO_MEM_LIMIT", "1"),
