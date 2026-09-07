@@ -1298,19 +1298,11 @@ impl<C: Clock> CapacityController<C> {
             }
             decision
         } else {
-            let total =
-                if previous == 0 && recomputed.availability == CapacityAvailability::Available {
-                    recomputed
-                        .safe_total_tokens
-                        .min(MINIMUM_RECOVERY_TOTAL_TOKENS)
-                } else {
-                    previous.min(recomputed.safe_total_tokens)
-                };
-            self.decision_for_total(
-                total,
-                recomputed.usable_bytes,
-                recomputed.recommended_output_tokens,
-            )
+            // Returning to normal ends the pressure episode. The fresh static
+            // decision is already bounded by the current byte ledger and model
+            // ceiling; preserving the pressure floor traps warm sessions that
+            // cannot produce the cold samples required by learning recovery.
+            recomputed
         };
         self.decision
     }
@@ -2282,14 +2274,14 @@ mod tests {
         });
         assert_eq!(critical.safe_total_tokens, 65_536);
         let normal = controller.recompute_for_pressure(MemoryPressure::Normal, None);
-        assert_eq!(normal.safe_total_tokens, 65_536);
+        assert_eq!(normal.safe_total_tokens, 131_072);
 
         let warning = controller.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Constrained,
             swap_out_delta: 0,
             compressor_delta: 0,
         });
-        assert_eq!(warning.safe_total_tokens, 49_152);
+        assert_eq!(warning.safe_total_tokens, 98_304);
         assert_eq!(warning.availability, CapacityAvailability::Available);
     }
 
@@ -2646,8 +2638,7 @@ mod tests {
         let full_static = CapacityController::new(controller_inputs(48, 48))
             .decision()
             .safe_total_tokens;
-        let clock = TestClock(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
-        let mut critical = CapacityController::with_clock(inputs, clock.clone());
+        let mut critical = CapacityController::new(inputs);
         assert_eq!(
             critical.decision().availability,
             CapacityAvailability::Unavailable
@@ -2658,33 +2649,7 @@ mod tests {
         ));
         let recovered = critical.recompute_for_pressure(MemoryPressure::Normal, None);
         assert_eq!(recovered.availability, CapacityAvailability::Available);
-        assert!(recovered.safe_total_tokens > 0);
-        assert!(recovered.safe_total_tokens < full_static);
-        for seconds in [0, 150] {
-            clock.set_seconds(seconds);
-            critical.observe(AllocationObservation::clean(
-                ExecutionPath::Cold,
-                recovered.max_prompt_tokens,
-                recovered.max_prompt_tokens,
-                4 * GIB,
-                4 * GIB,
-            ));
-            assert_eq!(critical.decision(), recovered);
-        }
-        clock.set_seconds(300);
-        critical.observe(AllocationObservation::clean(
-            ExecutionPath::Cold,
-            recovered.max_prompt_tokens,
-            recovered.max_prompt_tokens,
-            4 * GIB,
-            4 * GIB,
-        ));
-        let raised = critical.decision();
-        assert_eq!(
-            raised.safe_total_tokens - recovered.safe_total_tokens,
-            floor_1024(recovered.safe_total_tokens / 8).min(4096)
-        );
-        assert!(raised.safe_total_tokens < full_static);
+        assert_eq!(recovered.safe_total_tokens, full_static);
 
         let mut trained = CapacityController::new(controller_inputs(48, 48));
         trained.observe(AllocationObservation::clean(
@@ -2696,8 +2661,7 @@ mod tests {
         ));
         let key = learned_profile_key();
         let profile = trained.export_profile(key.clone(), 8 * GIB).unwrap();
-        let restore_clock = TestClock(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
-        let mut critical_restore = CapacityController::with_clock(inputs, restore_clock);
+        let mut critical_restore = CapacityController::new(inputs);
         assert!(critical_restore.restore_profile(&profile, &key, 8 * GIB));
         assert_eq!(
             critical_restore.decision().availability,
@@ -2709,8 +2673,7 @@ mod tests {
             restored_recovery.availability,
             CapacityAvailability::Available
         );
-        assert!(restored_recovery.safe_total_tokens > 0);
-        assert!(restored_recovery.safe_total_tokens < full_static);
+        assert_eq!(restored_recovery.safe_total_tokens, full_static);
     }
 
     #[test]
@@ -2748,14 +2711,21 @@ mod tests {
         let before = controller.decision();
         for prompt in [4096, 8192, 16384, 32768] {
             let mut observation = AllocationObservation::clean(
-                ExecutionPath::RetainedSuffix, prompt, 4096, 16 * GIB, 16 * GIB,
+                ExecutionPath::RetainedSuffix,
+                prompt,
+                4096,
+                16 * GIB,
+                16 * GIB,
             );
             // The engine receipt contains total retained KV, not extra workspace.
-            observation.observed_retained_bytes = controller.inputs.costs
-                .persistent_bytes(prompt).unwrap();
+            observation.observed_retained_bytes =
+                controller.inputs.costs.persistent_bytes(prompt).unwrap();
             controller.observe(observation);
-            assert_eq!(controller.decision(), before,
-                "known KV at {prompt} tokens was charged a second time");
+            assert_eq!(
+                controller.decision(),
+                before,
+                "known KV at {prompt} tokens was charged a second time"
+            );
         }
     }
 

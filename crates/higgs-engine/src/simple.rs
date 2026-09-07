@@ -13109,11 +13109,11 @@ impl SimpleEngine {
                         // client aborts before the next chunk allocates. The
                         // stream entry maps ModelError::PrefillCancelled back to
                         // the recorded reason.
-                        if crate::stop::generation_stop_check().is_some()
-                            || progress_sender.is_closed()
-                        {
-                            return Err(higgs_models::error::ModelError::PrefillCancelled);
-                        }
+                        let stop = crate::stop::generation_stop();
+                        observe_streaming_prefill_boundary(
+                            stop.as_ref(),
+                            progress_sender.is_closed(),
+                        )?;
                         if return_progress {
                             let _ = progress_sender.try_send(make_progress_output(
                                 u32::try_from(done.max(0)).unwrap_or(0),
@@ -13139,19 +13139,9 @@ impl SimpleEngine {
                 None,
                 None,
             )
-            .map_err(|error| match error {
-                // The prefill sink aborts with PrefillCancelled once a stop
-                // reason is recorded or the client disconnected; surface the
-                // recorded reason (typed for critical pressure) instead of a
-                // generic model error.
-                EngineError::Model(higgs_models::error::ModelError::PrefillCancelled) => {
-                    crate::stop::generation_stop()
-                        .and_then(|stop| stop.reason())
-                        .map_or(EngineError::Cancelled, |reason| {
-                            EngineError::from_stop_reason(&reason)
-                        })
-                }
-                other => other,
+            .map_err(|error| {
+                let stop = crate::stop::generation_stop();
+                map_streaming_prefill_error(error, stop.as_ref())
             })?;
         // Prefill done — decode must not report progress. Dropping the Option
         // uninstalls the sink when present; a no-op when progress was off.
@@ -14148,6 +14138,43 @@ impl SimpleEngine {
     }
 }
 
+fn observe_streaming_prefill_boundary(
+    stop: Option<&crate::stop::GenerationStop>,
+    client_closed: bool,
+) -> Result<(), higgs_models::error::ModelError> {
+    if stop.is_some_and(|stop| stop.check().is_some()) || client_closed {
+        return Err(higgs_models::error::ModelError::PrefillCancelled);
+    }
+    if let Some(stop) = stop {
+        stop.note_progress();
+    }
+    Ok(())
+}
+
+fn map_streaming_prefill_error(
+    error: EngineError,
+    stop: Option<&crate::stop::GenerationStop>,
+) -> EngineError {
+    // Chunked model forwards cross an MLX exception boundary, so their typed
+    // observer cancellation arrives wrapped. Match the exact raw message;
+    // unrelated MLX failures must remain visible even if a stop races them.
+    let is_prefill_cancelled = matches!(
+        &error,
+        EngineError::Model(higgs_models::error::ModelError::PrefillCancelled)
+    ) || matches!(
+        &error,
+        EngineError::Mlx(exception)
+            if exception.what()
+                == higgs_models::error::ModelError::PrefillCancelled.to_string()
+    );
+    if !is_prefill_cancelled {
+        return error;
+    }
+    stop.and_then(crate::stop::GenerationStop::reason)
+        .as_ref()
+        .map_or(EngineError::Cancelled, EngineError::from_stop_reason)
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
@@ -14172,18 +14199,106 @@ mod tests {
         dflash_new_stop_prefix_len, dflash_resolve_target_then_draft,
         dflash_sparse_taps_available_for_pflash_plan, dflash_tail_draft_cap,
         drive_canonical_dspark_round, estimate_paged_kv_blocks, extract_eos_tokens,
-        find_stop_in_tail, hybrid_checkpoint_boundary, lock_or_recover, message_boundary_delta,
-        mtp_allowed, optional_model_error_is_capacity, paired_dflash_exact_domain,
-        parse_enabled_flag, pflash_actual_keep_ratio, pflash_auto_plan_worth_executing,
-        pflash_cache_source_and_request_tail, pflash_cache_source_and_request_tail_with_boundary,
-        pflash_full_score_budget_exceeded, prefill_sample_count, reset_prefill_sample_count,
-        resolve_dflash_block_size_override, resolve_dflash_min_block_override,
-        resolve_dspark_draft_cap_override, resolve_optional_dflash_path,
-        resolve_pflash_full_score_max_tokens, resolve_pflash_min_free_memory_mb,
-        resolve_speculation_route, retained_kv_storage_at, select_continuation_candidate,
-        session_prefill_strategy, session_prompt_trace_metrics, stateless_mtp_family_eligible,
-        with_chat_terminator,
+        find_stop_in_tail, hybrid_checkpoint_boundary, lock_or_recover,
+        map_streaming_prefill_error, message_boundary_delta, mtp_allowed,
+        observe_streaming_prefill_boundary, optional_model_error_is_capacity,
+        paired_dflash_exact_domain, parse_enabled_flag, pflash_actual_keep_ratio,
+        pflash_auto_plan_worth_executing, pflash_cache_source_and_request_tail,
+        pflash_cache_source_and_request_tail_with_boundary, pflash_full_score_budget_exceeded,
+        prefill_sample_count, reset_prefill_sample_count, resolve_dflash_block_size_override,
+        resolve_dflash_min_block_override, resolve_dspark_draft_cap_override,
+        resolve_optional_dflash_path, resolve_pflash_full_score_max_tokens,
+        resolve_pflash_min_free_memory_mb, resolve_speculation_route, retained_kv_storage_at,
+        select_continuation_candidate, session_prefill_strategy, session_prompt_trace_metrics,
+        stateless_mtp_family_eligible, with_chat_terminator,
     };
+
+    #[test]
+    fn streaming_prefill_progress_renews_watchdog() {
+        use std::thread;
+        use std::time::Duration;
+
+        let stop = crate::stop::GenerationStop::new(Some(Duration::from_millis(1_000)));
+        thread::sleep(Duration::from_millis(600));
+        observe_streaming_prefill_boundary(Some(&stop), false).unwrap();
+        thread::sleep(Duration::from_millis(600));
+
+        assert_eq!(stop.check(), None);
+    }
+
+    #[test]
+    fn streaming_prefill_stall_still_fires_watchdog() {
+        use std::thread;
+        use std::time::Duration;
+
+        let stop = crate::stop::GenerationStop::new(Some(Duration::from_millis(20)));
+        thread::sleep(Duration::from_millis(30));
+
+        assert!(observe_streaming_prefill_boundary(Some(&stop), false).is_err());
+        assert_eq!(
+            stop.reason(),
+            Some(crate::stop::StopReason::NoProgressWatchdog)
+        );
+    }
+
+    #[test]
+    fn streaming_prefill_boundary_preserves_external_stops_and_disconnects() {
+        let stop = crate::stop::GenerationStop::new(None);
+        stop.stop(crate::stop::StopReason::ClientDisconnect);
+
+        assert!(observe_streaming_prefill_boundary(Some(&stop), false).is_err());
+        assert_eq!(
+            stop.reason(),
+            Some(crate::stop::StopReason::ClientDisconnect)
+        );
+        assert!(observe_streaming_prefill_boundary(None, true).is_err());
+        assert!(observe_streaming_prefill_boundary(None, false).is_ok());
+    }
+
+    #[test]
+    fn streaming_prefill_mlx_cancellation_recovers_typed_pressure_reason() {
+        let stop = crate::stop::GenerationStop::new(None);
+        stop.stop(crate::stop::StopReason::CriticalPressure {
+            boot_id: "boot-7".to_owned(),
+            generation: 9,
+        });
+        let wrapped = EngineError::Mlx(mlx_rs::error::Exception::custom(
+            higgs_models::error::ModelError::PrefillCancelled.to_string(),
+        ));
+
+        assert!(matches!(
+            map_streaming_prefill_error(wrapped, Some(&stop)),
+            EngineError::CapacityInterrupted { boot_id, generation }
+                if boot_id == "boot-7" && generation == 9
+        ));
+    }
+
+    #[test]
+    fn streaming_prefill_error_mapper_does_not_mask_unrelated_mlx_error() {
+        let stop = crate::stop::GenerationStop::new(None);
+        stop.stop(crate::stop::StopReason::CriticalPressure {
+            boot_id: "boot-7".to_owned(),
+            generation: 9,
+        });
+        let unrelated = EngineError::Mlx(mlx_rs::error::Exception::custom("bad tensor"));
+
+        assert!(matches!(
+            map_streaming_prefill_error(unrelated, Some(&stop)),
+            EngineError::Mlx(error) if error.what() == "bad tensor"
+        ));
+    }
+
+    #[test]
+    fn streaming_prefill_cancellation_without_recorded_reason_is_cancelled() {
+        let wrapped = EngineError::Mlx(mlx_rs::error::Exception::custom(
+            higgs_models::error::ModelError::PrefillCancelled.to_string(),
+        ));
+
+        assert!(matches!(
+            map_streaming_prefill_error(wrapped, None),
+            EngineError::Cancelled
+        ));
+    }
 
     #[test]
     fn numeric_runtime_knobs_use_exact_untrimmed_parsing() {

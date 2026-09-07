@@ -3594,6 +3594,13 @@ mod tests {
             seed.snapshot("escha").unwrap().basis,
             CapacityBasis::Learned
         );
+        let full = seed.snapshot("escha").unwrap().safe_total_tokens;
+        seed.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Constrained,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+        assert!(seed.snapshot("escha").unwrap().safe_total_tokens < full);
         seed.persist_profiles().unwrap();
 
         let restarted = CapacityRegistry::new_with_profile_dir(
@@ -3606,6 +3613,7 @@ mod tests {
             restarted.snapshot("escha").unwrap().basis,
             CapacityBasis::Learned
         );
+        assert_eq!(restarted.snapshot("escha").unwrap().safe_total_tokens, full);
     }
 
     #[test]
@@ -3943,9 +3951,10 @@ mod tests {
     }
 
     #[test]
-    fn normal_shared_ledger_recompute_does_not_instantly_restore_capacity() {
+    fn normal_shared_ledger_recompute_keeps_current_capacity_bound() {
         let registry = CapacityRegistry::new(["first".to_owned(), "second".to_owned()]);
         register(&registry, facts("first", 5 * GIB));
+        let initial = registry.snapshot("first").unwrap().safe_total_tokens;
         registry.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Constrained,
             swap_out_delta: 0,
@@ -3958,9 +3967,10 @@ mod tests {
             compressor_delta: 0,
         });
         let recovering = registry.snapshot("first").unwrap().safe_total_tokens;
+        assert_eq!(recovering, initial);
         register(&registry, facts("second", 5 * GIB));
         assert!(registry.snapshot("first").unwrap().safe_total_tokens <= recovering);
-        assert!(recovering <= constrained.saturating_add(131_072));
+        assert!(constrained < recovering);
     }
 
     #[test]

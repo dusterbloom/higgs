@@ -692,7 +692,7 @@ mod tests {
 
     use super::super::{
         CapacityAvailability, CapacityController, CapacityInputs, Clock, MemoryPressure,
-        PressureObservation, PressureTelemetry, floor_1024,
+        PressureObservation, PressureTelemetry, ZeroCapacityRecovery, floor_1024,
     };
     use super::{
         CounterSampler, NoopPressureSource, ObserverEvent, PressureEventSource,
@@ -818,6 +818,7 @@ mod tests {
     fn critical_to_constrained_to_normal_recovers_without_another_downshift() {
         let clock = TestClock::new();
         let mut controller = CapacityController::with_clock(controller_inputs(), clock);
+        let initial = controller.decision().safe_total_tokens;
         let critical = controller.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Critical,
             swap_out_delta: 0,
@@ -837,7 +838,7 @@ mod tests {
             swap_out_delta: 0,
             compressor_delta: 0,
         });
-        assert_eq!(normal.safe_total_tokens, critical.safe_total_tokens);
+        assert_eq!(normal.safe_total_tokens, initial);
         assert_eq!(normal.availability, CapacityAvailability::Available);
     }
 
@@ -877,15 +878,15 @@ mod tests {
     }
 
     #[test]
-    fn normal_recovery_changes_state_without_raising_capacity() {
+    fn normal_recovery_recomputes_current_capacity() {
         let clock = TestClock::new();
         let mut controller = CapacityController::with_clock(controller_inputs(), clock);
+        let initial = controller.decision().safe_total_tokens;
         controller.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Constrained,
             swap_out_delta: 0,
             compressor_delta: 0,
         });
-        let constrained = controller.decision().safe_total_tokens;
 
         let recovered = controller.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Normal,
@@ -894,7 +895,7 @@ mod tests {
         });
 
         assert_eq!(controller.pressure(), MemoryPressure::Normal);
-        assert_eq!(recovered.safe_total_tokens, constrained);
+        assert_eq!(recovered.safe_total_tokens, initial);
         assert_eq!(recovered.availability, CapacityAvailability::Available);
     }
 
@@ -924,6 +925,126 @@ mod tests {
             compressor_delta: 0,
         });
         assert_eq!(controller.pressure(), MemoryPressure::Normal);
+    }
+
+    #[test]
+    fn quiet_swap_recovery_restores_configured_context() {
+        let clock = TestClock::new();
+        let mut inputs = controller_inputs();
+        inputs.configured_total_token_ceiling = Some(49_152);
+        let mut controller = CapacityController::with_clock(inputs, clock.clone());
+        assert_eq!(controller.decision().safe_total_tokens, 49_152);
+
+        let critical = controller.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Normal,
+            swap_out_delta: 1,
+            compressor_delta: 0,
+        });
+        assert_eq!(critical.availability, CapacityAvailability::Unavailable);
+        assert_eq!(critical.safe_total_tokens, 24_576);
+
+        clock.set_seconds(60);
+        let recovered = controller.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Normal,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+
+        assert_eq!(recovered.availability, CapacityAvailability::Available);
+        assert_eq!(recovered.safe_total_tokens, 49_152);
+        assert_eq!(recovered.recommended_output_tokens, 4_096);
+        assert_eq!(recovered.max_prompt_tokens, 45_056);
+    }
+
+    #[test]
+    fn quiet_swap_recovery_respects_current_ledger_and_model_cap() {
+        let clock = TestClock::new();
+        let mut inputs = controller_inputs();
+        inputs.configured_total_token_ceiling = Some(49_152);
+        let mut controller = CapacityController::with_clock(inputs, clock.clone());
+        assert_eq!(controller.decision().safe_total_tokens, 49_152);
+
+        controller.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Normal,
+            swap_out_delta: 1,
+            compressor_delta: 0,
+        });
+        controller.replace_shared_residency(
+            MlxMemorySnapshot {
+                active_bytes: 11 * GIB + GIB / 2 + 109 * GIB / 5,
+                peak_bytes: 11 * GIB + GIB / 2 + 109 * GIB / 5,
+                memory_limit_bytes: Some(48 * GIB),
+                metal_recommended_working_set_bytes: Some(48 * GIB),
+            },
+            11 * GIB,
+            109 * GIB / 5,
+            GIB / 4,
+            0,
+            ZeroCapacityRecovery::Preserve,
+        );
+        assert_eq!(controller.decision().safe_total_tokens, 0);
+
+        clock.set_seconds(59);
+        controller.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Normal,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+        assert_eq!(controller.decision().safe_total_tokens, 0);
+
+        clock.set_seconds(60);
+        let recovered = controller.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Normal,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+        assert_eq!(recovered.availability, CapacityAvailability::Available);
+        assert_eq!(recovered.safe_total_tokens, 44_032);
+        assert_eq!(recovered.recommended_output_tokens, 4_096);
+        assert_eq!(recovered.max_prompt_tokens, 39_936);
+    }
+
+    #[test]
+    fn elapsed_swap_timer_does_not_override_current_critical_pressure() {
+        let clock = TestClock::new();
+        let mut controller = CapacityController::with_clock(controller_inputs(), clock.clone());
+        let critical = controller.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Normal,
+            swap_out_delta: 1,
+            compressor_delta: 0,
+        });
+
+        clock.set_seconds(60);
+        let still_critical = controller.apply_pressure_observation(PressureObservation {
+            pressure: MemoryPressure::Critical,
+            swap_out_delta: 0,
+            compressor_delta: 0,
+        });
+
+        assert_eq!(controller.pressure(), MemoryPressure::Critical);
+        assert_eq!(still_critical, critical);
+        assert_eq!(
+            still_critical.availability,
+            CapacityAvailability::Unavailable
+        );
+    }
+
+    #[test]
+    fn normal_recovery_stays_unavailable_without_current_memory_authority() {
+        let mut controller = CapacityController::with_clock(controller_inputs(), TestClock::new());
+        let unavailable_memory = MlxMemorySnapshot {
+            active_bytes: 11 * GIB,
+            peak_bytes: 11 * GIB,
+            memory_limit_bytes: None,
+            metal_recommended_working_set_bytes: None,
+        };
+        controller.recompute_for_pressure(MemoryPressure::Critical, Some(unavailable_memory));
+
+        let recovered = controller.recompute_for_pressure(MemoryPressure::Normal, None);
+
+        assert_eq!(recovered.availability, CapacityAvailability::Unavailable);
+        assert_eq!(recovered.safe_total_tokens, 0);
+        assert_eq!(recovered.max_prompt_tokens, 0);
     }
 
     #[test]
