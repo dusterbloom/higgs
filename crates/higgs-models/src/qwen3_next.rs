@@ -4409,6 +4409,72 @@ pub enum DFlashRowSchedule {
     CanonicalS1,
 }
 
+/// Bound attention scratch without shrinking the expert/recurrent prefill batch.
+/// The pinned MLX Metal backend uses unfused prefill for 256-wide heads.
+fn dense_prefill_attention(
+    queries: Array,
+    keys: Array,
+    values: Array,
+    scale: f32,
+    mask: Option<&AttentionMask>,
+) -> Result<Array, Exception> {
+    let query_len = queries.shape()[2];
+    let key_len = keys.shape()[2];
+    // Preserve MLX's general broadcast-mask contract outside the model's 2D case.
+    if matches!(mask, Some(AttentionMask::Array(m)) if m.shape() != [query_len, key_len]) {
+        return fast::scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale,
+            mask.map(fast::ScaledDotProductAttentionMask::from),
+            None::<&Array>,
+        );
+    }
+    // Resolve the shared producer graph once, before evaluating its query views.
+    mlx_rs::transforms::eval([&queries, &keys, &values])?;
+    let mut blocks = Vec::new();
+    for start in (0..query_len).step_by(128) {
+        let end = (start + 128).min(query_len);
+        let query = queries.index((.., .., start..end, ..));
+        let (block_keys, block_values, block_mask) = match mask {
+            Some(AttentionMask::Causal) => {
+                // Lower-right causal alignment requires this block's KV prefix.
+                let key_end = key_len - query_len + end;
+                (
+                    keys.index((.., .., ..key_end, ..)),
+                    values.index((.., .., ..key_end, ..)),
+                    Some(AttentionMask::Causal),
+                )
+            }
+            Some(AttentionMask::Array(m)) => {
+                // Explicit masks may allow future keys: slice queries only.
+                (
+                    keys.clone(),
+                    values.clone(),
+                    Some(AttentionMask::Array(m.index((start..end, ..)))),
+                )
+            }
+            None => (keys.clone(), values.clone(), None),
+        };
+        let block = fast::scaled_dot_product_attention(
+            query,
+            block_keys,
+            block_values,
+            scale,
+            block_mask
+                .as_ref()
+                .map(fast::ScaledDotProductAttentionMask::from),
+            None::<&Array>,
+        )?;
+        // Materialize before constructing the next score matrix. Concatenating
+        // lazy blocks alone would not establish this scratch allocation lifetime.
+        mlx_rs::transforms::eval([&block])?;
+        blocks.push(block);
+    }
+    ops::concatenate_axis(&blocks.iter().collect::<Vec<_>>(), 2)
+}
+
 impl Qwen3NextAttention {
     /// Construct with per-tensor quantization resolved from module paths
     /// (`quant_overrides` / global default; mode-aware). `dense_attention_outputs`
@@ -4691,17 +4757,31 @@ impl Qwen3NextAttention {
                 self.attend_one_query(&queries, view, B)?
             } else {
                 let (cached_keys, cached_values) = view.into_dense()?;
-                let sdpa_mask = mask.map(fast::ScaledDotProductAttentionMask::from);
-                fast::scaled_dot_product_attention(
-                    queries,
-                    cached_keys,
-                    cached_values,
-                    self.scale,
-                    sdpa_mask,
-                    None::<&Array>,
-                )?
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[B, L, -1])?
+                // The pinned MLX backend uses unfused D256 FP32 prefill.
+                // On the qualified base-M4 shape, query blocks bound scratch
+                // without shrinking expert batches or changing canonical S1.
+                let block_queries = L > 128
+                    && queries.shape()[3] == 256
+                    && queries.dtype() == Dtype::Float32
+                    && cached_keys.shape()[2] >= 16384
+                    && queries.shape()[1] == 16
+                    && cached_keys.shape()[1] == 2
+                    && crate::utils::is_base_m4(crate::utils::apple_cpu_brand());
+                let attention = if block_queries {
+                    dense_prefill_attention(queries, cached_keys, cached_values, self.scale, mask)?
+                } else {
+                    fast::scaled_dot_product_attention(
+                        queries,
+                        cached_keys,
+                        cached_values,
+                        self.scale,
+                        mask.map(fast::ScaledDotProductAttentionMask::from),
+                        None::<&Array>,
+                    )?
+                };
+                attention
+                    .transpose_axes(&[0, 2, 1, 3])?
+                    .reshape(&[B, L, -1])?
             }
         };
         if let Some(t0) = attn_t0 {
@@ -12764,6 +12844,86 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
 mod tests {
     use super::*;
     use crate::cache::KeyValueCache;
+
+    #[test]
+    fn dense_prefill_attention_bounds_scratch_and_preserves_offset_mask() {
+        let q = mlx_rs::random::normal::<f32>(&[1, 16, 513, 256], None, None, None).unwrap();
+        let k = mlx_rs::random::normal::<f32>(&[1, 2, 16385, 256], None, None, None).unwrap();
+        let v = mlx_rs::random::normal::<f32>(&[1, 2, 16385, 256], None, None, None).unwrap();
+        let mask = AttentionMask::Array(create_causal_mask(513, Some(16385 - 513)).unwrap());
+        mlx_rs::transforms::eval([&q, &k, &v]).unwrap();
+        let mut before = 0_usize;
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(mlx_sys::mlx_get_active_memory(&mut before), 0);
+            assert_eq!(mlx_sys::mlx_reset_peak_memory(), 0);
+        }
+        let out =
+            dense_prefill_attention(q.clone(), k.clone(), v.clone(), 0.0625, Some(&mask)).unwrap();
+        mlx_rs::transforms::eval([&out]).unwrap();
+        let mut peak = 0_usize;
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(mlx_sys::mlx_get_peak_memory(&mut peak), 0);
+        }
+        assert!(
+            peak.saturating_sub(before) < 384 * 1024 * 1024,
+            "attention scratch exceeded block budget: {} bytes",
+            peak.saturating_sub(before)
+        );
+        let expected = fast::scaled_dot_product_attention(
+            q.clone(),
+            k.clone(),
+            v.clone(),
+            0.0625,
+            Some(fast::ScaledDotProductAttentionMask::from(&mask)),
+            None::<&Array>,
+        )
+        .unwrap();
+        let causal =
+            dense_prefill_attention(q, k, v, 0.0625, Some(&AttentionMask::Causal)).unwrap();
+        for actual in [&out, &causal] {
+            let error = ops::abs(&ops::subtract(actual, &expected).unwrap())
+                .unwrap()
+                .max(None)
+                .unwrap();
+            mlx_rs::transforms::eval([&error]).unwrap();
+            assert!(
+                error.item::<f32>() < 1e-5,
+                "attention mismatch: {}",
+                error.item::<f32>()
+            );
+        }
+    }
+
+    #[test]
+    fn dense_prefill_attention_preserves_noncausal_keys_and_broadcast_masks() {
+        let q = mlx_rs::random::normal::<f32>(&[1, 16, 129, 256], None, None, None).unwrap();
+        let k = mlx_rs::random::normal::<f32>(&[1, 2, 193, 256], None, None, None).unwrap();
+        let v = mlx_rs::random::normal::<f32>(&[1, 2, 193, 256], None, None, None).unwrap();
+        for shape in [vec![129, 193], vec![1, 1, 129, 193]] {
+            // Zero additive bias permits every key, including future keys.
+            let mask = AttentionMask::Array(ops::zeros::<f32>(&shape).unwrap());
+            let actual =
+                dense_prefill_attention(q.clone(), k.clone(), v.clone(), 0.0625, Some(&mask))
+                    .unwrap();
+            let expected = fast::scaled_dot_product_attention(
+                q.clone(),
+                k.clone(),
+                v.clone(),
+                0.0625,
+                Some(fast::ScaledDotProductAttentionMask::from(&mask)),
+                None::<&Array>,
+            )
+            .unwrap();
+            let error = ops::abs(&ops::subtract(&actual, &expected).unwrap())
+                .unwrap()
+                .max(None)
+                .unwrap();
+            mlx_rs::transforms::eval([&error]).unwrap();
+            assert!(error.item::<f32>() < 1e-5);
+        }
+    }
 
     #[test]
     fn mixed_bit_retry_releases_failed_model_and_allocator_before_allocation() {

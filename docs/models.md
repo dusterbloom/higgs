@@ -208,6 +208,14 @@ numerical equivalence: GEMM and scratch round differently. Other hardware keeps
 scratch pending matched measurements. `HIGGS_ESCHA_TRELLIS_GEMM=0` selects scratch;
 `=1` selects GEMM on any host. Decode kernel selection is unchanged.
 
+On base M4, FP32 attention with 256-wide heads (16 query heads, two KV heads)
+uses 128-query blocks once the KV sequence reaches 16,384 tokens and the query
+sequence exceeds 128 tokens. This bounds the unfused attention score scratch
+while preserving the model's prefill chunk size, precision, and complete KV
+history. A matched 45K run on a 32 GiB M4 reduced sampled peak process footprint
+from 18.55 to 16.17 GiB with effectively unchanged latency; retrieval and cached
+continuation passed in both arms. This is a memory-headroom improvement.
+
 **Limitations.**
 
 - Support is currently text-only.
