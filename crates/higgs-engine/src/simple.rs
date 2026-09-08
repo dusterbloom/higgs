@@ -30,6 +30,7 @@ use mlx_rs::{
     ops::indexing::{IndexOp, NewAxis},
     with_new_default_stream,
 };
+use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
 use crate::{
@@ -753,6 +754,59 @@ fn common_prefix_token_len(left: &[u32], right: &[u32]) -> usize {
         .zip(right)
         .take_while(|(left, right)| left == right)
         .count()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TokenDivergenceDiagnostic {
+    retained_sha256: String,
+    candidate_prefix_sha256: String,
+    window_start: usize,
+    window_end: usize,
+    retained_window: Vec<u32>,
+    candidate_window: Vec<u32>,
+}
+
+fn token_ids_sha256(tokens: &[u32]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((tokens.len() as u64).to_le_bytes());
+    for token in tokens {
+        hasher.update(token.to_le_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
+
+fn token_divergence_diagnostic(
+    retained: &[u32],
+    candidate: &[u32],
+    divergence_token: usize,
+    radius: usize,
+) -> TokenDivergenceDiagnostic {
+    let candidate_prefix_len = retained.len().min(candidate.len());
+    let window_start = divergence_token.saturating_sub(radius);
+    let window_end = divergence_token
+        .saturating_add(radius)
+        .min(retained.len().max(candidate.len()));
+    TokenDivergenceDiagnostic {
+        retained_sha256: token_ids_sha256(retained),
+        candidate_prefix_sha256: token_ids_sha256(&candidate[..candidate_prefix_len]),
+        window_start,
+        window_end,
+        retained_window: retained
+            .get(window_start..window_end.min(retained.len()))
+            .unwrap_or_default()
+            .to_vec(),
+        candidate_window: candidate
+            .get(window_start..window_end.min(candidate.len()))
+            .unwrap_or_default()
+            .to_vec(),
+    }
 }
 
 fn continuation_reject_reason(prior_tokens: &[u32], full: &[u32]) -> &'static str {
@@ -4367,6 +4421,49 @@ impl SimpleEngine {
             .map(|kept| kept.state.tokens().to_vec())
     }
 
+    /// Reject and forget a retained entry whose exact token identity cannot
+    /// continue the canonical request. A present-but-diverged cache is not a
+    /// cold-cache miss: silently bootstrapping it can turn a cheap suffix turn
+    /// into an unbounded full-context prefill.
+    fn reject_diverged_retained_session(
+        &self,
+        session_id: u64,
+        retained_tokens: Option<&[u32]>,
+        candidate_tokens: &[u32],
+        run_mode: SessionRunMode,
+    ) -> Result<(), EngineError> {
+        let Some(retained_tokens) = retained_tokens else {
+            return Ok(());
+        };
+        if retained_continuation_prior_len(retained_tokens, candidate_tokens, run_mode).is_some() {
+            return Ok(());
+        }
+
+        let reason = continuation_reject_reason(retained_tokens, candidate_tokens);
+        let common_prefix_tokens = common_prefix_token_len(retained_tokens, candidate_tokens);
+        let diagnostic =
+            token_divergence_diagnostic(retained_tokens, candidate_tokens, common_prefix_tokens, 8);
+        let invalidated = {
+            let mut retained = lock_or_recover(&self.retained);
+            let still_same = retained
+                .get(&session_id)
+                .is_some_and(|entry| entry.state.tokens() == retained_tokens);
+            still_same && retained.remove(&session_id).is_some()
+        };
+        tracing::warn!(
+            session_id,
+            reason,
+            invalidated,
+            retained_tokens = retained_tokens.len(),
+            candidate_tokens = candidate_tokens.len(),
+            common_prefix_tokens,
+            retained_sha256 = %diagnostic.retained_sha256,
+            candidate_prefix_sha256 = %diagnostic.candidate_prefix_sha256,
+            "retained session identity rejected before prefill"
+        );
+        Err(EngineError::RetainedSessionUnavailable(session_id))
+    }
+
     /// Length of the token prefix `prompt_tokens` shares with the retained
     /// session state, or `None` when nothing is retained. This is the
     /// race-safe fact capacity admission charges as already cached; it must
@@ -6444,6 +6541,11 @@ impl SimpleEngine {
         if assumed_retained_prefix_tokens > actual_prefix {
             return Err(EngineError::RetainedSessionUnavailable(session_id));
         }
+        let run_mode = if max_tokens == 0 {
+            SessionRunMode::PrefillOnly
+        } else {
+            SessionRunMode::Generation
+        };
         let continued_prompt = self.continued_prompt_tokens_from_retained(
             session_id,
             retained_tokens.as_deref(),
@@ -6452,6 +6554,12 @@ impl SimpleEngine {
             tools,
             enable_thinking,
         );
+        self.reject_diverged_retained_session(
+            session_id,
+            retained_tokens.as_deref(),
+            &continued_prompt,
+            run_mode,
+        )?;
         let strategy = session_prefill_strategy(
             session_id,
             retained_tokens.as_deref(),
@@ -6459,11 +6567,6 @@ impl SimpleEngine {
             self.session_max_suffix_prefill_tokens,
             self.pflash_can_run_stateless_for_prompt(&continued_prompt),
         );
-        let run_mode = if max_tokens == 0 {
-            SessionRunMode::PrefillOnly
-        } else {
-            SessionRunMode::Generation
-        };
         let exact_retained_prefix = retained_tokens.as_deref().is_some_and(|retained| {
             retained_continuation_prior_len(retained, &continued_prompt, run_mode).is_some()
         });
@@ -6596,6 +6699,11 @@ impl SimpleEngine {
             }
             return Err(EngineError::RetainedSessionUnavailable(session_id));
         }
+        let run_mode = if max_tokens == 0 {
+            SessionRunMode::PrefillOnly
+        } else {
+            SessionRunMode::Generation
+        };
         let continued_prompt = self.continued_prompt_tokens_from_retained(
             session_id,
             retained_tokens.as_deref(),
@@ -6604,6 +6712,17 @@ impl SimpleEngine {
             tools,
             enable_thinking,
         );
+        if let Err(error) = self.reject_diverged_retained_session(
+            session_id,
+            retained_tokens.as_deref(),
+            &continued_prompt,
+            run_mode,
+        ) {
+            if let Some(acceptance) = acceptance.take() {
+                let _ = acceptance.send(Err(session_id));
+            }
+            return Err(error);
+        }
         let strategy = session_prefill_strategy(
             session_id,
             retained_tokens.as_deref(),
@@ -6611,11 +6730,6 @@ impl SimpleEngine {
             self.session_max_suffix_prefill_tokens,
             self.pflash_can_run_stateless_for_prompt(&continued_prompt),
         );
-        let run_mode = if max_tokens == 0 {
-            SessionRunMode::PrefillOnly
-        } else {
-            SessionRunMode::Generation
-        };
         let exact_retained_prefix = retained_tokens.as_deref().is_some_and(|retained| {
             retained_continuation_prior_len(retained, &continued_prompt, run_mode).is_some()
         });
@@ -6834,6 +6948,24 @@ impl SimpleEngine {
             tool_payload,
             outcome,
         );
+        if let (Some(retained), Some(divergence_token)) = (retained_tokens, trace.divergence_token)
+        {
+            let diagnostic =
+                token_divergence_diagnostic(retained, candidate_tokens, divergence_token, 8);
+            tracing::warn!(
+                session_id,
+                model = %self.model_name,
+                engine_version = env!("CARGO_PKG_VERSION"),
+                divergence_token,
+                retained_sha256 = %diagnostic.retained_sha256,
+                candidate_prefix_sha256 = %diagnostic.candidate_prefix_sha256,
+                window_start = diagnostic.window_start,
+                window_end = diagnostic.window_end,
+                retained_token_ids = ?diagnostic.retained_window,
+                candidate_token_ids = ?diagnostic.candidate_window,
+                "retained session token divergence"
+            );
+        }
         tracing::info!(
             session_id,
             prompt_tokens = trace.prompt_tokens,
@@ -14210,7 +14342,7 @@ mod tests {
         resolve_optional_dflash_path, resolve_pflash_full_score_max_tokens,
         resolve_pflash_min_free_memory_mb, resolve_speculation_route, retained_kv_storage_at,
         select_continuation_candidate, session_prefill_strategy, session_prompt_trace_metrics,
-        stateless_mtp_family_eligible, with_chat_terminator,
+        stateless_mtp_family_eligible, token_divergence_diagnostic, with_chat_terminator,
     };
 
     #[test]
@@ -15317,6 +15449,30 @@ mod tests {
     }
 
     #[test]
+    fn token_divergence_diagnostic_is_stable_and_bounds_windows() {
+        let retained = [10, 11, 12, 13, 14, 15];
+        let candidate = [10, 11, 99, 13, 14, 16, 17];
+
+        let diagnostic = token_divergence_diagnostic(&retained, &candidate, 2, 2);
+
+        assert_eq!(diagnostic.retained_window, vec![10, 11, 12, 13]);
+        assert_eq!(diagnostic.candidate_window, vec![10, 11, 99, 13]);
+        assert_eq!(diagnostic.window_start, 0);
+        assert_eq!(diagnostic.window_end, 4);
+        assert_eq!(diagnostic.retained_sha256.len(), 64);
+        assert_eq!(diagnostic.candidate_prefix_sha256.len(), 64);
+        assert_ne!(
+            diagnostic.retained_sha256,
+            diagnostic.candidate_prefix_sha256
+        );
+        assert_eq!(
+            diagnostic,
+            token_divergence_diagnostic(&retained, &candidate, 2, 2),
+            "the same token streams must produce byte-stable diagnostics"
+        );
+    }
+
+    #[test]
     fn session_prompt_metrics_distinguish_pflash_from_exact_bootstrap() {
         let engine = session_cache_test_engine();
         let prompt = [1, 2, 3, 4];
@@ -15917,6 +16073,85 @@ mod tests {
         ));
         assert!(engine.retained_session_tokens(0xCAFE).is_none());
         assert_eq!(engine.cache_stats().required_continuation_misses, 1);
+    }
+
+    #[test]
+    fn best_effort_diverged_retained_session_rejects_before_cold_prefill() {
+        let engine = session_cache_test_engine();
+        let session_id = 0x57A1E;
+        engine
+            .generate_continued(session_id, &[1, 2, 3], 0, &SamplingParams::default())
+            .unwrap();
+        assert_eq!(engine.retained_session_tokens(session_id), Some(vec![1, 2]));
+        reset_prefill_sample_count();
+
+        let error = engine
+            .generate_session_routed_with_thinking(
+                session_id,
+                &[1, 9, 10],
+                &[],
+                None,
+                1,
+                &SamplingParams::default(),
+                false,
+                SessionPromptTracePayloadStats::default(),
+                &PFlashPromptPolicy::default(),
+                SessionContinuationPolicy::BestEffort,
+                0,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            EngineError::RetainedSessionUnavailable(id) if id == session_id
+        ));
+        assert!(engine.retained_session_tokens(session_id).is_none());
+        assert_eq!(
+            prefill_sample_count(),
+            0,
+            "divergence launched cold prefill"
+        );
+    }
+
+    #[test]
+    fn best_effort_streaming_divergence_rejects_before_cold_prefill() {
+        let engine = session_cache_test_engine();
+        let session_id = 0x57A1F;
+        engine
+            .generate_continued(session_id, &[1, 2, 3], 0, &SamplingParams::default())
+            .unwrap();
+        reset_prefill_sample_count();
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
+
+        let error = engine
+            .generate_session_routed_streaming_with_thinking(
+                session_id,
+                &[1, 9, 10],
+                &[],
+                None,
+                1,
+                &SamplingParams::default(),
+                &output_tx,
+                false,
+                SessionPromptTracePayloadStats::default(),
+                &PFlashPromptPolicy::default(),
+                SessionContinuationPolicy::BestEffort,
+                None,
+                0,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            EngineError::RetainedSessionUnavailable(id) if id == session_id
+        ));
+        assert!(engine.retained_session_tokens(session_id).is_none());
+        assert!(output_rx.try_recv().is_err());
+        assert_eq!(
+            prefill_sample_count(),
+            0,
+            "divergence launched cold prefill"
+        );
     }
 
     #[test]
