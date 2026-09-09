@@ -161,7 +161,9 @@ mod tests {
 
     use mlx_rs::Array;
 
-    use super::{acquire, async_eval, eval, held};
+    #[cfg(debug_assertions)]
+    use super::async_eval;
+    use super::{acquire, eval, held};
 
     #[test]
     fn held_is_false_without_token() {
