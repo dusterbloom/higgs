@@ -225,6 +225,18 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
     let serve_result: Result<(), Box<dyn std::error::Error>> = async {
 
     // Loaded models remain provisional until the router accepts the complete set.
+    #[cfg(target_os = "macos")]
+    let (engines, registrations) = startup_load_once(
+        || load_engines(&higgs_config, &capacity),
+        offer_startup_memory_recovery,
+        || {
+            higgs_engine::simple::maybe_clear_mlx_cache(true, "startup memory recovery");
+            let memory = higgs_engine::MlxMemorySnapshot::measure()?;
+            capacity.refresh_memory(memory);
+            Ok(())
+        },
+    ).await?;
+    #[cfg(not(target_os = "macos"))]
     let (engines, registrations) = load_engines(&higgs_config, &capacity).await?;
     let cleanup_engines = engines.clone();
     let router = match Router::from_config(&higgs_config, engines) {
@@ -321,6 +333,307 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
     observer_result?;
     persist_result?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StartupApp {
+    pid: i32,
+    uid: u32,
+    started: (u64, u64),
+    path: PathBuf,
+    rss: u64,
+}
+
+#[cfg(target_os = "macos")]
+fn startup_app_candidates(mut apps: Vec<StartupApp>, uid: u32, own_pid: u32) -> Vec<StartupApp> {
+    apps.retain(|app| {
+        app.pid > 1
+            && u32::try_from(app.pid).ok() != Some(own_pid)
+            && app.uid != 0
+            && app.uid == uid
+            && app.path.is_absolute()
+            && !app.path.starts_with("/System")
+            && !app.path.starts_with("/usr")
+            && !app
+                .path
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("higgs")
+            && app
+                .path
+                .components()
+                .any(|part| part.as_os_str().to_string_lossy().ends_with(".app"))
+    });
+    // Nested helper bundles belong to the outer user application. Their memory
+    // contributes to ranking, but only a direct main executable is signalable.
+    let mut bundles: HashMap<PathBuf, (u64, Option<StartupApp>)> = HashMap::new();
+    for app in apps {
+        let Some(bundle) = app
+            .path
+            .ancestors()
+            .filter(|path| path.extension().is_some_and(|ext| ext == "app"))
+            .last()
+        else {
+            continue;
+        };
+        let direct_main = app.path.parent() == Some(bundle.join("Contents/MacOS").as_path());
+        let (rss, main) = bundles.entry(bundle.to_path_buf()).or_default();
+        *rss = rss.saturating_add(app.rss);
+        if direct_main && main.as_ref().is_none_or(|current| app.pid < current.pid) {
+            *main = Some(app);
+        }
+    }
+    let mut apps: Vec<_> = bundles
+        .into_values()
+        .filter_map(|(rss, main)| {
+            main.map(|mut app| {
+                app.rss = rss;
+                app
+            })
+        })
+        .collect();
+    apps.sort_by(|a, b| b.rss.cmp(&a.rss).then(a.pid.cmp(&b.pid)));
+    apps.truncate(3);
+    apps
+}
+
+#[cfg(target_os = "macos")]
+trait StartupRecovery {
+    fn confirm(&mut self, message: &str) -> std::io::Result<bool>;
+    fn same_process(&mut self, app: &StartupApp) -> bool;
+    fn signal(&mut self, app: &StartupApp, signal: nix::sys::signal::Signal)
+    -> std::io::Result<()>;
+    fn wait(&mut self, apps: &[StartupApp]);
+}
+
+#[cfg(target_os = "macos")]
+fn recover_startup_apps(
+    apps: &[StartupApp],
+    interactive: bool,
+    uid: u32,
+    io: &mut impl StartupRecovery,
+) -> std::io::Result<bool> {
+    use nix::sys::signal::Signal;
+    if !interactive || uid == 0 || apps.is_empty() {
+        return Ok(false);
+    }
+    if !io.confirm("Quit the listed apps with SIGTERM? Unsaved work may be lost. [y/N] ")? {
+        return Ok(false);
+    }
+    let mut signaled = false;
+    for app in apps {
+        // Check start timestamp and executable immediately before each signal.
+        // PID alone is never authority to act on a recycled process identifier.
+        if io.same_process(app) {
+            io.signal(app, Signal::SIGTERM)?;
+            signaled = true;
+        }
+    }
+    io.wait(apps);
+    let survivors: Vec<_> = apps
+        .iter()
+        .filter(|app| io.same_process(app))
+        .cloned()
+        .collect();
+    if !survivors.is_empty() {
+        if !io.confirm("Some listed apps remain. Force quit those survivors with SIGKILL? Unsaved work will be lost. [y/N] ")? { return Ok(false); }
+        for app in &survivors {
+            if io.same_process(app) {
+                io.signal(app, Signal::SIGKILL)?;
+                signaled = true;
+            }
+        }
+        // A successful kill syscall does not mean process teardown has finished.
+        // Give the authorized survivors time to release residency before measuring.
+        io.wait(&survivors);
+    }
+    Ok(signaled)
+}
+
+#[cfg(target_os = "macos")]
+async fn startup_load_once<T, F, Fut>(
+    mut load: F,
+    recover: impl FnOnce() -> Result<bool, Box<dyn std::error::Error>>,
+    refresh: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, Box<dyn std::error::Error>>>,
+{
+    match load().await {
+        Err(error) if error.to_string().contains("rejected by capacity policy") => {
+            if !recover()? {
+                return Err(error);
+            }
+            refresh()?;
+            // Deliberately outside the match: a second rejection is terminal.
+            load().await
+        }
+        result => result,
+    }
+}
+
+#[cfg(target_os = "macos")]
+// Native libproc has no safe wrapper here; all output pointers have exact-sized storage.
+#[allow(unsafe_code)]
+fn startup_process(pid: i32) -> Option<StartupApp> {
+    // libproc fills fixed-size C records. Treat partial records as unavailable.
+    unsafe {
+        let mut bsd: libc::proc_bsdinfo = std::mem::zeroed();
+        let bsd_size = i32::try_from(std::mem::size_of_val(&bsd)).ok()?;
+        if libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::from_mut(&mut bsd).cast(),
+            bsd_size,
+        ) != bsd_size
+        {
+            return None;
+        }
+        let mut task: libc::proc_taskinfo = std::mem::zeroed();
+        let task_size = i32::try_from(std::mem::size_of_val(&task)).ok()?;
+        if libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            std::ptr::from_mut(&mut task).cast(),
+            task_size,
+        ) != task_size
+        {
+            return None;
+        }
+        let mut path = [0u8; 4096];
+        if libc::proc_pidpath(
+            pid,
+            path.as_mut_ptr().cast(),
+            u32::try_from(path.len()).ok()?,
+        ) <= 0
+        {
+            return None;
+        }
+        let end = path.iter().position(|byte| *byte == 0)?;
+        use std::os::unix::ffi::OsStrExt;
+        Some(StartupApp {
+            pid,
+            uid: bsd.pbi_uid,
+            started: (bsd.pbi_start_tvsec, bsd.pbi_start_tvusec),
+            path: PathBuf::from(std::ffi::OsStr::from_bytes(&path[..end])),
+            rss: task.pti_resident_size,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn startup_signal_result(result: Result<(), nix::errno::Errno>) -> std::io::Result<()> {
+    // The process may exit after identity validation but before kill reaches it.
+    // Only ESRCH means the intended outcome already happened; permission errors remain fatal.
+    match result {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(error) => Err(std::io::Error::from(error)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct StartupTerminal;
+
+#[cfg(target_os = "macos")]
+impl StartupRecovery for StartupTerminal {
+    fn confirm(&mut self, message: &str) -> std::io::Result<bool> {
+        use std::io::Write;
+        let mut stderr = std::io::stderr().lock();
+        stderr.write_all(message.as_bytes())?;
+        stderr.flush()?;
+        let mut reply = String::new();
+        std::io::stdin().read_line(&mut reply)?;
+        Ok(matches!(
+            reply.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
+    }
+    fn same_process(&mut self, app: &StartupApp) -> bool {
+        startup_process(app.pid).is_some_and(|now| {
+            now.uid == app.uid && now.started == app.started && now.path == app.path
+        })
+    }
+    fn signal(
+        &mut self,
+        app: &StartupApp,
+        signal: nix::sys::signal::Signal,
+    ) -> std::io::Result<()> {
+        startup_signal_result(nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(app.pid),
+            signal,
+        ))
+    }
+    fn wait(&mut self, apps: &[StartupApp]) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while apps.iter().any(|app| self.same_process(app)) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(100)));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+// Enumeration writes only within the allocated PID buffer; geteuid takes no pointers.
+#[allow(unsafe_code)]
+fn offer_startup_memory_recovery() -> Result<bool, Box<dyn std::error::Error>> {
+    use std::io::Write;
+    // libproc returns PID counts, while its buffer capacity is specified in bytes.
+    let apps = unsafe {
+        let count = libc::proc_listallpids(std::ptr::null_mut(), 0);
+        if count <= 0 {
+            return Ok(false);
+        }
+        let mut pids = vec![0i32; usize::try_from(count)?.saturating_add(128)];
+        let used = libc::proc_listallpids(
+            pids.as_mut_ptr().cast(),
+            i32::try_from(std::mem::size_of_val(pids.as_slice()))?,
+        );
+        if used <= 0 {
+            return Ok(false);
+        }
+        pids.truncate(usize::try_from(used)?);
+        pids.into_iter()
+            .filter(|pid| *pid > 1)
+            .filter_map(startup_process)
+            .collect()
+    };
+    let uid = unsafe { libc::geteuid() };
+    let apps = startup_app_candidates(apps, uid, std::process::id());
+    {
+        let mut stderr = std::io::stderr().lock();
+        writeln!(
+            stderr,
+            "Startup was rejected by capacity policy. Close memory-heavy apps and retry higgs serve. Root and noninteractive runs never signal apps."
+        )?;
+        for app in &apps {
+            writeln!(
+                stderr,
+                "  {} — PID {}: {} MiB — {}",
+                app.path
+                    .components()
+                    .find(|part| part.as_os_str().to_string_lossy().ends_with(".app"))
+                    .map(|part| part.as_os_str().to_string_lossy())
+                    .unwrap_or_default(),
+                app.pid,
+                app.rss / (1024 * 1024),
+                app.path.display()
+            )?;
+        }
+    }
+    recover_startup_apps(
+        &apps,
+        std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+        uid,
+        &mut StartupTerminal,
+    )
+    .map_err(Into::into)
 }
 
 fn capacity_profile_dir(cli: &Cli) -> PathBuf {
@@ -614,6 +927,182 @@ fn init_tracing(verbose: bool) {
 #[allow(clippy::panic, clippy::unwrap_used, clippy::tests_outside_test_module)]
 mod tests {
     use super::*;
+
+    fn app(pid: i32, rss: u64) -> StartupApp {
+        StartupApp {
+            pid,
+            uid: 501,
+            started: (10, 20),
+            path: PathBuf::from(format!("/Applications/App{pid}.app/Contents/MacOS/App")),
+            rss,
+        }
+    }
+    struct RecoveryFixture {
+        answers: std::collections::VecDeque<bool>,
+        alive: bool,
+        reused: bool,
+        graceful: bool,
+        signals: Vec<nix::sys::signal::Signal>,
+        waits: usize,
+        waited_after_kill: bool,
+    }
+    impl StartupRecovery for RecoveryFixture {
+        fn confirm(&mut self, _: &str) -> std::io::Result<bool> {
+            Ok(self.answers.pop_front().expect("unexpected prompt"))
+        }
+        fn same_process(&mut self, _: &StartupApp) -> bool {
+            self.alive && !self.reused
+        }
+        fn signal(
+            &mut self,
+            _: &StartupApp,
+            signal: nix::sys::signal::Signal,
+        ) -> std::io::Result<()> {
+            self.signals.push(signal);
+            Ok(())
+        }
+        fn wait(&mut self, _: &[StartupApp]) {
+            self.waits += 1;
+            self.waited_after_kill =
+                self.signals.last() == Some(&nix::sys::signal::Signal::SIGKILL);
+            if self.graceful {
+                self.alive = false;
+            }
+        }
+    }
+    #[test]
+    fn startup_recovery_filters_sorts_and_caps() {
+        let mut apps: Vec<_> = (2..10)
+            .map(|id| app(id, u64::try_from(id).unwrap()))
+            .collect();
+        apps[0].uid = 0;
+        apps[1].uid = 502;
+        apps[2].path = PathBuf::from("/usr/bin/worker");
+        apps[3].path = PathBuf::from("/System/Foo.app/worker");
+        apps[4].path = PathBuf::from("/Applications/Higgs.app/higgs");
+        let result = startup_app_candidates(apps, 501, 9);
+        assert_eq!(result.iter().map(|a| a.pid).collect::<Vec<_>>(), [8, 7]);
+        assert_eq!(
+            startup_app_candidates(
+                (2..9)
+                    .map(|id| app(id, u64::try_from(id).unwrap()))
+                    .collect(),
+                501,
+                99
+            )
+            .len(),
+            3
+        );
+    }
+    #[test]
+    fn startup_recovery_groups_helpers_under_outer_main() {
+        let main = app(10, 100);
+        let mut helper = app(11, 900);
+        helper.path = PathBuf::from(
+            "/Applications/App10.app/Contents/Frameworks/Helper.app/Contents/MacOS/Helper",
+        );
+        let mut second_helper = helper.clone();
+        second_helper.pid = 12;
+        second_helper.rss = 500;
+        let mut orphan = helper.clone();
+        orphan.pid = 13;
+        orphan.path = PathBuf::from(
+            "/Applications/Orphan.app/Contents/Frameworks/Helper.app/Contents/MacOS/Helper",
+        );
+        let result = startup_app_candidates(
+            vec![helper, app(20, 1200), orphan, main.clone(), second_helper],
+            501,
+            99,
+        );
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].pid, main.pid);
+        assert_eq!(result[0].path, main.path);
+        assert_eq!(result[0].started, main.started);
+        assert_eq!(result[0].rss, 1500);
+        assert_eq!(result[1].pid, 20);
+    }
+
+    #[test]
+    fn startup_recovery_authorization_and_identity() {
+        assert!(startup_signal_result(Ok(())).is_ok());
+        assert!(startup_signal_result(Err(nix::errno::Errno::ESRCH)).is_ok());
+        assert_eq!(
+            startup_signal_result(Err(nix::errno::Errno::EPERM))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        use nix::sys::signal::Signal::{SIGKILL, SIGTERM};
+        for (interactive, uid, answers, graceful, reused, expected) in [
+            (false, 501, vec![], false, false, vec![]),
+            (true, 0, vec![], false, false, vec![]),
+            (true, 501, vec![false], false, false, vec![]),
+            (true, 501, vec![true], true, false, vec![SIGTERM]),
+            (true, 501, vec![true, false], false, false, vec![SIGTERM]),
+            (
+                true,
+                501,
+                vec![true, true],
+                false,
+                false,
+                vec![SIGTERM, SIGKILL],
+            ),
+            (true, 501, vec![true], false, true, vec![]),
+        ] {
+            let mut io = RecoveryFixture {
+                answers: answers.into(),
+                alive: true,
+                reused,
+                graceful,
+                signals: vec![],
+                waits: 0,
+                waited_after_kill: false,
+            };
+            let recovered =
+                recover_startup_apps(&[app(44, 100)], interactive, uid, &mut io).unwrap();
+            assert_eq!(
+                recovered,
+                !expected.is_empty() && (graceful || expected.contains(&SIGKILL))
+            );
+            assert_eq!(io.signals, expected);
+            if expected.contains(&SIGKILL) {
+                assert_eq!(io.waits, 2);
+                assert!(io.waited_after_kill);
+            } else {
+                assert!(io.waits <= 1);
+                assert!(!io.waited_after_kill);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn startup_recovery_matches_only_capacity_and_retries_once() {
+        for (message, recover, expected) in [
+            ("unrelated failure", true, 1),
+            ("load rejected by capacity policy: RAM", false, 1),
+            ("load rejected by capacity policy: RAM", true, 2),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let refreshed = std::cell::Cell::new(false);
+            let result = startup_load_once(
+                || {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 2 {
+                        assert!(refreshed.get());
+                    }
+                    async { Err::<(), Box<dyn std::error::Error>>(message.into()) }
+                },
+                || Ok(recover),
+                || {
+                    refreshed.set(true);
+                    Ok(())
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(calls.get(), expected);
+            assert_eq!(refreshed.get(), expected == 2);
+        }
+    }
 
     #[test]
     fn select_latest_metallib_candidate_prefers_newest_timestamp() {
