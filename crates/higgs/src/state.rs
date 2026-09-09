@@ -1729,7 +1729,17 @@ impl LoadCapacityLedger {
     ) -> Result<(), higgs_models::error::ModelError> {
         use higgs_models::progress::{ConversionKind, LoadBoundary, OptionalModelDisposition};
 
-        if snapshot.pressure == MemoryPressure::Critical {
+        // Completion boundaries close ledger state and let consumed inputs
+        // drop. Stopping there prevents the cleanup that can relieve the
+        // pressure; reject only before the loader starts another allocation.
+        if snapshot.pressure == MemoryPressure::Critical
+            && matches!(
+                boundary,
+                LoadBoundary::BeforeOptionalModel { .. }
+                    | LoadBoundary::BeforeShard { .. }
+                    | LoadBoundary::BeforeConversion { .. }
+            )
+        {
             return Err(higgs_models::error::ModelError::LoadCapacity(
                 "critical memory pressure at model allocation boundary".to_owned(),
             ));
@@ -1932,6 +1942,7 @@ pub(crate) fn measure_after_engine_drop(
     with_serialized_mlx_load(|| refresh_after_engine_drop_locked(capacity, reason))
 }
 
+#[cfg(not(test))]
 fn refresh_after_engine_drop_locked(
     capacity: &CapacityRegistry,
     reason: &'static str,
@@ -1940,6 +1951,7 @@ fn refresh_after_engine_drop_locked(
     Some(capacity.refresh_memory(memory))
 }
 
+#[cfg(not(test))]
 fn measure_after_engine_drop_locked(
     reason: &'static str,
 ) -> Option<higgs_engine::MlxMemorySnapshot> {
@@ -2466,6 +2478,65 @@ mod tests {
                 higgs_models::progress::LoadBoundary::BeforeShard {
                     index: 0,
                     bytes: 40,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            higgs_models::error::ModelError::LoadCapacity(_)
+        ));
+    }
+
+    /// Pressure may rise while a conversion is executing. Its completion
+    /// boundary must run so consumed inputs can be released; the next
+    /// allocation boundary remains responsible for stopping the load.
+    #[test]
+    fn load_boundary_policy_finishes_conversion_before_stopping_next_allocation() {
+        let estimate = higgs_engine::ModelLoadEstimate {
+            artifact_bytes: 100,
+            largest_selected_shard_bytes: 60,
+            workspace_kind: higgs_engine::LoaderWorkspaceKind::NativeEscha,
+            workspace_upper_bound_bytes: 60,
+            required_process_bytes: 140,
+        };
+        let mut ledger = LoadCapacityLedger::new(estimate);
+        ledger
+            .enforce(
+                crate::capacity::LoadCapacitySnapshot {
+                    pressure: crate::capacity::MemoryPressure::Normal,
+                    headroom_bytes: 140,
+                },
+                higgs_models::progress::LoadBoundary::BeforeConversion {
+                    index: 0,
+                    bytes: 20,
+                    kind: higgs_models::progress::ConversionKind::NativeEscha,
+                },
+            )
+            .unwrap();
+
+        ledger
+            .enforce(
+                crate::capacity::LoadCapacitySnapshot {
+                    pressure: crate::capacity::MemoryPressure::Critical,
+                    headroom_bytes: 140,
+                },
+                higgs_models::progress::LoadBoundary::AfterConversion {
+                    index: 0,
+                    kind: higgs_models::progress::ConversionKind::NativeEscha,
+                },
+            )
+            .unwrap();
+
+        let error = ledger
+            .enforce(
+                crate::capacity::LoadCapacitySnapshot {
+                    pressure: crate::capacity::MemoryPressure::Critical,
+                    headroom_bytes: 140,
+                },
+                higgs_models::progress::LoadBoundary::BeforeConversion {
+                    index: 1,
+                    bytes: 20,
+                    kind: higgs_models::progress::ConversionKind::NativeEscha,
                 },
             )
             .unwrap_err();
