@@ -5,7 +5,7 @@
 //! are valid at the current state, and `apply_mask` zeros out disallowed
 //! logits before sampling.
 
-use mlx_rs::{error::Exception, Array};
+use mlx_rs::{Array, error::Exception};
 use outlines_core::index::Index;
 use outlines_core::json_schema;
 use outlines_core::vocabulary::Vocabulary;
@@ -72,12 +72,29 @@ impl ConstrainedGenerator {
     ///
     /// Returns `true` if the transition was valid, `false` if the token was
     /// not allowed (should not happen if `apply_mask` was used).
-    pub fn advance(&mut self, token_id: u32) -> bool {
+    fn advance(&mut self, token_id: u32) -> bool {
         if let Some(next) = self.index.next_state(&self.state, &token_id) {
             self.state = next;
             true
         } else {
             false
+        }
+    }
+
+    /// Advance the FSM after a masked sample, failing closed when the mask
+    /// invariant breaks.
+    ///
+    /// A masked decode can only sample tokens the FSM accepts; a rejection
+    /// means the invariant broke and the caller must fail the request instead
+    /// of continuing off-grammar. Every FSM transition in the decode paths
+    /// goes through this method.
+    pub fn advance_checked(&mut self, token_id: u32) -> Result<(), EngineError> {
+        if self.advance(token_id) {
+            Ok(())
+        } else {
+            Err(EngineError::Generation(format!(
+                "grammar-constrained generation sampled token {token_id}, which the FSM rejected"
+            )))
         }
     }
 
@@ -90,23 +107,59 @@ impl ConstrainedGenerator {
     ///
     /// Sets disallowed token logits to negative infinity so they have zero
     /// probability after softmax.
-    pub fn apply_mask(&self, logits: &Array) -> Result<Array, Exception> {
-        let Some(allowed) = self.allowed_token_ids() else {
-            // No allowed tokens -- this shouldn't happen in practice.
-            // Return logits unchanged and let EOS handling take over.
-            return Ok(logits.clone());
+    ///
+    /// Fail-closed: a state with no allowed token has no legal continuation,
+    /// so this is a typed error — never unchanged logits for unconstrained
+    /// sampling.
+    pub fn apply_mask(&self, logits: &Array) -> Result<Array, EngineError> {
+        Self::masked_logits(logits, self.allowed_token_ids().as_deref())
+    }
+
+    /// Mask construction, split from [`Self::apply_mask`] so the
+    /// no-allowed-tokens failure is testable without a dead FSM state.
+    fn masked_logits(
+        logits: &Array,
+        allowed: Option<&[outlines_core::primitives::TokenId]>,
+    ) -> Result<Array, EngineError> {
+        let Some(allowed) = allowed else {
+            return Err(EngineError::Generation(
+                "constrained generation reached an FSM state with no allowed tokens; \
+                 refusing to sample unconstrained logits"
+                    .to_owned(),
+            ));
         };
+        if allowed.is_empty() {
+            return Err(EngineError::Generation(
+                "constrained generation reached an FSM state with an empty allowed-token set; \
+                 refusing to sample unconstrained logits"
+                    .to_owned(),
+            ));
+        }
 
         // Use the actual logits vocab dimension, not the tokenizer's count.
         // Models often pad their embedding table beyond the tokenizer vocabulary.
         let vocab_size = usize::try_from(*logits.shape().last().unwrap_or(&0)).unwrap_or(0);
+        if vocab_size == 0 {
+            return Err(EngineError::Generation(
+                "constrained generation produced an empty logits vocabulary dimension".to_owned(),
+            ));
+        }
 
         // Build a mask: -inf for disallowed, 0 for allowed
         let mut mask_vec = vec![f32::NEG_INFINITY; vocab_size];
-        for &tid in &allowed {
+        let mut in_vocab = 0usize;
+        for &tid in allowed {
             if let Some(slot) = mask_vec.get_mut(usize::try_from(tid).unwrap_or(usize::MAX)) {
                 *slot = 0.0;
+                in_vocab += 1;
             }
+        }
+        if in_vocab == 0 {
+            return Err(EngineError::Generation(format!(
+                "none of the {} allowed tokens are inside the logits vocabulary of \
+                 size {vocab_size}; refusing to sample unconstrained logits",
+                allowed.len()
+            )));
         }
 
         let vocab_i32 =
@@ -120,7 +173,7 @@ impl ConstrainedGenerator {
             mask_array
         };
 
-        logits.add(reshaped)
+        logits.add(reshaped).map_err(EngineError::Mlx)
     }
 }
 
@@ -333,8 +386,7 @@ mod tests {
 
     #[test]
     fn tagged_json_schema_accepts_a_parser_visible_tool_call() {
-        let output =
-            "<tool_call>\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Rome\"}}\n</tool_call>";
+        let output = "<tool_call>\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Rome\"}}\n</tool_call>";
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
@@ -406,13 +458,115 @@ mod tests {
     }
 
     #[test]
-    fn apply_mask_no_allowed_tokens_returns_unchanged() {
-        // When allowed_token_ids returns None, logits should be unchanged.
-        // We test this by directly checking the code path:
-        // If there are no allowed tokens the function returns early.
+    fn masked_logits_without_allowed_tokens_is_an_error() {
+        // A dead FSM state offers no legal continuation: masking must fail
+        // closed instead of returning unchanged logits for unconstrained
+        // sampling.
         let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let vals: Vec<f32> = logits.as_slice().to_vec();
-        assert_eq!(vals, vec![1.0, 2.0, 3.0]);
+        let error = ConstrainedGenerator::masked_logits(&logits, None)
+            .expect_err("no allowed tokens must fail closed");
+        assert!(error.to_string().contains("no allowed tokens"), "{error}");
+    }
+
+    #[test]
+    fn masked_logits_empty_allowed_set_is_an_error() {
+        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let error = ConstrainedGenerator::masked_logits(&logits, Some(&[]))
+            .expect_err("an empty allowed set must fail closed");
+        assert!(
+            error.to_string().contains("empty allowed-token set"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn masked_logits_empty_vocab_dimension_is_an_error() {
+        let logits = mlx_rs::Array::zeros::<f32>(&[0]).unwrap();
+        let error = ConstrainedGenerator::masked_logits(&logits, Some(&[0]))
+            .expect_err("a zero-width vocabulary must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("empty logits vocabulary dimension"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn masked_logits_all_allowed_outside_vocab_is_an_error() {
+        // Every allowed ID maps past the logits dimension: masking would
+        // leave an all--inf mask (uniform zero probability), so fail closed.
+        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let error = ConstrainedGenerator::masked_logits(&logits, Some(&[7, 999]))
+            .expect_err("all-OOV allowed tokens must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("are inside the logits vocabulary"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn masked_logits_partially_oov_allowed_tokens_still_mask() {
+        // Mixed in-vocab and out-of-vocab allowed IDs: the OOV ones are
+        // skipped, the in-vocab ones still constrain sampling.
+        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let masked = ConstrainedGenerator::masked_logits(&logits, Some(&[1, 999])).unwrap();
+        mlx_rs::transforms::eval([&masked]).unwrap();
+        let vals = masked.as_slice::<f32>();
+        assert!((vals[1] - 2.0).abs() < 1e-5);
+        assert!(vals[0].is_infinite() && vals[2].is_infinite());
+    }
+
+    #[test]
+    fn constrained_one_token_regex_completes_on_the_first_sampled_token() {
+        // Regex `a` with max_tokens > 1: the single accepted token completes
+        // the grammar, so both the blocking and streaming decode loops — which
+        // consult `is_finished` immediately after the checked advance — must
+        // terminate successfully at completion_tokens=1 without scheduling a
+        // successor decode.
+        let mut vocabulary = Vocabulary::new(0);
+        vocabulary.try_insert(vec![b'a'], 1).unwrap();
+        let mut generator = ConstrainedGenerator::from_regex("a", &vocabulary).unwrap();
+        assert!(!generator.is_finished(), "initial state is not final");
+        generator
+            .advance_checked(1)
+            .expect("token 'a' is the whole grammar");
+        assert!(
+            generator.is_finished(),
+            "one accepted token must complete the grammar; the loops key off this \
+             predicate to finish 'stop' before any second decode"
+        );
+    }
+
+    #[test]
+    fn masked_logits_masks_disallowed_tokens() {
+        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let masked = ConstrainedGenerator::masked_logits(&logits, Some(&[1])).unwrap();
+        mlx_rs::transforms::eval([&masked]).unwrap();
+        let vals = masked.as_slice::<f32>();
+        assert!((vals[1] - 2.0).abs() < 1e-5, "allowed token keeps logit");
+        assert!(vals[0].is_infinite() && vals[0].is_sign_negative());
+        assert!(vals[2].is_infinite() && vals[2].is_sign_negative());
+    }
+
+    #[test]
+    fn advance_rejects_token_outside_grammar() {
+        let mut vocabulary = Vocabulary::new(0);
+        vocabulary.try_insert(vec![b'a'], 1).unwrap();
+        vocabulary.try_insert(vec![b'b'], 2).unwrap();
+        let mut generator = ConstrainedGenerator::from_regex("a", &vocabulary).unwrap();
+        generator
+            .advance_checked(1)
+            .expect("'a' is the only accepted character");
+        let error = generator
+            .advance_checked(2)
+            .expect_err("a token outside the grammar must fail the request, not continue");
+        assert!(
+            error.to_string().contains("which the FSM rejected"),
+            "{error}"
+        );
     }
 
     #[test]

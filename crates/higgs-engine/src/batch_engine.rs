@@ -1385,21 +1385,28 @@ fn complete_prefill(
     prefix_cache: &mut PrefixCache,
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
-    req: BatchRequest,
+    mut req: BatchRequest,
     prompt_len: u32,
     cache: AnyCache,
     last_logits: Array,
     has_images: bool,
 ) -> Result<Option<ActiveRequest>, EngineError> {
     {
-        let current_token = sample(&last_logits, &req.params).map_err(EngineError::Mlx)?;
+        // Mask T1 with the request's FSM before sampling/logprobs: an
+        // unconstrained first token would escape the grammar entirely.
+        let constrained_logits = if let Some(ref cg) = req.constraint {
+            cg.apply_mask(&last_logits)?
+        } else {
+            last_logits
+        };
+        let current_token = sample(&constrained_logits, &req.params).map_err(EngineError::Mlx)?;
 
         let logprob_top_n = req.logprobs.then(|| req.top_logprobs.unwrap_or(0));
         let first_logprob_data = if let Some(top_n) = logprob_top_n {
             let scaled = if req.params.temperature <= f32::EPSILON {
-                last_logits
+                constrained_logits
             } else {
-                last_logits
+                constrained_logits
                     .multiply(mlx_rs::array!(1.0 / req.params.temperature))
                     .map_err(EngineError::Mlx)?
             };
@@ -1435,6 +1442,16 @@ fn complete_prefill(
             .as_ref()
             .map(|lp| lp.materialize(first_token_id));
 
+        // Checked-advance T1 through the request's FSM. A one-token grammar is
+        // already final here: finish successfully without scheduling a decode,
+        // because a final state has no legal successor to mask.
+        let constraint_done = if let Some(ref mut cg) = req.constraint {
+            cg.advance_checked(first_token_id)?;
+            cg.is_finished()
+        } else {
+            false
+        };
+
         // Decode the first token incrementally (routes through IncrementalDetok
         // so partial UTF-8 is held back and prefix-before-stop is correctly emitted).
         // Preserve content-bearing special tokens (e.g. MiniCPM tool-call markup)
@@ -1455,8 +1472,12 @@ fn complete_prefill(
             && find_stop_in_tail(&detok.text, first_chunk.len(), &req.stop_sequences).is_some();
         let at_max = req.max_tokens <= 1;
 
-        if is_eos || hit_stop || at_max {
-            let finish_reason = if is_eos || hit_stop { "stop" } else { "length" };
+        if is_eos || hit_stop || at_max || constraint_done {
+            let finish_reason = if is_eos || hit_stop || constraint_done {
+                "stop"
+            } else {
+                "length"
+            };
             let mut send_text = if hit_stop {
                 // Emit any prefix text before the stop sequence
                 find_stop_in_tail(&detok.text, first_chunk.len(), &req.stop_sequences)
@@ -1542,7 +1563,7 @@ fn build_decode_graph(
         apply_penalties(&sliced, &ar.generated_tokens, &ar.params).map_err(EngineError::Mlx)?;
 
     let constrained = if let Some(ref cg) = ar.constraint {
-        cg.apply_mask(&penalized).map_err(EngineError::Mlx)?
+        cg.apply_mask(&penalized)?
     } else {
         penalized
     };
@@ -1578,9 +1599,15 @@ fn materialize_decode_step(
 ) -> bool {
     let token_id: u32 = result.next_token.item();
 
-    // Advance constrained generator
+    // Advance constrained generator. A rejected token means the mask
+    // invariant broke: terminate the request through the worker error
+    // protocol instead of continuing off-grammar (the error chunk rides back
+    // to the generate tail, which reconstructs `EngineError::Generation`).
     if let Some(ref mut cg) = ar.constraint {
-        cg.advance(token_id);
+        if let Err(error) = cg.advance_checked(token_id) {
+            send_prefill_error(&ar.response_tx, &error);
+            return true;
+        }
     }
 
     let token_logprob = result
@@ -1735,9 +1762,9 @@ mod tests {
         let (gone_tx, gone_rx) = tokio::sync::mpsc::channel(4);
         drop(gone_rx);
 
-        let (mut alive, _alive_worker_rx) = make_active_request(8, vec![]);
-        let (mut pressured, _pressured_rx) = make_active_request(8, vec![]);
-        let (mut disconnected, _disconnected_rx) = make_active_request(8, vec![]);
+        let (alive, _alive_worker_rx) = make_active_request(8, vec![]);
+        let (pressured, _pressured_rx) = make_active_request(8, vec![]);
+        let (disconnected, _disconnected_rx) = make_active_request(8, vec![]);
         let mut active = vec![alive, pressured, disconnected];
         // 0: alive but stalled — no stop, open channel → survives and notes.
         active[0].response_tx = live_tx.clone();
@@ -2278,6 +2305,132 @@ mod tests {
         };
         let finished = materialize_decode_step(&mut ar, result, &tokenizer, &[0]);
         assert!(finished, "Should be finished at max_tokens=1");
+    }
+
+    #[test]
+    fn materialize_decode_step_constraint_rejection_fails_the_request() {
+        let (mut ar, mut rx) = make_active_request(100, vec![]);
+        let mut vocabulary = outlines_core::vocabulary::Vocabulary::new(0);
+        vocabulary.try_insert(vec![b'a'], 1).unwrap();
+        ar.constraint =
+            Some(crate::constrained::ConstrainedGenerator::from_regex("a", &vocabulary).unwrap());
+        let tokenizer = make_tokenizer();
+        // A masked decode can never sample a token the FSM rejects; when it
+        // happens anyway the invariant broke and the request must terminate
+        // through the worker error protocol, not continue off-grammar.
+        let result = DecodeGraphResult {
+            next_token: Array::from_slice(&[2_u32], &[1]),
+            logprob_data: None,
+        };
+        let finished = materialize_decode_step(&mut ar, result, &tokenizer, &[0]);
+        assert!(finished, "constraint rejection must terminate the request");
+        let chunk = rx.try_recv().expect("rejection must send a terminal chunk");
+        assert_eq!(chunk.finish_reason.as_deref(), Some("error"));
+        assert!(
+            chunk.new_text.contains("which the FSM rejected"),
+            "{:?}",
+            chunk.new_text
+        );
+        assert!(matches!(
+            worker_error_from_output(&chunk),
+            EngineError::Generation(_)
+        ));
+    }
+
+    #[test]
+    fn materialize_decode_step_mixed_constrained_failure_isolates_unconstrained_peer() {
+        // A batch mixing a constrained and an unconstrained request: when the
+        // constrained request's mask invariant breaks, only that request
+        // terminates with the typed error — the peer decodes on untouched.
+        let tokenizer = make_tokenizer();
+        let off_grammar = || DecodeGraphResult {
+            next_token: Array::from_slice(&[2_u32], &[1]),
+            logprob_data: None,
+        };
+
+        let (mut constrained, mut constrained_rx) = make_active_request(100, vec![]);
+        let mut vocabulary = outlines_core::vocabulary::Vocabulary::new(0);
+        vocabulary.try_insert(vec![b'a'], 1).unwrap();
+        constrained.constraint =
+            Some(crate::constrained::ConstrainedGenerator::from_regex("a", &vocabulary).unwrap());
+        assert!(materialize_decode_step(
+            &mut constrained,
+            off_grammar(),
+            &tokenizer,
+            &[0]
+        ));
+
+        let (mut peer, mut peer_rx) = make_active_request(100, vec![]);
+        assert!(!materialize_decode_step(
+            &mut peer,
+            off_grammar(),
+            &tokenizer,
+            &[0]
+        ));
+        assert_eq!(peer.generated_tokens, vec![2]);
+
+        let error_chunk = constrained_rx.try_recv().expect("constrained terminal");
+        assert_eq!(error_chunk.finish_reason.as_deref(), Some("error"));
+        assert!(matches!(
+            worker_error_from_output(&error_chunk),
+            EngineError::Generation(_)
+        ));
+        let peer_chunk = peer_rx.try_recv().expect("peer continues normally");
+        assert!(!peer_chunk.finished);
+        assert_eq!(peer_chunk.finish_reason, None);
+    }
+
+    #[test]
+    fn complete_prefill_constrained_t1_masks_advances_and_terminates() {
+        // T1 of a batched request: the mask must override the raw argmax
+        // ('b', id 2) with the grammar-legal 'a' (id 1), the checked advance
+        // must succeed, and the completed one-token grammar must finish the
+        // request at T1 ("stop", completion_tokens=1) even with max_tokens=8 —
+        // never escaping into an unconstrained decode.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut vocabulary = outlines_core::vocabulary::Vocabulary::new(0);
+        vocabulary.try_insert(vec![b'a'], 1).unwrap();
+        vocabulary.try_insert(vec![b'b'], 2).unwrap();
+        let req = BatchRequest {
+            prompt_tokens: vec![3, 4],
+            max_tokens: 8,
+            params: SamplingParams::default(),
+            stop_sequences: vec![],
+            logprobs: false,
+            top_logprobs: None,
+            constraint: Some(
+                crate::constrained::ConstrainedGenerator::from_regex("a", &vocabulary).unwrap(),
+            ),
+            image_inputs: Vec::new(),
+            response_tx: tx,
+            stop: crate::stop::GenerationStop::default(),
+        };
+        let last_logits = Array::from_slice(&[0.0_f32, 1.0, 9.0], &[3]);
+        let mut prefix_cache = PrefixCache::new(1);
+        let tokenizer = make_tokenizer();
+        let active = complete_prefill(
+            &mut prefix_cache,
+            &tokenizer,
+            &[0],
+            req,
+            2,
+            AnyCache::KV(vec![]),
+            last_logits,
+            false,
+        )
+        .expect("masked T1 must complete prefill");
+        assert!(
+            active.is_none(),
+            "a completed one-token grammar must not enter the decode set"
+        );
+        let chunk = rx.try_recv().expect("T1 terminal chunk");
+        assert!(chunk.finished);
+        assert_eq!(chunk.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(chunk.completion_tokens, 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "no decode may follow a grammar completed at T1"
+        );
     }
 
     // -----------------------------------------------------------------------

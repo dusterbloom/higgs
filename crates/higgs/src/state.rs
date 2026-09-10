@@ -228,7 +228,14 @@ fn route_test_tokenizer() -> &'static Tokenizer {
                 "decoder": null,
                 "model": {
                     "type": "WordLevel",
-                    "vocab": {"[UNK]": 0, "token": 7},
+                    "vocab": {
+                        "[UNK]": 0, "token": 7,
+                        "<": 10, ">": 11, "/": 12, "t": 13, "o": 14, "l": 15, "_": 16,
+                        "c": 17, "a": 18, "\n": 19, "{": 20, "}": 21, "\"": 22, "n": 23,
+                        "m": 24, "e": 25, ":": 26, " ": 27, ",": 28, "w": 29, "h": 30,
+                        "r": 31, "s": 32, "g": 33, "u": 34, "y": 35, "R": 36, "i": 37,
+                        "b": 38, "d": 39, "f": 40, "p": 41
+                    },
                     "unk_token": "[UNK]"
                 }
             }"#,
@@ -424,7 +431,8 @@ impl Engine {
                     || stub.name() == "blocking-required-post-admission-evicted"
                     || stub.name() == "session-prefill-render-spy"
                     || stub.name() == "prompt-limit-mutation-spy"
-                    || stub.name() == "capacity-interrupted" =>
+                    || stub.name() == "capacity-interrupted"
+                    || stub.name().starts_with("required-stream-") =>
             {
                 route_test_tokenizer()
             }
@@ -1275,6 +1283,66 @@ impl Engine {
             ),
             #[cfg(test)]
             Self::Stub(stub) if stub.name() == "capacity-interrupted" => {
+                Err(EngineError::CapacityInterrupted {
+                    boot_id: "boot-route-test".to_owned(),
+                    generation: 4,
+                })
+            }
+            #[cfg(test)]
+            Self::Stub(stub) if stub.name() == "required-stream-valid-call" => {
+                // One complete, well-formed tool call: the required/named
+                // postcondition must pass and emit exactly one delta.
+                sender
+                    .blocking_send(StreamingOutput {
+                        new_text:
+                            "<tool_call>\n{\"name\": \"weather\", \"arguments\": {\"city\": \"Rome\"}}\n</tool_call>"
+                                .to_owned(),
+                        finished: true,
+                        finish_reason: Some("stop".to_owned()),
+                        prompt_tokens: u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX),
+                        completion_tokens: 13,
+                        token_logprob: None,
+                        prefill_progress: None,
+                    })
+                    .map_err(|_| EngineError::Cancelled)
+            }
+            #[cfg(test)]
+            Self::Stub(stub) if stub.name() == "required-stream-leaky-text" => {
+                // Visible text leaks outside the tool_call envelope: the
+                // required/named postcondition must fail the stream closed.
+                sender
+                    .blocking_send(StreamingOutput {
+                        new_text:
+                            "Sure, calling <tool_call>\n{\"name\": \"weather\", \"arguments\": {\"city\": \"Rome\"}}\n</tool_call> hope that helps!"
+                                .to_owned(),
+                        finished: true,
+                        finish_reason: Some("stop".to_owned()),
+                        prompt_tokens: u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX),
+                        completion_tokens: 21,
+                        token_logprob: None,
+                        prefill_progress: None,
+                    })
+                    .map_err(|_| EngineError::Cancelled)
+            }
+            #[cfg(test)]
+            Self::Stub(stub) if stub.name() == "required-stream-capacity-partial-call" => {
+                // Partial `<tool_call>` bytes reach the route trackers, then
+                // the engine dies with a capacity interruption: the typed
+                // terminal must end the required stream with nothing
+                // parser-visible after it.
+                sender
+                    .blocking_send(StreamingOutput {
+                        new_text: "<tool_call>\n{\"name\": \"weat".to_owned(),
+                        // A pending finish marker must not survive the
+                        // capacity terminal on a required stream.
+                        finished: true,
+                        finish_reason: Some("stop".to_owned()),
+                        prompt_tokens: u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX),
+                        completion_tokens: 7,
+                        token_logprob: None,
+                        prefill_progress: None,
+                    })
+                    .map_err(|_| EngineError::Cancelled)?;
                 Err(EngineError::CapacityInterrupted {
                     boot_id: "boot-route-test".to_owned(),
                     generation: 4,

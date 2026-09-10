@@ -4,13 +4,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
+    Json,
     extract::{Extension, State},
     http::HeaderMap,
     response::{
-        sse::{Event, KeepAlive},
         IntoResponse, Sse,
+        sse::{Event, KeepAlive},
     },
-    Json,
 };
 use bytes::Bytes;
 use higgs_engine::chat_template::ChatPromptMode;
@@ -25,11 +25,10 @@ use crate::{
     router::ResolvedRoute,
     state::{Engine, SharedState},
     types::openai::{
-        merge_repetition_penalty, ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage,
-        ChatCompletionRequest, ChatCompletionResponse, ChoiceLogprobs, CompletionUsage,
-        ContentPart, MessageContent, SessionCachePolicy, StopSequence, TokenLogprob, ToolCall,
-        ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta, ToolChoice, ToolChoiceMode,
-        TopLogprob,
+        ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage, ChatCompletionRequest,
+        ChatCompletionResponse, ChoiceLogprobs, CompletionUsage, ContentPart, MessageContent,
+        SessionCachePolicy, StopSequence, TokenLogprob, ToolCall, ToolCallDelta, ToolCallFunction,
+        ToolCallFunctionDelta, ToolChoice, ToolChoiceMode, TopLogprob, merge_repetition_penalty,
     },
 };
 use higgs_models::SamplingParams;
@@ -39,6 +38,9 @@ const TOOL_RESULT_PROMPT_WARN_BYTES: usize = 16 * 1024;
 struct ToolChoicePlan<'a> {
     prompt_tools: Option<&'a [serde_json::Value]>,
     constraint_schema: Option<serde_json::Value>,
+    /// The pinned function name for a named tool_choice (`None` for the
+    /// required-any mode).
+    required_name: Option<String>,
 }
 
 impl ToolChoicePlan<'_> {
@@ -53,17 +55,19 @@ fn resolve_tool_choice<'a>(
     response_format: Option<&crate::types::openai::ResponseFormat>,
 ) -> Result<ToolChoicePlan<'a>, ServerError> {
     let tools = tools.filter(|tools| !tools.is_empty());
-    let required_name = match choice {
+    let required_name: Option<&str> = match choice {
         None | Some(ToolChoice::Mode(ToolChoiceMode::Auto)) => {
             return Ok(ToolChoicePlan {
                 prompt_tools: tools,
                 constraint_schema: None,
+                required_name: None,
             });
         }
         Some(ToolChoice::Mode(ToolChoiceMode::None)) => {
             return Ok(ToolChoicePlan {
                 prompt_tools: None,
                 constraint_schema: None,
+                required_name: None,
             });
         }
         Some(ToolChoice::Mode(ToolChoiceMode::Required)) => None,
@@ -91,6 +95,7 @@ fn resolve_tool_choice<'a>(
     Ok(ToolChoicePlan {
         prompt_tools: Some(tools),
         constraint_schema: Some(constraint_schema),
+        required_name: required_name.map(str::to_owned),
     })
 }
 
@@ -159,6 +164,77 @@ fn tool_call_schema(
         return Ok(variant.clone());
     }
     Ok(serde_json::json!({"oneOf": variants}))
+}
+
+/// Materialized response parts for the Required/named tool-choice
+/// postcondition: exactly one parser-visible tool call, valid against the
+/// declared tool schema, with no visible content around it.
+///
+/// Invariant: everything about the call's *arguments* (required keys, value
+/// types, nested shape) is enforced by the exact grammar FSM that
+/// `tool_call_schema` built — `from_tagged_json_schema` makes a malformed
+/// argument sequence unsampleable — so this helper only rejects what the
+/// grammar cannot express: wrong call count, leaked text outside the
+/// `<tool_call>` envelope, an undeclared function name, a name that does not
+/// match a named tool_choice, or non-object arguments. Shared by the
+/// blocking, streaming, and session-routed materialization paths; every
+/// deviation fails closed with a typed engine error.
+fn required_tool_call_parts(
+    parsed: &higgs_engine::tool_parser::ToolParseResult,
+    declared_tools: &[serde_json::Value],
+    required_name: Option<&str>,
+) -> Result<(Option<MessageContent>, Option<Vec<ToolCall>>), ServerError> {
+    let fail = |message: String| {
+        ServerError::Engine(higgs_engine::error::EngineError::Generation(message))
+    };
+    let [call] = parsed.tool_calls.as_slice() else {
+        return Err(fail(format!(
+            "required tool choice produced {} parser-visible tool calls, \
+             expected exactly one",
+            parsed.tool_calls.len()
+        )));
+    };
+    if !parsed.text.is_empty() {
+        return Err(fail(format!(
+            "required tool call violated its grammar: {} bytes of visible text \
+             outside the tool_call envelope",
+            parsed.text.len()
+        )));
+    }
+    if let Some(expected) = required_name {
+        if call.name != expected {
+            return Err(fail(format!(
+                "required tool call named '{}', but tool_choice required '{expected}'",
+                call.name
+            )));
+        }
+    }
+    if !declared_tools.iter().any(|tool| {
+        tool.get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(serde_json::Value::as_str)
+            == Some(call.name.as_str())
+    }) {
+        return Err(fail(format!(
+            "required tool call named '{}' is not a declared tool",
+            call.name
+        )));
+    }
+    if !call.arguments.is_object() {
+        return Err(fail(format!(
+            "tool '{}' arguments must be a JSON object",
+            call.name
+        )));
+    }
+    let tool_call = ToolCall {
+        id: format!("call_0_{}", uuid::Uuid::new_v4()),
+        r#type: "function".to_owned(),
+        function: ToolCallFunction {
+            name: call.name.clone(),
+            arguments: call.arguments.to_string(),
+        },
+    };
+    Ok((None, Some(vec![tool_call])))
 }
 
 fn continuation_policy(policy: Option<SessionCachePolicy>) -> SessionContinuationPolicy {
@@ -474,6 +550,8 @@ async fn chat_completions_non_streaming(
         req.response_format.as_ref(),
     )?;
     let tools = tool_choice.prompt_tools;
+    let required_call = tool_choice.requires_call();
+    let required_name = tool_choice.required_name.clone();
     let thinking_enabled = crate::reasoning::effective_thinking_enabled(
         engine.enable_thinking(),
         &[engine.model_name(), req.model.as_str()],
@@ -606,7 +684,7 @@ async fn chat_completions_non_streaming(
         .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
         .map_err(map_session_engine_error)?;
 
-        return Ok(build_session_response(
+        return build_session_response(
             &req.model,
             &request_id,
             session_output,
@@ -614,7 +692,9 @@ async fn chat_completions_non_streaming(
             has_tools,
             thinking_enabled,
             lease_active,
-        ));
+            required_call,
+            required_name.as_deref(),
+        );
     } else {
         tokio::task::spawn_blocking(move || {
             crate::capacity::run_reserved_generation(reservation, watchdog, || {
@@ -688,7 +768,11 @@ async fn chat_completions_non_streaming(
     let (content, tool_calls, finish_reason) = if has_tools {
         let schema = higgs_engine::tool_parser::ToolSchema::from_tools(tools);
         let parsed = higgs_engine::tool_parser::parse_tool_calls(&raw_text, schema.as_ref());
-        if parsed.tool_calls.is_empty() {
+        if required_call {
+            let (content, calls) =
+                required_tool_call_parts(&parsed, tools.unwrap_or(&[]), required_name.as_deref())?;
+            (content, calls, "tool_calls".to_owned())
+        } else if parsed.tool_calls.is_empty() {
             (
                 Some(MessageContent::Text(raw_text)),
                 None,
@@ -786,6 +870,13 @@ fn warn_large_tool_payload(stats: SessionPromptTracePayloadStats) {
 /// extraction, tool-call parsing, and the `finish_reason: "tool_calls"`
 /// override. The continued path uses greedy decode without logprobs, so
 /// logprobs are absent; its actual engine finish reason is preserved.
+///
+/// Required/named tool-choice requests apply the same postcondition as the
+/// blocking path and fail closed on any violation. Constraints and sessions
+/// are mutually exclusive today (`session_continuation_id`), so this only
+/// fires if that ever changes — enforcement here keeps the invariant local to
+/// every materialization path.
+#[allow(clippy::too_many_arguments)]
 fn build_session_response(
     model: &str,
     request_id: &str,
@@ -794,7 +885,9 @@ fn build_session_response(
     has_tools: bool,
     thinking_enabled: bool,
     lease_active: bool,
-) -> ChatCompletionResponse {
+    required_call: bool,
+    required_name: Option<&str>,
+) -> Result<ChatCompletionResponse, ServerError> {
     let usage = session_usage(&output).with_session_lease_active(lease_active);
     let generation_finish_reason = output.finish_reason.clone();
     let output_text = output.text;
@@ -820,7 +913,11 @@ fn build_session_response(
     let (content, tool_calls, finish_reason) = if has_tools {
         let schema = higgs_engine::tool_parser::ToolSchema::from_tools(tools);
         let parsed = higgs_engine::tool_parser::parse_tool_calls(&raw_text, schema.as_ref());
-        if parsed.tool_calls.is_empty() {
+        if required_call {
+            let (content, calls) =
+                required_tool_call_parts(&parsed, tools.unwrap_or(&[]), required_name)?;
+            (content, calls, "tool_calls".to_owned())
+        } else if parsed.tool_calls.is_empty() {
             (
                 Some(MessageContent::Text(raw_text)),
                 None,
@@ -855,7 +952,7 @@ fn build_session_response(
         )
     };
 
-    ChatCompletionResponse {
+    Ok(ChatCompletionResponse {
         id: request_id.to_owned(),
         object: "chat.completion",
         created: current_unix_timestamp(),
@@ -873,7 +970,7 @@ fn build_session_response(
             logprobs: None,
         }],
         usage,
-    }
+    })
 }
 
 /// Usage for a session-continuation turn. `cached_tokens` = the prompt tokens
@@ -909,6 +1006,13 @@ async fn chat_completions_stream(
         req.response_format.as_ref(),
     )?;
     let prompt_tools = tool_choice.prompt_tools;
+    let required_call = tool_choice.requires_call();
+    let required_name = tool_choice.required_name.clone();
+    // Owned copy so the 'static stream block can judge the required-call
+    // postcondition at end-of-stream without borrowing the request.
+    let required_tools = tool_choice
+        .requires_call()
+        .then(|| tool_choice.prompt_tools.unwrap_or(&[]).to_vec());
     let stream_includes_tools = prompt_tools.is_some();
     // Built here (before the `async_stream::stream!` block, which captures by
     // move) so the tracker can coerce XML-format tool-call values to their
@@ -1211,6 +1315,14 @@ async fn chat_completions_stream(
             stream_includes_tools,
             tool_schema,
         );
+        // Required/named tool-choice bookkeeping: the postcondition can only
+        // be judged once the tracker has fully drained, so — unlike ordinary
+        // Auto streams — every content and tool delta is held here (zero
+        // allocation on ordinary Auto streams) and only emitted after
+        // validation below. Nothing parser-visible leaves this route before
+        // the postcondition holds.
+        let mut required_hold: Option<(String, Vec<higgs_engine::tool_parser::ParsedToolCall>)> =
+            required_call.then(|| (String::new(), Vec::new()));
 
         // Closure that turns a `ParsedToolCall` into the OpenAI streaming
         // delta shape. Index is the running zero-based position of the
@@ -1270,6 +1382,10 @@ async fn chat_completions_stream(
             // deltas rather than being spoken aloud as plain text.
             let tool_out = tool_tracker.process(&visible);
             let visible_is_empty = tool_out.visible.is_empty();
+            if let Some((required_visible, required_calls)) = required_hold.as_mut() {
+                required_visible.push_str(&tool_out.visible);
+                required_calls.extend(tool_out.new_tool_calls.iter().cloned());
+            }
 
             // Tool-call indices count up across the whole response. Each
             // chunk that closes N tool calls covers indices
@@ -1278,26 +1394,28 @@ async fn chat_completions_stream(
             let base_index = tool_tracker
                 .completed_count()
                 .saturating_sub(tool_out.new_tool_calls.len());
-            for (i, parsed) in tool_out.new_tool_calls.iter().enumerate() {
-                #[allow(clippy::cast_possible_truncation)]
-                let idx = u32::try_from(base_index + i).unwrap_or(u32::MAX);
-                let d = ChatCompletionDelta {
-                    role: None,
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: Some(vec![make_tool_delta(idx, parsed)]),
-                };
-                emit_delta!(&d, None, None);
-            }
+            if required_hold.is_none() {
+                for (i, parsed) in tool_out.new_tool_calls.iter().enumerate() {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let idx = u32::try_from(base_index + i).unwrap_or(u32::MAX);
+                    let d = ChatCompletionDelta {
+                        role: None,
+                        content: None,
+                        reasoning_content: None,
+                        tool_calls: Some(vec![make_tool_delta(idx, parsed)]),
+                    };
+                    emit_delta!(&d, None, None);
+                }
 
-            if !tool_out.visible.is_empty() {
-                let d = ChatCompletionDelta {
-                    role: None,
-                    content: Some(tool_out.visible),
-                    reasoning_content: None,
-                    tool_calls: None,
-                };
-                emit_delta!(&d, None, chunk_logprobs.as_ref());
+                if !tool_out.visible.is_empty() {
+                    let d = ChatCompletionDelta {
+                        role: None,
+                        content: Some(tool_out.visible),
+                        reasoning_content: None,
+                        tool_calls: None,
+                    };
+                    emit_delta!(&d, None, chunk_logprobs.as_ref());
+                }
             }
 
             if let Some(finish_reason) = output.finish_reason {
@@ -1311,9 +1429,11 @@ async fn chat_completions_stream(
                 "streaming generation worker terminated unexpectedly: {error}"
             ))
         });
+        let mut capacity_interrupted = false;
         match terminal {
             crate::sse::WorkerTerminal::Completed => {}
             crate::sse::WorkerTerminal::Capacity(info) => {
+                capacity_interrupted = true;
                 // Exact frozen v1 terminal event, then the normal tail
                 // terminates the stream with [DONE].
                 if let Some(ref m) = metrics {
@@ -1348,9 +1468,18 @@ async fn chat_completions_stream(
             }
         }
 
+        // A capacity terminal ends every stream. Discard buffered parser and
+        // finish state so no content, tool, reasoning, or finish delta follows
+        // the terminal; only optional usage and [DONE] remain.
+        let discard_stream_remainder = capacity_interrupted;
+        if discard_stream_remainder {
+            pending_finish_reason = None;
+            pending_finish_logprobs = None;
+        }
+
         // Flush any remaining buffered content.
         let (flush_vis, flush_reas) = reasoning_tracker.flush();
-        if !flush_reas.is_empty() {
+        if !flush_reas.is_empty() && !discard_stream_remainder {
             let d = ChatCompletionDelta {
                 role: None,
                 content: None,
@@ -1363,31 +1492,44 @@ async fn chat_completions_stream(
         // re-emitting their buffered prefix as visible content — never
         // silently drop tokens).
         let flush_tool_out = tool_tracker.process(&flush_vis);
+        if let Some((required_visible, required_calls)) = required_hold.as_mut() {
+            required_visible.push_str(&flush_tool_out.visible);
+            required_calls.extend(flush_tool_out.new_tool_calls.iter().cloned());
+        }
         let flush_base_index = tool_tracker
             .completed_count()
             .saturating_sub(flush_tool_out.new_tool_calls.len());
-        for (i, parsed) in flush_tool_out.new_tool_calls.iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation)]
-            let idx = u32::try_from(flush_base_index + i).unwrap_or(u32::MAX);
-            let d = ChatCompletionDelta {
-                role: None,
-                content: None,
-                reasoning_content: None,
-                tool_calls: Some(vec![make_tool_delta(idx, parsed)]),
-            };
-            emit_delta!(&d, None, None);
-        }
-        if !flush_tool_out.visible.is_empty() {
-            let d = ChatCompletionDelta {
-                role: None,
-                content: Some(flush_tool_out.visible),
-                reasoning_content: None,
-                tool_calls: None,
-            };
-            emit_delta!(&d, None, None);
+        if required_hold.is_none() && !discard_stream_remainder {
+            for (i, parsed) in flush_tool_out.new_tool_calls.iter().enumerate() {
+                #[allow(clippy::cast_possible_truncation)]
+                let idx = u32::try_from(flush_base_index + i).unwrap_or(u32::MAX);
+                let d = ChatCompletionDelta {
+                    role: None,
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![make_tool_delta(idx, parsed)]),
+                };
+                emit_delta!(&d, None, None);
+            }
+            if !flush_tool_out.visible.is_empty() {
+                let d = ChatCompletionDelta {
+                    role: None,
+                    content: Some(flush_tool_out.visible),
+                    reasoning_content: None,
+                    tool_calls: None,
+                };
+                emit_delta!(&d, None, None);
+            }
         }
         let final_tool_out = tool_tracker.flush();
-        if !final_tool_out.visible.is_empty() {
+        if let Some((required_visible, required_calls)) = required_hold.as_mut() {
+            required_visible.push_str(&final_tool_out.visible);
+            required_calls.extend(final_tool_out.new_tool_calls.iter().cloned());
+        }
+        if required_hold.is_none()
+            && !discard_stream_remainder
+            && !final_tool_out.visible.is_empty()
+        {
             let d = ChatCompletionDelta {
                 role: None,
                 content: Some(final_tool_out.visible),
@@ -1395,6 +1537,60 @@ async fn chat_completions_stream(
                 tool_calls: None,
             };
             emit_delta!(&d, None, None);
+        }
+
+        // Required/named tool choice: judge the postcondition now that the
+        // tracker has drained. Up to this point the stream emitted only the
+        // role chunk — nothing parser-visible. Zero calls, leaked visible
+        // text, or multiple calls end the stream with the typed error event
+        // (no deltas, no DONE). A capacity interruption already ended the
+        // request with its own terminal: the held remainder is discarded
+        // above and only the tail below runs (usage if the contract requires
+        // it, then [DONE]).
+        if !discard_stream_remainder {
+            if let Some((required_visible, required_calls)) = required_hold.take() {
+                let parsed = higgs_engine::tool_parser::ToolParseResult {
+                    text: required_visible,
+                    tool_calls: required_calls,
+                };
+                match required_tool_call_parts(
+                    &parsed,
+                    required_tools.as_deref().unwrap_or(&[]),
+                    required_name.as_deref(),
+                ) {
+                    Ok((_, calls)) => {
+                        for call in calls.into_iter().flatten() {
+                            let d = ChatCompletionDelta {
+                                role: None,
+                                content: None,
+                                reasoning_content: None,
+                                tool_calls: Some(vec![ToolCallDelta {
+                                    index: 0,
+                                    id: Some(call.id),
+                                    r#type: Some(call.r#type),
+                                    function: Some(ToolCallFunctionDelta {
+                                        name: Some(call.function.name),
+                                        arguments: Some(call.function.arguments),
+                                    }),
+                                }]),
+                            };
+                            emit_delta!(&d, None, None);
+                        }
+                    }
+                    Err(error) => {
+                        if let (Some(ref m), Some(id)) = (metrics.as_ref(), metrics_id) {
+                            m.fail_stream(
+                                id,
+                                u64::from(output_token_count),
+                                start.elapsed(),
+                                error.to_string(),
+                            );
+                        }
+                        yield Ok(Event::default().data(streaming_error_json(&error.to_string())));
+                        return;
+                    }
+                }
+            }
         }
 
         // Defer `finish_reason` until after the tracker has drained so we
@@ -2040,6 +2236,312 @@ mod tests {
         ));
     }
 
+    // -----------------------------------------------------------------------
+    // Required/named tool-choice materialization postcondition
+    // -----------------------------------------------------------------------
+
+    fn parsed_call(
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> higgs_engine::tool_parser::ParsedToolCall {
+        higgs_engine::tool_parser::ParsedToolCall {
+            name: name.to_owned(),
+            arguments,
+        }
+    }
+
+    fn parse_result(
+        text: &str,
+        calls: Vec<higgs_engine::tool_parser::ParsedToolCall>,
+    ) -> higgs_engine::tool_parser::ToolParseResult {
+        higgs_engine::tool_parser::ToolParseResult {
+            text: text.to_owned(),
+            tool_calls: calls,
+        }
+    }
+
+    /// Assert the parse outcome fails closed with the typed engine error and
+    /// return its message.
+    fn expect_required_failure(
+        parsed: &higgs_engine::tool_parser::ToolParseResult,
+        required_name: Option<&str>,
+    ) -> String {
+        let tools = weather_and_shell_tools();
+        let error = required_tool_call_parts(parsed, &tools, required_name)
+            .expect_err("degenerate required-call materialization must fail closed");
+        match error {
+            ServerError::Engine(higgs_engine::error::EngineError::Generation(message)) => message,
+            other => panic!("expected typed EngineError::Generation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blocking_required_materialization_accepts_exactly_one_valid_call() {
+        let parsed = parse_result(
+            "",
+            vec![parsed_call("weather", serde_json::json!({"city": "Rome"}))],
+        );
+        let tools = weather_and_shell_tools();
+        let (content, tool_calls) = required_tool_call_parts(&parsed, &tools, None)
+            .expect("one schema-valid call is the only success shape");
+        assert!(
+            content.is_none(),
+            "a required call carries no visible content"
+        );
+        let calls = tool_calls.expect("exactly one tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "weather");
+        assert_eq!(calls[0].function.arguments, r#"{"city":"Rome"}"#);
+    }
+
+    #[test]
+    fn blocking_required_materialization_fails_on_zero_calls() {
+        let parsed = parse_result("no call at all", vec![]);
+        let message = expect_required_failure(&parsed, None);
+        assert!(message.contains("expected exactly one"), "{message}");
+    }
+
+    #[test]
+    fn blocking_required_materialization_fails_on_leftover_text() {
+        let parsed = parse_result(
+            "sure, calling",
+            vec![parsed_call("weather", serde_json::json!({"city": "Rome"}))],
+        );
+        let message = expect_required_failure(&parsed, None);
+        assert!(
+            message.contains("outside the tool_call envelope"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn blocking_required_materialization_fails_on_whitespace_only_visible_text() {
+        // The postcondition is zero visible *bytes*: whitespace is still
+        // leaked text, reported by its original byte length.
+        let parsed = parse_result(
+            " \t\n",
+            vec![parsed_call("weather", serde_json::json!({"city": "Rome"}))],
+        );
+        let message = expect_required_failure(&parsed, None);
+        assert!(message.contains("3 bytes of visible text"), "{message}");
+    }
+
+    #[test]
+    fn blocking_required_materialization_fails_on_multiple_calls() {
+        let call = parsed_call("weather", serde_json::json!({"city": "Rome"}));
+        let parsed = parse_result("", vec![call.clone(), call]);
+        let message = expect_required_failure(&parsed, None);
+        assert!(message.contains("2 parser-visible tool calls"), "{message}");
+    }
+
+    #[test]
+    fn blocking_required_materialization_fails_on_wrong_named_function() {
+        let parsed = parse_result(
+            "",
+            vec![parsed_call("weather", serde_json::json!({"city": "Rome"}))],
+        );
+        let message = expect_required_failure(&parsed, Some("shell"));
+        assert!(
+            message.contains("tool_choice required 'shell'"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn blocking_required_materialization_fails_on_non_object_arguments() {
+        // Argument *shape* beyond "must be an object" is the grammar FSM's job
+        // (see `required_tool_call_parts`); a non-object arguments value is
+        // rejected here.
+        let parsed = parse_result("", vec![parsed_call("weather", serde_json::json!("Rome"))]);
+        let message = expect_required_failure(&parsed, None);
+        assert!(message.contains("must be a JSON object"), "{message}");
+    }
+
+    #[test]
+    fn blocking_required_materialization_fails_on_undeclared_function() {
+        let parsed = parse_result("", vec![parsed_call("ghost", serde_json::json!({}))]);
+        let message = expect_required_failure(&parsed, None);
+        assert!(message.contains("is not a declared tool"), "{message}");
+    }
+
+    #[test]
+    fn streaming_required_materialization_rejects_degenerate_tracker_output() {
+        // Mirrors the streaming route's accumulation: tracker output (visible
+        // leaks plus completed calls) is validated once at end-of-stream with
+        // the same helper as the blocking and session paths.
+        let drain = |chunks: &[&str]| {
+            let mut tracker = higgs_engine::tool_parser::StreamingToolCallTracker::new(
+                true,
+                higgs_engine::tool_parser::ToolSchema::from_tools(Some(&weather_and_shell_tools())),
+            );
+            let mut visible = String::new();
+            let mut calls = Vec::new();
+            for chunk in chunks {
+                let out = tracker.process(chunk);
+                visible.push_str(&out.visible);
+                calls.extend(out.new_tool_calls);
+            }
+            let flush = tracker.flush();
+            visible.push_str(&flush.visible);
+            calls.extend(flush.new_tool_calls);
+            let parsed = higgs_engine::tool_parser::ToolParseResult {
+                text: visible,
+                tool_calls: calls,
+            };
+            required_tool_call_parts(&parsed, &weather_and_shell_tools(), None)
+        };
+
+        let good = drain(&[
+            "<tool_call>\n{\"name\": \"weather\", \"arguments\": {\"city\": \"Rome\"}}\n",
+            "</tool_call>",
+        ])
+        .expect("a single well-formed streamed call must pass");
+        assert_eq!(good.1.expect("call").len(), 1);
+
+        // Two complete calls are a terminal failure even though both parsed.
+        let double = drain(&[
+            "<tool_call>\n{\"name\": \"weather\", \"arguments\": {\"city\": \"Rome\"}}\n</tool_call>",
+            "<tool_call>\n{\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}\n</tool_call>",
+        ])
+        .expect_err("multiple streamed calls must fail closed");
+        assert!(matches!(
+            double,
+            ServerError::Engine(higgs_engine::error::EngineError::Generation(_))
+        ));
+
+        // A truncated call flushes as visible text — never a silent success.
+        let truncated = drain(&["<tool_call>\n{\"name\": \"weather\""])
+            .expect_err("truncated streamed call must fail closed");
+        assert!(matches!(
+            truncated,
+            ServerError::Engine(higgs_engine::error::EngineError::Generation(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Required/named streaming SSE behavior (stub engine)
+    // -----------------------------------------------------------------------
+
+    async fn required_stream_body(model: &str) -> String {
+        let request = chat_request(serde_json::json!({
+            "model": model,
+            "stream": true,
+            "tools": weather_and_shell_tools(),
+            "tool_choice": "required"
+        }));
+        let stream = chat_completions_stream(
+            streaming_test_state(),
+            request,
+            Arc::new(Engine::test_stub(model)),
+            GenerationDefaults::default(),
+            None,
+            crate::router::RoutingMethod::Direct,
+        )
+        .await
+        .expect("admitted required stream must start");
+        let response = axum::response::sse::Sse::new(stream).into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn required_streaming_emits_nothing_before_validation_then_one_call_and_done() {
+        let body = required_stream_body("required-stream-valid-call").await;
+        // Nothing parser-visible may precede validation: no content text and
+        // exactly the one validated tool call.
+        assert!(!body.contains("\"content\":\""), "{body}");
+        assert_eq!(body.matches("call_0_").count(), 1, "{body}");
+        assert!(body.contains(r#"{\"city\":\"Rome\"}"#), "{body}");
+        assert!(body.contains("\"finish_reason\":\"tool_calls\""), "{body}");
+        assert!(body.contains("data: [DONE]"), "{body}");
+        assert!(!body.contains("generation_error"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn required_streaming_leaked_text_emits_only_the_typed_error_event() {
+        let body = required_stream_body("required-stream-leaky-text").await;
+        // Fail closed: no content delta, no tool delta, no success tail —
+        // only the typed error event.
+        assert!(!body.contains("\"content\":\""), "{body}");
+        assert!(!body.contains("call_0_"), "{body}");
+        assert!(body.contains("outside the tool_call envelope"), "{body}");
+        assert!(body.contains("generation_error"), "{body}");
+        assert!(!body.contains("data: [DONE]"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn required_streaming_capacity_emits_only_capacity_terminal_then_done() {
+        let body = required_stream_body("capacity-interrupted").await;
+        // The capacity terminal has already ended the request: exactly one
+        // capacity event, no required-call postvalidation error, no tool
+        // deltas, then the normal tail terminator.
+        assert_eq!(
+            body.matches("higgs_capacity_interrupted").count(),
+            1,
+            "{body}"
+        );
+        assert!(!body.contains("generation_error"), "{body}");
+        assert!(!body.contains("call_0_"), "{body}");
+        assert!(body.contains("data: [DONE]"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn required_streaming_capacity_after_partial_call_emits_only_terminal_then_done() {
+        // Partial `<tool_call>` bytes reach the trackers before the engine
+        // dies: the buffered prefix and every tracker remainder must be
+        // discarded after the typed capacity terminal — no content delta, no
+        // tool delta, no generation error, only usage/[DONE] tail.
+        let body = required_stream_body("required-stream-capacity-partial-call").await;
+        assert_eq!(
+            body.matches("higgs_capacity_interrupted").count(),
+            1,
+            "{body}"
+        );
+        assert!(!body.contains("<tool_call>"), "{body}");
+        assert!(!body.contains("\"content\":\""), "{body}");
+        assert!(!body.contains("call_0_"), "{body}");
+        assert!(!body.contains("generation_error"), "{body}");
+        // No finish delta may follow the capacity terminal: only [DONE].
+        let terminal = body.find("higgs_capacity_interrupted").expect("terminal");
+        let tail: String = body[terminal..]
+            .split("\n\n")
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(tail.trim(), "data: [DONE]", "{body}");
+    }
+
+    #[test]
+    fn session_required_materialization_failure_is_terminal() {
+        let output = higgs_engine::simple::SessionGeneration {
+            text: "plain text, no tool call".to_owned(),
+            completion_tokens: 5,
+            finish_reason: "stop".to_owned(),
+            prompt_tokens: 3,
+            prefilled_tokens: 3,
+            continued: false,
+            outcome: higgs_engine::simple::SessionOutcome::ExactBootstrap,
+        };
+        let tools = weather_and_shell_tools();
+        let error = build_session_response(
+            "model",
+            "request",
+            output,
+            Some(&tools),
+            true,
+            false,
+            false,
+            true,
+            None,
+        )
+        .expect_err("session-routed required materialization must fail closed");
+        assert!(matches!(
+            error,
+            ServerError::Engine(higgs_engine::error::EngineError::Generation(_))
+        ));
+    }
+
     #[test]
     fn generation_defaults_fill_omitted_sampling_fields() {
         let req = chat_request(serde_json::json!({}));
@@ -2151,8 +2653,10 @@ mod tests {
             outcome: higgs_engine::simple::SessionOutcome::ExactBootstrap,
         };
 
-        let response =
-            build_session_response("model", "request", output, None, false, false, false);
+        let response = build_session_response(
+            "model", "request", output, None, false, false, false, false, None,
+        )
+        .unwrap();
         assert_eq!(response.choices[0].finish_reason, "length");
     }
 
@@ -2167,7 +2671,10 @@ mod tests {
             continued: false,
             outcome: higgs_engine::simple::SessionOutcome::ExactBootstrap,
         };
-        let response = build_session_response("model", "request", output, None, false, false, true);
+        let response = build_session_response(
+            "model", "request", output, None, false, false, true, false, None,
+        )
+        .unwrap();
         assert_eq!(response.usage.higgs_session_lease_active, Some(1));
     }
 
@@ -2294,6 +2801,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_streaming_capacity_discards_every_buffered_remainder() {
+        let model = "required-stream-capacity-partial-call";
+        let request = chat_request(serde_json::json!({
+            "model": model,
+            "stream": true,
+            "max_tokens": 8
+        }));
+        let stream = chat_completions_stream(
+            streaming_test_state(),
+            request,
+            Arc::new(Engine::test_stub(model)),
+            GenerationDefaults::default(),
+            None,
+            crate::router::RoutingMethod::Direct,
+        )
+        .await
+        .expect("admitted Auto stream must start");
+        let response = axum::response::sse::Sse::new(stream).into_response();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        let terminal = body.find("higgs_capacity_interrupted").expect("terminal");
+        let tail: String = body[terminal..]
+            .split("\n\n")
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(tail.trim(), "data: [DONE]", "{body}");
+    }
+
+    #[tokio::test]
     async fn required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409() {
         let request = || {
             chat_request(serde_json::json!({
@@ -2374,17 +2912,21 @@ mod tests {
         let seed_body: serde_json::Value = serde_json::from_slice(&seed_body).unwrap();
         assert_eq!(seed_body["choices"].as_array().unwrap().len(), 1);
         assert_eq!(seed_body["choices"][0]["message"]["content"], "");
-        assert!(seed_body["choices"][0]["message"]
-            .get("tool_calls")
-            .is_none());
+        assert!(
+            seed_body["choices"][0]["message"]
+                .get("tool_calls")
+                .is_none()
+        );
         assert_eq!(seed_body["choices"][0]["finish_reason"], "length");
         assert_eq!(seed_body["usage"]["prompt_tokens"], 1);
         assert_eq!(seed_body["usage"]["completion_tokens"], 0);
         assert_eq!(seed_body["usage"]["total_tokens"], 1);
         assert!(seed_body["usage"].get("prompt_tokens_details").is_none());
-        assert!(seed_body["usage"]
-            .get("higgs_session_lease_active")
-            .is_none());
+        assert!(
+            seed_body["usage"]
+                .get("higgs_session_lease_active")
+                .is_none()
+        );
 
         let leased = accepted_app
             .clone()

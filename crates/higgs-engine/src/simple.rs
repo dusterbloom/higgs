@@ -5363,7 +5363,7 @@ impl SimpleEngine {
                 score_mode = ?plan.metadata.score_mode,
                 "PFlash sparse prefill executed"
             );
-            higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos);
+            higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos)?;
             output.logits
         } else if let Some(ref batch) = prepared.image_batch {
             // Multimodal path: full forward (VLMs need all tokens for vision)
@@ -5535,7 +5535,7 @@ impl SimpleEngine {
         let last_logits = logits.index((.., -1, ..));
 
         let constrained_logits = if let Some(cg) = constraint {
-            cg.apply_mask(&last_logits).map_err(EngineError::Mlx)?
+            cg.apply_mask(&last_logits)?
         } else {
             last_logits
         };
@@ -6369,7 +6369,7 @@ impl SimpleEngine {
 
         // Apply constraint mask if structured output is requested
         let constrained = if let Some(cg) = constraint {
-            cg.apply_mask(&penalized).map_err(EngineError::Mlx)?
+            cg.apply_mask(&penalized)?
         } else {
             penalized
         };
@@ -9709,14 +9709,35 @@ impl SimpleEngine {
         // Capture T1 (already eval'd inside run_prefill).
         let first_token_id: u32 = current_token.item();
         let ar_prefill_elapsed = ar_request_t0.elapsed();
-        // Advance the constraint past the first sampled token before decode.
-        if let Some(ref mut cg) = constraint {
-            cg.advance(first_token_id);
-        }
         let mut tokens: Vec<u32> = vec![first_token_id];
         let mut all_logprobs: Option<Vec<higgs_models::TokenLogprobInfo>> = logprobs.then(Vec::new);
         if let (Some(all_lp), Some(lp_data)) = (&mut all_logprobs, &first_logprob_data) {
             all_lp.push(lp_data.materialize(first_token_id));
+        }
+        // Advance the constraint past the first sampled token before decode.
+        // A one-token grammar (e.g. regex `a`) is already final here: finish
+        // successfully without scheduling decode #2, because a final state has
+        // no legal successor to mask.
+        if let Some(ref mut cg) = constraint {
+            cg.advance_checked(first_token_id)?;
+            if cg.is_finished() {
+                self.record_ar_generation_timing(
+                    ar_prefill_elapsed,
+                    std::time::Duration::ZERO,
+                    ar_request_t0.elapsed(),
+                    1,
+                    "stop",
+                );
+                return Ok(GenerationOutput {
+                    text: self.decode_tokens(&tokens)?,
+                    finish_reason: "stop".to_owned(),
+                    prompt_tokens: prompt_len,
+                    completion_tokens: 1,
+                    token_logprobs: all_logprobs,
+                    reasoning_content: None,
+                    cached_prompt_tokens,
+                });
+            }
         }
         let has_stop_sequences = !stop_sequences.is_empty();
 
@@ -9896,18 +9917,23 @@ impl SimpleEngine {
             let will_finish_by_length =
                 Self::completion_len(&tokens)?.saturating_add(1) >= max_tokens;
 
-            // When constrained, extract the sampled token and advance the FSM
-            // before building the next step, so the mask is always applied at the
-            // correct FSM state.
-            let constrained_token_id: Option<u32> = constraint.is_some().then(|| {
-                let id: u32 = next_token.item();
-                if let Some(ref mut cg) = constraint {
-                    cg.advance(id);
+            // When constrained, extract the sampled token, advance the FSM,
+            // and probe for grammar completion before building the next step,
+            // so the mask is always applied at the correct FSM state and no
+            // successor decode is ever scheduled past a final state (it would
+            // have no legal continuation to mask).
+            let mut constraint_done = false;
+            let constrained_token_id: Option<u32> = match constraint.as_mut() {
+                Some(cg) => {
+                    let id: u32 = next_token.item();
+                    cg.advance_checked(id)?;
+                    constraint_done = cg.is_finished();
+                    Some(id)
                 }
-                id
-            });
+                None => None,
+            };
 
-            let following = if will_finish_by_length {
+            let following = if will_finish_by_length || constraint_done {
                 None
             } else {
                 Some(Self::decode_step(
@@ -9991,11 +10017,9 @@ impl SimpleEngine {
                 );
             };
 
-            // Check if constraint is in final state
-            if constraint
-                .as_ref()
-                .is_some_and(crate::constrained::ConstrainedGenerator::is_finished)
-            {
+            // Check if constraint is in final state (probed right after the
+            // checked advance above — no successor was scheduled in that case).
+            if constraint_done {
                 record_ar_finish("stop");
                 Self::log_decode_timing(
                     step_count,
@@ -10204,7 +10228,7 @@ impl SimpleEngine {
                 .prime_taps(&taps, draft_cache)
                 .map_err(EngineError::Mlx)?;
             offset += chunk_size;
-            higgs_models::progress::report_prefill_progress(offset, seq_len);
+            higgs_models::progress::report_prefill_progress(offset, seq_len)?;
         }
 
         let final_chunk = prompt.index((.., offset..));
@@ -10224,7 +10248,7 @@ impl SimpleEngine {
             )));
         }
         cache.eval().map_err(EngineError::Mlx)?;
-        higgs_models::progress::report_prefill_progress(seq_len, seq_len);
+        higgs_models::progress::report_prefill_progress(seq_len, seq_len)?;
         Ok((hidden, taps))
     }
 
@@ -10401,7 +10425,7 @@ impl SimpleEngine {
             score_mode = ?plan.metadata.score_mode,
             "PFlash sparse dSpark prefill executed"
         );
-        higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos);
+        higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos)?;
         DflashPrefillOutcome::validated(
             cache,
             drafter.make_cache(),
@@ -13282,8 +13306,13 @@ impl SimpleEngine {
         let mut all_tokens: Vec<u32> = Vec::new();
         let first_token_id: u32 = current_token.item();
         // Advance the constraint past the first sampled token before decode.
+        // A one-token grammar (e.g. regex `a`) is already final here: finish
+        // successfully without scheduling decode #2, because a final state has
+        // no legal successor to mask.
+        let mut first_constraint_done = false;
         if let Some(ref mut cg) = constraint {
-            cg.advance(first_token_id);
+            cg.advance_checked(first_token_id)?;
+            first_constraint_done = cg.is_finished();
         }
         all_tokens.push(first_token_id);
 
@@ -13311,7 +13340,7 @@ impl SimpleEngine {
         };
 
         let first_is_eos = self.eos_token_ids.contains(&first_token_id);
-        let finished = first_is_eos || first_hit_stop || 1 >= max_tokens;
+        let finished = first_is_eos || first_hit_stop || first_constraint_done || 1 >= max_tokens;
 
         if finished && !first_hit_stop {
             first_text.push_str(&detok.flush(&self.tokenizer, &all_tokens)?);
@@ -13325,7 +13354,7 @@ impl SimpleEngine {
             .blocking_send(StreamingOutput {
                 new_text: first_text,
                 finished,
-                finish_reason: if first_is_eos || first_hit_stop {
+                finish_reason: if first_is_eos || first_hit_stop || first_constraint_done {
                     Some("stop".to_owned())
                 } else if 1 >= max_tokens {
                     Some("length".to_owned())
@@ -13413,38 +13442,51 @@ impl SimpleEngine {
             if let Some(reason) = crate::stop::generation_stop_check() {
                 return Err(EngineError::from_stop_reason(&reason));
             }
-            crate::stop::generation_stop().map_or((), |stop| stop.note_progress());
-            // When constrained, extract the sampled token and advance the FSM
-            // before decode_step, so the mask is always applied at the correct
-            // FSM state (mirrors the non-streaming pattern in generate_inner).
-            let constrained_token_id: Option<u32> = constraint.is_some().then(|| {
-                let id: u32 = next_token.item();
-                if let Some(ref mut cg) = constraint {
-                    cg.advance(id);
-                }
-                id
-            });
-
-            let (following, following_logprob_data) = Self::decode_step(
-                &next_token,
-                &mut prepared.model,
-                &mut prepared.cache,
-                params,
-                &all_tokens,
-                logprob_top_n,
-                constraint.as_ref(),
-            )?;
-            {
-                let mut eval_targets: Vec<&Array> = vec![&following];
-                if let Some(ref lp) = following_logprob_data {
-                    eval_targets.extend(lp.eval_targets());
-                }
-                if constraint.is_some() {
-                    eval(eval_targets).map_err(EngineError::Mlx)?;
-                } else {
-                    async_eval(eval_targets).map_err(EngineError::Mlx)?;
-                }
+            if let Some(stop) = crate::stop::generation_stop() {
+                stop.note_progress();
             }
+            // When constrained, extract the sampled token, advance the FSM,
+            // and probe for grammar completion before decode_step, so the mask
+            // is always applied at the correct FSM state (mirrors the
+            // non-streaming pattern in generate_inner) and no successor decode
+            // is ever scheduled past a final state (it would have no legal
+            // continuation to mask).
+            let mut constraint_done = false;
+            let constrained_token_id: Option<u32> = match constraint.as_mut() {
+                Some(cg) => {
+                    let id: u32 = next_token.item();
+                    cg.advance_checked(id)?;
+                    constraint_done = cg.is_finished();
+                    Some(id)
+                }
+                None => None,
+            };
+
+            let following = if constraint_done {
+                None
+            } else {
+                let (following, following_logprob_data) = Self::decode_step(
+                    &next_token,
+                    &mut prepared.model,
+                    &mut prepared.cache,
+                    params,
+                    &all_tokens,
+                    logprob_top_n,
+                    constraint.as_ref(),
+                )?;
+                {
+                    let mut eval_targets: Vec<&Array> = vec![&following];
+                    if let Some(ref lp) = following_logprob_data {
+                        eval_targets.extend(lp.eval_targets());
+                    }
+                    if constraint.is_some() {
+                        eval(eval_targets).map_err(EngineError::Mlx)?;
+                    } else {
+                        async_eval(eval_targets).map_err(EngineError::Mlx)?;
+                    }
+                }
+                Some((following, following_logprob_data))
+            };
 
             let mut token_id: u32 = constrained_token_id.unwrap_or_else(|| next_token.item());
 
@@ -13497,9 +13539,8 @@ impl SimpleEngine {
 
             let is_eos = self.eos_token_ids.contains(&token_id);
             let is_max = completion_len >= max_tokens;
-            let constraint_done = constraint
-                .as_ref()
-                .is_some_and(crate::constrained::ConstrainedGenerator::is_finished);
+            // Probed right after the checked advance above; no successor was
+            // scheduled in that case.
             let step_finished = is_eos || is_max || hit_stop_seq || constraint_done;
 
             if step_finished && !hit_stop_seq {
@@ -13540,10 +13581,10 @@ impl SimpleEngine {
                     next_token = Array::from_slice(&[close_id], &[1]);
                 }
                 thinking_tokens += 1; // prevent re-triggering
-            } else {
+            } else if let Some((following, following_logprob_data)) = following {
                 next_token = following;
+                next_logprob_data = following_logprob_data;
             }
-            next_logprob_data = following_logprob_data;
         }
 
         Ok(())
