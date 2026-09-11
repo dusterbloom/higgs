@@ -15,8 +15,9 @@ use mlx_rs::{Array, Dtype};
 
 use crate::cache::disk_storage::{
     DiskCacheBlock, DiskCacheEntryMetadata, DiskCacheError, DiskCacheFileHeader, DiskCacheLayer,
-    DiskCacheSnapshot, DiskStorage,
+    DiskCacheSnapshot, DiskStorage, RecurrentStateSnapshot,
 };
+use higgs_models::LayerCache;
 use crate::cache::paired::{PairedCacheError, RadixPairCheckpoint};
 use crate::paged_prefix_cache::{
     PagedPairedLookupPlan, PagedPrefixCache, PagedPrefixMatch, PairedPrefixCacheStats,
@@ -283,8 +284,8 @@ impl DiskPrefixCache {
             return;
         };
         let header = storage.header().clone();
-        let layers = match snapshot_layers(cache, &header, stored_len) {
-            Ok(layers) => layers,
+        let (layers, recurrent) = match snapshot_layers(cache, &header, stored_len, prefix_tokens.len()) {
+            Ok(ok) => ok,
             Err(DiskCacheError::Unsupported(reason)) => {
                 tracing::debug!(reason, "Skipping disk prefix cache store");
                 return;
@@ -296,15 +297,21 @@ impl DiskPrefixCache {
         };
 
         let token_session_id = hash_tokens_for_session(tokens_to_store);
-        if let Err(error) = storage.save_blocks(token_session_id, token_hash, stored_len, &layers) {
+        if let Err(error) =
+            storage.save_blocks(token_session_id, token_hash, stored_len, &layers, &recurrent)
+        {
             tracing::warn!(error = %error, "Failed to persist disk prefix cache snapshot");
         }
         if let Some(checkpoint) = checkpoint_id {
             let checkpoint_session_id = hash_checkpoint_id(checkpoint);
             if checkpoint_session_id != token_session_id {
-                if let Err(error) =
-                    storage.save_blocks(checkpoint_session_id, token_hash, stored_len, &layers)
-                {
+                if let Err(error) = storage.save_blocks(
+                    checkpoint_session_id,
+                    token_hash,
+                    stored_len,
+                    &layers,
+                    &recurrent,
+                ) {
                     tracing::warn!(
                         checkpoint_id = checkpoint,
                         error = %error,
@@ -465,9 +472,10 @@ fn snapshot_layers(
     cache: &AnyCache,
     header: &DiskCacheFileHeader,
     stored_len: usize,
-) -> Result<Vec<DiskCacheLayer>, DiskCacheError> {
+    full_prefix_len: usize,
+) -> Result<(Vec<DiskCacheLayer>, Vec<RecurrentStateSnapshot>), DiskCacheError> {
     let AnyCache::KV(layers) = cache else {
-        return Err(DiskCacheError::Unsupported("hybrid caches are memory-only"));
+        return snapshot_hybrid_layers(cache, header, stored_len, full_prefix_len);
     };
     let block_count = stored_len / header.block_size;
     let block_size_i32 =
@@ -515,7 +523,92 @@ fn snapshot_layers(
         }
         disk_layers.push(DiskCacheLayer { blocks });
     }
-    Ok(disk_layers)
+    Ok((disk_layers, Vec::new()))
+}
+
+/// Snapshot a hybrid cache: attention layers persist their per-token K/V
+/// blocks exactly as pure-KV caches do; recurrent (GDN) layers contribute
+/// their fixed-size conv/SSM state, which is valid for the same token prefix.
+/// Hybrid snapshots require format v2 — the loader treats v1 files as misses.
+fn snapshot_hybrid_layers(
+    cache: &AnyCache,
+    header: &DiskCacheFileHeader,
+    stored_len: usize,
+    full_prefix_len: usize,
+) -> Result<(Vec<DiskCacheLayer>, Vec<RecurrentStateSnapshot>), DiskCacheError> {
+    let AnyCache::Hybrid(layers) = cache else {
+        return Err(DiskCacheError::Unsupported("unsupported cache kind"));
+    };
+    if full_prefix_len != stored_len {
+        // Recurrent state is cumulative over the whole prompt: a partial
+        // trailing block cannot be truncated, so a non-aligned prompt cannot
+        // produce a self-consistent hybrid snapshot.
+        return Err(DiskCacheError::Unsupported(
+            "hybrid prompt is not block-aligned",
+        ));
+    }
+    // Reuse the pure-KV path for the whole layer vector by borrowing the KV
+    // layers and standing in empty placeholder layers for recurrent ones,
+    // collecting the recurrent states alongside.
+    let mut recurrent: Vec<RecurrentStateSnapshot> = Vec::new();
+    let block_count = stored_len / header.block_size;
+    let block_size_i32 =
+        i32::try_from(header.block_size).map_err(|_| DiskCacheError::Overflow("block_size"))?;
+    let block_elems = header
+        .block_size
+        .checked_mul(header.num_kv_heads)
+        .and_then(|value| value.checked_mul(header.head_dim))
+        .ok_or(DiskCacheError::Overflow("block elements"))?;
+
+    let mut disk_layers = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let Some(layer) = layer else {
+            disk_layers.push(DiskCacheLayer { blocks: Vec::new() });
+            continue;
+        };
+        match layer {
+            LayerCache::KV(kv) => {
+                let (Some(keys), Some(values)) = (kv.keys(), kv.values()) else {
+                    disk_layers.push(DiskCacheLayer { blocks: Vec::new() });
+                    continue;
+                };
+                validate_array_layout(keys, header, stored_len)?;
+                validate_array_layout(values, header, stored_len)?;
+                let mut blocks = Vec::with_capacity(block_count);
+                for block_index in 0..block_count {
+                    let start_usize =
+                        block_index.checked_mul(header.block_size).unwrap_or(0);
+                    let start = i32::try_from(start_usize)
+                        .map_err(|_| DiskCacheError::Overflow("block start"))?;
+                    let end = start
+                        .checked_add(block_size_i32)
+                        .ok_or(DiskCacheError::Overflow("block end"))?;
+                    let k_block = array_block_to_f16(keys, start, end, block_elems)?;
+                    let v_block = array_block_to_f16(values, start, end, block_elems)?;
+                    blocks.push(DiskCacheBlock { k: k_block, v: v_block });
+                }
+                disk_layers.push(DiskCacheLayer { blocks });
+            }
+            LayerCache::Arrays(arrays) => {
+                let to_f16 = |array: &Array| -> Result<Vec<f16>, DiskCacheError> {
+                    let converted = array
+                        .as_dtype(Dtype::Float16)
+                        .map_err(|error| DiskCacheError::Mlx(format!("{error}")))?;
+                    Ok(converted.as_slice::<f16>().to_vec())
+                };
+                recurrent.push(RecurrentStateSnapshot {
+                    layer_index: disk_layers.len(),
+                    conv: arrays.conv_state.as_ref().map(to_f16).transpose()?,
+                    ssm: arrays.ssm_state.as_ref().map(to_f16).transpose()?,
+                    conv_pos: arrays.conv_pos,
+                    offset: arrays.offset,
+                });
+                // Placeholder keeps layer indices aligned for the loader.
+                disk_layers.push(DiskCacheLayer { blocks: Vec::new() });
+            }
+        }
+    }
+    Ok((disk_layers, recurrent))
 }
 
 fn validate_array_layout(
@@ -568,17 +661,66 @@ fn materialize_snapshot(
     snapshot: &DiskCacheSnapshot,
     header: &DiskCacheFileHeader,
 ) -> Result<AnyCache, DiskCacheError> {
-    let layers: Result<Vec<_>, _> = snapshot
-        .layers
-        .iter()
-        .map(|layer| {
-            if layer.blocks.is_empty() {
-                return Ok(Some(SteppingKeyValueCache::new()));
-            }
-            materialize_layer(layer, header).map(Some)
-        })
-        .collect();
-    Ok(AnyCache::KV(layers?))
+    if snapshot.recurrent.is_empty() {
+        let layers: Result<Vec<_>, _> = snapshot
+            .layers
+            .iter()
+            .map(|layer| {
+                if layer.blocks.is_empty() {
+                    return Ok(Some(SteppingKeyValueCache::new()));
+                }
+                materialize_layer(layer, header).map(Some)
+            })
+            .collect();
+        return Ok(AnyCache::KV(layers?));
+    }
+    // Hybrid: recurrent states carry the arrays-layer payloads; block layers
+    // rebuild the attention KV layers. Layer indices align across both.
+    let mut recurrent_by_index: std::collections::HashMap<usize, &RecurrentStateSnapshot> =
+        snapshot
+            .recurrent
+            .iter()
+            .map(|state| (state.layer_index, state))
+            .collect();
+    let mut layers = Vec::with_capacity(snapshot.layers.len());
+    for (index, layer) in snapshot.layers.iter().enumerate() {
+        if let Some(state) = recurrent_by_index.remove(&index) {
+            let to_array = |data: &Vec<f16>| -> Result<Array, DiskCacheError> {
+                let len = i32::try_from(data.len())
+                    .map_err(|_| DiskCacheError::Overflow("state len"))?;
+                Ok(Array::from_slice(data, &[1, len]))
+            };
+            layers.push(Some(LayerCache::Arrays(
+                higgs_models::qwen3_next::ArraysCache {
+                    conv_state: state
+                        .conv
+                        .as_ref()
+                        .map(&to_array)
+                        .transpose()?,
+                    ssm_state: state
+                        .ssm
+                        .as_ref()
+                        .map(&to_array)
+                        .transpose()?,
+                    conv_pos: state.conv_pos,
+                    offset: state.offset,
+                },
+            )));
+            continue;
+        }
+        if layer.blocks.is_empty() {
+            return Err(DiskCacheError::Format(
+                "hybrid snapshot layer has neither blocks nor recurrent state".to_owned(),
+            ));
+        }
+        layers.push(Some(LayerCache::KV(materialize_layer(layer, header)?)));
+    }
+    if !recurrent_by_index.is_empty() {
+        return Err(DiskCacheError::Format(
+            "hybrid snapshot recurrent states reference unknown layers".to_owned(),
+        ));
+    }
+    Ok(AnyCache::Hybrid(layers))
 }
 
 fn materialize_layer(
@@ -1054,5 +1196,118 @@ mod tests {
             assert_eq!(prefix.token_hash, hash_tokens(prefix_tokens));
             assert_eq!(prefix.session_id, hash_tokens_for_session(prefix_tokens));
         }
+    }
+}
+
+#[cfg(test)]
+mod hybrid_snapshot_tests {
+    use super::*;
+    use higgs_models::qwen3_next::ArraysCache;
+
+    /// Hybrid caches must roundtrip through the disk snapshot: attention
+    /// layers via K/V blocks, recurrent (GDN) layers via the fixed-state
+    /// section. This is the escha (hybrid) persistence path that used to be
+    /// rejected as "memory-only".
+    #[test]
+    fn hybrid_snapshot_roundtrips_recurrent_state() {
+        let header = DiskCacheFileHeader {
+            block_size: 8,
+            num_blocks: 4,
+            num_kv_heads: 2,
+            head_dim: 4,
+        };
+        let seq_len = 8i32; // block-aligned
+        let kv = SteppingKeyValueCache::from_arrays(
+            Array::from_slice(&vec![0.5f32; 2 * 8 * 4], &[1, 2, seq_len, 4]),
+            Array::from_slice(&vec![0.25f32; 2 * 8 * 4], &[1, 2, seq_len, 4]),
+        )
+        .unwrap();
+        let arrays = ArraysCache {
+            conv_state: Some(Array::from_slice(
+                &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+                &[1, 8],
+            )),
+            ssm_state: Some(Array::from_slice(&[9.0f32, 10.0, 11.0, 12.0], &[1, 4])),
+            conv_pos: 3,
+            offset: seq_len,
+        };
+        let cache = AnyCache::Hybrid(vec![
+            Some(LayerCache::KV(kv)),
+            Some(LayerCache::Arrays(arrays)),
+        ]);
+
+        let (layers, recurrent) = snapshot_layers(&cache, &header, 8, 8).expect("snapshot");
+        assert_eq!(layers.len(), 2);
+        assert_eq!(recurrent.len(), 1, "one recurrent layer captured");
+        assert_eq!(recurrent[0].layer_index, 1);
+        assert_eq!(recurrent[0].conv_pos, 3);
+        assert_eq!(recurrent[0].offset, 8);
+
+        let restored = materialize_snapshot(
+            &DiskCacheSnapshot {
+                token_count: 8,
+                token_hash: 0,
+                layers,
+                recurrent,
+            },
+            &header,
+        )
+        .expect("materialize");
+        let AnyCache::Hybrid(restored_layers) = restored else {
+            panic!("hybrid snapshot must materialize as hybrid");
+        };
+        assert_eq!(restored_layers.len(), 2);
+
+        // Attention layer: same shape, same values.
+        let Some(LayerCache::KV(kv_restored)) = &restored_layers[0] else {
+            panic!("layer 0 must be KV");
+        };
+        let keys = kv_restored.keys().unwrap();
+        assert_eq!(keys.shape(), &[1, 2, seq_len, 4]);
+
+        // Recurrent layer: conv/ssm states and positions preserved.
+        let Some(LayerCache::Arrays(arrays_restored)) = &restored_layers[1] else {
+            panic!("layer 1 must be Arrays");
+        };
+        let conv = arrays_restored.conv_state.as_ref().unwrap();
+        let conv_f32: Vec<f32> = conv.as_slice::<f16>().iter().map(|v| v.to_f32()).collect();
+        assert_eq!(conv_f32, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let ssm = arrays_restored.ssm_state.as_ref().unwrap();
+        let ssm_f32: Vec<f32> = ssm.as_slice::<f16>().iter().map(|v| v.to_f32()).collect();
+        assert_eq!(ssm_f32, vec![9.0, 10.0, 11.0, 12.0]);
+        assert_eq!(arrays_restored.conv_pos, 3);
+        assert_eq!(arrays_restored.offset, 8);
+    }
+
+    #[test]
+    fn non_block_aligned_hybrid_prompt_is_rejected() {
+        let header = DiskCacheFileHeader {
+            block_size: 8,
+            num_blocks: 4,
+            num_kv_heads: 2,
+            head_dim: 4,
+        };
+        let arrays = ArraysCache {
+            conv_state: Some(Array::from_slice(&[1.0f32; 4], &[1, 4])),
+            ssm_state: None,
+            conv_pos: 1,
+            offset: 9,
+        };
+        let kv = SteppingKeyValueCache::from_arrays(
+            Array::from_slice(&vec![0.5f32; 2 * 9 * 4], &[1, 2, 9, 4]),
+            Array::from_slice(&vec![0.25f32; 2 * 9 * 4], &[1, 2, 9, 4]),
+        )
+        .unwrap();
+        let cache = AnyCache::Hybrid(vec![
+            Some(LayerCache::KV(kv)),
+            Some(LayerCache::Arrays(arrays)),
+        ]);
+        // 9 tokens are not aligned to the 8-token block: the cumulative
+        // recurrent state cannot be truncated, so the snapshot must refuse.
+        let result = snapshot_layers(&cache, &header, 8, 9);
+        assert!(matches!(
+            result,
+            Err(DiskCacheError::Unsupported(reason)) if reason.contains("block-aligned")
+        ));
     }
 }

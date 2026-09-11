@@ -11,7 +11,7 @@ use memmap2::{Mmap, MmapOptions};
 
 const FILE_MAGIC: [u8; 8] = *b"HIGGSKV\0";
 const ENTRY_MAGIC: [u8; 4] = *b"BLK1";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const FILE_HEADER_LEN: usize = 32;
 const ENTRY_HEADER_LEN: usize = 44;
 
@@ -48,6 +48,20 @@ pub struct DiskCacheSnapshot {
     pub token_count: usize,
     pub token_hash: u64,
     pub layers: Vec<DiskCacheLayer>,
+    /// Recurrent (GDN) fixed-size states for hybrid caches, valid exactly for
+    /// `token_count` tokens. Empty for pure-KV snapshots (format v1 files).
+    pub recurrent: Vec<RecurrentStateSnapshot>,
+}
+
+/// One recurrent layer's fixed-size state, checkpointed whole (it is not
+/// block-structured). Valid exactly for the entry's token prefix.
+#[derive(Debug, Clone)]
+pub struct RecurrentStateSnapshot {
+    pub layer_index: usize,
+    pub conv: Option<Vec<f16>>,
+    pub ssm: Option<Vec<f16>>,
+    pub conv_pos: i32,
+    pub offset: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +99,7 @@ struct EntryHeader {
 pub struct DiskStorage {
     file: File,
     header: DiskCacheFileHeader,
+    format_version: u32,
     index: HashMap<u64, EntryIndex>,
 }
 
@@ -120,13 +135,14 @@ impl DiskStorage {
         }
 
         let map = map_file(&file)?;
-        let found_header = read_file_header(&map)?;
+        let (format_version, found_header) = read_file_header(&map)?;
         validate_header(&expected_header, &found_header)?;
         let index = scan_index(&map);
 
         Ok(Self {
             file,
             header: found_header,
+            format_version,
             index,
         })
     }
@@ -145,6 +161,7 @@ impl DiskStorage {
         token_hash: u64,
         token_count: usize,
         layers: &[DiskCacheLayer],
+        recurrent: &[RecurrentStateSnapshot],
     ) -> Result<(), DiskCacheError> {
         if token_count == 0 {
             return Err(DiskCacheError::Format(
@@ -186,6 +203,33 @@ impl DiskStorage {
                 push_f16_slice(&mut payload, &block.k);
                 push_f16_slice(&mut payload, &block.v);
             }
+        }
+
+        // Recurrent-state section (format v2): count-prefixed fixed-size
+        // states, written after the KV layer blocks.
+        payload.extend_from_slice(&u32_from_usize(recurrent.len(), "recurrent len")?.to_le_bytes());
+        for state in recurrent {
+            payload.extend_from_slice(
+                &u32_from_usize(state.layer_index, "layer_index")?.to_le_bytes(),
+            );
+            match &state.conv {
+                Some(conv) => {
+                    payload
+                        .extend_from_slice(&u32_from_usize(conv.len(), "conv len")?.to_le_bytes());
+                    push_f16_slice(&mut payload, conv);
+                }
+                None => payload.extend_from_slice(&0u32.to_le_bytes()),
+            }
+            match &state.ssm {
+                Some(ssm) => {
+                    payload
+                        .extend_from_slice(&u32_from_usize(ssm.len(), "ssm len")?.to_le_bytes());
+                    push_f16_slice(&mut payload, ssm);
+                }
+                None => payload.extend_from_slice(&0u32.to_le_bytes()),
+            }
+            payload.extend_from_slice(&state.conv_pos.to_le_bytes());
+            payload.extend_from_slice(&state.offset.to_le_bytes());
         }
 
         let append_offset = usize::try_from(self.file.metadata()?.len())
@@ -234,11 +278,18 @@ impl DiskStorage {
         let payload = map
             .get(payload_start..payload_end)
             .ok_or_else(|| DiskCacheError::Format("entry payload is truncated".to_owned()))?;
-        let layers = read_layers(payload, &self.header, &entry_header)?;
+        let mut cursor = 0usize;
+        let layers = read_layers(payload, &self.header, &entry_header, &mut cursor)?;
+        let recurrent = if self.format_version >= 2 {
+            read_recurrent_states(payload, &mut cursor)?
+        } else {
+            Vec::new()
+        };
         Ok(Some(DiskCacheSnapshot {
             token_count: entry_header.token_count,
             token_hash: entry_header.token_hash,
             layers,
+            recurrent,
         }))
     }
 
@@ -251,6 +302,41 @@ impl DiskStorage {
     }
 }
 
+/// Parse the format-v2 recurrent-state section that follows the KV layer
+/// blocks in an entry payload.
+fn read_recurrent_states(
+    payload: &[u8],
+    cursor: &mut usize,
+) -> Result<Vec<RecurrentStateSnapshot>, DiskCacheError> {
+    if *cursor >= payload.len() {
+        return Ok(Vec::new());
+    }
+    let count = usize_from_u32(u32::from_le_bytes(take_array::<4>(payload, cursor)?))?;
+    let mut states = Vec::with_capacity(count);
+    for _ in 0..count {
+        let layer_index =
+            usize_from_u32(u32::from_le_bytes(take_array::<4>(payload, cursor)?))?;
+        let conv_len = usize_from_u32(u32::from_le_bytes(take_array::<4>(payload, cursor)?))?;
+        let conv = (conv_len > 0)
+            .then(|| take_f16_vec(payload, cursor, conv_len))
+            .transpose()?;
+        let ssm_len = usize_from_u32(u32::from_le_bytes(take_array::<4>(payload, cursor)?))?;
+        let ssm = (ssm_len > 0)
+            .then(|| take_f16_vec(payload, cursor, ssm_len))
+            .transpose()?;
+        let conv_pos = i32::from_le_bytes(take_array::<4>(payload, cursor)?);
+        let offset = i32::from_le_bytes(take_array::<4>(payload, cursor)?);
+        states.push(RecurrentStateSnapshot {
+            layer_index,
+            conv,
+            ssm,
+            conv_pos,
+            offset,
+        });
+    }
+    Ok(states)
+}
+
 fn write_file_header(file: &mut File, header: &DiskCacheFileHeader) -> Result<(), DiskCacheError> {
     file.write_all(&FILE_MAGIC)?;
     file.write_all(&VERSION.to_le_bytes())?;
@@ -261,7 +347,7 @@ fn write_file_header(file: &mut File, header: &DiskCacheFileHeader) -> Result<()
     Ok(())
 }
 
-fn read_file_header(bytes: &[u8]) -> Result<DiskCacheFileHeader, DiskCacheError> {
+fn read_file_header(bytes: &[u8]) -> Result<(u32, DiskCacheFileHeader), DiskCacheError> {
     let mut cursor = 0;
     let magic = take_array::<8>(bytes, &mut cursor)?;
     if magic != FILE_MAGIC {
@@ -270,7 +356,7 @@ fn read_file_header(bytes: &[u8]) -> Result<DiskCacheFileHeader, DiskCacheError>
         ));
     }
     let version = u32::from_le_bytes(take_array::<4>(bytes, &mut cursor)?);
-    if version != VERSION {
+    if version > VERSION {
         return Err(DiskCacheError::Format(format!(
             "unsupported disk cache version {version}"
         )));
@@ -279,12 +365,15 @@ fn read_file_header(bytes: &[u8]) -> Result<DiskCacheFileHeader, DiskCacheError>
     let num_blocks = usize_from_u64(u64::from_le_bytes(take_array::<8>(bytes, &mut cursor)?))?;
     let num_kv_heads = usize_from_u32(u32::from_le_bytes(take_array::<4>(bytes, &mut cursor)?))?;
     let head_dim = usize_from_u32(u32::from_le_bytes(take_array::<4>(bytes, &mut cursor)?))?;
-    Ok(DiskCacheFileHeader {
-        block_size,
-        num_blocks,
-        num_kv_heads,
-        head_dim,
-    })
+    Ok((
+        version,
+        DiskCacheFileHeader {
+            block_size,
+            num_blocks,
+            num_kv_heads,
+            head_dim,
+        },
+    ))
 }
 
 fn validate_header(
@@ -366,16 +455,16 @@ fn read_layers(
     payload: &[u8],
     file_header: &DiskCacheFileHeader,
     entry_header: &EntryHeader,
+    cursor: &mut usize,
 ) -> Result<Vec<DiskCacheLayer>, DiskCacheError> {
     let block_elems = file_header
         .block_size
         .checked_mul(file_header.num_kv_heads)
         .and_then(|value| value.checked_mul(file_header.head_dim))
         .ok_or(DiskCacheError::Overflow("block elements"))?;
-    let mut cursor = 0;
     let mut layers = Vec::with_capacity(entry_header.layer_count);
     for _ in 0..entry_header.layer_count {
-        let kind = u8::from_le_bytes(take_array::<1>(payload, &mut cursor)?);
+        let kind = u8::from_le_bytes(take_array::<1>(payload, cursor)?);
         if kind == 0 {
             layers.push(DiskCacheLayer { blocks: Vec::new() });
             continue;
@@ -385,17 +474,14 @@ fn read_layers(
         }
         let mut blocks = Vec::with_capacity(entry_header.block_count);
         for _ in 0..entry_header.block_count {
-            let k = take_f16_vec(payload, &mut cursor, block_elems)?;
-            let v = take_f16_vec(payload, &mut cursor, block_elems)?;
+            let k = take_f16_vec(payload, cursor, block_elems)?;
+            let v = take_f16_vec(payload, cursor, block_elems)?;
             blocks.push(DiskCacheBlock { k, v });
         }
         layers.push(DiskCacheLayer { blocks });
     }
-    if cursor != payload.len() {
-        return Err(DiskCacheError::Format(
-            "entry payload has trailing bytes".to_owned(),
-        ));
-    }
+    // Trailing bytes are allowed: format v2 entries carry the recurrent-state
+    // section after the KV layer blocks (parsed by read_recurrent_states).
     Ok(layers)
 }
 
@@ -483,7 +569,7 @@ mod tests {
             blocks: vec![block.clone(), block],
         }];
 
-        storage.save_blocks(7, 99, 4, &layers).unwrap();
+        storage.save_blocks(7, 99, 4, &layers, &[]).unwrap();
         drop(storage);
 
         let reopened_storage = DiskStorage::open(&path, 2, 16, 2, 2).unwrap();
@@ -515,8 +601,8 @@ mod tests {
             }],
         }];
 
-        storage.save_blocks(7, 1, 2, &first).unwrap();
-        storage.save_blocks(7, 2, 2, &second).unwrap();
+        storage.save_blocks(7, 1, 2, &first, &[]).unwrap();
+        storage.save_blocks(7, 2, 2, &second, &[]).unwrap();
 
         let snapshot = storage.load_blocks(7).unwrap().unwrap();
         assert_eq!(snapshot.token_hash, 2);
