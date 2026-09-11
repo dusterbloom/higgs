@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::path::Path;
 
 use half::f16;
@@ -129,10 +129,29 @@ impl DiskStorage {
             head_dim,
         };
 
-        if file.metadata()?.len() == 0 {
+        // A file from an older format cannot be appended to: v2 entries carry
+        // the recurrent-state section, and a v1-versioned file would be read
+        // back without it — materializing hybrid caches as the wrong variant
+        // (observed as "Model/cache type mismatch"). Recreate stale files;
+        // losing old warm snapshots costs one cold prefill.
+        let mut file = if file.metadata()?.len() == 0 {
             write_file_header(&mut file, &expected_header)?;
             file.flush()?;
-        }
+            file
+        } else {
+            let map = map_file(&file)?;
+            let found_version = read_file_version(&map)?;
+            drop(map);
+            if found_version != VERSION {
+                file.set_len(0)?;
+                file.seek(std::io::SeekFrom::Start(0))?;
+                write_file_header(&mut file, &expected_header)?;
+                file.flush()?;
+                file
+            } else {
+                file
+            }
+        };
 
         let map = map_file(&file)?;
         let (format_version, found_header) = read_file_header(&map)?;
@@ -347,6 +366,16 @@ fn write_file_header(file: &mut File, header: &DiskCacheFileHeader) -> Result<()
     Ok(())
 }
 
+/// Read only the format version from a file's header.
+fn read_file_version(bytes: &[u8]) -> Result<u32, DiskCacheError> {
+    let mut cursor = 0;
+    let magic = take_array::<8>(bytes, &mut cursor)?;
+    if magic != FILE_MAGIC {
+        return Err(DiskCacheError::Format("invalid disk cache magic".to_owned()));
+    }
+    Ok(u32::from_le_bytes(take_array::<4>(bytes, &mut cursor)?))
+}
+
 fn read_file_header(bytes: &[u8]) -> Result<(u32, DiskCacheFileHeader), DiskCacheError> {
     let mut cursor = 0;
     let magic = take_array::<8>(bytes, &mut cursor)?;
@@ -554,6 +583,59 @@ fn usize_from_u64(value: u64) -> Result<usize, DiskCacheError> {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_v1_file_is_recreated_not_appended() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.bin");
+
+        // Hand-write a v1 file header (wrong version, same geometry).
+        {
+            use std::io::Write as _;
+            let mut f = File::create(&path).unwrap();
+            f.write_all(&FILE_MAGIC[..]).unwrap();
+            f.write_all(&1u32.to_le_bytes()).unwrap();
+            f.write_all(&8usize.to_le_bytes()).unwrap(); // block_size
+            f.write_all(&4u64.to_le_bytes()).unwrap(); // num_blocks
+            f.write_all(&2u32.to_le_bytes()).unwrap(); // num_kv_heads
+            f.write_all(&4u32.to_le_bytes()).unwrap(); // head_dim
+        }
+
+        let mut storage = DiskStorage::open(
+            &path,
+            8,
+            4,
+            2,
+            4,
+        )
+        .unwrap();
+        assert!(
+            storage.snapshot_metadata(1234).is_none(),
+            "stale file entries must be dropped"
+        );
+
+        // A v2 entry with a recurrent state must survive save+load in the
+        // recreated (v2) file.
+        let recurrent = vec![RecurrentStateSnapshot {
+            layer_index: 1,
+            conv: Some(vec![f16::from_f32(1.0)]),
+            ssm: None,
+            conv_pos: 3,
+            offset: 8,
+        }];
+        let layers = vec![DiskCacheLayer { blocks: Vec::new() }, DiskCacheLayer {
+            blocks: vec![DiskCacheBlock {
+                k: vec![f16::from_f32(0.5); 64],
+                v: vec![f16::from_f32(0.25); 64],
+            }],
+        }];
+        storage.save_blocks(9, 1234, 8, &layers, &recurrent).unwrap();
+        let snapshot = storage.load_blocks(9).unwrap().unwrap();
+        assert_eq!(snapshot.recurrent.len(), 1);
+        assert_eq!(snapshot.recurrent[0].layer_index, 1);
+        assert_eq!(snapshot.recurrent[0].conv.as_ref().unwrap()[0], f16::from_f32(1.0));
+        assert!(snapshot.recurrent[0].ssm.is_none());
+    }
 
     #[test]
     fn save_and_load_blocks_roundtrips() {
