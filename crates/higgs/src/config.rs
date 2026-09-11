@@ -776,6 +776,13 @@ impl ModelConfig {
             return;
         }
         self.kv_cache = KvCacheMode::Turboquant;
+        // Quantize-on-retain must actually fire: the default activation
+        // boundary (100k tokens) sits above every practical session, which
+        // would keep retained KV dense and void the memory win. Lower it to
+        // zero unless the operator tuned it via env.
+        if env("HIGGS_TURBOQUANT_MIN_TOKENS").is_none() {
+            higgs_models::set_turboquant_activation_threshold(0);
+        }
         if let Some(bits_raw) = bits_raw.as_deref() {
             match bits_raw.trim().parse::<u8>() {
                 Ok(bits) if (1..=4).contains(&bits) => self.kv_bits = bits,

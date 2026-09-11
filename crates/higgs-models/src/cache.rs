@@ -30,6 +30,19 @@ pub enum KvCacheView {
 }
 
 static TURBOQUANT_ACTIVATE_AT: OnceLock<i32> = OnceLock::new();
+/// Explicit override set by the embedding server (e.g. the
+/// `HIGGS_KV_TURBO` config gate): takes precedence over the env default so
+/// enabling TurboQuant does not also require tuning the activation env var.
+/// `i32::MIN` means "no override".
+static TURBOQUANT_ACTIVATE_AT_OVERRIDE: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(i32::MIN);
+
+/// Override the token boundary at which TurboQuant activates, bypassing the
+/// env-derived default. Call once at startup, before caches exist.
+pub fn set_turboquant_activation_threshold(tokens: i32) {
+    TURBOQUANT_ACTIVATE_AT_OVERRIDE
+        .store(tokens, std::sync::atomic::Ordering::Relaxed);
+}
 static TURBOQUANT_INACTIVE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// KV token count at which TurboQuant quantization activates for decode.
@@ -107,6 +120,10 @@ fn parse_turboquant_activate_at(raw: Option<&str>) -> i32 {
 }
 
 fn turboquant_activate_at() -> i32 {
+    let override_at = TURBOQUANT_ACTIVATE_AT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if override_at != i32::MIN {
+        return override_at;
+    }
     *TURBOQUANT_ACTIVATE_AT.get_or_init(|| {
         let raw = std::env::var("HIGGS_TURBOQUANT_MIN_TOKENS")
             .ok()

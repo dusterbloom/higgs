@@ -62,6 +62,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::error::ModelError;
+pub use crate::cache::set_turboquant_activation_threshold;
 use crate::turboquant::KvCacheConfig;
 use crate::vision::{ImageBatch, VisionCapabilities, VisionModel};
 
