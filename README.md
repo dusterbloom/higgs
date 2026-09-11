@@ -1,8 +1,10 @@
 # Higgs nightly
 
-A Rust inference server for local MLX models on Apple Silicon and routed remote providers.
+Get more useful work from Escha on your MacBook—with inference built around Apple Silicon.
 
 ## TL;DR
+
+Our ambition: the best Escha inference engine on this hardware, paired with nanobot for capable local agents. Native kernels, caching, and measured capacity target speed that survives real sessions. Matched competitor evaluations must establish the claim.
 
 This is the development branch of [dusterbloom/higgs](https://github.com/dusterbloom/higgs), a fork of [panbanda/higgs](https://github.com/panbanda/higgs). Build nightly from source; upstream packages may not include its changes. Higgs serves models and manages inference resources; clients such as nanobot own agent workflows.
 

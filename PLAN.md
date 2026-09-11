@@ -307,3 +307,51 @@ decode slot assignment all transfer.
 - All HuggingFace GGUF models served natively with the full higgs agent stack
 - nanobot's session management, tool guard, continuity, and memory system
   working with ANY open-source model, not just trellis-quantized ones
+
+---
+
+# Metal 27 TensorOps fused attention (2026-09-10, M4 base, macOS 27)
+
+## De-risk results (all measured, not assumed)
+
+- `coreai-build 3600.79.1` PRESENT (`MetalToolchain/mounts/.../usr/bin`).
+  `xcodebuild -showComponent MetalToolchain` → `Status: installed`. The
+  "missing Metal Toolchain" note is stale; no install needed.
+- TensorOps compiles+runs through the existing `mlx_fast_metal_kernel` path:
+  MLX pins `LanguageVersion4_0` on macOS 26+ (`device.cpp`), and
+  `#include <metal_tensor>` +
+  `#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>` resolve
+  at runtime. No MLX fork, no toolchain change.
+- `tensor_inline` from raw `device half*` + `.slice()` + `matmul2d` (64x32x128,
+  fp16->fp32) is BIT-EXACT vs MLX matmul (probe:
+  `crates/higgs-models/examples/tensorops_matmul_probe.rs`).
+- Gotcha that cost an hour: MLX `set_grid` is TOTAL threads
+  (`dispatch_threads`), not threadgroups. Single-tile 64x32 kernel =
+  `set_grid(128,1,1)` + `set_thread_group(128,1,1)`.
+- `mpp::tensor_ops` (not `metal::`) holds `matmul2d`; `metal::tensor_inline`
+  holds the tensor types. Metal tensor coords are transposed vs row-major
+  (extent(0) = contiguous dim).
+
+## Ceiling (probe: `crates/higgs-models/examples/sdpa_ceiling.rs`)
+
+MLX SDPA has NO fused path for Escha shapes (fused `sdpa_full` supports
+head_dim ∈ {64,80,128}; Escha uses 256 f32) — every prefill layer call
+materializes full `[16,L,S]` fp32 scores:
+
+| L=S  | SDPA/layer | x10 layers | transient scores/layer |
+|------|------------|------------|------------------------|
+| 2048 | 54 ms      | 0.5 s      | 0.27 GB                |
+| 8192 | 1403 ms    | 14 s       | 4.29 GB                |
+
+Scaling is worse than quadratic (26x per 4x length: allocation churn).
+Share of chunked-prefill e2e is small at 2K (~2%) but dominates at 16K+
+(est. 15-40%). A fused kernel's e2e value is long-context prefill.
+
+## Next: fused FlashAttention at `qwen3_next.rs:4773`
+
+WWDC330 recipe per (kv-head, q-tile): QK `matmul2d` → coop tensor →
+`reduce_rows` max/sum → in-place softmax via `map_iterator` → SV `matmul2d`
+with `is_compatible_as_left_input` / `get_left_input_cooperative_tensor`
+(Metal 27 direct reuse; threadgroup store/reload fallback). GQA 16q/2kv,
+D=256 f32, causal+array masks, online softmax over S-blocks. Gate on shape
+with fallback to current SDPA call.
