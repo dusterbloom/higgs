@@ -85,6 +85,7 @@ pub fn build_router(
         .route("/v1/capacity", get(routes::capacity::capacity))
         .route("/v1/models/{name}", delete(routes::models::unload_model))
         .route("/v1/chat/completions", post(routes::chat::chat_completions))
+        .route("/v1/sessions/drop", post(routes::chat::drop_sessions))
         .route("/v1/completions", post(routes::completions::completions))
         .route("/v1/embeddings", post(routes::embeddings::embeddings))
         .route("/v1/messages", post(routes::anthropic::create_message))

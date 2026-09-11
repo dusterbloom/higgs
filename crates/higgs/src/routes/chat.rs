@@ -1983,6 +1983,48 @@ fn retained_session_drop_ids(session_id: Option<u64>, session_ids: Option<&[u64]
     ids
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct DropSessionsRequest {
+    pub model: String,
+    #[serde(default)]
+    pub session_ids: Vec<u64>,
+    pub session_id: Option<u64>,
+}
+
+/// Eager retained-session drop. Lets a client free a rotated session's
+/// resident KV immediately — before the next (smaller) prompt prefills —
+/// instead of piggybacking the drop on that request. Sessions still in
+/// flight report `dropped: false` and remain covered by the piggyback path.
+pub async fn drop_sessions(
+    State(state): State<SharedState>,
+    Json(req): Json<DropSessionsRequest>,
+) -> Result<Json<serde_json::Value>, ServerError> {
+    let ids = retained_session_drop_ids(req.session_id, Some(&req.session_ids));
+    if ids.is_empty() {
+        return Err(ServerError::BadRequest(
+            "no session ids provided".to_owned(),
+        ));
+    }
+    let resolved = state
+        .router
+        .resolve(&req.model, None)
+        .await
+        .map_err(ServerError::ModelNotFound)?;
+    let ResolvedRoute::Higgs { engine, .. } = resolved else {
+        return Err(ServerError::BadRequest(
+            "session drop requires a higgs-routed model".to_owned(),
+        ));
+    };
+    let mut dropped = Vec::with_capacity(ids.len());
+    for session_id in ids {
+        dropped.push(serde_json::json!({
+            "session_id": session_id,
+            "dropped": engine.drop_retained_session(session_id),
+        }));
+    }
+    Ok(Json(serde_json::json!({ "dropped": dropped })))
+}
+
 fn current_unix_timestamp() -> i64 {
     chrono::Utc::now().timestamp()
 }
