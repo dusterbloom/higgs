@@ -3814,4 +3814,79 @@ mod tests {
         );
         assert_eq!(state.capacity.active_reservation_count(model), 0);
     }
+    #[tokio::test]
+    async fn drop_sessions_route_reports_per_id_dropped_flags() {
+        let engine_name = "drop-target";
+        let engine = Arc::new(Engine::test_stub(engine_name));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[provider.stub]\nurl = \"http://127.0.0.1:1\"\n").unwrap();
+        let config = crate::config::load_config_file(&path, None).unwrap();
+        let router = crate::router::Router::from_config(
+            &config,
+            std::collections::HashMap::from([(
+                engine_name.to_owned(),
+                std::sync::Arc::clone(&engine),
+            )]),
+        )
+        .unwrap();
+        let state = Arc::new(crate::state::AppState::new(
+            router,
+            config,
+            reqwest::Client::new(),
+            None,
+        ));
+        let app = axum::Router::new()
+            .route("/v1/sessions/drop", axum::routing::post(drop_sessions))
+            .with_state(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/drop")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "model": engine_name,
+                            "session_ids": [7, 9],
+                            "session_id": 5,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(
+            &response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        let dropped = json["dropped"].as_array().unwrap();
+        assert_eq!(dropped.len(), 3, "ids dedup + sort: 5, 7, 9");
+        assert_eq!(dropped[0]["session_id"], 5);
+        assert_eq!(dropped[1]["session_id"], 7);
+        assert_eq!(dropped[2]["session_id"], 9);
+        for entry in dropped {
+            assert_eq!(entry["dropped"], false, "stub engine retains nothing");
+        }
+
+        // Empty id list is a 400.
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/drop")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "model": engine_name }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
 }
