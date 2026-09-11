@@ -134,7 +134,7 @@ impl DiskStorage {
         // back without it — materializing hybrid caches as the wrong variant
         // (observed as "Model/cache type mismatch"). Recreate stale files;
         // losing old warm snapshots costs one cold prefill.
-        let mut file = if file.metadata()?.len() == 0 {
+        let file = if file.metadata()?.len() == 0 {
             write_file_header(&mut file, &expected_header)?;
             file.flush()?;
             file
