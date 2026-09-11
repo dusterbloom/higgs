@@ -177,6 +177,10 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
     } else {
         config::build_simple_config(args)?
     };
+    for model_cfg in &mut higgs_config.models {
+        model_cfg.apply_kv_turbo_env_overrides(&|key| std::env::var(key).ok());
+    }
+
 
     // Rewrite metrics path for profile isolation if still at default
     if let Some(name) = profile {

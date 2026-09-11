@@ -263,7 +263,10 @@ pub async fn load_model(
     // The weight load is blocking and GPU-bound; keep it off the async runtime.
     let config = state.config.clone();
     let capacity = Arc::clone(&state.capacity);
-    let cfg = model_cfg.clone();
+    let mut cfg = model_cfg.clone();
+    // Honor the HIGGS_KV_TURBO[BITS] env gate on runtime model loads too, so
+    // a model loaded after boot matches the boot-time engines' KV storage.
+    cfg.apply_kv_turbo_env_overrides(&|key| std::env::var(key).ok());
     let load_capacity = Arc::clone(&capacity);
     let (name, engine, facts) = RuntimeLoadGuard::spawn(load_capacity, move || {
         build_engine_with_capacity(&resolved, &cfg, &config, &capacity)

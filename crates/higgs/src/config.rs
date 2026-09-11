@@ -759,6 +759,34 @@ const fn default_kv_disk_space_mb() -> u64 {
 }
 
 impl ModelConfig {
+    /// Apply the `HIGGS_KV_TURBO` / `HIGGS_KV_TURBO_BITS` env overrides.
+    ///
+    /// `HIGGS_KV_TURBO=1` (or any of 1/true/yes/on) switches the retained-KV
+    /// storage to `TurboQuant` — quantized-on-retain, so the *live* generation
+    /// cache stays dense and only the retained between-turns copy compresses.
+    /// `HIGGS_KV_TURBO_BITS=1..4` overrides the bit width (TurboQuant codes are
+    /// capped at 4 bits; 8-bit storage is not a TurboQuant width). Invalid
+    /// values are warned about and ignored, never fatal.
+    pub fn apply_kv_turbo_env_overrides(&mut self, env: &dyn Fn(&str) -> Option<String>) {
+        let bits_raw = env("HIGGS_KV_TURBO_BITS");
+        let enabled = env("HIGGS_KV_TURBO").is_some_and(|v| {
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        }) || bits_raw.is_some();
+        if !enabled {
+            return;
+        }
+        self.kv_cache = KvCacheMode::Turboquant;
+        if let Some(bits_raw) = bits_raw.as_deref() {
+            match bits_raw.trim().parse::<u8>() {
+                Ok(bits) if (1..=4).contains(&bits) => self.kv_bits = bits,
+                _ => tracing::warn!(
+                    value = %bits_raw,
+                    "HIGGS_KV_TURBO_BITS must be 1-4; keeping configured kv_bits"
+                ),
+            }
+        }
+    }
+
     /// Validate disk-prefix-store settings independently of engine startup.
     pub fn validate_disk_prefix_store(&self) -> Result<(), String> {
         let Some(dir) = self.kv_disk_dir.as_deref() else {
@@ -2897,5 +2925,70 @@ mod tests {
         assert_ne!(default, profiled);
         assert!(default.to_str().unwrap().contains("higgs.log"));
         assert!(profiled.to_str().unwrap().contains("higgs.dev.log"));
+    }
+}
+
+#[cfg(test)]
+mod kv_turbo_env_tests {
+    use super::*;
+
+    fn env_map(pairs: &[(&str, String)]) -> impl Fn(&str) -> Option<String> {
+        // Owned copy: no borrow of `pairs` escapes.
+        let owned: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect();
+        move |key: &str| owned.get(key).cloned()
+    }
+
+
+    fn turbo_model() -> ModelConfig {
+        ModelConfig {
+            path: "m".to_owned(),
+            kv_cache: KvCacheMode::Off,
+            kv_bits: 3,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn turbo_flag_switches_mode_and_keeps_configured_bits() {
+        let mut model = turbo_model();
+        model.apply_kv_turbo_env_overrides(&env_map(&[(
+            "HIGGS_KV_TURBO",
+            "1".to_owned(),
+        )]));
+        assert!(matches!(model.kv_cache, KvCacheMode::Turboquant));
+        assert_eq!(model.kv_bits, 3, "bits stay at the configured default");
+    }
+
+    #[test]
+    fn turbo_bits_override_sets_width_and_enables_mode() {
+        let mut model = turbo_model();
+        model.apply_kv_turbo_env_overrides(&env_map(&[(
+            "HIGGS_KV_TURBO_BITS",
+            "4".to_owned(),
+        )]));
+        assert!(matches!(model.kv_cache, KvCacheMode::Turboquant));
+        assert_eq!(model.kv_bits, 4);
+    }
+
+    #[test]
+    fn invalid_bits_are_warned_and_ignored_but_still_enable_turbo() {
+        let mut model = turbo_model();
+        model.apply_kv_turbo_env_overrides(&env_map(&[
+            ("HIGGS_KV_TURBO", "1".to_owned()),
+            ("HIGGS_KV_TURBO_BITS", "8".to_owned()),
+        ]));
+        assert!(matches!(model.kv_cache, KvCacheMode::Turboquant));
+        assert_eq!(model.kv_bits, 3, "unsupported 8-bit width falls back to configured bits");
+    }
+
+    #[test]
+    fn no_env_leaves_config_untouched() {
+        let mut model = turbo_model();
+        model.apply_kv_turbo_env_overrides(&env_map(&[]));
+        assert!(matches!(model.kv_cache, KvCacheMode::Off));
+        assert_eq!(model.kv_bits, 3);
     }
 }
