@@ -1066,9 +1066,6 @@ impl<C: Clock> CapacityController<C> {
             prior_total
         };
         self.decision = raw.bounded_by(recovery_ceiling);
-        if self.inputs.pressure == MemoryPressure::Critical {
-            self.decision.availability = CapacityAvailability::Unavailable;
-        }
     }
 
     #[must_use]
@@ -1084,6 +1081,20 @@ impl<C: Clock> CapacityController<C> {
             strongest_pressure_since_normal: initial_pressure,
         };
         controller.decision = controller.solve_static();
+        // A controller booting under pressure starts at the pressure-level
+        // envelope (Critical: 50%), not the full static solve — matching the
+        // downshift any later observation of the same level would apply.
+        // Available regardless: the show must go on.
+        if initial_pressure == MemoryPressure::Critical {
+            let recomputed = controller.decision;
+            let total = floor_1024(recomputed.safe_total_tokens / 2);
+            let output = recomputed.recommended_output_tokens.min(total);
+            controller.decision = controller.decision_for_total(
+                total,
+                recomputed.usable_bytes,
+                output,
+            );
+        }
         controller
     }
 
@@ -1108,7 +1119,10 @@ impl<C: Clock> CapacityController<C> {
         &mut self,
         observation: PressureObservation,
     ) -> CapacityDecision {
-        const SWAP_RECOVERY_MILLIS: u64 = 60_000;
+        // Five seconds: the sticky window now only holds a reduced envelope
+        // (no blackout, no cache loss), so a short brake suffices — swap-out
+        // bursts stay damped without pinning headroom for a minute.
+        const SWAP_RECOVERY_MILLIS: u64 = 5_000;
 
         let now = self.clock.now_millis();
         if observation.swap_out_delta > 0 {
@@ -1121,8 +1135,15 @@ impl<C: Clock> CapacityController<C> {
         if self.last_swap_out_millis.is_some() && !swap_is_sticky {
             self.last_swap_out_millis = None;
         }
-        let effective_pressure = if swap_is_sticky {
-            MemoryPressure::Critical
+        // Swap-out evidence reserves envelope headroom (Constrained) but must
+        // never black out admission, interrupt live requests, or zero cache
+        // allocations: a wired multi-GiB model makes system-wide swap-outs
+        // routine noise, and the Critical path evicts the hot session's KV
+        // (the registry zeroes caches only on Critical). Only an OS-level
+        // Critical verdict keeps Critical semantics.
+        let effective_pressure = if swap_is_sticky && observation.pressure == MemoryPressure::Normal
+        {
+            MemoryPressure::Constrained
         } else {
             // Global compression activity is not an OS pressure verdict. It
             // disqualifies clean learning below, but must not ratchet a healthy
@@ -1159,14 +1180,11 @@ impl<C: Clock> CapacityController<C> {
         } else {
             previous_total
         };
-        let mut transition = self.decision_for_total(
+        let transition = self.decision_for_total(
             transition_total,
             recomputed.usable_bytes,
             recomputed.recommended_output_tokens,
         );
-        if effective_pressure == MemoryPressure::Critical {
-            transition.availability = CapacityAvailability::Unavailable;
-        }
         self.decision = transition;
         self.decision
     }
@@ -1288,15 +1306,11 @@ impl<C: Clock> CapacityController<C> {
                     .unwrap_or(0)
             };
             let total = downshift.min(recomputed.safe_total_tokens);
-            let mut decision = self.decision_for_total(
+            self.decision_for_total(
                 total,
                 recomputed.usable_bytes,
                 recomputed.recommended_output_tokens,
-            );
-            if pressure == MemoryPressure::Critical {
-                decision.availability = CapacityAvailability::Unavailable;
-            }
-            decision
+            )
         } else {
             // Returning to normal ends the pressure episode. The fresh static
             // decision is already bounded by the current byte ledger and model
@@ -1499,6 +1513,15 @@ impl<C: Clock> CapacityController<C> {
             .collect();
         self.evidence = evidence;
         self.decision = self.solve_static();
+        // Booting under pressure starts at the pressure-level envelope
+        // (Critical: 50%), mirroring with_clock — a restored profile never
+        // outruns the pressure the controller is currently living under.
+        if self.inputs.pressure == MemoryPressure::Critical {
+            let recomputed = self.decision;
+            let total = floor_1024(recomputed.safe_total_tokens / 2);
+            let output = recomputed.recommended_output_tokens.min(total);
+            self.decision = self.decision_for_total(total, recomputed.usable_bytes, output);
+        }
         true
     }
 
@@ -1515,9 +1538,9 @@ impl<C: Clock> CapacityController<C> {
         suffix_tokens: u64,
         publication_worst_path: bool,
     ) -> CapacityDecision {
-        if self.inputs.pressure == MemoryPressure::Critical {
-            return unavailable_decision();
-        }
+        // No pressure short-circuit: solves always compute the largest total
+        // that actually fits the ledger. Under pressure that is a smaller but
+        // real envelope — never a 0/unavailable stop-the-world.
         self.solve_for_shape_at_current_limits(
             execution_path,
             output,
@@ -2210,7 +2233,7 @@ mod tests {
             critical.safe_total_tokens,
             floor_1024(before_critical * 50 / 100)
         );
-        assert_eq!(critical.availability, CapacityAvailability::Unavailable);
+        assert_eq!(critical.availability, CapacityAvailability::Available);
     }
 
     #[test]
@@ -2243,8 +2266,11 @@ mod tests {
                 swap_out_delta: 0,
                 compressor_delta: 0,
             });
-            assert_eq!(recovered.safe_total_tokens, 8_192);
+            // Critical-constructed controllers boot at the Critical-level
+            // envelope (half the static solve); a less-severe observation
+            // holds that envelope — bounded, Available, never a full reset.
             assert_eq!(recovered.availability, CapacityAvailability::Available);
+            assert_eq!(recovered.safe_total_tokens, full_static / 2);
             assert!(recovered.safe_total_tokens < full_static);
         }
     }
@@ -2639,13 +2665,15 @@ mod tests {
             .decision()
             .safe_total_tokens;
         let mut critical = CapacityController::new(inputs);
+        // Pressure downshifts the envelope; it never makes the model
+        // unavailable nor rejects admission (the show must go on).
         assert_eq!(
             critical.decision().availability,
-            CapacityAvailability::Unavailable
+            CapacityAvailability::Available
         );
         assert!(matches!(
             critical.admit(request(1024, 1024)),
-            Admission::Unavailable
+            Admission::Admitted(_)
         ));
         let recovered = critical.recompute_for_pressure(MemoryPressure::Normal, None);
         assert_eq!(recovered.availability, CapacityAvailability::Available);
@@ -2665,7 +2693,7 @@ mod tests {
         assert!(critical_restore.restore_profile(&profile, &key, 8 * GIB));
         assert_eq!(
             critical_restore.decision().availability,
-            CapacityAvailability::Unavailable
+            CapacityAvailability::Available
         );
         let restored_recovery =
             critical_restore.recompute_for_pressure(MemoryPressure::Normal, None);

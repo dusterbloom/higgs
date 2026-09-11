@@ -796,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn critical_observation_downshifts_once_and_rejects_new_admission() {
+    fn critical_observation_downshifts_once_but_keeps_admission() {
         let clock = TestClock::new();
         let mut controller = CapacityController::with_clock(controller_inputs(), clock);
         let initial = controller.decision().safe_total_tokens;
@@ -811,7 +811,8 @@ mod tests {
 
         assert_eq!(first.safe_total_tokens, floor_1024(initial * 50 / 100));
         assert_eq!(second, first);
-        assert_eq!(first.availability, CapacityAvailability::Unavailable);
+        // Pressure downshifts the envelope; it never rejects admission.
+        assert_eq!(first.availability, CapacityAvailability::Available);
     }
 
     #[test]
@@ -873,7 +874,7 @@ mod tests {
                 compressor_delta: 0,
             });
             assert_eq!(critical.safe_total_tokens, first_critical.safe_total_tokens);
-            assert_eq!(critical.availability, CapacityAvailability::Unavailable);
+            assert_eq!(critical.availability, CapacityAvailability::Available);
         }
     }
 
@@ -900,31 +901,39 @@ mod tests {
     }
 
     #[test]
-    fn swap_out_is_critical_until_sixty_clean_seconds() {
+    fn swap_out_constrains_until_five_clean_seconds() {
         let clock = TestClock::new();
         let mut controller = CapacityController::with_clock(controller_inputs(), clock.clone());
-        controller.apply_pressure_observation(PressureObservation {
+        let initial = controller.decision().safe_total_tokens;
+        let constrained = controller.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Normal,
             swap_out_delta: 1,
             compressor_delta: 0,
         });
-        assert_eq!(controller.pressure(), MemoryPressure::Critical);
+        assert_eq!(controller.pressure(), MemoryPressure::Constrained);
+        // Swap-outs must not black out admission or interrupt live requests.
+        assert_eq!(constrained.availability, CapacityAvailability::Available);
+        assert_eq!(
+            constrained.safe_total_tokens,
+            floor_1024(initial * 75 / 100)
+        );
 
-        clock.set_seconds(59);
+        clock.set_seconds(4);
         controller.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Normal,
             swap_out_delta: 0,
             compressor_delta: 0,
         });
-        assert_eq!(controller.pressure(), MemoryPressure::Critical);
+        assert_eq!(controller.pressure(), MemoryPressure::Constrained);
 
-        clock.set_seconds(60);
-        controller.apply_pressure_observation(PressureObservation {
+        clock.set_seconds(5);
+        let recovered = controller.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Normal,
             swap_out_delta: 0,
             compressor_delta: 0,
         });
         assert_eq!(controller.pressure(), MemoryPressure::Normal);
+        assert_eq!(recovered.availability, CapacityAvailability::Available);
     }
 
     #[test]
@@ -935,15 +944,15 @@ mod tests {
         let mut controller = CapacityController::with_clock(inputs, clock.clone());
         assert_eq!(controller.decision().safe_total_tokens, 49_152);
 
-        let critical = controller.apply_pressure_observation(PressureObservation {
+        let constrained = controller.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Normal,
             swap_out_delta: 1,
             compressor_delta: 0,
         });
-        assert_eq!(critical.availability, CapacityAvailability::Unavailable);
-        assert_eq!(critical.safe_total_tokens, 24_576);
+        assert_eq!(constrained.availability, CapacityAvailability::Available);
+        assert_eq!(constrained.safe_total_tokens, 36_864);
 
-        clock.set_seconds(60);
+        clock.set_seconds(5);
         let recovered = controller.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Normal,
             swap_out_delta: 0,
@@ -984,7 +993,7 @@ mod tests {
         );
         assert_eq!(controller.decision().safe_total_tokens, 0);
 
-        clock.set_seconds(59);
+        clock.set_seconds(4);
         controller.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Normal,
             swap_out_delta: 0,
@@ -992,7 +1001,7 @@ mod tests {
         });
         assert_eq!(controller.decision().safe_total_tokens, 0);
 
-        clock.set_seconds(60);
+        clock.set_seconds(5);
         let recovered = controller.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Normal,
             swap_out_delta: 0,
@@ -1008,25 +1017,25 @@ mod tests {
     fn elapsed_swap_timer_does_not_override_current_critical_pressure() {
         let clock = TestClock::new();
         let mut controller = CapacityController::with_clock(controller_inputs(), clock.clone());
-        let critical = controller.apply_pressure_observation(PressureObservation {
+        let constrained = controller.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Normal,
             swap_out_delta: 1,
             compressor_delta: 0,
         });
+        assert_eq!(constrained.availability, CapacityAvailability::Available);
 
-        clock.set_seconds(60);
-        let still_critical = controller.apply_pressure_observation(PressureObservation {
+        clock.set_seconds(5);
+        let critical = controller.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Critical,
             swap_out_delta: 0,
             compressor_delta: 0,
         });
 
+        // An OS-level Critical verdict downshifts the envelope further but
+        // still never stops the world.
         assert_eq!(controller.pressure(), MemoryPressure::Critical);
-        assert_eq!(still_critical, critical);
-        assert_eq!(
-            still_critical.availability,
-            CapacityAvailability::Unavailable
-        );
+        assert_ne!(critical, constrained);
+        assert_eq!(critical.availability, CapacityAvailability::Available);
     }
 
     #[test]
@@ -1048,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn new_swap_out_restarts_the_clean_minute_without_repeated_downshift() {
+    fn new_swap_out_restarts_the_clean_window_without_repeated_downshift() {
         let clock = TestClock::new();
         let mut controller = CapacityController::with_clock(controller_inputs(), clock.clone());
         controller.apply_pressure_observation(PressureObservation {
@@ -1058,7 +1067,7 @@ mod tests {
         });
         let first_downshift = controller.decision();
 
-        clock.set_seconds(30);
+        clock.set_seconds(2);
         let repeated = controller.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Normal,
             swap_out_delta: 2,
@@ -1066,15 +1075,15 @@ mod tests {
         });
         assert_eq!(repeated, first_downshift);
 
-        clock.set_seconds(89);
+        clock.set_seconds(6);
         controller.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Normal,
             swap_out_delta: 0,
             compressor_delta: 0,
         });
-        assert_eq!(controller.pressure(), MemoryPressure::Critical);
+        assert_eq!(controller.pressure(), MemoryPressure::Constrained);
 
-        clock.set_seconds(90);
+        clock.set_seconds(7);
         controller.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Normal,
             swap_out_delta: 0,
@@ -1445,10 +1454,10 @@ mod tests {
         wait_for_samples(&calls, 2).await;
 
         let controller = controller.lock().await;
-        assert_eq!(controller.pressure(), MemoryPressure::Critical);
+        assert_eq!(controller.pressure(), MemoryPressure::Constrained);
         assert_eq!(
             controller.decision().availability,
-            CapacityAvailability::Unavailable
+            CapacityAvailability::Available
         );
         drop(controller);
         handle.stop().await.unwrap();
@@ -1527,7 +1536,7 @@ mod tests {
 
         cadence.emit(ObserverEvent::Sample);
         wait_for_samples(&calls, 3).await;
-        assert_eq!(controller.lock().await.pressure(), MemoryPressure::Critical);
+        assert_eq!(controller.lock().await.pressure(), MemoryPressure::Constrained);
         handle.stop().await.unwrap();
     }
 

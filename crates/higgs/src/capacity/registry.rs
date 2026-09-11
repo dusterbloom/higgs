@@ -305,6 +305,9 @@ pub struct CapacityRegistry {
     profile_dir: Option<PathBuf>,
     state: Mutex<RegistryState>,
     reservation_changed: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(crate) test_memory_measurement:
+        Mutex<Option<Result<MlxMemorySnapshot, higgs_engine::MlxMemoryProbeError>>>,
 }
 
 #[derive(Debug)]
@@ -468,6 +471,8 @@ impl CapacityRegistry {
                 counters: CapacityCounters::default(),
             }),
             reservation_changed: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            test_memory_measurement: Mutex::new(None),
         })
     }
 
@@ -622,14 +627,26 @@ impl CapacityRegistry {
     /// Sample the live MLX allocator and publish it so admission decisions
     /// see fresh bytes, not the last observer's cached snapshot. Positive
     /// unaccounted MLX bytes left by prior work must be visible to an
-    /// otherwise-successful admission. Test builds skip sampling: they
-    /// publish deterministic memory explicitly via `refresh_memory`.
-    pub(crate) fn refresh_measured_memory(&self) {
-        if cfg!(test) {
-            return;
-        }
-        if let Ok(memory) = MlxMemorySnapshot::measure() {
-            self.refresh_memory(memory);
+    /// otherwise-successful admission. Returns false when measurement fails;
+    /// callers exposing an admission budget must not advertise stale headroom.
+    /// Tests retain explicit registry measurements unless a probe is injected.
+    pub(crate) fn refresh_measured_memory(&self) -> bool {
+        #[cfg(test)]
+        let measured = match *self.test_memory_measurement.lock().unwrap() {
+            Some(measured) => measured,
+            None => return true,
+        };
+        #[cfg(not(test))]
+        let measured = MlxMemorySnapshot::measure();
+        match measured {
+            Ok(memory) => {
+                self.refresh_memory(memory);
+                true
+            }
+            Err(error) => {
+                tracing::warn!(?error, "capacity allocator measurement failed");
+                false
+            }
         }
     }
 
@@ -1554,24 +1571,11 @@ impl CapacityRegistry {
         state.pressure = effective_pressure;
         state.counters.last_swap_out_delta = observation.swap_out_delta;
         state.counters.last_compressor_delta = observation.compressor_delta;
-        if effective_pressure == MemoryPressure::Critical {
-            // Interrupt every live reservation: each worker acknowledges at
-            // its next allocation boundary and surfaces the typed capacity
-            // interruption. Bytes are NOT released here — the worker-owned
-            // guard still drops only after allocation has stopped.
-            for reservation in state.active_reservations.values() {
-                let generation = state
-                    .models
-                    .get(&reservation.model)
-                    .map_or(0, |entry| entry.generation);
-                reservation
-                    .stop
-                    .stop(higgs_engine::stop::StopReason::CriticalPressure {
-                        boot_id: self.boot_id.clone(),
-                        generation,
-                    });
-            }
-        }
+        // The show must go on: pressure never stops the world. Live
+        // reservations keep their reserved bytes and run to completion;
+        // admission shrinks through the published envelope and cache memory
+        // is reclaimed by LRU eviction (recompute below), never by
+        // interrupting in-flight requests.
         recompute_registry(&mut state, "memory pressure");
         let wake = state
             .admission_queue
@@ -2226,16 +2230,15 @@ fn cache_allocations_with(
             *requested = automatic_ceiling;
         }
     }
-    if state.pressure == MemoryPressure::Critical {
-        let mut allocations = frozen;
-        for name in requested_retained.keys().chain(requested_prefix.keys()) {
-            allocations.entry(name.clone()).or_default();
-        }
-        return Ok(allocations);
-    }
+    // Never zero cache allocations under pressure: the engine trims its
+    // retained KV LRU-first to whatever budget is published, which keeps the
+    // hot session resident while still freeing memory. Zeroing (the old
+    // Critical behavior) evicted the active conversation and forced a full
+    // re-prefill storm after every pressure episode.
     let percentage = match state.pressure {
         MemoryPressure::Normal => 20,
-        MemoryPressure::Constrained | MemoryPressure::Critical => 30,
+        MemoryPressure::Constrained => 30,
+        MemoryPressure::Critical => 40,
     };
     let reserve = authority
         .checked_mul(percentage)
@@ -3098,18 +3101,16 @@ mod tests {
         assert_eq!(diagnostics.swap_out_delta, 42);
         assert_eq!(diagnostics.compressor_delta, 7);
 
-        // A stopped worker releases with its outcome counted. The critical
-        // escalation from the delta observation marked the live reservation
-        // first (first reason wins), so the recorded outcome is the pressure
-        // interrupt — a later ModelDrain signal cannot rewrite it.
+        // The show must go on: a critical observation downshifts admission
+        // but must NOT interrupt the live reservation. The worker keeps its
+        // reserved bytes and runs to completion; cache memory is reclaimed
+        // by LRU eviction instead.
         drop(reservation);
         let diagnostics = registry.diagnostics();
         assert_eq!(diagnostics.active_reservations, 0);
-        assert_eq!(diagnostics.stop_outcomes.get("critical_pressure"), Some(&1));
-        assert_eq!(
-            diagnostics.stop_outcomes.values().sum::<u64>(),
-            1,
-            "exactly one released-with-reason outcome: {:?}",
+        assert!(
+            diagnostics.stop_outcomes.is_empty(),
+            "pressure must never interrupt a live reservation: {:?}",
             diagnostics.stop_outcomes
         );
 
@@ -3129,7 +3130,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn capacity_admission_critical_pressure_interrupts_live_reservations() {
+    async fn capacity_admission_critical_pressure_keeps_live_reservations_running() {
         let registry = CapacityRegistry::new(["model".to_owned()]);
         register(&registry, admission_facts("model"));
         let reservation = registry
@@ -3138,29 +3139,16 @@ mod tests {
             .unwrap();
         assert_eq!(reservation.stop().reason(), None);
 
-        let generation_before = registry.snapshot("model").unwrap().generation;
         registry.apply_pressure_observation(PressureObservation {
             pressure: MemoryPressure::Critical,
             swap_out_delta: 0,
             compressor_delta: 0,
         });
 
-        // The interrupt carries this boot's identity and the post-transition
-        // generation nanobot will retry against.
-        assert!(
-            matches!(
-                reservation.stop().reason(),
-                Some(higgs_engine::stop::StopReason::CriticalPressure {
-                    boot_id,
-                    generation,
-                }) if *boot_id == registry.boot_id().to_owned()
-                    && generation >= generation_before
-            ),
-            "unexpected interrupt payload: {:?}",
-            reservation.stop().reason()
-        );
-        // Bytes are still held: the worker releases its guard only after it
-        // acknowledges at an allocation boundary.
+        // Pressure never stops the world: even an OS-level Critical verdict
+        // must leave the live request running to completion.
+        assert_eq!(reservation.stop().reason(), None);
+        // Bytes are still held by the running worker.
         assert_eq!(registry.active_reservation_count("model"), 1);
         drop(reservation);
         assert_eq!(registry.active_reservation_count("model"), 0);
@@ -3902,16 +3890,17 @@ mod tests {
                 "rolling back metadata before engine cleanup is not recovery evidence"
             );
 
-            let expected_after_decrease = if pressure == MemoryPressure::Critical {
+            // Under either pressure level the sticky swap window recovers
+            // only to the Constrained envelope (never the full one); here the
+            // configured ceiling caps it back to 1_024.
+            if pressure == MemoryPressure::Critical {
                 registry.apply_pressure_observation(PressureObservation {
                     pressure: MemoryPressure::Normal,
                     swap_out_delta: 0,
                     compressor_delta: 0,
                 });
-                0
-            } else {
-                1_024
-            };
+            }
+            let expected_after_decrease = 1_024;
             registry.refresh_memory(MlxMemorySnapshot {
                 active_bytes: 4 * GIB,
                 peak_bytes: 5 * GIB,
@@ -4559,7 +4548,7 @@ mod tests {
     }
 
     #[test]
-    fn critical_pressure_evicts_active_optional_caches_but_keeps_draining_reserved() {
+    fn critical_pressure_trims_active_optional_caches_but_keeps_draining_reserved() {
         let registry = CapacityRegistry::new(["draining".to_owned(), "active".to_owned()]);
         register(&registry, facts("draining", 5 * GIB));
         register(&registry, facts("active", 5 * GIB));
@@ -4568,6 +4557,12 @@ mod tests {
             .cache_allocations()
             .into_iter()
             .find(|(name, _, _)| name == "draining")
+            .unwrap();
+        let active_before = registry
+            .cache_allocations()
+            .into_iter()
+            .find(|(name, _, _)| name == "active")
+            .map(|(_, retained, prefix)| (retained, prefix))
             .unwrap();
 
         registry.apply_pressure_observation(PressureObservation {
@@ -4583,12 +4578,22 @@ mod tests {
                 .unwrap(),
             &frozen
         );
-        assert_eq!(
-            allocations
-                .iter()
-                .find(|(name, _, _)| name == "active")
-                .map(|(_, retained, prefix)| (*retained, *prefix)),
-            Some((0, 0))
+        // Pressure trims the active model's optional caches (LRU eviction
+        // recovers the bytes) but never zeroes them: a zeroed allocation
+        // evicts the hot session and forces a full re-prefill storm.
+        let (retained, prefix) = allocations
+            .iter()
+            .find(|(name, _, _)| name == "active")
+            .map(|(_, retained, prefix)| (*retained, *prefix))
+            .unwrap();
+        assert!(
+            (retained, prefix) != (0, 0),
+            "pressure must trim, never zero, cache allocations"
+        );
+        assert!(
+            retained <= active_before.0 && prefix <= active_before.1,
+            "pressure must not grow cache allocations: {retained}/{prefix} vs {:?}",
+            active_before
         );
 
         registry.finish_unregister(drain, None).unwrap();
@@ -4670,18 +4675,26 @@ mod tests {
             compressor_delta: 0,
         });
 
+        // Swap evidence is retained as Constrained and shapes the first
+        // registration — but it must not make the model unavailable.
         assert_eq!(
             registry.snapshot("escha").unwrap().pressure,
-            MemoryPressure::Critical
+            MemoryPressure::Constrained
         );
+        registry.refresh_memory(MlxMemorySnapshot {
+            active_bytes: 5 * GIB,
+            peak_bytes: 5 * GIB,
+            memory_limit_bytes: Some(24 * GIB),
+            metal_recommended_working_set_bytes: Some(24 * GIB),
+        });
         let ticket = registry.begin_registration("escha".to_owned()).unwrap();
-        assert!(matches!(
-            registry.commit_active(ticket, facts("escha", 5 * GIB)),
-            Err(RegistrationError::InsufficientCapacity(model)) if model == "escha"
-        ));
-        let unavailable = registry.snapshot("escha").unwrap();
-        assert_eq!(unavailable.pressure, MemoryPressure::Critical);
-        assert_eq!(unavailable.availability, CapacityAvailability::Unavailable);
+        registry
+            .commit_active(ticket, facts("escha", 5 * GIB))
+            .unwrap()
+            .publish();
+        let snapshot = registry.snapshot("escha").unwrap();
+        assert_eq!(snapshot.pressure, MemoryPressure::Constrained);
+        assert_eq!(snapshot.availability, CapacityAvailability::Available);
     }
 
     #[test]

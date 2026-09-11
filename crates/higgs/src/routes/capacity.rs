@@ -15,7 +15,9 @@ pub struct CapacityQuery {
     model: String,
 }
 
-/// Return the registry's already-computed snapshot without route-side policy math.
+/// Sample live allocator bytes before exposing the registry's admission budget.
+/// This publishes measurements only: cache eviction and generation cancellation
+/// remain owned by the existing pressure/admission paths.
 pub async fn capacity(
     State(state): State<SharedState>,
     Query(query): Query<CapacityQuery>,
@@ -24,7 +26,28 @@ pub async fn capacity(
         return ServerError::BadRequest("model must not be blank".to_owned()).into_response();
     }
     match state.capacity.snapshot(&query.model) {
-        Ok(snapshot) => Json(snapshot).into_response(),
+        Ok(snapshot) => {
+            if !state.capacity.refresh_measured_memory() {
+                // Preserve the known-unavailable response (including unloaded
+                // models), but never claim stale positive capacity is fresh.
+                if snapshot.availability == crate::capacity::CapacityAvailability::Unavailable {
+                    return Json(snapshot).into_response();
+                }
+                return ServerError::CapacityUnavailable(
+                    crate::capacity::CapacityUnavailableError::new(
+                        state.capacity.boot_id(),
+                        snapshot.generation,
+                    ),
+                )
+                .into_response();
+            }
+            // Re-read after publication: the first snapshot only establishes
+            // model identity so an unknown model retains its typed 404 contract.
+            match state.capacity.snapshot(&query.model) {
+                Ok(snapshot) => Json(snapshot).into_response(),
+                Err(error) => ServerError::InternalError(error.to_string()).into_response(),
+            }
+        }
         Err(RegistrationError::UnknownModel(model)) => (
             StatusCode::NOT_FOUND,
             Json(CapacityErrorEnvelope::new(CapacityModelNotFoundError::new(
@@ -160,6 +183,70 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body(response).await, expected);
+    }
+
+    #[tokio::test]
+    async fn active_route_refreshes_allocator_before_returning_capacity() {
+        let registry = CapacityRegistry::new(["escha".to_owned()]);
+        let facts = active_facts();
+        registry.refresh_memory(facts.memory);
+        let ticket = registry.begin_registration("escha".to_owned()).unwrap();
+        registry
+            .commit_active(ticket, facts.clone())
+            .unwrap()
+            .publish();
+        let before = registry.snapshot("escha").unwrap();
+        assert!(before.max_prompt_tokens > 0);
+        let revision = registry.admission_test_memory().1;
+        *registry.test_memory_measurement.lock().unwrap() = Some(Ok(MlxMemorySnapshot {
+            active_bytes: 24 * GIB,
+            peak_bytes: 24 * GIB,
+            ..facts.memory
+        }));
+        let app = crate::build_router(state_with(Arc::clone(&registry)), 30.0, None, 0, 1024, None);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/capacity?model=escha")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body(response).await;
+        assert_eq!(json["availability"], "unavailable");
+        assert_eq!(json["maxPromptTokens"], 0);
+        assert!(json["generation"].as_u64().unwrap() > before.generation);
+        assert_eq!(registry.admission_test_memory().1, revision + 1);
+        assert_eq!(registry.active_reservation_count("escha"), 0);
+    }
+
+    #[tokio::test]
+    async fn active_route_measurement_failure_never_returns_stale_available_capacity() {
+        let registry = CapacityRegistry::new(["escha".to_owned()]);
+        let facts = active_facts();
+        registry.refresh_memory(facts.memory);
+        let ticket = registry.begin_registration("escha".to_owned()).unwrap();
+        registry.commit_active(ticket, facts).unwrap().publish();
+        assert!(registry.snapshot("escha").unwrap().max_prompt_tokens > 0);
+        *registry.test_memory_measurement.lock().unwrap() = Some(Err(
+            higgs_engine::MlxMemoryProbeError::QueryFailed("test allocator"),
+        ));
+        let app = crate::build_router(state_with(Arc::clone(&registry)), 30.0, None, 0, 1024, None);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/capacity?model=escha")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json = body(response).await;
+        assert_eq!(json["error"]["type"], "higgs_capacity_unavailable");
+        assert!(json.get("maxPromptTokens").is_none());
     }
 
     #[tokio::test]
