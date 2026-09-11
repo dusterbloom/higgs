@@ -173,6 +173,7 @@ impl TokenLedger {
     }
 
     /// Record a visible token whose target-cache transition already succeeded.
+    #[cfg(test)]
     pub(crate) fn record_forwarded(&mut self, token: u32) -> Result<(), LedgerError> {
         self.extend_forwarded([token])
     }

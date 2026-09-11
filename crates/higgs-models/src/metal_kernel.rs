@@ -22,7 +22,6 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::OnceLock;
 
-use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{Array, Dtype, Stream, error::Exception};
 
 use crate::eschamoe::EschaSpec;
@@ -1207,7 +1206,7 @@ pub fn eschamoe_gather_qgemm_simd(
         (128, 32, 40)
     };
     let rows_pad = ((rows + bm - 1) / bm) * bm;
-    let row_count_pad = u32::try_from(rows_pad)
+    u32::try_from(rows_pad)
         .map_err(|_| Exception::custom("eschamoe_gather_qgemm_simd: negative padded rows"))?;
 
     let stream = Stream::task_local_or_default();
@@ -1384,6 +1383,7 @@ fn simd_probe_matrix_ops_run() {
 /// Empirical semantics dump: loads buf (8x8, ld=8, buf[i*8+j]=i*10+j) under
 /// a given (transpose, origin) and stores the fragment row-major. Prints the
 /// 64 values so the host can derive Metal's exact orientation convention.
+#[cfg(test)]
 const QGEMM_SEMANTICS_SOURCE: &str = r"
 threadgroup float buf[64];
 uint tid = thread_index_in_threadgroup;
@@ -8514,8 +8514,10 @@ mod tests {
             assert!(out.as_slice::<f32>().iter().all(|x| x.is_finite()));
         }
         let after = active_bytes();
-        assert!(after <= baseline + 65_536,
-            "dropped calls retained MLX arrays: before={baseline}, after={after}");
+        assert!(
+            after <= baseline + 65_536,
+            "dropped calls retained MLX arrays: before={baseline}, after={after}"
+        );
     }
 
     #[test]
