@@ -571,6 +571,13 @@ impl StreamingToolCallTracker {
         self.completed_count
     }
 
+    /// Whether the tracker is currently holding bytes inside an unclosed
+    /// tool-call block. Streams in this state produce no visible deltas, so
+    /// the route emits SSE transport comments to keep client watchdogs fed.
+    pub fn is_holding(&self) -> bool {
+        self.inside != Inside::None
+    }
+
     pub const fn has_tool_calls(&self) -> bool {
         self.completed_count > 0
     }

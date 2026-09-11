@@ -1387,6 +1387,14 @@ async fn chat_completions_stream(
                 required_calls.extend(tool_out.new_tool_calls.iter().cloned());
             }
 
+            // Tool-payload transport heartbeat: while a `<tool_call>` block
+            // is still generating, emit an SSE comment so the client's
+            // stream watchdog stays fed. The payload bytes themselves are
+            // delivered with the parsed call at the closer.
+            if tool_tracker.is_holding() {
+                yield Ok(Event::default().comment("ping"));
+            }
+
             // Tool-call indices count up across the whole response. Each
             // chunk that closes N tool calls covers indices
             // `[base_index .. base_index+N)` where `base_index` is the
