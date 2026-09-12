@@ -47,11 +47,23 @@ pub struct CreateMessageRequest {
     pub stop_sequences: Option<Vec<String>>,
     #[serde(default)]
     pub tools: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub tool_choice: Option<AnthropicToolChoice>,
     /// Per-request speculative-decoding method: `auto` (default), `dflash`,
     /// `mtp`, or `none`. `auto` uses the `DFlash` drafter when one is loaded
     /// (including while streaming), else the built-in MTP head.
     #[serde(default)]
     pub speculation: Option<String>,
+}
+
+/// Anthropic policy for whether the model may or must call a tool.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicToolChoice {
+    Auto,
+    None,
+    Any,
+    Tool { name: String },
 }
 
 /// A message in the Anthropic format.
@@ -619,6 +631,53 @@ mod tests {
         assert!(req.tools.is_some());
         let tools = req.tools.unwrap();
         assert_eq!(tools.len(), 1);
+    }
+
+    #[test]
+    fn anthropic_request_parses_native_tool_choices() {
+        let parse = |choice: &str| {
+            serde_json::from_str::<CreateMessageRequest>(&format!(
+                r#"{{
+                    "model":"test",
+                    "messages":[{{"role":"user","content":"hi"}}],
+                    "max_tokens":100,
+                    "tool_choice":{choice}
+                }}"#
+            ))
+            .unwrap()
+            .tool_choice
+            .unwrap()
+        };
+
+        assert!(matches!(
+            parse(r#"{"type":"auto"}"#),
+            AnthropicToolChoice::Auto
+        ));
+        assert!(matches!(
+            parse(r#"{"type":"none"}"#),
+            AnthropicToolChoice::None
+        ));
+        assert!(matches!(
+            parse(r#"{"type":"any"}"#),
+            AnthropicToolChoice::Any
+        ));
+        assert!(matches!(
+            parse(r#"{"type":"tool","name":"write"}"#),
+            AnthropicToolChoice::Tool { name } if name == "write"
+        ));
+    }
+
+    #[test]
+    fn anthropic_request_rejects_unknown_tool_choice_type() {
+        let result = serde_json::from_str::<CreateMessageRequest>(
+            r#"{
+                "model":"test",
+                "messages":[{"role":"user","content":"hi"}],
+                "max_tokens":100,
+                "tool_choice":{"type":"required"}
+            }"#,
+        );
+        assert!(result.is_err());
     }
 
     #[test]

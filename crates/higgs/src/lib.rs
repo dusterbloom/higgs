@@ -23,6 +23,9 @@ pub mod translate;
 pub mod tui;
 pub mod types;
 
+#[cfg(test)]
+mod streaming_compat_tests;
+
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;

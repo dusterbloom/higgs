@@ -7246,15 +7246,22 @@ impl SimpleEngine {
             has_mtp,
         );
         if run_mode == SessionRunMode::Generation && speculation_route == SpeculationRoute::DFlash {
-            let output = self.generate_continued_dflash_locked(
-                session_id,
-                prompt_tokens,
-                max_tokens,
-                params,
-                timing,
-                total_start,
-                sender,
-            )?;
+            let prefill_sink = sender.map(install_retained_prefill_cancellation_sink);
+            let output = self
+                .generate_continued_dflash_locked(
+                    session_id,
+                    prompt_tokens,
+                    max_tokens,
+                    params,
+                    timing,
+                    total_start,
+                    sender,
+                )
+                .map_err(|error| {
+                    let stop = crate::stop::generation_stop();
+                    map_streaming_prefill_error(error, stop.as_ref())
+                })?;
+            drop(prefill_sink);
             if let Some(sender) = sender {
                 let cached = if output.continued {
                     output.prompt_tokens.saturating_sub(output.prefilled_tokens)
@@ -7417,39 +7424,50 @@ impl SimpleEngine {
         // remaining selectors are deliberately sidecar-free MTP or AR. Session
         // prefix-cache storage stays disabled because hybrid reconstruction is
         // not safe on this path (see `run_prefill_evaluation`).
+        // Retained streaming shares the stateless path's cooperative prefill
+        // boundary: a stop or disconnected client interrupts before the next
+        // chunk allocates. The request-local fork is dropped on error, leaving
+        // the previously published retained session valid.
+        let prefill_sink = sender.map(install_retained_prefill_cancellation_sink);
         let sampled_prefill = match run_mode {
-            SessionRunMode::PrefillOnly => {
-                if !prepared.actual_prompt_tokens.is_empty() {
-                    let _ = prepared
-                        .model
-                        .forward_chunked(
-                            &prepared.prompt_array,
-                            &mut prepared.cache,
-                            self.tuning.chunked_prefill_chunk_size(),
-                        )
-                        .map_err(EngineError::Mlx)?;
+            SessionRunMode::PrefillOnly if prepared.actual_prompt_tokens.is_empty() => Ok(None),
+            SessionRunMode::PrefillOnly => prepared
+                .model
+                .forward_chunked(
+                    &prepared.prompt_array,
+                    &mut prepared.cache,
+                    self.tuning.chunked_prefill_chunk_size(),
+                )
+                .map_err(EngineError::Mlx)
+                .map(|_| {
                     maybe_clear_mlx_cache(
                         self.tuning.clear_cache_after_prefill(),
                         "simple_post_prefill",
                     );
-                }
-                None
-            }
-            SessionRunMode::Generation => Some(self.run_prefill(
-                run_prompt,
-                self.gen_prompt_suffixes.for_request(enable_thinking),
-                &mut prepared,
-                params,
-                None,
-                None,
-                want_mtp,
-                false,
-                None,
-                None,
-                None,
-                None,
-            )?),
-        };
+                    None
+                }),
+            SessionRunMode::Generation => self
+                .run_prefill(
+                    run_prompt,
+                    self.gen_prompt_suffixes.for_request(enable_thinking),
+                    &mut prepared,
+                    params,
+                    None,
+                    None,
+                    want_mtp,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .map(Some),
+        }
+        .map_err(|error| {
+            let stop = crate::stop::generation_stop();
+            map_streaming_prefill_error(error, stop.as_ref())
+        })?;
+        drop(prefill_sink);
         let prefill_elapsed = prefill_start.elapsed();
 
         if run_mode == SessionRunMode::PrefillOnly {
@@ -7565,6 +7583,11 @@ impl SimpleEngine {
         // this is the buffered `generate_continued_with_thinking` caller) —
         // mirrors `generate_streaming_inner`'s `IncrementalDetok` usage so
         // streamed text matches a full `decode_tokens` byte-for-byte.
+        let mut stream_detok_elapsed = std::time::Duration::ZERO;
+        let mut stream_send_elapsed = std::time::Duration::ZERO;
+        let mut first_stream_detok_elapsed = std::time::Duration::ZERO;
+        let mut first_stream_send_elapsed = std::time::Duration::ZERO;
+        let mut stream_events = 0_u32;
         let mut detok = sender.map(|_| {
             IncrementalDetok::new(
                 String::new(),
@@ -7575,10 +7598,15 @@ impl SimpleEngine {
         if let (Some(sender), Some(detok)) = (sender, detok.as_mut()) {
             let is_eos = self.eos_token_ids.contains(&first_id);
             let is_max = 1 >= max_tokens;
+            let detok_start = timing.then(std::time::Instant::now);
             let mut new_text = detok.append(&self.tokenizer, &generated)?;
             let step_finished = is_eos || is_max;
             if step_finished {
                 new_text.push_str(&detok.flush(&self.tokenizer, &generated)?);
+            }
+            if let Some(start) = detok_start {
+                first_stream_detok_elapsed = start.elapsed();
+                stream_detok_elapsed += first_stream_detok_elapsed;
             }
             let finish_reason = if is_eos {
                 Some("stop".to_owned())
@@ -7587,7 +7615,8 @@ impl SimpleEngine {
             } else {
                 None
             };
-            send_session_stream_output(
+            let send_start = timing.then(std::time::Instant::now);
+            let send_result = send_session_stream_output(
                 sender,
                 StreamingOutput {
                     new_text,
@@ -7598,7 +7627,13 @@ impl SimpleEngine {
                     token_logprob: None,
                     prefill_progress: None,
                 },
-            )?;
+            );
+            if let Some(start) = send_start {
+                first_stream_send_elapsed = start.elapsed();
+                stream_send_elapsed += first_stream_send_elapsed;
+                stream_events = stream_events.saturating_add(1);
+            }
+            send_result?;
         }
 
         let decode_start = std::time::Instant::now();
@@ -7614,6 +7649,7 @@ impl SimpleEngine {
         let mtp_cache = (want_mtp && !self.eos_token_ids.contains(&first_id))
             .then(|| prepared.model.make_mtp_cache())
             .flatten();
+        let sequential_ar = mtp_cache.is_none();
         let mut mtp_stats = crate::mtp::MtpStats::default();
         if let Some(mut session_mtp_cache) = mtp_cache {
             // Prime the head over the freshly-prefilled tokens, then mirror
@@ -7795,10 +7831,14 @@ impl SimpleEngine {
                 if let (Some(sender), Some(detok)) = (sender, detok.as_mut()) {
                     let completion_len = u32::try_from(generated.len()).unwrap_or(u32::MAX);
                     let is_max = completion_len >= max_tokens;
+                    let detok_start = timing.then(std::time::Instant::now);
                     let mut new_text = detok.append(&self.tokenizer, &generated)?;
                     let step_finished = is_eos || is_max;
                     if step_finished {
                         new_text.push_str(&detok.flush(&self.tokenizer, &generated)?);
+                    }
+                    if let Some(start) = detok_start {
+                        stream_detok_elapsed += start.elapsed();
                     }
                     let finish_reason = if is_eos {
                         Some("stop".to_owned())
@@ -7807,7 +7847,8 @@ impl SimpleEngine {
                     } else {
                         None
                     };
-                    send_session_stream_output(
+                    let send_start = timing.then(std::time::Instant::now);
+                    let send_result = send_session_stream_output(
                         sender,
                         StreamingOutput {
                             new_text,
@@ -7818,7 +7859,12 @@ impl SimpleEngine {
                             token_logprob: None,
                             prefill_progress: None,
                         },
-                    )?;
+                    );
+                    if let Some(start) = send_start {
+                        stream_send_elapsed += start.elapsed();
+                        stream_events = stream_events.saturating_add(1);
+                    }
+                    send_result?;
                 }
                 if is_eos {
                     break;
@@ -7973,6 +8019,11 @@ impl SimpleEngine {
                 "DIAG session-timing: continued={continued} prompt={total} prefilled={prefilled} generated={} prefill={prefill_elapsed:.2?} decode={decode_elapsed:.2?} retain_eval={retain_elapsed:.2?} total={total_elapsed:.2?}",
                 generated.len()
             );
+            if sender.is_some() && sequential_ar {
+                eprintln!(
+                    "DIAG session-stream-timing: route=ar events={stream_events} detok_total={stream_detok_elapsed:.2?} blocking_send_total={stream_send_elapsed:.2?} first_detok={first_stream_detok_elapsed:.2?} first_blocking_send={first_stream_send_elapsed:.2?}"
+                );
+            }
         }
 
         tracing::info!(
@@ -8459,6 +8510,10 @@ impl SimpleEngine {
                 })();
             match attempt {
                 Ok(parts) => break parts,
+                Err(error) if is_streaming_prefill_cancellation(&error) => {
+                    let stop = crate::stop::generation_stop();
+                    return Err(map_streaming_prefill_error(error, stop.as_ref()));
+                }
                 Err(EngineError::Cancelled) => return Err(EngineError::Cancelled),
                 Err(error)
                     if continued_dspark_cold_retry_allowed(
@@ -14332,23 +14387,54 @@ fn observe_streaming_prefill_boundary(
     Ok(())
 }
 
+fn install_retained_prefill_cancellation_sink(
+    sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+) -> higgs_models::progress::PrefillSinkGuard {
+    let progress_sender = sender.clone();
+    higgs_models::progress::install_prefill_progress_sink(Box::new(move |_done, _total| {
+        let stop = crate::stop::generation_stop();
+        observe_streaming_prefill_boundary(stop.as_ref(), progress_sender.is_closed())
+    }))
+}
+
+fn is_streaming_prefill_cancellation(error: &EngineError) -> bool {
+    // Chunked model forwards cross an MLX exception boundary, so their typed
+    // observer cancellation arrives wrapped. Match the exact raw message;
+    // unrelated MLX failures must remain visible even if a stop races them.
+    let is_paired_prefill_cancelled = if let EngineError::Generation(message) = error {
+        let paired_error = PairedCacheError::Advance {
+            details: EngineError::Model(higgs_models::error::ModelError::PrefillCancelled)
+                .to_string(),
+        };
+        [
+            session_pair_error(paired_error.clone()),
+            radix_pair_error(paired_error),
+        ]
+        .iter()
+        .any(|candidate| {
+            matches!(candidate, EngineError::Generation(candidate_message) if message == candidate_message)
+        })
+    } else {
+        false
+    };
+    is_paired_prefill_cancelled
+        || matches!(
+            error,
+            EngineError::Model(higgs_models::error::ModelError::PrefillCancelled)
+        )
+        || matches!(
+            error,
+            EngineError::Mlx(exception)
+                if exception.what()
+                    == higgs_models::error::ModelError::PrefillCancelled.to_string()
+        )
+}
+
 fn map_streaming_prefill_error(
     error: EngineError,
     stop: Option<&crate::stop::GenerationStop>,
 ) -> EngineError {
-    // Chunked model forwards cross an MLX exception boundary, so their typed
-    // observer cancellation arrives wrapped. Match the exact raw message;
-    // unrelated MLX failures must remain visible even if a stop races them.
-    let is_prefill_cancelled = matches!(
-        &error,
-        EngineError::Model(higgs_models::error::ModelError::PrefillCancelled)
-    ) || matches!(
-        &error,
-        EngineError::Mlx(exception)
-            if exception.what()
-                == higgs_models::error::ModelError::PrefillCancelled.to_string()
-    );
-    if !is_prefill_cancelled {
+    if !is_streaming_prefill_cancellation(&error) {
         return error;
     }
     stop.and_then(crate::stop::GenerationStop::reason)
@@ -14455,6 +14541,45 @@ mod tests {
     }
 
     #[test]
+    fn streaming_prefill_error_mapper_recovers_paired_dflash_wrappers() {
+        let stop = crate::stop::GenerationStop::new(None);
+        stop.stop(crate::stop::StopReason::CriticalPressure {
+            boot_id: "boot-paired".to_owned(),
+            generation: 11,
+        });
+        let details =
+            EngineError::Model(higgs_models::error::ModelError::PrefillCancelled).to_string();
+        let wrapped = [
+            super::session_pair_error(super::PairedCacheError::Advance {
+                details: details.clone(),
+            }),
+            super::radix_pair_error(super::PairedCacheError::Advance { details }),
+        ];
+
+        for error in wrapped {
+            assert!(matches!(
+                map_streaming_prefill_error(error, Some(&stop)),
+                EngineError::CapacityInterrupted { boot_id, generation }
+                    if boot_id == "boot-paired" && generation == 11
+            ));
+        }
+    }
+
+    #[test]
+    fn streaming_prefill_error_mapper_does_not_mask_unrelated_paired_error() {
+        let stop = crate::stop::GenerationStop::new(None);
+        stop.stop(crate::stop::StopReason::ModelDrain);
+        let unrelated = super::session_pair_error(super::PairedCacheError::Advance {
+            details: "bad tensor".to_owned(),
+        });
+
+        assert!(matches!(
+            map_streaming_prefill_error(unrelated, Some(&stop)),
+            EngineError::Generation(message) if message.ends_with("bad tensor")
+        ));
+    }
+
+    #[test]
     fn streaming_prefill_error_mapper_does_not_mask_unrelated_mlx_error() {
         let stop = crate::stop::GenerationStop::new(None);
         stop.stop(crate::stop::StopReason::CriticalPressure {
@@ -14477,6 +14602,23 @@ mod tests {
 
         assert!(matches!(
             map_streaming_prefill_error(wrapped, None),
+            EngineError::Cancelled
+        ));
+    }
+
+    #[test]
+    fn retained_prefill_observes_disconnect_at_reported_chunk_boundary() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let stop = crate::stop::GenerationStop::new(None);
+        let _stop_guard = crate::stop::install_generation_stop(stop.clone());
+        let _prefill_guard = super::install_retained_prefill_cancellation_sink(&sender);
+
+        assert!(higgs_models::progress::report_prefill_progress(1_024, 3_072).is_ok());
+        drop(receiver);
+        let error = higgs_models::progress::report_prefill_progress(2_048, 3_072).unwrap_err();
+
+        assert!(matches!(
+            map_streaming_prefill_error(EngineError::Model(error), Some(&stop)),
             EngineError::Cancelled
         ));
     }

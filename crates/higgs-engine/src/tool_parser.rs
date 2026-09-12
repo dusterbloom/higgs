@@ -28,6 +28,12 @@
 //! using the request's declared tool schema ([`ToolSchema`]) when available,
 //! falling back to best-effort parsing otherwise.
 
+mod streaming;
+
+pub use streaming::{
+    IncrementalToolCallOutput, IncrementalToolCallTracker, ToolParseError, ToolStreamEvent,
+};
+
 /// A parsed tool call extracted from model output.
 #[derive(Debug, Clone)]
 pub struct ParsedToolCall {

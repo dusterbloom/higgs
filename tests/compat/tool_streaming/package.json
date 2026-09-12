@@ -1,0 +1,12 @@
+{
+  "name": "higgs-tool-streaming-compat",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node clients.mjs" },
+  "dependencies": {
+    "openai": "6.40.0",
+    "@anthropic-ai/sdk": "0.123.0",
+    "@earendil-works/pi-ai": "0.85.1",
+    "@deepseek-ai/dsh-llm-pi-ai": "0.1.5-rc.2"
+  }
+}

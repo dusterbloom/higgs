@@ -21,7 +21,7 @@ use crate::{
     config::{ApiFormat, GenerationDefaults},
     error::ServerError,
     media::{MediaExtractor, MediaItem},
-    metrics::{MetricsStore, RequestMetricsContext, RequestRecord},
+    metrics::{MetricsStore, RequestMetricsContext, RequestRecord, StreamMetricsGuard},
     router::ResolvedRoute,
     state::{Engine, SharedState},
     types::openai::{
@@ -1018,7 +1018,7 @@ async fn chat_completions_stream(
         tracing::debug!(
             request_model = req.model,
             tool_count = prompt_tools.map_or(0, <[serde_json::Value]>::len),
-            "Streaming with tool-calls enabled; will emit tool_calls deltas via StreamingToolCallTracker",
+            "Streaming with tool-calls enabled; will emit incremental tool_calls deltas",
         );
     }
 
@@ -1065,7 +1065,7 @@ async fn chat_completions_stream(
 
     // Pass tools into prompt rendering so the chat template emits the
     // tool spec the model recognises. The on-the-fly
-    // [`StreamingToolCallTracker`] below intercepts `<tool_call>…
+    // [`IncrementalToolCallTracker`] below intercepts `<tool_call>…
     // </tool_call>` blocks the model produces and turns them into
     // structured `ToolCallDelta` SSE events.
     let (prompt_tokens, pflash_policy) = engine
@@ -1267,17 +1267,37 @@ async fn chat_completions_stream(
         })
     });
 
+    let mut metrics_guard = StreamMetricsGuard::new(metrics.clone(), metrics_id, start);
     let stream = async_stream::stream! {
         let mut writer = crate::sse::ChatChunkWriter::new(&request_id, created, &model);
+        let route_timing = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|value| value == "1");
+        let route_timer = route_timing.then(Instant::now);
+        let mut tool_parser_elapsed = Duration::ZERO;
+        let mut tool_parser_calls = 0_u64;
+        let mut delta_serialize_elapsed = Duration::ZERO;
+        let mut delta_yield_elapsed = Duration::ZERO;
+        let mut delta_yields = 0_u64;
 
         // Helper to emit a chunk carrying a delta.
         macro_rules! emit_delta {
-            ($delta:expr, $finish:expr, $logprobs:expr) => {
-                match writer.write_delta($delta, $finish, $logprobs) {
-                    Ok(json) => yield Ok(Event::default().data(json)),
+            ($delta:expr, $finish:expr, $logprobs:expr) => {{
+                let serialize_timer = route_timing.then(Instant::now);
+                let serialized = writer.write_delta($delta, $finish, $logprobs);
+                if let Some(serialize_started_at) = serialize_timer {
+                    delta_serialize_elapsed += serialize_started_at.elapsed();
+                }
+                match serialized {
+                    Ok(json) => {
+                        let yield_timer = route_timing.then(Instant::now);
+                        yield Ok(Event::default().data(json));
+                        if let Some(yield_started_at) = yield_timer {
+                            delta_yield_elapsed += yield_started_at.elapsed();
+                            delta_yields = delta_yields.saturating_add(1);
+                        }
+                    }
                     Err(e) => tracing::error!(error = %e, "Failed to serialize SSE chunk"),
                 }
-            };
+            }};
         }
 
         // Send initial role chunk
@@ -1297,33 +1317,141 @@ async fn chat_completions_stream(
         // Streaming tool-call extractor — passthrough when no tools were
         // requested, otherwise watches for `<tool_call>…</tool_call>`
         // blocks and emits structured `ToolCallDelta` events.
-        let mut tool_tracker = higgs_engine::tool_parser::StreamingToolCallTracker::new(
+        let mut tool_tracker = higgs_engine::tool_parser::IncrementalToolCallTracker::new(
             stream_includes_tools,
             tool_schema,
         );
-        // Required/named tool-choice bookkeeping: the postcondition can only
-        // be judged once the tracker has fully drained, so — unlike ordinary
-        // Auto streams — every content and tool delta is held here (zero
-        // allocation on ordinary Auto streams) and only emitted after
-        // validation below. Nothing parser-visible leaves this route before
-        // the postcondition holds.
-        let mut required_hold: Option<(String, Vec<higgs_engine::tool_parser::ParsedToolCall>)> =
-            required_call.then(|| (String::new(), Vec::new()));
+        // Required/named calls stream append-only arguments immediately, but
+        // retain enough bookkeeping to enforce the full postcondition before
+        // emitting a successful finish.
+        let mut required_visible = String::new();
+        let mut required_calls: Vec<(String, String, bool)> = Vec::new();
 
-        // Closure that turns a `ParsedToolCall` into the OpenAI streaming
-        // delta shape. Index is the running zero-based position of the
-        // call in this response.
-        let make_tool_delta = |index: u32, parsed: &higgs_engine::tool_parser::ParsedToolCall| {
-            ToolCallDelta {
-                index,
-                id: Some(format!("call_{index}_{}", uuid::Uuid::new_v4())),
-                r#type: Some("function".to_owned()),
-                function: Some(ToolCallFunctionDelta {
-                    name: Some(parsed.name.clone()),
-                    arguments: Some(parsed.arguments.to_string()),
-                }),
-            }
-        };
+        macro_rules! handle_tool_output {
+            ($output:expr, $text_logprobs:expr) => {{
+                let parser_timer = route_timing.then(Instant::now);
+                let output = $output;
+                if let Some(parser_started_at) = parser_timer {
+                    tool_parser_elapsed += parser_started_at.elapsed();
+                    tool_parser_calls = tool_parser_calls.saturating_add(1);
+                }
+                let mut adapter_error = None;
+                for event in output.events {
+                    use higgs_engine::tool_parser::ToolStreamEvent;
+                    match event {
+                        ToolStreamEvent::Text(text) => {
+                            if required_call {
+                                required_visible.push_str(&text);
+                            } else if !text.is_empty() {
+                                let d = ChatCompletionDelta {
+                                    role: None,
+                                    content: Some(text),
+                                    reasoning_content: None,
+                                    tool_calls: None,
+                                };
+                                metrics_guard.semantic_event();
+                                emit_delta!(&d, None, $text_logprobs);
+                            }
+                        }
+                        ToolStreamEvent::ToolStart { index, name } => {
+                            if index != required_calls.len() {
+                                adapter_error = Some(format!(
+                                    "tool stream started out-of-order call index {index}"
+                                ));
+                                break;
+                            }
+                            if required_call {
+                                let declared = required_tools
+                                    .as_deref()
+                                    .unwrap_or(&[])
+                                    .iter()
+                                    .any(|tool| {
+                                        tool.get("function")
+                                            .and_then(|function| function.get("name"))
+                                            .and_then(serde_json::Value::as_str)
+                                            == Some(name.as_str())
+                                    });
+                                if !declared
+                                    || required_name
+                                        .as_deref()
+                                        .is_some_and(|expected| expected != name)
+                                    || index > 0
+                                {
+                                    adapter_error = Some(format!(
+                                        "required tool choice rejected call '{}' at index {index}",
+                                        name
+                                    ));
+                                    break;
+                                }
+                            }
+                            required_calls.push((name.clone(), String::new(), false));
+                            let index = u32::try_from(index).unwrap_or(u32::MAX);
+                            let d = ChatCompletionDelta {
+                                role: None,
+                                content: None,
+                                reasoning_content: None,
+                                tool_calls: Some(vec![ToolCallDelta {
+                                    index,
+                                    id: Some(format!("call_{index}_{}", uuid::Uuid::new_v4())),
+                                    r#type: Some("function".to_owned()),
+                                    function: Some(ToolCallFunctionDelta {
+                                        name: Some(name),
+                                        arguments: Some(String::new()),
+                                    }),
+                                }]),
+                            };
+                            metrics_guard.semantic_event();
+                            emit_delta!(&d, None, None);
+                        }
+                        ToolStreamEvent::ArgumentsDelta { index, fragment } => {
+                            let Some((_, arguments, _)) = required_calls.get_mut(index) else {
+                                adapter_error = Some(format!(
+                                    "tool arguments arrived before call index {index}"
+                                ));
+                                break;
+                            };
+                            arguments.push_str(&fragment);
+                            if !fragment.is_empty() {
+                                let index = u32::try_from(index).unwrap_or(u32::MAX);
+                                let d = ChatCompletionDelta {
+                                    role: None,
+                                    content: None,
+                                    reasoning_content: None,
+                                    tool_calls: Some(vec![ToolCallDelta {
+                                        index,
+                                        id: None,
+                                        r#type: None,
+                                        function: Some(ToolCallFunctionDelta {
+                                            name: None,
+                                            arguments: Some(fragment),
+                                        }),
+                                    }]),
+                                };
+                                metrics_guard.semantic_event();
+                                emit_delta!(&d, None, None);
+                            }
+                        }
+                        ToolStreamEvent::ToolEnd { index } => {
+                            let Some((_, _, ended)) = required_calls.get_mut(index) else {
+                                adapter_error = Some(format!(
+                                    "tool end arrived before call index {index}"
+                                ));
+                                break;
+                            };
+                            *ended = true;
+                        }
+                    }
+                }
+                if adapter_error.is_none() {
+                    adapter_error = output.error.map(|error| error.to_string());
+                }
+                if let Some(error) = adapter_error {
+                    metrics_guard.fail(error.clone());
+                    yield Ok(Event::default().data(streaming_error_json(&error)));
+                    return;
+                }
+            }};
+        }
 
         let mut output_token_count: u32 = 0;
         // Radix prefix-cache tokens reused this turn, taken from the prefill
@@ -1346,6 +1474,7 @@ async fn chat_completions_stream(
                 continue;
             }
             output_token_count = output.completion_tokens;
+            metrics_guard.update(u64::from(output_token_count));
             let chunk_logprobs = output
                 .token_logprob
                 .as_ref()
@@ -1360,57 +1489,15 @@ async fn chat_completions_stream(
                     reasoning_content: Some(reasoning),
                     tool_calls: None,
                 };
+                metrics_guard.semantic_event();
                 emit_delta!(&d, None, None);
             }
 
             // Run the visible-text portion through the tool-call tracker
             // so `<tool_call>…</tool_call>` blocks become structured
             // deltas rather than being spoken aloud as plain text.
-            let tool_out = tool_tracker.process(&visible);
-            let visible_is_empty = tool_out.visible.is_empty();
-            if let Some((required_visible, required_calls)) = required_hold.as_mut() {
-                required_visible.push_str(&tool_out.visible);
-                required_calls.extend(tool_out.new_tool_calls.iter().cloned());
-            }
-
-            // Tool-payload transport heartbeat: while a `<tool_call>` block
-            // is still generating, emit an SSE comment so the client's
-            // stream watchdog stays fed. The payload bytes themselves are
-            // delivered with the parsed call at the closer.
-            if tool_tracker.is_holding() {
-                yield Ok(Event::default().comment("ping"));
-            }
-
-            // Tool-call indices count up across the whole response. Each
-            // chunk that closes N tool calls covers indices
-            // `[base_index .. base_index+N)` where `base_index` is the
-            // total completed *before* this chunk.
-            let base_index = tool_tracker
-                .completed_count()
-                .saturating_sub(tool_out.new_tool_calls.len());
-            if required_hold.is_none() {
-                for (i, parsed) in tool_out.new_tool_calls.iter().enumerate() {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let idx = u32::try_from(base_index + i).unwrap_or(u32::MAX);
-                    let d = ChatCompletionDelta {
-                        role: None,
-                        content: None,
-                        reasoning_content: None,
-                        tool_calls: Some(vec![make_tool_delta(idx, parsed)]),
-                    };
-                    emit_delta!(&d, None, None);
-                }
-
-                if !tool_out.visible.is_empty() {
-                    let d = ChatCompletionDelta {
-                        role: None,
-                        content: Some(tool_out.visible),
-                        reasoning_content: None,
-                        tool_calls: None,
-                    };
-                    emit_delta!(&d, None, chunk_logprobs.as_ref());
-                }
-            }
+            let visible_is_empty = visible.is_empty();
+            handle_tool_output!(tool_tracker.process(&visible), chunk_logprobs.as_ref());
 
             if let Some(finish_reason) = output.finish_reason {
                 pending_finish_reason = Some(finish_reason);
@@ -1430,16 +1517,7 @@ async fn chat_completions_stream(
                 capacity_interrupted = true;
                 // Exact frozen v1 terminal event, then the normal tail
                 // terminates the stream with [DONE].
-                if let Some(ref m) = metrics {
-                    if let Some(id) = metrics_id {
-                        m.fail_stream(
-                            id,
-                            u64::from(output_token_count),
-                            start.elapsed(),
-                            "capacity_interrupted".to_owned(),
-                        );
-                    }
-                }
+                metrics_guard.fail("capacity_interrupted".to_owned());
                 yield Ok(Event::default().data(crate::sse::capacity_interrupted_event_json(
                     &info,
                     u64::from(output_token_count),
@@ -1447,16 +1525,7 @@ async fn chat_completions_stream(
             }
             crate::sse::WorkerTerminal::Failed(error) => {
                 tracing::error!(error = %error, "Streaming generation terminated with an error");
-                if let Some(ref m) = metrics {
-                    if let Some(id) = metrics_id {
-                        m.fail_stream(
-                            id,
-                            u64::from(output_token_count),
-                            start.elapsed(),
-                            error.clone(),
-                        );
-                    }
-                }
+                metrics_guard.fail(error.clone());
                 yield Ok(Event::default().data(streaming_error_json(&error)));
                 return;
             }
@@ -1480,109 +1549,52 @@ async fn chat_completions_stream(
                 reasoning_content: Some(flush_reas),
                 tool_calls: None,
             };
+            metrics_guard.semantic_event();
             emit_delta!(&d, None, None);
         }
-        // Drain the tool tracker (handles unclosed `<tool_call>` tags by
-        // re-emitting their buffered prefix as visible content — never
-        // silently drop tokens).
-        let flush_tool_out = tool_tracker.process(&flush_vis);
-        if let Some((required_visible, required_calls)) = required_hold.as_mut() {
-            required_visible.push_str(&flush_tool_out.visible);
-            required_calls.extend(flush_tool_out.new_tool_calls.iter().cloned());
-        }
-        let flush_base_index = tool_tracker
-            .completed_count()
-            .saturating_sub(flush_tool_out.new_tool_calls.len());
-        if required_hold.is_none() && !discard_stream_remainder {
-            for (i, parsed) in flush_tool_out.new_tool_calls.iter().enumerate() {
-                #[allow(clippy::cast_possible_truncation)]
-                let idx = u32::try_from(flush_base_index + i).unwrap_or(u32::MAX);
-                let d = ChatCompletionDelta {
-                    role: None,
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: Some(vec![make_tool_delta(idx, parsed)]),
-                };
-                emit_delta!(&d, None, None);
-            }
-            if !flush_tool_out.visible.is_empty() {
-                let d = ChatCompletionDelta {
-                    role: None,
-                    content: Some(flush_tool_out.visible),
-                    reasoning_content: None,
-                    tool_calls: None,
-                };
-                emit_delta!(&d, None, None);
-            }
-        }
-        let final_tool_out = tool_tracker.flush();
-        if let Some((required_visible, required_calls)) = required_hold.as_mut() {
-            required_visible.push_str(&final_tool_out.visible);
-            required_calls.extend(final_tool_out.new_tool_calls.iter().cloned());
-        }
-        if required_hold.is_none()
-            && !discard_stream_remainder
-            && !final_tool_out.visible.is_empty()
-        {
-            let d = ChatCompletionDelta {
-                role: None,
-                content: Some(final_tool_out.visible),
-                reasoning_content: None,
-                tool_calls: None,
-            };
-            emit_delta!(&d, None, None);
+        if !discard_stream_remainder {
+            handle_tool_output!(tool_tracker.process(&flush_vis), None);
+            handle_tool_output!(tool_tracker.finish(), None);
         }
 
         // Required/named tool choice: judge the postcondition now that the
-        // tracker has drained. Up to this point the stream emitted only the
-        // role chunk — nothing parser-visible. Zero calls, leaked visible
-        // text, or multiple calls end the stream with the typed error event
-        // (no deltas, no DONE). A capacity interruption already ended the
-        // request with its own terminal: the held remainder is discarded
-        // above and only the tail below runs (usage if the contract requires
-        // it, then [DONE]).
+        // tracker has drained. Tentative arguments may already be visible,
+        // but zero calls, leaked text, or multiple calls still end with the
+        // typed error event and no successful finish. A capacity interruption
+        // already ended the request with its own terminal.
         if !discard_stream_remainder {
-            if let Some((required_visible, required_calls)) = required_hold.take() {
-                let parsed = higgs_engine::tool_parser::ToolParseResult {
+            if required_call {
+                let parsed_calls = required_calls
+                    .into_iter()
+                    .filter_map(|(name, arguments_text, ended)| {
+                        ended.then(|| {
+                            serde_json::from_str(&arguments_text)
+                                .map(|arguments_value| higgs_engine::tool_parser::ParsedToolCall {
+                                    name,
+                                    arguments: arguments_value,
+                                })
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+                let parsed = parsed_calls.map(|tool_calls| higgs_engine::tool_parser::ToolParseResult {
                     text: required_visible,
-                    tool_calls: required_calls,
-                };
-                match required_tool_call_parts(
-                    &parsed,
-                    required_tools.as_deref().unwrap_or(&[]),
-                    required_name.as_deref(),
-                ) {
-                    Ok((_, calls)) => {
-                        for call in calls.into_iter().flatten() {
-                            let d = ChatCompletionDelta {
-                                role: None,
-                                content: None,
-                                reasoning_content: None,
-                                tool_calls: Some(vec![ToolCallDelta {
-                                    index: 0,
-                                    id: Some(call.id),
-                                    r#type: Some(call.r#type),
-                                    function: Some(ToolCallFunctionDelta {
-                                        name: Some(call.function.name),
-                                        arguments: Some(call.function.arguments),
-                                    }),
-                                }]),
-                            };
-                            emit_delta!(&d, None, None);
-                        }
-                    }
-                    Err(error) => {
-                        if let (Some(ref m), Some(id)) = (metrics.as_ref(), metrics_id) {
-                            m.fail_stream(
-                                id,
-                                u64::from(output_token_count),
-                                start.elapsed(),
-                                error.to_string(),
-                            );
-                        }
-                        yield Ok(Event::default().data(streaming_error_json(&error.to_string())));
-                        return;
-                    }
+                    tool_calls,
+                });
+                let validation = parsed
+                    .map_err(|error| error.to_string())
+                    .and_then(|parsed_result| {
+                        required_tool_call_parts(
+                            &parsed_result,
+                            required_tools.as_deref().unwrap_or(&[]),
+                            required_name.as_deref(),
+                        )
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                    });
+                if let Err(error) = validation {
+                    metrics_guard.fail(error.clone());
+                    yield Ok(Event::default().data(streaming_error_json(&error)));
+                    return;
                 }
             }
         }
@@ -1590,7 +1602,7 @@ async fn chat_completions_stream(
         // Defer `finish_reason` until after the tracker has drained so we
         // know whether to report `"tool_calls"` or `"stop"`.
         if let Some(finish_reason) = pending_finish_reason {
-            let effective_finish = if tool_tracker.has_tool_calls() {
+            let effective_finish = if tool_tracker.completed_call_count() > 0 {
                 "tool_calls".to_owned()
             } else {
                 finish_reason
@@ -1618,10 +1630,14 @@ async fn chat_completions_stream(
             }
         }
 
-        if let Some(ref m) = metrics {
-            if let Some(id) = metrics_id {
-                m.finalize_stream(id, u64::from(output_token_count), start.elapsed());
-            }
+        metrics_guard.finish();
+
+        #[allow(clippy::print_stderr)] // Existing env-gated session performance diagnostic.
+        if let Some(route_started_at) = route_timer {
+            eprintln!(
+                "DIAG chat-stream-route: tool_parser_calls={tool_parser_calls} tool_parser={tool_parser_elapsed:.2?} delta_yields={delta_yields} delta_serialize={delta_serialize_elapsed:.2?} delta_yield_resume={delta_yield_elapsed:.2?} total={:.2?}",
+                route_started_at.elapsed(),
+            );
         }
 
         // Send [DONE] sentinel
@@ -2481,14 +2497,136 @@ mod tests {
         String::from_utf8(body.to_vec()).unwrap()
     }
 
+    async fn automatic_stream_body(model: &str) -> String {
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "write",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"content": {"type": "string"}},
+                    "required": ["content"]
+                }
+            }
+        })];
+        let request = chat_request(serde_json::json!({
+            "model": model,
+            "stream": true,
+            "tools": tools
+        }));
+        let stream = chat_completions_stream(
+            streaming_test_state(),
+            request,
+            Arc::new(Engine::test_stub(model)),
+            GenerationDefaults::default(),
+            None,
+            crate::router::RoutingMethod::Direct,
+        )
+        .await
+        .unwrap();
+        let response = axum::response::sse::Sse::new(stream).into_response();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    fn openai_stream_data(body: &str) -> Vec<serde_json::Value> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn automatic_long_tool_call_streams_append_only_argument_deltas() {
+        let body = automatic_stream_body("required-stream-script-long").await;
+        let chunks = openai_stream_data(&body);
+        let tool_deltas: Vec<&serde_json::Value> = chunks
+            .iter()
+            .filter_map(|chunk| {
+                let delta = &chunk["choices"][0]["delta"]["tool_calls"][0];
+                delta.is_object().then_some(delta)
+            })
+            .collect();
+
+        assert!(tool_deltas.len() > 2, "expected incremental deltas: {body}");
+        assert_eq!(tool_deltas[0]["index"], 0);
+        assert_eq!(tool_deltas[0]["type"], "function");
+        assert_eq!(tool_deltas[0]["function"]["name"], "write");
+        assert_eq!(tool_deltas[0]["function"]["arguments"], "");
+        let call_id = tool_deltas[0]["id"].as_str().unwrap();
+        assert!(call_id.starts_with("call_0_"), "{call_id}");
+        assert_eq!(
+            tool_deltas
+                .iter()
+                .filter(|delta| delta.get("id").is_some())
+                .count(),
+            1,
+            "identity must be sent exactly once: {body}"
+        );
+        assert!(tool_deltas.iter().skip(1).all(|delta| {
+            delta.get("id").is_none()
+                && delta["function"].get("name").is_none()
+                && delta["function"]["arguments"]
+                    .as_str()
+                    .is_some_and(|fragment| !fragment.is_empty())
+        }));
+        let arguments: String = tool_deltas
+            .iter()
+            .filter_map(|delta| delta["function"]["arguments"].as_str())
+            .collect();
+        let parsed: serde_json::Value = serde_json::from_str(&arguments).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({"content": "chunk ".repeat(16 * 80)})
+        );
+
+        let first_tool = chunks
+            .iter()
+            .position(|chunk| !chunk["choices"][0]["delta"]["tool_calls"].is_null())
+            .unwrap();
+        let text_before_tool: String = chunks[..first_tool]
+            .iter()
+            .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(text_before_tool, "Preparing.\n", "{body}");
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| { chunk["choices"][0]["finish_reason"] == "tool_calls" })
+        );
+    }
+
     #[tokio::test]
     async fn required_streaming_emits_nothing_before_validation_then_one_call_and_done() {
         let body = required_stream_body("required-stream-valid-call").await;
-        // Nothing parser-visible may precede validation: no content text and
-        // exactly the one validated tool call.
+        let chunks = openai_stream_data(&body);
+        let tool_deltas: Vec<&serde_json::Value> = chunks
+            .iter()
+            .filter_map(|chunk| {
+                let delta = &chunk["choices"][0]["delta"]["tool_calls"][0];
+                delta.is_object().then_some(delta)
+            })
+            .collect();
+        let arguments: String = tool_deltas
+            .iter()
+            .filter_map(|delta| delta["function"]["arguments"].as_str())
+            .collect();
+
         assert!(!body.contains("\"content\":\""), "{body}");
-        assert_eq!(body.matches("call_0_").count(), 1, "{body}");
-        assert!(body.contains(r#"{\"city\":\"Rome\"}"#), "{body}");
+        assert_eq!(
+            tool_deltas
+                .iter()
+                .filter(|delta| delta.get("id").is_some())
+                .count(),
+            1,
+            "{body}"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
+            serde_json::json!({"city": "Rome"}),
+            "{body}"
+        );
         assert!(body.contains("\"finish_reason\":\"tool_calls\""), "{body}");
         assert!(body.contains("data: [DONE]"), "{body}");
         assert!(!body.contains("generation_error"), "{body}");
@@ -2497,13 +2635,48 @@ mod tests {
     #[tokio::test]
     async fn required_streaming_leaked_text_emits_only_the_typed_error_event() {
         let body = required_stream_body("required-stream-leaky-text").await;
-        // Fail closed: no content delta, no tool delta, no success tail —
-        // only the typed error event.
+        let chunks = openai_stream_data(&body);
+        let tool_deltas: Vec<&serde_json::Value> = chunks
+            .iter()
+            .filter_map(|chunk| {
+                let delta = &chunk["choices"][0]["delta"]["tool_calls"][0];
+                delta.is_object().then_some(delta)
+            })
+            .collect();
+        let arguments: String = tool_deltas
+            .iter()
+            .filter_map(|delta| delta["function"]["arguments"].as_str())
+            .collect();
+        // Argument deltas are tentative: the route may expose them once the
+        // call identity is valid, but leaked prose still prevents a successful
+        // finish and nothing follows the terminal error.
         assert!(!body.contains("\"content\":\""), "{body}");
-        assert!(!body.contains("call_0_"), "{body}");
+        assert_eq!(
+            tool_deltas
+                .iter()
+                .filter(|delta| delta.get("id").is_some())
+                .count(),
+            1,
+            "{body}"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
+            serde_json::json!({"city": "Rome"}),
+            "{body}"
+        );
         assert!(body.contains("outside the tool_call envelope"), "{body}");
-        assert!(body.contains("generation_error"), "{body}");
+        assert!(!body.contains("\"finish_reason\":\"tool_calls\""), "{body}");
         assert!(!body.contains("data: [DONE]"), "{body}");
+        let data_lines: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .collect();
+        assert!(
+            data_lines
+                .last()
+                .is_some_and(|data| data.contains("generation_error")),
+            "{body}"
+        );
     }
 
     #[tokio::test]

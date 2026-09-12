@@ -41,6 +41,10 @@ use crate::router::Router;
 /// generate/embed call. NOTE: this also serializes concurrent requests to a
 /// single `Batch` engine; if per-model batch interleaving is reintroduced, this
 /// gate should be narrowed to cross-model boundaries.
+#[cfg(test)]
+#[path = "streaming_fixtures.rs"]
+pub(crate) mod streaming_fixtures;
+
 static GPU_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
@@ -867,6 +871,10 @@ impl Engine {
         assumed_retained_prefix_tokens: u64,
     ) -> Result<(), EngineError> {
         let _gpu = gpu_gate();
+        // A request can disconnect while waiting for the serialized GPU worker.
+        if sender.is_closed() {
+            return Err(EngineError::Cancelled);
+        }
         match self {
             Self::Simple(e) => e.generate_session_routed_streaming_with_thinking(
                 session_id,
@@ -906,6 +914,13 @@ impl Engine {
                         let _ = acceptance.send(Err(session_id));
                     }
                     return Err(EngineError::RetainedSessionUnavailable(session_id));
+                }
+                if stub.name().starts_with("required-stream-script-") {
+                    stub.route_session(session_id);
+                    if let Some(acceptance_sender) = acceptance.take() {
+                        let _ = acceptance_sender.send(Ok(()));
+                    }
+                    return streaming_fixtures::emit(stub.name(), sender, prompt_tokens.len());
                 }
                 if stub.name() == "session-prefill-render-spy" {
                     stub.record_mutation();
@@ -1205,6 +1220,10 @@ impl Engine {
         pflash_policy: &PFlashPromptPolicy,
     ) -> Result<(), EngineError> {
         let _gpu = gpu_gate();
+        // A request can disconnect while waiting for the serialized GPU worker.
+        if sender.is_closed() {
+            return Err(EngineError::Cancelled);
+        }
         match self {
             Self::Simple(e) => e.generate_streaming_with_thinking_and_pflash_policy(
                 prompt_tokens,
@@ -1235,6 +1254,10 @@ impl Engine {
                 image_inputs,
             ),
             #[cfg(test)]
+            Self::Stub(stub) if stub.name().starts_with("required-stream-script-") => {
+                streaming_fixtures::emit(stub.name(), sender, prompt_tokens.len())
+            }
+            #[cfg(test)]
             Self::Stub(_) => Err(EngineError::Generation("test stub".to_owned())),
         }
     }
@@ -1258,6 +1281,10 @@ impl Engine {
         allow_prefix_cache: bool,
     ) -> Result<(), EngineError> {
         let _gpu = gpu_gate();
+        // A request can disconnect while waiting for the serialized GPU worker.
+        if sender.is_closed() {
+            return Err(EngineError::Cancelled);
+        }
         match self {
             Self::Simple(e) => e.generate_streaming_with_thinking_and_pflash_policy_with_cache(
                 prompt_tokens,
@@ -1288,6 +1315,10 @@ impl Engine {
                 constraint,
                 image_inputs,
             ),
+            #[cfg(test)]
+            Self::Stub(stub) if stub.name().starts_with("required-stream-script-") => {
+                streaming_fixtures::emit(stub.name(), sender, prompt_tokens.len())
+            }
             #[cfg(test)]
             Self::Stub(stub) if stub.name() == "capacity-interrupted" => {
                 Err(EngineError::CapacityInterrupted {
