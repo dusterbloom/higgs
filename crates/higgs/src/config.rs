@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use figment::{
     Figment,
@@ -426,6 +428,9 @@ impl Default for LocalConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
+    /// Fixed prompt-plus-output context limit, capped by model architecture.
+    #[serde(default = "default_max_tokens")]
+    pub max_context_tokens: u32,
     /// Filesystem path or Hugging Face reference for the model.
     pub path: String,
     /// Optional external name exposed to API clients.
@@ -568,13 +573,14 @@ pub struct ModelConfig {
     pub kv_max_suffix_prefill_tokens: usize,
     /// Resident-byte budget for the prefix KV cache. When exceeded, the
     /// least-recently-used prefix is evicted (in addition to the count cap).
-    /// `0` (default) disables the budget.
+    /// `0` (default) selects a fixed 1 GiB budget.
     #[serde(default)]
     pub kv_cache_bytes: usize,
-    /// Directory used for durable, disk-backed prefix KV entries.
+    /// Enables durable prefix KV snapshots in model-path-specific files in this directory.
     #[serde(default)]
     pub kv_disk_dir: Option<String>,
-    /// Maximum disk-prefix-store size in MiB.
+    /// Disk file byte ceiling in MiB when `kv_disk_dir` is set; minimum 64.
+    /// Older snapshots are discarded when the append log reaches this ceiling.
     #[serde(default = "default_kv_disk_space_mb")]
     pub kv_disk_space_mb: u64,
     /// Store `DeepSeek`-V2 MLA caches as compressed latent rows.
@@ -769,9 +775,9 @@ impl ModelConfig {
     /// values are warned about and ignored, never fatal.
     pub fn apply_kv_turbo_env_overrides(&mut self, env: &dyn Fn(&str) -> Option<String>) {
         let bits_raw = env("HIGGS_KV_TURBO_BITS");
-        let enabled = env("HIGGS_KV_TURBO").is_some_and(|v| {
-            matches!(v.as_str(), "1" | "true" | "yes" | "on")
-        }) || bits_raw.is_some();
+        let enabled = env("HIGGS_KV_TURBO")
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            || bits_raw.is_some();
         if !enabled {
             return;
         }
@@ -794,20 +800,78 @@ impl ModelConfig {
         }
     }
 
-    /// Validate disk-prefix-store settings independently of engine startup.
+    pub const fn disk_prefix_cache_enabled(&self) -> bool {
+        self.disk_cache_enabled || self.kv_disk_dir.is_some()
+    }
+
+    fn validate_disk_prefix_settings(&self) -> Result<(), String> {
+        if self.kv_disk_dir.is_some() && self.disk_cache_path.is_some() {
+            return Err("kv_disk_dir and disk_cache_path cannot both be set".to_owned());
+        }
+        if self
+            .disk_cache_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err("disk_cache_path must not be empty".to_owned());
+        }
+        if let Some(dir) = &self.kv_disk_dir {
+            if dir.trim().is_empty() {
+                return Err("kv_disk_dir must not be empty or whitespace-only".to_owned());
+            }
+            if self.kv_disk_space_mb < 64 {
+                return Err("kv_disk_space_mb must be at least 64".to_owned());
+            }
+            self.kv_disk_space_mb
+                .checked_mul(1024 * 1024)
+                .ok_or_else(|| "kv_disk_space_mb overflows the disk byte limit".to_owned())?;
+        }
+        if self.disk_prefix_cache_enabled() {
+            if self.batch {
+                return Err("disk prefix cache is only supported with batch=false".to_owned());
+            }
+            if self.max_disk_blocks == 0 {
+                return Err("max_disk_blocks must be greater than zero".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the same settings used at startup, then probe the configured directory.
     pub fn validate_disk_prefix_store(&self) -> Result<(), String> {
-        let Some(dir) = self.kv_disk_dir.as_deref() else {
+        self.validate_disk_prefix_settings()?;
+        if !self.disk_prefix_cache_enabled() {
+            return Ok(());
+        }
+        let directory = self
+            .kv_disk_dir
+            .as_deref()
+            .map(Path::new)
+            .or_else(|| self.disk_cache_path.as_deref().and_then(Path::parent));
+        let Some(dir) = directory.filter(|path| !path.as_os_str().is_empty()) else {
             return Ok(());
         };
-        if self.kv_disk_space_mb < 64 {
-            return Err("kv_disk_space_mb must be at least 64".to_owned());
-        }
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("kv_disk_dir {dir:?} is not creatable: {e}"))?;
-        let probe = std::path::Path::new(dir).join(".higgs-write-probe");
-        std::fs::write(&probe, [])
-            .map_err(|e| format!("kv_disk_dir {dir:?} is not writable: {e}"))?;
-        std::fs::remove_file(probe).map_err(|e| format!("kv_disk_dir cleanup failed: {e}"))?;
+        std::fs::create_dir_all(dir).map_err(|e| {
+            format!(
+                "disk prefix directory {} is not creatable: {e}",
+                dir.display()
+            )
+        })?;
+        let probe = dir.join(format!(".higgs-write-probe-{}", std::process::id()));
+        // Never overwrite an existing file while checking configuration.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .map_err(|e| {
+                format!(
+                    "disk prefix directory {} is not writable: {e}",
+                    dir.display()
+                )
+            })?;
+        drop(file);
+        std::fs::remove_file(probe)
+            .map_err(|e| format!("disk prefix probe cleanup failed: {e}"))?;
         Ok(())
     }
     pub const fn kv_cache_config(&self) -> KvCacheConfig {
@@ -823,7 +887,11 @@ impl ModelConfig {
             max_session_tokens: self.kv_max_session_tokens,
             retained_idle_secs: self.kv_retained_idle_secs,
             max_retained_bytes: self.kv_max_retained_bytes,
-            kv_cache_bytes: self.kv_cache_bytes,
+            kv_cache_bytes: if self.kv_cache_bytes == 0 {
+                1_073_741_824
+            } else {
+                self.kv_cache_bytes
+            },
             mla_latent: match self.mla_latent_cache {
                 Some(v) => v,
                 None => false,
@@ -838,25 +906,51 @@ impl ModelConfig {
         }
     }
 
-    pub fn disk_prefix_cache_config(&self, model_dir: &Path) -> Option<DiskPrefixCacheConfig> {
-        if !self.disk_cache_enabled {
-            return None;
+    pub fn disk_prefix_cache_config(
+        &self,
+        model_dir: &Path,
+    ) -> Result<Option<DiskPrefixCacheConfig>, String> {
+        self.validate_disk_prefix_settings()?;
+        if !self.disk_prefix_cache_enabled() {
+            return Ok(None);
         }
-        let disk_path = self
-            .disk_cache_path
-            .clone()
-            .unwrap_or_else(|| model_dir.join(".higgs-prefix-cache.bin"));
-        Some(DiskPrefixCacheConfig {
+        let (disk_path, max_disk_bytes) = if let Some(dir) = &self.kv_disk_dir {
+            // A directory can serve several models. Bind each file to the resolved
+            // model path; the explicit legacy filename retains its existing semantics.
+            let identity = Sha256::digest(model_dir.as_os_str().as_encoded_bytes());
+            let mut filename = String::from(".higgs-prefix-cache-");
+            for byte in identity {
+                use std::fmt::Write as _;
+                write!(&mut filename, "{byte:02x}").map_err(|error| error.to_string())?;
+            }
+            filename.push_str(".bin");
+            let path = Path::new(dir).join(filename);
+            let bytes = self
+                .kv_disk_space_mb
+                .checked_mul(1024 * 1024)
+                .ok_or_else(|| "kv_disk_space_mb overflows the disk byte limit".to_owned())?;
+            (path, bytes)
+        } else {
+            (
+                self.disk_cache_path
+                    .clone()
+                    .unwrap_or_else(|| model_dir.join(".higgs-prefix-cache.bin")),
+                0,
+            )
+        };
+        Ok(Some(DiskPrefixCacheConfig {
             disk_path,
+            max_disk_bytes,
             max_disk_blocks: self.max_disk_blocks,
             min_tokens_to_persist: self.min_tokens_to_persist,
-        })
+        }))
     }
 }
 
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
+            max_context_tokens: default_max_tokens(),
             path: String::new(),
             name: None,
             generation_defaults: GenerationDefaults::default(),
@@ -1113,6 +1207,7 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
         .models
         .iter()
         .map(|p| ModelConfig {
+            max_context_tokens: default_max_tokens(),
             path: p.clone(),
             name: None,
             generation_defaults: GenerationDefaults::default(),
@@ -1254,6 +1349,7 @@ fn extract_config(
                 .models
                 .iter()
                 .map(|p| ModelConfig {
+                    max_context_tokens: default_max_tokens(),
                     path: p.clone(),
                     name: None,
                     generation_defaults: GenerationDefaults::default(),
@@ -1328,6 +1424,9 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
     }
 
     for model in &config.models {
+        if model.max_context_tokens == 0 {
+            return Err("max_context_tokens must be greater than zero".to_owned());
+        }
         if model.path.trim().is_empty() {
             return Err("model path must not be empty or whitespace-only".to_owned());
         }
@@ -1346,31 +1445,15 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
                 model.path
             ));
         }
-        if model.batch && model.disk_cache_enabled {
-            return Err(format!(
-                "disk prefix cache is only supported with batch=false for model {}",
+        model.validate_disk_prefix_settings().map_err(|error| {
+            format!(
+                "invalid disk prefix cache settings for model {}: {error}",
                 model.path
-            ));
-        }
+            )
+        })?;
         validate_pflash_settings(model).map_err(|error| {
             format!("invalid PFlash settings for model {}: {error}", model.path)
         })?;
-        if model.disk_cache_enabled && model.max_disk_blocks == 0 {
-            return Err(format!(
-                "max_disk_blocks must be greater than zero for model {}",
-                model.path
-            ));
-        }
-        if model
-            .disk_cache_path
-            .as_ref()
-            .is_some_and(|path| path.as_os_str().is_empty())
-        {
-            return Err(format!(
-                "disk_cache_path must not be empty for model {}",
-                model.path
-            ));
-        }
         if model.kv_max_suffix_prefill_tokens == 0 {
             return Err(format!(
                 "kv_max_suffix_prefill_tokens must be greater than zero for model {}",
@@ -1498,6 +1581,7 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
     let path = config.auto_router.model.clone();
     let name = path_basename(&path);
     config.models.push(ModelConfig {
+        max_context_tokens: default_max_tokens(),
         path,
         name: Some(name.clone()),
         generation_defaults: GenerationDefaults::default(),
@@ -1665,6 +1749,148 @@ pub type ServerConfig = ServerSection;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_context_default_and_positive_validation() {
+        let model: ModelConfig =
+            serde_json::from_value(serde_json::json!({"path": "/tmp/model"})).unwrap();
+        assert_eq!(
+            serde_json::to_value(&model).unwrap()["max_context_tokens"],
+            32_768
+        );
+        let config: HiggsConfig = serde_json::from_value(
+            serde_json::json!({"models": [{"path": "/tmp/model", "max_context_tokens": 0}]}),
+        )
+        .unwrap();
+        assert!(validate_config(&config, false).is_err());
+    }
+
+    #[test]
+    fn zero_prefix_byte_setting_uses_fixed_bounded_default() {
+        assert_eq!(
+            ModelConfig::default().kv_cache_config().kv_cache_bytes,
+            1_073_741_824
+        );
+    }
+
+    #[test]
+    fn disk_directory_activates_existing_prefix_cache() {
+        let model = ModelConfig {
+            kv_disk_dir: Some("/tmp/higgs-config-prefix".to_owned()),
+            ..ModelConfig::default()
+        };
+        let cache = model
+            .disk_prefix_cache_config(Path::new("/models/escha"))
+            .unwrap()
+            .expect("documented directory must enable disk persistence");
+        assert_eq!(
+            cache.disk_path.parent(),
+            Some(Path::new("/tmp/higgs-config-prefix"))
+        );
+        let same = model
+            .disk_prefix_cache_config(Path::new("/models/escha"))
+            .unwrap()
+            .unwrap();
+        let other = model
+            .disk_prefix_cache_config(Path::new("/models/another-model"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cache.disk_path, same.disk_path);
+        assert_ne!(
+            cache.disk_path, other.disk_path,
+            "shared directories must isolate models"
+        );
+    }
+
+    #[test]
+    fn disk_directory_budget_and_legacy_path_compatibility() {
+        let dir_model = ModelConfig {
+            kv_disk_dir: Some("/tmp/higgs-config-prefix".to_owned()),
+            kv_disk_space_mb: 64,
+            ..ModelConfig::default()
+        };
+        let cache = dir_model
+            .disk_prefix_cache_config(Path::new("/models/escha"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cache.max_disk_bytes, 67_108_864);
+        assert!(
+            ModelConfig::default()
+                .disk_prefix_cache_config(Path::new("/models/escha"))
+                .unwrap()
+                .is_none()
+        );
+        let mut legacy = ModelConfig {
+            disk_cache_enabled: true,
+            ..ModelConfig::default()
+        };
+        let cache = legacy
+            .disk_prefix_cache_config(Path::new("/models/escha"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cache.disk_path,
+            Path::new("/models/escha/.higgs-prefix-cache.bin")
+        );
+        assert_eq!(cache.max_disk_bytes, 0);
+        legacy.disk_cache_path = Some(PathBuf::from("/tmp/legacy-cache.bin"));
+        let cache = legacy
+            .disk_prefix_cache_config(Path::new("/models/escha"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cache.disk_path, Path::new("/tmp/legacy-cache.bin"));
+        assert_eq!(cache.max_disk_bytes, 0);
+    }
+
+    #[test]
+    fn disk_directory_rejects_conflicting_legacy_path() {
+        let model = ModelConfig {
+            kv_disk_dir: Some("/tmp/higgs-config-prefix".to_owned()),
+            disk_cache_path: Some(PathBuf::from("/tmp/other-prefix.bin")),
+            ..ModelConfig::default()
+        };
+        let error = model
+            .validate_disk_prefix_store()
+            .expect_err("two cache destinations are ambiguous");
+        assert!(error.contains("disk_cache_path"), "{error}");
+    }
+
+    #[test]
+    fn disk_directory_rejects_overflow_and_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = ModelConfig {
+            kv_disk_dir: Some(dir.path().to_str().unwrap().to_owned()),
+            kv_disk_space_mb: u64::MAX,
+            ..ModelConfig::default()
+        };
+        assert!(
+            model.validate_disk_prefix_store().is_err(),
+            "byte conversion must not overflow"
+        );
+        let model = ModelConfig {
+            kv_disk_dir: Some("   ".to_owned()),
+            ..ModelConfig::default()
+        };
+        assert!(
+            model.validate_disk_prefix_store().is_err(),
+            "blank directory must not create a relative store"
+        );
+    }
+
+    #[test]
+    fn disk_directory_rejects_batch_before_model_load() {
+        let mut config = HiggsConfig::default();
+        config.models.push(ModelConfig {
+            max_context_tokens: default_max_tokens(),
+            path: "/missing/model".to_owned(),
+            kv_disk_dir: Some("/tmp/higgs-config-prefix".to_owned()),
+            batch: true,
+            ..ModelConfig::default()
+        });
+        let error =
+            validate_config(&config, false).expect_err("disk cache needs the simple engine");
+        assert!(error.contains("disk prefix cache"), "{error}");
+    }
 
     #[allow(unsafe_code)]
     fn with_env_var<R>(key: &str, desired_value: Option<&str>, f: impl FnOnce() -> R) -> R {
@@ -2948,7 +3174,6 @@ mod kv_turbo_env_tests {
         move |key: &str| owned.get(key).cloned()
     }
 
-
     fn turbo_model() -> ModelConfig {
         ModelConfig {
             path: "m".to_owned(),
@@ -2961,10 +3186,7 @@ mod kv_turbo_env_tests {
     #[test]
     fn turbo_flag_switches_mode_and_keeps_configured_bits() {
         let mut model = turbo_model();
-        model.apply_kv_turbo_env_overrides(&env_map(&[(
-            "HIGGS_KV_TURBO",
-            "1".to_owned(),
-        )]));
+        model.apply_kv_turbo_env_overrides(&env_map(&[("HIGGS_KV_TURBO", "1".to_owned())]));
         assert!(matches!(model.kv_cache, KvCacheMode::Turboquant));
         assert_eq!(model.kv_bits, 3, "bits stay at the configured default");
     }
@@ -2972,10 +3194,7 @@ mod kv_turbo_env_tests {
     #[test]
     fn turbo_bits_override_sets_width_and_enables_mode() {
         let mut model = turbo_model();
-        model.apply_kv_turbo_env_overrides(&env_map(&[(
-            "HIGGS_KV_TURBO_BITS",
-            "4".to_owned(),
-        )]));
+        model.apply_kv_turbo_env_overrides(&env_map(&[("HIGGS_KV_TURBO_BITS", "4".to_owned())]));
         assert!(matches!(model.kv_cache, KvCacheMode::Turboquant));
         assert_eq!(model.kv_bits, 4);
     }
@@ -2988,7 +3207,10 @@ mod kv_turbo_env_tests {
             ("HIGGS_KV_TURBO_BITS", "8".to_owned()),
         ]));
         assert!(matches!(model.kv_cache, KvCacheMode::Turboquant));
-        assert_eq!(model.kv_bits, 3, "unsupported 8-bit width falls back to configured bits");
+        assert_eq!(
+            model.kv_bits, 3,
+            "unsupported 8-bit width falls back to configured bits"
+        );
     }
 
     #[test]

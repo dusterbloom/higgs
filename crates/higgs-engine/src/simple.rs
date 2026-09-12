@@ -3416,14 +3416,11 @@ impl SimpleEngine {
         // model_loader.rs). The parameter is retained so the state/main call
         // chain stays shape-compatible.
         let _ = disable_vision;
-        // Map the vision-shaped `(dir, byte budget)` pair onto nightly's
-        // `DiskPrefixCacheConfig`. Nightly sizes the disk store in token
-        // blocks (`max_disk_blocks`, baked into the store file header), not
-        // bytes, so the byte budget has no direct nightly equivalent; a
-        // non-`None` dir enables the store at nightly's default block cap.
-        let _ = disk_prefix_budget;
+        // Preserve this adapter's existing file-path argument semantics while
+        // forwarding its byte ceiling to the same disk prefix cache implementation.
         let disk_cache_config = disk_prefix_dir.map(|path| DiskPrefixCacheConfig {
             disk_path: path.to_path_buf(),
+            max_disk_bytes: disk_prefix_budget,
             max_disk_blocks: DEFAULT_MAX_DISK_BLOCKS,
             min_tokens_to_persist: DEFAULT_MIN_TOKENS_TO_PERSIST,
         });
@@ -4548,6 +4545,17 @@ impl SimpleEngine {
         lock_or_recover(&self.retained)
             .remove(&session_id)
             .is_some()
+    }
+
+    /// Best-effort release for the eager-reclaim endpoint; busy sessions stay retained.
+    pub fn try_drop_retained_session(&self, session_id: u64) -> bool {
+        let session_lock = self.session_lock_for(session_id);
+        let _session_guard = match session_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        lock_or_recover(&self.retained).remove(&session_id).is_some()
     }
 
     /// Evict retained caches idle longer than `ttl`; returns how many were
@@ -16588,6 +16596,35 @@ mod tests {
             true
         );
         handle.join().unwrap();
+        assert_eq!(engine.retained_session_tokens(SESSION_ID), None);
+    }
+
+    #[test]
+    fn eager_drop_returns_busy_without_waiting_or_removing_fallback() {
+        const SESSION_ID: u64 = 0xD202_5E56;
+        let engine = std::sync::Arc::new(session_cache_test_engine());
+        engine.stash_retained(
+            SESSION_ID,
+            crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+                AnyCache::KV(Vec::new()),
+                vec![9, 10, 11],
+            ),
+            false,
+        );
+        let session_lock = engine.session_lock_for(SESSION_ID);
+        let guard = session_lock.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_engine = std::sync::Arc::clone(&engine);
+        let worker = std::thread::spawn(move || {
+            tx.send(worker_engine.try_drop_retained_session(SESSION_ID)).unwrap();
+        });
+        let busy = rx.recv_timeout(std::time::Duration::from_millis(250));
+        // Release even on regression so the worker can finish before the assertion.
+        drop(guard);
+        worker.join().unwrap();
+        assert_eq!(busy, Ok(false), "eager release must return while generation owns the lock");
+        assert_eq!(engine.retained_session_tokens(SESSION_ID), Some(vec![9, 10, 11]));
+        assert!(engine.try_drop_retained_session(SESSION_ID));
         assert_eq!(engine.retained_session_tokens(SESSION_ID), None);
     }
 

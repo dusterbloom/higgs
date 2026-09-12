@@ -167,11 +167,16 @@ async fn completions_non_streaming(
         .encode(req.prompt.as_str(), false)
         .map_err(|e| ServerError::BadRequest(format!("Tokenization error: {e}")))?;
     let prompt_tokens = encoding.get_ids().to_vec();
+    let max_tokens = crate::capacity::resolve_output_tokens(
+        &state,
+        &req.model,
+        prompt_tokens.len(),
+        req.max_tokens,
+        max_tokens,
+    );
     let reservation = crate::capacity::admit_generation_request(
         &state,
         &req.model,
-        crate::capacity::ExecutionPath::Cold,
-        prompt_tokens.len(),
         prompt_tokens.len(),
         max_tokens,
     )
@@ -241,12 +246,17 @@ async fn completions_stream(
         .encode(req.prompt.as_str(), false)
         .map_err(|e| ServerError::BadRequest(format!("Tokenization error: {e}")))?;
     let prompt_tokens = encoding.get_ids().to_vec();
+    let max_tokens = crate::capacity::resolve_output_tokens(
+        &state,
+        &req.model,
+        prompt_tokens.len(),
+        req.max_tokens,
+        max_tokens,
+    );
     let input_token_count = u64::try_from(prompt_tokens.len()).unwrap_or(u64::MAX);
     let reservation = crate::capacity::admit_generation_request(
         &state,
         &req.model,
-        crate::capacity::ExecutionPath::Cold,
-        prompt_tokens.len(),
         prompt_tokens.len(),
         max_tokens,
     )

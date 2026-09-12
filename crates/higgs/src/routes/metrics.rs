@@ -16,10 +16,8 @@ pub struct MetricsResponse {
     pub models: Vec<MetricsGroup>,
     pub providers: Vec<MetricsGroup>,
     pub cache: CacheMetricsView,
-    /// Adaptive-capacity diagnostics: live reservations, FIFO depth,
-    /// pressure with swap/compressor deltas, rejection and cancellation
-    /// outcome counters, downshifts, peak MLX allocation, and one row per
-    /// model. Numbers only — no prompt content.
+    /// Fixed context limits, active request lifetimes, and memory telemetry.
+    /// Numbers only — no prompt content.
     pub capacity: crate::capacity::CapacityDiagnostics,
 }
 
@@ -312,6 +310,7 @@ pub async fn metrics(
     };
     let mut response = build_metrics_response(metrics);
     response.cache = aggregate_cache(&state.router);
+    state.capacity.refresh_measured_memory();
     response.capacity = state.capacity.diagnostics();
     Ok(Json(response))
 }
@@ -405,71 +404,17 @@ mod tests {
         let diagnostics = crate::capacity::CapacityDiagnostics {
             boot_id: "boot-1".to_owned(),
             active_reservations: 2,
-            active_reservation_bytes: 4096,
-            oldest_reservation_age_ms: Some(17),
-            queued_waiters: 1,
-            pressure: crate::capacity::MemoryPressure::Constrained,
-            raw_pressure: crate::capacity::MemoryPressure::Constrained,
             mlx_active_bytes: 100,
-            mlx_peak_bytes: 200,
-            mlx_cached_bytes: None,
-            mlx_measured_at_unix_ms: None,
-            swap_out_delta: 3,
-            compressor_delta: 4,
-            swap_outs_total: None,
-            compressions_total: None,
-            pressure_sampled_at_unix_ms: None,
-            pressure_sample_epoch: None,
-            non_normal_pressure_event_epoch: 0,
-            allocation_observations: 0,
-            clean_allocation_observations: 0,
-            skipped_allocation_observations: 0,
-            last_observed_prefill_peak_bytes: None,
-            last_observed_decode_peak_bytes: None,
-            last_observed_retained_bytes: None,
-            downshifts: 5,
-            rejections: crate::capacity::CapacityRejectionDiagnostics {
-                exceeded: 6,
-                unavailable: 7,
-            },
-            stop_outcomes: std::collections::BTreeMap::from([(
-                "critical_pressure".to_owned(),
-                1_u64,
-            )]),
-            models: vec![crate::capacity::CapacityModelDiagnostics {
-                model: "m".to_owned(),
-                generation: 9,
-                available: true,
-                basis: crate::capacity::CapacityBasis::Conservative,
-                pressure: crate::capacity::MemoryPressure::Constrained,
-                safe_total_tokens: 10,
-                recommended_output_tokens: 11,
-                max_prompt_tokens: 12,
-                usable_bytes: 13,
-                qualified_cold_bands: 0,
-            }],
+            pressure: crate::capacity::MemoryPressure::Constrained,
+            ..crate::capacity::CapacityDiagnostics::default()
         };
-
-        let json = serde_json::to_value(&diagnostics).unwrap();
+        let json = serde_json::to_value(diagnostics).unwrap();
         assert_eq!(json["bootId"], "boot-1");
         assert_eq!(json["activeReservations"], 2);
-        assert_eq!(json["activeReservationBytes"], 4096);
-        assert_eq!(json["oldestReservationAgeMs"], 17);
-        assert_eq!(json["queuedWaiters"], 1);
-        assert_eq!(json["pressure"], "constrained");
         assert_eq!(json["mlxActiveBytes"], 100);
-        assert_eq!(json["mlxPeakBytes"], 200);
-        assert_eq!(json["swapOutDelta"], 3);
-        assert_eq!(json["compressorDelta"], 4);
-        assert_eq!(json["downshifts"], 5);
-        assert_eq!(json["rejections"]["exceeded"], 6);
-        assert_eq!(json["rejections"]["unavailable"], 7);
-        assert_eq!(json["stopOutcomes"]["critical_pressure"], 1);
-        assert_eq!(json["models"][0]["safeTotalTokens"], 10);
-        // Numbers and identities only: no field carries request text.
-        let rendered = json.to_string();
-        assert!(!rendered.contains("prompt"), "{rendered}");
-        assert!(!rendered.contains("message"), "{rendered}");
+        assert_eq!(json["pressure"], "constrained");
+        assert!(json.get("activeReservationBytes").is_none());
+        assert!(json.get("downshifts").is_none());
     }
 
     fn cache_stats_fixture() -> CacheStats {

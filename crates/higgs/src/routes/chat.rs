@@ -568,6 +568,13 @@ async fn chat_completions_non_streaming(
     let (prompt_tokens, pflash_policy) = engine
         .prepare_chat_prompt_with_pflash_policy(&messages, tools, thinking_enabled, prompt_mode)
         .map_err(ServerError::Engine)?;
+    let max_tokens = crate::capacity::resolve_output_tokens(
+        &state,
+        &req.model,
+        prompt_tokens.len(),
+        req.max_tokens,
+        max_tokens,
+    );
     validate_prompt_limit(req.max_prompt_tokens, prompt_tokens.len())?;
     validate_session_lease_ttl(req.session_lease.map(|lease| lease.ttl_seconds))?;
     // Multimodal requests: hand the raw decoded images to the engine, which
@@ -614,27 +621,15 @@ async fn chat_completions_non_streaming(
             req.session_id.unwrap_or_default(),
         ));
     }
-    // Best-effort sessions may bootstrap cold if the retained branch changes;
-    // only required continuation can safely reserve the smaller suffix path.
+    // Retained prefix facts are revalidated by the worker at acceptance.
+    // They never discount the full prompt in the fixed context check.
     let retained_prefix = session_id
         .and_then(|sid| engine.retained_session_prefix_len(sid, &prompt_tokens))
         .unwrap_or(0);
-    let admitted_retained_prefix =
-        if continuation_policy == SessionContinuationPolicy::RequireContinuation {
-            retained_prefix
-        } else {
-            0
-        };
     let reservation = crate::capacity::admit_generation_request(
         &state,
         &req.model,
-        if session_id.is_some() && admitted_retained_prefix > 0 {
-            crate::capacity::ExecutionPath::RetainedSuffix
-        } else {
-            crate::capacity::ExecutionPath::Cold
-        },
         prompt_tokens.len(),
-        prompt_tokens.len() - admitted_retained_prefix,
         max_tokens,
     )
     .await?;
@@ -1081,6 +1076,13 @@ async fn chat_completions_stream(
             prompt_mode,
         )
         .map_err(ServerError::Engine)?;
+    let max_tokens = crate::capacity::resolve_output_tokens(
+        &state,
+        &req.model,
+        prompt_tokens.len(),
+        req.max_tokens,
+        max_tokens,
+    );
     validate_prompt_limit(req.max_prompt_tokens, prompt_tokens.len())?;
     validate_session_lease_ttl(req.session_lease.map(|lease| lease.ttl_seconds))?;
     // Multimodal requests: hand the raw decoded images to the engine, which
@@ -1133,30 +1135,14 @@ async fn chat_completions_stream(
             request_session_id.unwrap_or_default(),
         ));
     }
-    // Best-effort sessions may bootstrap cold if the retained branch changes;
-    // only required continuation can safely reserve the smaller suffix path.
+    // Retained prefix facts are revalidated by the worker at acceptance.
+    // They never discount the full prompt in the fixed context check.
     let retained_prefix = stream_session_id
         .and_then(|sid| engine.retained_session_prefix_len(sid, &prompt_tokens))
         .unwrap_or(0);
-    let admitted_retained_prefix =
-        if continuation_policy == SessionContinuationPolicy::RequireContinuation {
-            retained_prefix
-        } else {
-            0
-        };
-    let reservation = crate::capacity::admit_generation_request(
-        &state,
-        &model,
-        if stream_session_id.is_some() && admitted_retained_prefix > 0 {
-            crate::capacity::ExecutionPath::RetainedSuffix
-        } else {
-            crate::capacity::ExecutionPath::Cold
-        },
-        prompt_tokens.len(),
-        prompt_tokens.len() - admitted_retained_prefix,
-        max_tokens,
-    )
-    .await?;
+    let reservation =
+        crate::capacity::admit_generation_request(&state, &model, prompt_tokens.len(), max_tokens)
+            .await?;
     let assumed_retained_prefix = u64::try_from(retained_prefix).unwrap_or(u64::MAX);
     let watchdog = crate::capacity::request_watchdog(&state);
     drop_requested_retained_sessions(
@@ -2019,7 +2005,7 @@ pub async fn drop_sessions(
     for session_id in ids {
         dropped.push(serde_json::json!({
             "session_id": session_id,
-            "dropped": engine.drop_retained_session(session_id),
+            "dropped": engine.try_drop_retained_session(session_id),
         }));
     }
     Ok(Json(serde_json::json!({ "dropped": dropped })))
@@ -2766,10 +2752,13 @@ mod tests {
             "session_cache_policy": "require_continuation"
         }));
 
+        let engine = Arc::new(Engine::test_stub("zero-prefix-materialization-fail"));
+        engine.test_retain_session_tokens(42, Vec::new());
+
         let error = match chat_completions_stream(
             streaming_test_state(),
             request,
-            Arc::new(Engine::test_stub("zero-prefix-materialization-fail")),
+            engine,
             GenerationDefaults::default(),
             None,
             crate::router::RoutingMethod::Direct,
@@ -2894,6 +2883,7 @@ mod tests {
         };
 
         let accepted_engine = Arc::new(Engine::test_stub("zero-prefix-accept"));
+        accepted_engine.test_retain_session_tokens(42, Vec::new());
         let accepted = chat_completions_stream(
             streaming_test_state(),
             request(),
@@ -3717,7 +3707,10 @@ mod tests {
         assert!(matches!(streaming, Err(ServerError::CapacityExceeded(_))));
         assert!(engine.route_test_mutation_sequence().is_empty());
         assert_eq!(state.capacity.active_reservation_count(model), 0);
-        assert!(state.capacity.admission_test_memory().1 > initial_memory_revision);
+        assert_eq!(
+            state.capacity.admission_test_memory().1,
+            initial_memory_revision
+        );
     }
 
     #[tokio::test]
@@ -3737,8 +3730,7 @@ mod tests {
             serde_json::from_value::<ChatCompletionRequest>(request).unwrap()
         };
 
-        // Best-effort may lose the retained branch and bootstrap cold, so it
-        // must reserve the full prompt and reject under this narrow envelope.
+        // Best-effort and required continuation use the same full context bound.
         let best_effort = chat_completions_non_streaming(
             Arc::clone(&state),
             request(serde_json::json!({"session_id": 42, "max_tokens": 16})),
@@ -3746,10 +3738,12 @@ mod tests {
             GenerationDefaults::default(),
         )
         .await;
-        assert!(matches!(best_effort, Err(ServerError::CapacityExceeded(_))));
+        assert!(
+            best_effort.is_ok(),
+            "fixed context permits full prompt: {best_effort:?}"
+        );
 
-        // Required continuation rejects instead of falling back, so charging
-        // only the validated uncached 100-token suffix is safe.
+        // Required continuation still verifies its retained prefix at acceptance.
         let admitted = chat_completions_non_streaming(
             Arc::clone(&state),
             request(serde_json::json!({
@@ -3763,7 +3757,7 @@ mod tests {
         .await;
         assert!(
             admitted.is_ok(),
-            "suffix-charged session turn must admit: {admitted:?}"
+            "fixed-context session turn must admit: {admitted:?}"
         );
         assert_eq!(
             state.capacity.active_reservation_count(model),
@@ -3771,8 +3765,7 @@ mod tests {
             "worker-owned reservation must release after completion"
         );
 
-        // Same prompt without retained state must exceed the envelope: this is
-        // the exact charge the pre-fix code applied to session turns.
+        // A missing required session remains a typed 409 independent of context.
         let cold = chat_completions_non_streaming(
             Arc::clone(&state),
             request(serde_json::json!({
@@ -3785,8 +3778,8 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(cold, Err(ServerError::CapacityExceeded(_))),
-            "cold full-prompt charge must still 413: {cold:?}"
+            matches!(cold, Err(ServerError::RetainedSessionUnavailable(43))),
+            "missing required session must return 409: {cold:?}"
         );
 
         // Worker-acceptance revalidation: admission measures a 2,900-token
@@ -3814,6 +3807,82 @@ mod tests {
         );
         assert_eq!(state.capacity.active_reservation_count(model), 0);
     }
+    #[tokio::test]
+    async fn omitted_output_uses_remaining_fixed_context_in_both_chat_paths() {
+        let model = "zero-prefix-accept";
+        let (state, engine) = crate::capacity::suffix_charging_route_test_state(model);
+        engine.test_set_chat_prompt_tokens(vec![7; 3000]);
+        let request = || {
+            serde_json::from_value::<ChatCompletionRequest>(serde_json::json!({
+                "model": model,
+                "session_id": 42,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap()
+        };
+        let blocking = chat_completions_non_streaming(
+            Arc::clone(&state),
+            request(),
+            Arc::clone(&engine),
+            GenerationDefaults::default(),
+        )
+        .await;
+        assert!(
+            blocking.is_ok(),
+            "omitted output must fit remaining context: {blocking:?}"
+        );
+        let streaming = chat_completions_stream(
+            Arc::clone(&state),
+            request(),
+            Arc::clone(&engine),
+            GenerationDefaults::default(),
+            None,
+            crate::router::RoutingMethod::Direct,
+        )
+        .await;
+        assert!(
+            streaming.is_ok(),
+            "omitted output must fit remaining context"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_prompt_still_counts_toward_fixed_context_in_both_chat_paths() {
+        let model = "zero-prefix-accept";
+        let (state, engine) = crate::capacity::suffix_charging_route_test_state(model);
+        engine.test_set_chat_prompt_tokens(vec![7; 3000]);
+        engine.test_retain_session_tokens(42, vec![7; 2900]);
+        let request = || {
+            serde_json::from_value::<ChatCompletionRequest>(serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "session_id": 42,
+                "session_cache_policy": "require_continuation",
+                "max_tokens": 128
+            }))
+            .unwrap()
+        };
+        let blocking = chat_completions_non_streaming(
+            Arc::clone(&state),
+            request(),
+            Arc::clone(&engine),
+            GenerationDefaults::default(),
+        )
+        .await;
+        assert!(matches!(blocking, Err(ServerError::CapacityExceeded(_))));
+        let streaming = chat_completions_stream(
+            Arc::clone(&state),
+            request(),
+            Arc::clone(&engine),
+            GenerationDefaults::default(),
+            None,
+            crate::router::RoutingMethod::Direct,
+        )
+        .await;
+        assert!(matches!(streaming, Err(ServerError::CapacityExceeded(_))));
+        assert_eq!(state.capacity.active_reservation_count(model), 0);
+    }
+
     #[tokio::test]
     async fn drop_sessions_route_reports_per_id_dropped_flags() {
         let engine_name = "drop-target";
@@ -3860,10 +3929,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let json: serde_json::Value = serde_json::from_slice(
-            &response.into_body().collect().await.unwrap().to_bytes(),
-        )
-        .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
         let dropped = json["dropped"].as_array().unwrap();
         assert_eq!(dropped.len(), 3, "ids dedup + sort: 5, 7, 9");
         assert_eq!(dropped[0]["session_id"], 5);

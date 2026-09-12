@@ -15,14 +15,14 @@ use mlx_rs::{Array, Dtype};
 
 use crate::cache::disk_storage::{
     DiskCacheBlock, DiskCacheEntryMetadata, DiskCacheError, DiskCacheFileHeader, DiskCacheLayer,
-    DiskCacheSnapshot, DiskStorage, RecurrentStateSnapshot,
+    DiskCacheSnapshot, DiskStorage, RecurrentArraySnapshot, RecurrentDtype, RecurrentStateSnapshot,
 };
-use higgs_models::LayerCache;
 use crate::cache::paired::{PairedCacheError, RadixPairCheckpoint};
 use crate::paged_prefix_cache::{
     PagedPairedLookupPlan, PagedPrefixCache, PagedPrefixMatch, PairedPrefixCacheStats,
     PairedPrepareTicket, PairedTouchToken, PreparedPairedPrefix, RadixByteStats,
 };
+use higgs_models::LayerCache;
 
 pub const DEFAULT_MIN_TOKENS_TO_PERSIST: usize = 512;
 pub const DEFAULT_MAX_DISK_BLOCKS: usize = 4096;
@@ -30,6 +30,8 @@ pub const DEFAULT_MAX_DISK_BLOCKS: usize = 4096;
 #[derive(Debug, Clone)]
 pub struct DiskPrefixCacheConfig {
     pub disk_path: PathBuf,
+    /// Complete disk file byte ceiling; zero preserves the legacy unlimited log.
+    pub max_disk_bytes: u64,
     pub max_disk_blocks: usize,
     pub min_tokens_to_persist: usize,
 }
@@ -85,6 +87,7 @@ impl DiskPrefixCache {
     ) -> Result<Self, DiskCacheError> {
         let DiskPrefixCacheConfig {
             disk_path,
+            max_disk_bytes,
             max_disk_blocks,
             min_tokens_to_persist,
         } = config;
@@ -94,7 +97,8 @@ impl DiskPrefixCache {
             max_disk_blocks,
             num_kv_heads,
             head_dim,
-        )?;
+        )?
+        .with_max_disk_bytes(max_disk_bytes)?;
         Ok(Self {
             memory: PagedPrefixCache::new(max_entries, block_size),
             storage: Some(storage),
@@ -284,22 +288,27 @@ impl DiskPrefixCache {
             return;
         };
         let header = storage.header().clone();
-        let (layers, recurrent) = match snapshot_layers(cache, &header, stored_len, prefix_tokens.len()) {
-            Ok(ok) => ok,
-            Err(DiskCacheError::Unsupported(reason)) => {
-                tracing::debug!(reason, "Skipping disk prefix cache store");
-                return;
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "Failed to build disk prefix cache snapshot");
-                return;
-            }
-        };
+        let (layers, recurrent) =
+            match snapshot_layers(cache, &header, stored_len, prefix_tokens.len()) {
+                Ok(ok) => ok,
+                Err(DiskCacheError::Unsupported(reason)) => {
+                    tracing::debug!(reason, "Skipping disk prefix cache store");
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "Failed to build disk prefix cache snapshot");
+                    return;
+                }
+            };
 
         let token_session_id = hash_tokens_for_session(tokens_to_store);
-        if let Err(error) =
-            storage.save_blocks(token_session_id, token_hash, stored_len, &layers, &recurrent)
-        {
+        if let Err(error) = storage.save_blocks(
+            token_session_id,
+            token_hash,
+            stored_len,
+            &layers,
+            &recurrent,
+        ) {
             tracing::warn!(error = %error, "Failed to persist disk prefix cache snapshot");
         }
         if let Some(checkpoint) = checkpoint_id {
@@ -529,7 +538,7 @@ fn snapshot_layers(
 /// Snapshot a hybrid cache: attention layers persist their per-token K/V
 /// blocks exactly as pure-KV caches do; recurrent (GDN) layers contribute
 /// their fixed-size conv/SSM state, which is valid for the same token prefix.
-/// Hybrid snapshots require format v2 — the loader treats v1 files as misses.
+/// Hybrid snapshots require format v3; earlier files are invalidated on open.
 fn snapshot_hybrid_layers(
     cache: &AnyCache,
     header: &DiskCacheFileHeader,
@@ -576,8 +585,7 @@ fn snapshot_hybrid_layers(
                 validate_array_layout(values, header, stored_len)?;
                 let mut blocks = Vec::with_capacity(block_count);
                 for block_index in 0..block_count {
-                    let start_usize =
-                        block_index.checked_mul(header.block_size).unwrap_or(0);
+                    let start_usize = block_index.checked_mul(header.block_size).unwrap_or(0);
                     let start = i32::try_from(start_usize)
                         .map_err(|_| DiskCacheError::Overflow("block start"))?;
                     let end = start
@@ -585,21 +593,46 @@ fn snapshot_hybrid_layers(
                         .ok_or(DiskCacheError::Overflow("block end"))?;
                     let k_block = array_block_to_f16(keys, start, end, block_elems)?;
                     let v_block = array_block_to_f16(values, start, end, block_elems)?;
-                    blocks.push(DiskCacheBlock { k: k_block, v: v_block });
+                    blocks.push(DiskCacheBlock {
+                        k: k_block,
+                        v: v_block,
+                    });
                 }
                 disk_layers.push(DiskCacheLayer { blocks });
             }
             LayerCache::Arrays(arrays) => {
-                let to_f16 = |array: &Array| -> Result<Vec<f16>, DiskCacheError> {
-                    let converted = array
-                        .as_dtype(Dtype::Float16)
+                let snapshot = |array: &Array| -> Result<RecurrentArraySnapshot, DiskCacheError> {
+                    let dtype = match array.dtype() {
+                        Dtype::Float32 => RecurrentDtype::Float32,
+                        Dtype::Float16 => RecurrentDtype::Float16,
+                        Dtype::Bfloat16 => RecurrentDtype::Bfloat16,
+                        Dtype::Bool
+                        | Dtype::Uint8
+                        | Dtype::Uint16
+                        | Dtype::Uint32
+                        | Dtype::Uint64
+                        | Dtype::Int8
+                        | Dtype::Int16
+                        | Dtype::Int32
+                        | Dtype::Int64
+                        | Dtype::Float64
+                        | Dtype::Complex64 => {
+                            return Err(DiskCacheError::Unsupported("unsupported recurrent dtype"));
+                        }
+                    };
+                    let values = array
+                        .as_dtype(Dtype::Float32)
                         .map_err(|error| DiskCacheError::Mlx(format!("{error}")))?;
-                    Ok(converted.as_slice::<f16>().to_vec())
+                    Ok(RecurrentArraySnapshot {
+                        shape: array.shape().to_vec(),
+                        dtype,
+                        values: values.as_slice::<f32>().to_vec(),
+                    })
                 };
                 recurrent.push(RecurrentStateSnapshot {
                     layer_index: disk_layers.len(),
-                    conv: arrays.conv_state.as_ref().map(to_f16).transpose()?,
-                    ssm: arrays.ssm_state.as_ref().map(to_f16).transpose()?,
+                    conv: arrays.conv_state.as_ref().map(snapshot).transpose()?,
+                    ssm: arrays.ssm_state.as_ref().map(snapshot).transpose()?,
                     conv_pos: arrays.conv_pos,
                     offset: arrays.offset,
                 });
@@ -685,23 +718,32 @@ fn materialize_snapshot(
     let mut layers = Vec::with_capacity(snapshot.layers.len());
     for (index, layer) in snapshot.layers.iter().enumerate() {
         if let Some(state) = recurrent_by_index.remove(&index) {
-            let to_array = |data: &Vec<f16>| -> Result<Array, DiskCacheError> {
-                let len = i32::try_from(data.len())
-                    .map_err(|_| DiskCacheError::Overflow("state len"))?;
-                Ok(Array::from_slice(data, &[1, len]))
+            if state
+                .conv
+                .as_ref()
+                .is_some_and(|data| data.shape.len() != 3)
+                || state.ssm.as_ref().is_some_and(|data| {
+                    data.shape.len() != 4 || !matches!(data.dtype, RecurrentDtype::Float32)
+                })
+            {
+                return Err(DiskCacheError::Format(
+                    "invalid GDN state geometry or dtype".to_owned(),
+                ));
+            }
+            let to_array = |data: &RecurrentArraySnapshot| -> Result<Array, DiskCacheError> {
+                let dtype = match data.dtype {
+                    RecurrentDtype::Float32 => Dtype::Float32,
+                    RecurrentDtype::Float16 => Dtype::Float16,
+                    RecurrentDtype::Bfloat16 => Dtype::Bfloat16,
+                };
+                Array::from_slice(&data.values, &data.shape)
+                    .as_dtype(dtype)
+                    .map_err(|error| DiskCacheError::Mlx(format!("{error}")))
             };
             layers.push(Some(LayerCache::Arrays(
                 higgs_models::qwen3_next::ArraysCache {
-                    conv_state: state
-                        .conv
-                        .as_ref()
-                        .map(&to_array)
-                        .transpose()?,
-                    ssm_state: state
-                        .ssm
-                        .as_ref()
-                        .map(&to_array)
-                        .transpose()?,
+                    conv_state: state.conv.as_ref().map(&to_array).transpose()?,
+                    ssm_state: state.ssm.as_ref().map(&to_array).transpose()?,
                     conv_pos: state.conv_pos,
                     offset: state.offset,
                 },
@@ -849,6 +891,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = DiskPrefixCacheConfig {
             disk_path: dir.path().join("prefix.bin"),
+            max_disk_bytes: 0,
             max_disk_blocks: 16,
             min_tokens_to_persist: 32,
         };
@@ -880,6 +923,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = DiskPrefixCacheConfig {
             disk_path: dir.path().join("prefix.bin"),
+            max_disk_bytes: 0,
             max_disk_blocks: 16,
             min_tokens_to_persist: 1,
         };
@@ -980,6 +1024,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = DiskPrefixCacheConfig {
             disk_path: dir.path().join("prefix.bin"),
+            max_disk_bytes: 0,
             max_disk_blocks: 16,
             min_tokens_to_persist: 1,
         };
@@ -1017,6 +1062,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = DiskPrefixCacheConfig {
             disk_path: dir.path().join("prefix.bin"),
+            max_disk_bytes: 0,
             max_disk_blocks: 16,
             min_tokens_to_persist: 1,
         };
@@ -1065,6 +1111,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = DiskPrefixCacheConfig {
             disk_path: dir.path().join("prefix.bin"),
+            max_disk_bytes: 0,
             max_disk_blocks: 0,
             min_tokens_to_persist: 1,
         };
@@ -1094,6 +1141,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = DiskPrefixCacheConfig {
             disk_path: dir.path().join("prefix.bin"),
+            max_disk_bytes: 0,
             max_disk_blocks: 16,
             min_tokens_to_persist: 1,
         };
@@ -1131,6 +1179,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = DiskPrefixCacheConfig {
             disk_path: dir.path().join("prefix.bin"),
+            max_disk_bytes: 0,
             max_disk_blocks: 16,
             min_tokens_to_persist: 32,
         };
@@ -1163,10 +1212,34 @@ mod tests {
     }
 
     #[test]
+    fn disk_byte_budget_bounds_named_checkpoint_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskPrefixCacheConfig {
+            disk_path: dir.path().join("prefix.bin"),
+            max_disk_bytes: 1500,
+            max_disk_blocks: 16,
+            min_tokens_to_persist: 32,
+        };
+        let tokens: Vec<u32> = (0..32).collect();
+        let cache = make_kv_cache(1, 32);
+        let mut writer = DiskPrefixCache::new(8, 32, config.clone(), 2, 4).unwrap();
+        writer.store(&tokens, &cache, Some("checkpoint-budget"));
+        assert!(std::fs::metadata(&config.disk_path).unwrap().len() <= 1500);
+        drop(writer);
+        let mut reader = DiskPrefixCache::new(8, 32, config, 2, 4).unwrap();
+        assert!(
+            reader
+                .find_longest_prefix(&tokens, Some("checkpoint-budget"))
+                .is_some()
+        );
+    }
+
+    #[test]
     fn named_checkpoint_validates_prompt_hash() {
         let dir = tempfile::tempdir().unwrap();
         let config = DiskPrefixCacheConfig {
             disk_path: dir.path().join("prefix.bin"),
+            max_disk_bytes: 0,
             max_disk_blocks: 16,
             min_tokens_to_persist: 32,
         };
@@ -1204,6 +1277,67 @@ mod hybrid_snapshot_tests {
     use super::*;
     use higgs_models::qwen3_next::ArraysCache;
 
+    #[test]
+    fn hybrid_disk_restart_preserves_recurrent_geometry_and_precision() {
+        for conv_dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("prefix.bin");
+            let header = DiskCacheFileHeader {
+                block_size: 8,
+                num_blocks: 4,
+                num_kv_heads: 2,
+                head_dim: 4,
+            };
+            // Real GDN ranks, with a Float32 value that Float16 cannot preserve.
+            let conv = Array::from_slice(&[0.12345679f32; 3 * 8], &[1, 3, 8])
+                .as_dtype(conv_dtype)
+                .unwrap();
+            let conv_values = conv
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec();
+            let ssm_values = vec![0.12345679f32; 2 * 4 * 32];
+            let cache = AnyCache::Hybrid(vec![Some(LayerCache::Arrays(ArraysCache {
+                conv_state: Some(conv),
+                ssm_state: Some(Array::from_slice(&ssm_values, &[1, 2, 4, 32])),
+                conv_pos: 2,
+                offset: 8,
+            }))]);
+            let (layers, recurrent) = snapshot_layers(&cache, &header, 8, 8).unwrap();
+            let mut storage = DiskStorage::open(&path, 8, 4, 2, 4).unwrap();
+            storage.save_blocks(7, 99, 8, &layers, &recurrent).unwrap();
+            drop(storage);
+            let storage = DiskStorage::open(&path, 8, 4, 2, 4).unwrap();
+            let snapshot = storage.load_blocks(7).unwrap().unwrap();
+            let restored = materialize_snapshot(&snapshot, &header).unwrap();
+            let AnyCache::Hybrid(layers) = restored else {
+                panic!("expected hybrid")
+            };
+            let Some(LayerCache::Arrays(state)) = &layers[0] else {
+                panic!("expected recurrent")
+            };
+            let conv = state.conv_state.as_ref().unwrap();
+            let ssm = state.ssm_state.as_ref().unwrap();
+            assert_eq!(conv.shape(), &[1, 3, 8]);
+            assert_eq!(ssm.shape(), &[1, 2, 4, 32]);
+            assert_eq!(conv.dtype(), conv_dtype);
+            assert_eq!(ssm.dtype(), Dtype::Float32);
+            assert_eq!(
+                conv.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>(),
+                conv_values
+            );
+            assert_eq!(ssm.as_slice::<f32>(), ssm_values);
+            assert_eq!((state.conv_pos, state.offset), (2, 8));
+            // The next prefill must accept the restored convolution history.
+            let next = Array::from_slice(&[0.0f32; 8], &[1, 1, 8]);
+            assert_eq!(
+                concatenate_axis(&[conv, &next], 1).unwrap().shape(),
+                &[1, 4, 8]
+            );
+        }
+    }
+
     /// Hybrid caches must roundtrip through the disk snapshot: attention
     /// layers via K/V blocks, recurrent (GDN) layers via the fixed-state
     /// section. This is the escha (hybrid) persistence path that used to be
@@ -1225,9 +1359,12 @@ mod hybrid_snapshot_tests {
         let arrays = ArraysCache {
             conv_state: Some(Array::from_slice(
                 &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-                &[1, 8],
+                &[1, 2, 4],
             )),
-            ssm_state: Some(Array::from_slice(&[9.0f32, 10.0, 11.0, 12.0], &[1, 4])),
+            ssm_state: Some(Array::from_slice(
+                &[9.0f32, 10.0, 11.0, 12.0],
+                &[1, 1, 2, 2],
+            )),
             conv_pos: 3,
             offset: seq_len,
         };
@@ -1270,10 +1407,10 @@ mod hybrid_snapshot_tests {
             panic!("layer 1 must be Arrays");
         };
         let conv = arrays_restored.conv_state.as_ref().unwrap();
-        let conv_f32: Vec<f32> = conv.as_slice::<f16>().iter().map(|v| v.to_f32()).collect();
+        let conv_f32: Vec<f32> = conv.as_slice::<f32>().to_vec();
         assert_eq!(conv_f32, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
         let ssm = arrays_restored.ssm_state.as_ref().unwrap();
-        let ssm_f32: Vec<f32> = ssm.as_slice::<f16>().iter().map(|v| v.to_f32()).collect();
+        let ssm_f32: Vec<f32> = ssm.as_slice::<f32>().to_vec();
         assert_eq!(ssm_f32, vec![9.0, 10.0, 11.0, 12.0]);
         assert_eq!(arrays_restored.conv_pos, 3);
         assert_eq!(arrays_restored.offset, 8);

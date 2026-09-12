@@ -477,9 +477,9 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
         }
         if let Err(error) = model.validate_disk_prefix_store() {
             fail(&format!("model {label} disk prefix store: {error}"), result);
-        } else if model.kv_disk_dir.is_some() {
+        } else if model.disk_prefix_cache_enabled() {
             pass(
-                &format!("model {label} disk prefix store is writable"),
+                &format!("model {label} disk prefix settings are valid"),
                 result,
             );
         }
@@ -933,7 +933,7 @@ fn check_eschamoe_memory(
                 &format!(
                     "model {label} needs an estimated {:.1} GiB resident after eschamoe \
                      conversion, above the measured Metal recommended working set ({:.1} GiB). \
-                     Expect adaptive capacity to constrain or reject requests under pressure; \
+                     Requests use the configured fixed context limit; \
                      consider a smaller quantization",
                     gib(estimate),
                     gib(metal)
@@ -2089,6 +2089,25 @@ mod tests {
         assert_eq!(affine.passes, 1);
         // The affine path adds the slow CPU load warning.
         assert_eq!(affine.warnings, 2);
+    }
+
+    #[test]
+    fn disk_directory_doctor_rejects_conflicting_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_config_json(dir.path(), "qwen2");
+        let mut model = model_with_path(dir.path().to_str().unwrap().to_owned());
+        model.kv_disk_dir = Some(dir.path().join("prefix").to_str().unwrap().to_owned());
+        model.disk_cache_path = Some(dir.path().join("other.bin"));
+        let config = HiggsConfig {
+            models: vec![model],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_models(&config, &mut result);
+        assert_eq!(
+            result.failures, 1,
+            "doctor must reject ambiguous cache destinations"
+        );
     }
 
     #[test]

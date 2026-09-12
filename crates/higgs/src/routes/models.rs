@@ -529,7 +529,7 @@ mod tests {
     use crate::router::Router;
     use crate::state::AppState;
     use axum::body::Body;
-    use higgs_engine::{EngineCostDescription, MlxMemorySnapshot, TransientPrefillEstimate};
+    use higgs_engine::MlxMemorySnapshot;
     use http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -554,46 +554,16 @@ mod tests {
     }
 
     fn capacity_facts(name: &str) -> crate::capacity::ModelCapacityFacts {
-        const GIB: u64 = 1024 * 1024 * 1024;
         crate::capacity::ModelCapacityFacts {
             model: name.to_owned(),
             model_fingerprint: format!("sha256:{name}"),
-            memory: MlxMemorySnapshot {
-                active_bytes: 5 * GIB,
-                peak_bytes: 5 * GIB,
-                memory_limit_bytes: Some(24 * GIB),
-                metal_recommended_working_set_bytes: Some(24 * GIB),
-            },
-            costs: EngineCostDescription {
-                fixed_live_session_bytes: 0,
-                persistent_bytes_per_token: 20_480,
-                decode_workspace_bytes: 0,
-                transient_prefill: TransientPrefillEstimate {
-                    base_bytes: GIB,
-                    bytes_per_prompt_token: 0,
-                    bytes_per_chunk_token: 0,
-                    max_prompt_tokens: 131_072,
-                    max_chunk_tokens: 4_096,
-                },
-            },
-            loaded_model_bytes: 5 * GIB,
-            architectural_max_tokens: 131_072,
-            prefill_chunk_tokens: 1_024,
-            retained_session_tokens: 49_152,
-            retained_resident_bytes: 0,
-            prefix_cache_resident_bytes: 0,
-            retained_bytes_ceiling: 2 * GIB,
-            prefix_cache_bytes_ceiling: GIB,
+            architectural_max_tokens: 131072,
+            retained_session_tokens: 49152,
+            retained_bytes_ceiling: 2 * 1024 * 1024 * 1024,
+            prefix_cache_bytes_ceiling: 1024 * 1024 * 1024,
             cache_capabilities: crate::capacity::CacheCapabilities::SIMPLE,
-            configured_total_token_ceiling: None,
-            configured_output_token_ceiling: Some(4_096),
-            quantization: "3bit".to_owned(),
-            execution_mode: "native".to_owned(),
-            kv_representation: "fp16".to_owned(),
-            prefill_model_identity: None,
-            drafter_identity: None,
-            learned_profile_key: None,
-            startup_headroom_bytes: 0,
+            configured_total_token_ceiling: Some(32768),
+            configured_output_token_ceiling: Some(4096),
         }
     }
 
@@ -607,7 +577,7 @@ mod tests {
         // Production facts are returned only after their allocator snapshot is
         // published inside the serialized MLX load window. Stub tests model
         // that boundary explicitly before entering lifecycle publication.
-        state.capacity.refresh_memory(facts.memory);
+        state.capacity.refresh_memory(MlxMemorySnapshot::default());
         publish_loaded_engine(state, name, engine, generation_defaults, facts).await
     }
 
@@ -648,7 +618,7 @@ mod tests {
         let publication = tokio::spawn(async move {
             publish_state
                 .capacity
-                .refresh_memory(capacity_facts("second").memory);
+                .refresh_memory(MlxMemorySnapshot::default());
             publish_loaded_engine_inner(
                 &publish_state,
                 "second".to_owned(),
@@ -774,9 +744,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn cancelling_committed_publication_restores_existing_engine_policy() {
         let state = build_state("[local]\nallow_runtime_model_load = true\n", HashMap::new());
-        let mut first_facts = capacity_facts("first");
-        first_facts.retained_bytes_ceiling = 0;
-        first_facts.prefix_cache_bytes_ceiling = 0;
+        let first_facts = capacity_facts("first");
         publish_test_engine(
             &state,
             "first".to_owned(),
@@ -802,13 +770,10 @@ mod tests {
             .find(|(name, _, _)| name == "first")
             .map(|(_, retained, prefix)| (retained, prefix))
             .unwrap();
-        assert_ne!(expected_after_rollback, baseline);
+        assert_eq!(expected_after_rollback, baseline);
 
         let (second_engine, arrived, release) = Engine::test_stub_with_cache_gate("second");
         let mut second_facts = capacity_facts("second");
-        second_facts.memory.memory_limit_bytes = Some(128 * 1024 * 1024 * 1024);
-        second_facts.memory.metal_recommended_working_set_bytes =
-            second_facts.memory.memory_limit_bytes;
         second_facts.retained_bytes_ceiling = 0;
         second_facts.prefix_cache_bytes_ceiling = 0;
         let publish_state = Arc::clone(&state);
@@ -831,7 +796,11 @@ mod tests {
                 publication.await
             );
         }
-        assert_ne!(first_engine.route_test_capacity_cache_limits(), baseline);
+        assert_eq!(
+            first_engine.route_test_capacity_cache_limits(),
+            baseline,
+            "registering another model must not change configured cache ceilings"
+        );
         let published_first = state.capacity.snapshot("first").unwrap();
         assert_eq!(
             (
@@ -882,7 +851,9 @@ mod tests {
         let publish_state = Arc::clone(&state);
         let publication = tokio::spawn(async move {
             let facts = capacity_facts("second");
-            publish_state.capacity.refresh_memory(facts.memory);
+            publish_state
+                .capacity
+                .refresh_memory(MlxMemorySnapshot::default());
             publish_loaded_engine_inner(
                 &publish_state,
                 "second".to_owned(),
@@ -1155,11 +1126,8 @@ mod tests {
             .reserve_request(
                 "reserved",
                 crate::capacity::RequestCost {
-                    execution_path: crate::capacity::ExecutionPath::Cold,
                     prompt_tokens: 1,
-                    suffix_tokens: 1,
                     output_tokens: 1,
-                    retained_growth_bytes: 0,
                 },
             )
             .await

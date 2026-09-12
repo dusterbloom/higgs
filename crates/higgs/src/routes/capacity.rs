@@ -15,9 +15,7 @@ pub struct CapacityQuery {
     model: String,
 }
 
-/// Sample live allocator bytes before exposing the registry's admission budget.
-/// This publishes measurements only: cache eviction and generation cancellation
-/// remain owned by the existing pressure/admission paths.
+/// Return fixed model context limits; pressure is advisory telemetry.
 pub async fn capacity(
     State(state): State<SharedState>,
     Query(query): Query<CapacityQuery>,
@@ -26,28 +24,7 @@ pub async fn capacity(
         return ServerError::BadRequest("model must not be blank".to_owned()).into_response();
     }
     match state.capacity.snapshot(&query.model) {
-        Ok(snapshot) => {
-            if !state.capacity.refresh_measured_memory() {
-                // Preserve the known-unavailable response (including unloaded
-                // models), but never claim stale positive capacity is fresh.
-                if snapshot.availability == crate::capacity::CapacityAvailability::Unavailable {
-                    return Json(snapshot).into_response();
-                }
-                return ServerError::CapacityUnavailable(
-                    crate::capacity::CapacityUnavailableError::new(
-                        state.capacity.boot_id(),
-                        snapshot.generation,
-                    ),
-                )
-                .into_response();
-            }
-            // Re-read after publication: the first snapshot only establishes
-            // model identity so an unknown model retains its typed 404 contract.
-            match state.capacity.snapshot(&query.model) {
-                Ok(snapshot) => Json(snapshot).into_response(),
-                Err(error) => ServerError::InternalError(error.to_string()).into_response(),
-            }
-        }
+        Ok(snapshot) => Json(snapshot).into_response(),
         Err(RegistrationError::UnknownModel(model)) => (
             StatusCode::NOT_FOUND,
             Json(CapacityErrorEnvelope::new(CapacityModelNotFoundError::new(
@@ -65,7 +42,7 @@ mod tests {
     use std::sync::Arc;
 
     use axum::body::Body;
-    use higgs_engine::{EngineCostDescription, MlxMemorySnapshot, TransientPrefillEstimate};
+    use higgs_engine::MlxMemorySnapshot;
     use http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -89,46 +66,12 @@ mod tests {
     }
 
     fn active_facts() -> ModelCapacityFacts {
-        ModelCapacityFacts {
-            model: "escha".to_owned(),
-            model_fingerprint: "sha256:stored".to_owned(),
-            memory: MlxMemorySnapshot {
-                active_bytes: 5 * GIB,
-                peak_bytes: 5 * GIB,
-                memory_limit_bytes: Some(24 * GIB),
-                metal_recommended_working_set_bytes: Some(24 * GIB),
-            },
-            costs: EngineCostDescription {
-                fixed_live_session_bytes: 0,
-                persistent_bytes_per_token: 20_480,
-                decode_workspace_bytes: 0,
-                transient_prefill: TransientPrefillEstimate {
-                    base_bytes: GIB,
-                    bytes_per_prompt_token: 0,
-                    bytes_per_chunk_token: 0,
-                    max_prompt_tokens: 131_072,
-                    max_chunk_tokens: 4_096,
-                },
-            },
-            loaded_model_bytes: 5 * GIB,
-            architectural_max_tokens: 131_072,
-            prefill_chunk_tokens: 1_024,
-            retained_session_tokens: 49_152,
-            retained_resident_bytes: 0,
-            prefix_cache_resident_bytes: 0,
-            retained_bytes_ceiling: 2 * GIB,
-            prefix_cache_bytes_ceiling: GIB,
-            cache_capabilities: crate::capacity::CacheCapabilities::SIMPLE,
-            configured_total_token_ceiling: None,
-            configured_output_token_ceiling: Some(4_096),
-            quantization: "3bit".to_owned(),
-            execution_mode: "native".to_owned(),
-            kv_representation: "fp16".to_owned(),
-            prefill_model_identity: None,
-            drafter_identity: None,
-            learned_profile_key: None,
-            startup_headroom_bytes: 0,
-        }
+        super::super::super::capacity::route_test_facts(
+            "escha",
+            MlxMemorySnapshot::default(),
+            0,
+            32768,
+        )
     }
 
     async fn body(response: axum::response::Response) -> serde_json::Value {
@@ -167,7 +110,7 @@ mod tests {
     async fn active_route_returns_the_stored_snapshot_unchanged() {
         let registry = CapacityRegistry::new(["escha".to_owned()]);
         let facts = active_facts();
-        registry.refresh_memory(facts.memory);
+        registry.refresh_memory(MlxMemorySnapshot::default());
         let ticket = registry.begin_registration("escha".to_owned()).unwrap();
         registry.commit_active(ticket, facts).unwrap().publish();
         let expected = serde_json::to_value(registry.snapshot("escha").unwrap()).unwrap();
@@ -189,7 +132,7 @@ mod tests {
     async fn active_route_refreshes_allocator_before_returning_capacity() {
         let registry = CapacityRegistry::new(["escha".to_owned()]);
         let facts = active_facts();
-        registry.refresh_memory(facts.memory);
+        registry.refresh_memory(MlxMemorySnapshot::default());
         let ticket = registry.begin_registration("escha".to_owned()).unwrap();
         registry
             .commit_active(ticket, facts.clone())
@@ -201,7 +144,7 @@ mod tests {
         *registry.test_memory_measurement.lock().unwrap() = Some(Ok(MlxMemorySnapshot {
             active_bytes: 24 * GIB,
             peak_bytes: 24 * GIB,
-            ..facts.memory
+            ..MlxMemorySnapshot::default()
         }));
         let app = crate::build_router(state_with(Arc::clone(&registry)), 30.0, None, 0, 1024, None);
         let response = app
@@ -215,10 +158,10 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let json = body(response).await;
-        assert_eq!(json["availability"], "unavailable");
-        assert_eq!(json["maxPromptTokens"], 0);
-        assert!(json["generation"].as_u64().unwrap() > before.generation);
-        assert_eq!(registry.admission_test_memory().1, revision + 1);
+        assert_eq!(json["availability"], "available");
+        assert_eq!(json["safeTotalTokens"], before.safe_total_tokens);
+        assert_eq!(json["generation"], before.generation);
+        assert_eq!(registry.admission_test_memory().1, revision);
         assert_eq!(registry.active_reservation_count("escha"), 0);
     }
 
@@ -226,7 +169,7 @@ mod tests {
     async fn active_route_measurement_failure_never_returns_stale_available_capacity() {
         let registry = CapacityRegistry::new(["escha".to_owned()]);
         let facts = active_facts();
-        registry.refresh_memory(facts.memory);
+        registry.refresh_memory(MlxMemorySnapshot::default());
         let ticket = registry.begin_registration("escha".to_owned()).unwrap();
         registry.commit_active(ticket, facts).unwrap().publish();
         assert!(registry.snapshot("escha").unwrap().max_prompt_tokens > 0);
@@ -243,10 +186,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::OK);
         let json = body(response).await;
-        assert_eq!(json["error"]["type"], "higgs_capacity_unavailable");
-        assert!(json.get("maxPromptTokens").is_none());
+        assert_eq!(json["availability"], "available");
+        assert_eq!(json["safeTotalTokens"], 32768);
     }
 
     #[tokio::test]

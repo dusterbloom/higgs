@@ -11,7 +11,7 @@ use memmap2::{Mmap, MmapOptions};
 
 const FILE_MAGIC: [u8; 8] = *b"HIGGSKV\0";
 const ENTRY_MAGIC: [u8; 4] = *b"BLK1";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const FILE_HEADER_LEN: usize = 32;
 const ENTRY_HEADER_LEN: usize = 44;
 
@@ -49,7 +49,7 @@ pub struct DiskCacheSnapshot {
     pub token_hash: u64,
     pub layers: Vec<DiskCacheLayer>,
     /// Recurrent (GDN) fixed-size states for hybrid caches, valid exactly for
-    /// `token_count` tokens. Empty for pure-KV snapshots (format v1 files).
+    /// `token_count` tokens. Empty for pure-KV snapshots.
     pub recurrent: Vec<RecurrentStateSnapshot>,
 }
 
@@ -58,10 +58,26 @@ pub struct DiskCacheSnapshot {
 #[derive(Debug, Clone)]
 pub struct RecurrentStateSnapshot {
     pub layer_index: usize,
-    pub conv: Option<Vec<f16>>,
-    pub ssm: Option<Vec<f16>>,
+    pub conv: Option<RecurrentArraySnapshot>,
+    pub ssm: Option<RecurrentArraySnapshot>,
     pub conv_pos: i32,
     pub offset: i32,
+}
+
+/// Recurrent tensors keep their geometry and source dtype. Values use f32 on
+/// disk: conversion from f16/bf16 is lossless, and Float32 SSM is never rounded.
+#[derive(Debug, Clone)]
+pub struct RecurrentArraySnapshot {
+    pub shape: Vec<i32>,
+    pub dtype: RecurrentDtype,
+    pub values: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RecurrentDtype {
+    Float32,
+    Float16,
+    Bfloat16,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +116,7 @@ pub struct DiskStorage {
     file: File,
     header: DiskCacheFileHeader,
     format_version: u32,
+    max_disk_bytes: u64,
     index: HashMap<u64, EntryIndex>,
 }
 
@@ -129,11 +146,9 @@ impl DiskStorage {
             head_dim,
         };
 
-        // A file from an older format cannot be appended to: v2 entries carry
-        // the recurrent-state section, and a v1-versioned file would be read
-        // back without it — materializing hybrid caches as the wrong variant
-        // (observed as "Model/cache type mismatch"). Recreate stale files;
-        // losing old warm snapshots costs one cold prefill.
+        // Older formats cannot reconstruct recurrent state: v1 has none,
+        // and v2 loses geometry and Float32 SSM precision. Recreate rather
+        // than append incompatible entries; the next request cold-prefills.
         let file = if file.metadata()?.len() == 0 {
             write_file_header(&mut file, &expected_header)?;
             file.flush()?;
@@ -162,8 +177,35 @@ impl DiskStorage {
             file,
             header: found_header,
             format_version,
+            max_disk_bytes: 0,
             index,
         })
+    }
+
+    /// Bound the complete append log, including its header. Zero retains legacy behavior.
+    pub fn with_max_disk_bytes(mut self, max_disk_bytes: u64) -> Result<Self, DiskCacheError> {
+        if max_disk_bytes != 0
+            && max_disk_bytes < u64_from_usize(FILE_HEADER_LEN, "file header length")?
+        {
+            return Err(DiskCacheError::Format(
+                "disk byte limit cannot fit the file header".to_owned(),
+            ));
+        }
+        self.max_disk_bytes = max_disk_bytes;
+        if max_disk_bytes != 0 && self.file.metadata()?.len() > max_disk_bytes {
+            self.reset_entries()?;
+        }
+        Ok(self)
+    }
+
+    fn reset_entries(&mut self) -> Result<(), DiskCacheError> {
+        // Cache entries are disposable. Clear offsets before truncation so a failed
+        // write can never leave an old index pointing into a different snapshot.
+        self.index.clear();
+        self.file.set_len(0)?;
+        write_file_header(&mut self.file, &self.header)?;
+        self.file.flush()?;
+        Ok(())
     }
 
     pub const fn header(&self) -> &DiskCacheFileHeader {
@@ -224,31 +266,40 @@ impl DiskStorage {
             }
         }
 
-        // Recurrent-state section (format v2): count-prefixed fixed-size
+        // Recurrent-state section (format v3): count-prefixed fixed-size
         // states, written after the KV layer blocks.
         payload.extend_from_slice(&u32_from_usize(recurrent.len(), "recurrent len")?.to_le_bytes());
         for state in recurrent {
             payload.extend_from_slice(
                 &u32_from_usize(state.layer_index, "layer_index")?.to_le_bytes(),
             );
-            match &state.conv {
-                Some(conv) => {
-                    payload
-                        .extend_from_slice(&u32_from_usize(conv.len(), "conv len")?.to_le_bytes());
-                    push_f16_slice(&mut payload, conv);
-                }
-                None => payload.extend_from_slice(&0u32.to_le_bytes()),
-            }
-            match &state.ssm {
-                Some(ssm) => {
-                    payload
-                        .extend_from_slice(&u32_from_usize(ssm.len(), "ssm len")?.to_le_bytes());
-                    push_f16_slice(&mut payload, ssm);
-                }
-                None => payload.extend_from_slice(&0u32.to_le_bytes()),
-            }
+            write_recurrent_array(&mut payload, state.conv.as_ref())?;
+            write_recurrent_array(&mut payload, state.ssm.as_ref())?;
             payload.extend_from_slice(&state.conv_pos.to_le_bytes());
             payload.extend_from_slice(&state.offset.to_le_bytes());
+        }
+
+        let entry_bytes = u64_from_usize(ENTRY_HEADER_LEN, "entry header length")?
+            .checked_add(u64_from_usize(payload.len(), "payload_len")?)
+            .ok_or(DiskCacheError::Overflow("disk entry bytes"))?;
+        if self.max_disk_bytes != 0 {
+            let snapshot_file_bytes = u64_from_usize(FILE_HEADER_LEN, "file header length")?
+                .checked_add(entry_bytes)
+                .ok_or(DiskCacheError::Overflow("disk snapshot bytes"))?;
+            if snapshot_file_bytes > self.max_disk_bytes {
+                // Do not discard a usable cache to make room for an entry that
+                // cannot fit even in an empty file.
+                return Err(DiskCacheError::Overflow("snapshot exceeds disk byte limit"));
+            }
+            if self
+                .file
+                .metadata()?
+                .len()
+                .checked_add(entry_bytes)
+                .is_none_or(|bytes| bytes > self.max_disk_bytes)
+            {
+                self.reset_entries()?;
+            }
         }
 
         let append_offset = usize::try_from(self.file.metadata()?.len())
@@ -321,28 +372,110 @@ impl DiskStorage {
     }
 }
 
-/// Parse the format-v2 recurrent-state section that follows the KV layer
+fn write_recurrent_array(
+    payload: &mut Vec<u8>,
+    maybe_array: Option<&RecurrentArraySnapshot>,
+) -> Result<(), DiskCacheError> {
+    let Some(array) = maybe_array else {
+        payload.push(0);
+        return Ok(());
+    };
+    if recurrent_element_count(&array.shape)? != array.values.len() {
+        return Err(DiskCacheError::Format(
+            "recurrent shape/data mismatch".to_owned(),
+        ));
+    }
+    payload.push(match array.dtype {
+        RecurrentDtype::Float32 => 1,
+        RecurrentDtype::Float16 => 2,
+        RecurrentDtype::Bfloat16 => 3,
+    });
+    payload.extend_from_slice(&u32_from_usize(array.shape.len(), "recurrent rank")?.to_le_bytes());
+    for dim in &array.shape {
+        payload.extend_from_slice(&dim.to_le_bytes());
+    }
+    for value in &array.values {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn read_recurrent_array(
+    payload: &[u8],
+    cursor: &mut usize,
+) -> Result<Option<RecurrentArraySnapshot>, DiskCacheError> {
+    let dtype = match take_array::<1>(payload, cursor)?[0] {
+        0 => return Ok(None),
+        1 => RecurrentDtype::Float32,
+        2 => RecurrentDtype::Float16,
+        3 => RecurrentDtype::Bfloat16,
+        _ => return Err(DiskCacheError::Format("invalid recurrent dtype".to_owned())),
+    };
+    let rank = usize_from_u32(u32::from_le_bytes(take_array::<4>(payload, cursor)?))?;
+    // Only convolution and SSM tensors are stored here. Bound rank before
+    // allocating so corrupt metadata is a cache miss, not an allocation spike.
+    if !(3..=4).contains(&rank) {
+        return Err(DiskCacheError::Format("invalid recurrent rank".to_owned()));
+    }
+    let mut shape = Vec::with_capacity(rank);
+    for _ in 0..rank {
+        shape.push(i32::from_le_bytes(take_array::<4>(payload, cursor)?));
+    }
+    let byte_len = recurrent_element_count(&shape)?
+        .checked_mul(4)
+        .ok_or(DiskCacheError::Overflow("recurrent bytes"))?;
+    let bytes = take_slice(payload, cursor, byte_len)?;
+    let values = bytes
+        .chunks_exact(4)
+        .map(|chunk| {
+            let mut word = [0; 4];
+            word.copy_from_slice(chunk);
+            f32::from_le_bytes(word)
+        })
+        .collect();
+    Ok(Some(RecurrentArraySnapshot {
+        shape,
+        dtype,
+        values,
+    }))
+}
+
+fn recurrent_element_count(shape: &[i32]) -> Result<usize, DiskCacheError> {
+    if !(3..=4).contains(&shape.len()) {
+        return Err(DiskCacheError::Format("invalid recurrent rank".to_owned()));
+    }
+    shape.iter().try_fold(1usize, |count, raw_dim| {
+        let dim = usize::try_from(*raw_dim)
+            .map_err(|_| DiskCacheError::Format("invalid recurrent dimension".to_owned()))?;
+        if dim == 0 {
+            return Err(DiskCacheError::Format(
+                "empty recurrent dimension".to_owned(),
+            ));
+        }
+        count
+            .checked_mul(dim)
+            .ok_or(DiskCacheError::Overflow("recurrent elements"))
+    })
+}
+
+/// Parse the format-v3 recurrent-state section that follows the KV layer
 /// blocks in an entry payload.
 fn read_recurrent_states(
     payload: &[u8],
     cursor: &mut usize,
 ) -> Result<Vec<RecurrentStateSnapshot>, DiskCacheError> {
-    if *cursor >= payload.len() {
-        return Ok(Vec::new());
-    }
     let count = usize_from_u32(u32::from_le_bytes(take_array::<4>(payload, cursor)?))?;
+    // Each state needs at least an index, two absence tags and two positions.
+    if count > payload.len().saturating_sub(*cursor) / 14 {
+        return Err(DiskCacheError::Format(
+            "truncated recurrent states".to_owned(),
+        ));
+    }
     let mut states = Vec::with_capacity(count);
     for _ in 0..count {
-        let layer_index =
-            usize_from_u32(u32::from_le_bytes(take_array::<4>(payload, cursor)?))?;
-        let conv_len = usize_from_u32(u32::from_le_bytes(take_array::<4>(payload, cursor)?))?;
-        let conv = (conv_len > 0)
-            .then(|| take_f16_vec(payload, cursor, conv_len))
-            .transpose()?;
-        let ssm_len = usize_from_u32(u32::from_le_bytes(take_array::<4>(payload, cursor)?))?;
-        let ssm = (ssm_len > 0)
-            .then(|| take_f16_vec(payload, cursor, ssm_len))
-            .transpose()?;
+        let layer_index = usize_from_u32(u32::from_le_bytes(take_array::<4>(payload, cursor)?))?;
+        let conv = read_recurrent_array(payload, cursor)?;
+        let ssm = read_recurrent_array(payload, cursor)?;
         let conv_pos = i32::from_le_bytes(take_array::<4>(payload, cursor)?);
         let offset = i32::from_le_bytes(take_array::<4>(payload, cursor)?);
         states.push(RecurrentStateSnapshot {
@@ -371,7 +504,9 @@ fn read_file_version(bytes: &[u8]) -> Result<u32, DiskCacheError> {
     let mut cursor = 0;
     let magic = take_array::<8>(bytes, &mut cursor)?;
     if magic != FILE_MAGIC {
-        return Err(DiskCacheError::Format("invalid disk cache magic".to_owned()));
+        return Err(DiskCacheError::Format(
+            "invalid disk cache magic".to_owned(),
+        ));
     }
     Ok(u32::from_le_bytes(take_array::<4>(bytes, &mut cursor)?))
 }
@@ -509,7 +644,7 @@ fn read_layers(
         }
         layers.push(DiskCacheLayer { blocks });
     }
-    // Trailing bytes are allowed: format v2 entries carry the recurrent-state
+    // Trailing bytes are allowed: format v3 entries carry the recurrent-state
     // section after the KV layer blocks (parsed by read_recurrent_states).
     Ok(layers)
 }
@@ -585,6 +720,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stale_v2_recurrent_format_is_invalidated_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.bin");
+        let mut storage = DiskStorage::open(&path, 8, 4, 2, 4).unwrap();
+        storage
+            .save_blocks(7, 99, 8, &[DiskCacheLayer { blocks: Vec::new() }], &[])
+            .unwrap();
+        drop(storage);
+        let mut bytes = std::fs::read(&path).unwrap();
+        // V2 has no recurrent tensor geometry and rounds SSM to f16.
+        bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        let storage = DiskStorage::open(&path, 8, 4, 2, 4).unwrap();
+        assert!(
+            storage.snapshot_metadata(7).is_none(),
+            "v2 snapshots must be invalidated"
+        );
+    }
+
+    #[test]
     fn stale_v1_file_is_recreated_not_appended() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.bin");
@@ -601,39 +756,41 @@ mod tests {
             f.write_all(&4u32.to_le_bytes()).unwrap(); // head_dim
         }
 
-        let mut storage = DiskStorage::open(
-            &path,
-            8,
-            4,
-            2,
-            4,
-        )
-        .unwrap();
+        let mut storage = DiskStorage::open(&path, 8, 4, 2, 4).unwrap();
         assert!(
             storage.snapshot_metadata(1234).is_none(),
             "stale file entries must be dropped"
         );
 
-        // A v2 entry with a recurrent state must survive save+load in the
-        // recreated (v2) file.
+        // A current-format entry with a recurrent state must survive save+load in the
+        // recreated file.
         let recurrent = vec![RecurrentStateSnapshot {
             layer_index: 1,
-            conv: Some(vec![f16::from_f32(1.0)]),
+            conv: Some(RecurrentArraySnapshot {
+                shape: vec![1, 1, 1],
+                dtype: RecurrentDtype::Float32,
+                values: vec![1.0],
+            }),
             ssm: None,
             conv_pos: 3,
             offset: 8,
         }];
-        let layers = vec![DiskCacheLayer { blocks: Vec::new() }, DiskCacheLayer {
-            blocks: vec![DiskCacheBlock {
-                k: vec![f16::from_f32(0.5); 64],
-                v: vec![f16::from_f32(0.25); 64],
-            }],
-        }];
-        storage.save_blocks(9, 1234, 8, &layers, &recurrent).unwrap();
+        let layers = vec![
+            DiskCacheLayer { blocks: Vec::new() },
+            DiskCacheLayer {
+                blocks: vec![DiskCacheBlock {
+                    k: vec![f16::from_f32(0.5); 64],
+                    v: vec![f16::from_f32(0.25); 64],
+                }],
+            },
+        ];
+        storage
+            .save_blocks(9, 1234, 8, &layers, &recurrent)
+            .unwrap();
         let snapshot = storage.load_blocks(9).unwrap().unwrap();
         assert_eq!(snapshot.recurrent.len(), 1);
         assert_eq!(snapshot.recurrent[0].layer_index, 1);
-        assert_eq!(snapshot.recurrent[0].conv.as_ref().unwrap()[0], f16::from_f32(1.0));
+        assert_eq!(snapshot.recurrent[0].conv.as_ref().unwrap().values[0], 1.0);
         assert!(snapshot.recurrent[0].ssm.is_none());
     }
 
@@ -662,6 +819,58 @@ mod tests {
         assert_eq!(snapshot.layers[0].blocks.len(), 2);
         assert_eq!(snapshot.layers[0].blocks[0].k[0], f16::from_f32(1.0));
         assert_eq!(snapshot.layers[0].blocks[0].v[0], f16::from_f32(2.0));
+    }
+
+    #[test]
+    fn disk_byte_budget_rotates_and_preserves_on_oversize() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefix.bin");
+        let mut storage = DiskStorage::open(&path, 2, 16, 1, 1)
+            .unwrap()
+            .with_max_disk_bytes(128)
+            .unwrap();
+        let layers = vec![DiskCacheLayer { blocks: Vec::new() }];
+        storage.save_blocks(1, 1, 2, &layers, &[]).unwrap();
+        storage.save_blocks(2, 2, 2, &layers, &[]).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() <= 128);
+        assert!(
+            storage.snapshot_metadata(1).is_none(),
+            "rotation must remove stale offsets"
+        );
+        assert!(storage.load_blocks(2).unwrap().is_some());
+        let before = std::fs::read(&path).unwrap();
+        let oversized = vec![DiskCacheLayer { blocks: Vec::new() }; 64];
+        assert!(storage.save_blocks(3, 3, 2, &oversized, &[]).is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "oversized entry must preserve old cache"
+        );
+        assert!(storage.load_blocks(2).unwrap().is_some());
+    }
+
+    #[test]
+    fn disk_byte_budget_reopen_clears_existing_oversize_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefix.bin");
+        let mut storage = DiskStorage::open(&path, 2, 16, 1, 1).unwrap();
+        let layers = vec![DiskCacheLayer { blocks: Vec::new() }];
+        for id in 1..=3 {
+            storage.save_blocks(id, id, 2, &layers, &[]).unwrap();
+        }
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > 128,
+            "legacy zero budget stays unlimited"
+        );
+        drop(storage);
+        let mut storage = DiskStorage::open(&path, 2, 16, 1, 1)
+            .unwrap()
+            .with_max_disk_bytes(128)
+            .unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() <= 128);
+        assert!(storage.load_blocks(3).unwrap().is_none());
+        storage.save_blocks(4, 4, 2, &layers, &[]).unwrap();
+        assert!(storage.load_blocks(4).unwrap().is_some());
     }
 
     #[test]

@@ -186,8 +186,9 @@ port = 8000
 # # prefill_suffix_identity_threshold = 128           # small suffixes stay exact
 # # prefill_score_mode  = "full"                      # full | l7
 # # prefill_exit_layer  = 7
-# kv_disk_dir = "/var/lib/higgs/prefix-kv" # optional durable prefix cache
-# kv_disk_space_mb = 4096                # LRU budget; minimum 64 MiB
+# kv_disk_dir = "/var/lib/higgs/prefix-kv" # enables model-path-specific prefix files
+# kv_disk_space_mb = 4096                # file byte ceiling, minimum 64 MiB; rotates old entries
+# # Do not combine kv_disk_dir with legacy disk_cache_path.
 # prefill_yield_tokens = 512 # optional: interleave decode during long prefills
 # mla_latent_cache = true # DeepSeek-V2 only: compressed latent KV cache; cannot combine with kv_cache = "turboquant"
 # disable_vision = true # force-disable vision for this model (escape hatch; no-op on nightly)

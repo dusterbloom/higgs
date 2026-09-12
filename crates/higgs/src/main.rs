@@ -181,7 +181,6 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
         model_cfg.apply_kv_turbo_env_overrides(&|key| std::env::var(key).ok());
     }
 
-
     // Rewrite metrics path for profile isolation if still at default
     if let Some(name) = profile {
         let default_path = config::default_metrics_log_path_for_profile(name);
@@ -199,14 +198,9 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
         );
     }
 
-    // One registry owns shared residency and pressure across every local model.
-    let capacity =
-        CapacityRegistry::new_with_profile_dir(std::iter::empty(), capacity_profile_dir(cli));
-    // Boot-time memory authority: engines load (and admit against capacity)
-    // BEFORE any AppState exists, so the registry needs one measured snapshot
-    // here. Without it the first startup load fails closed with "no safe
-    // process memory authority" because the fresh registry's memory state is
-    // empty.
+    // One registry owns local-model lifecycle and fixed token limits.
+    let capacity = CapacityRegistry::new(std::iter::empty());
+    // Initial allocator sample for diagnostics; admission uses fixed token limits.
     match higgs_engine::MlxMemorySnapshot::measure() {
         Ok(memory) => {
             tracing::info!(
@@ -293,7 +287,6 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
         metrics,
         Arc::clone(&capacity),
     ));
-    pressure_coordinator.attach(&shared_state).await?;
 
     // Build router with middleware
     let app = build_router(
@@ -321,21 +314,20 @@ async fn cmd_serve(cli: &Cli, args: &ServeArgs) -> Result<(), Box<dyn std::error
     Ok(())
     }
     .await;
-    let (observer_result, persist_result) = stop_observer_then_cleanup(
+    let (observer_result, cleanup_result) = stop_observer_then_cleanup(
         || pressure_observer.stop(),
         || {
             if !pid_written {
                 return Ok(());
             }
-            let persist_result = capacity.persist_profiles();
             higgs::daemon::remove_pid_file(profile);
-            persist_result
+            Ok::<(), Box<dyn std::error::Error>>(())
         },
     )
     .await;
     serve_result?;
     observer_result?;
-    persist_result?;
+    cleanup_result?;
     Ok(())
 }
 
@@ -638,18 +630,6 @@ fn offer_startup_memory_recovery() -> Result<bool, Box<dyn std::error::Error>> {
         &mut StartupTerminal,
     )
     .map_err(Into::into)
-}
-
-fn capacity_profile_dir(cli: &Cli) -> PathBuf {
-    let config_path = cli.config.clone().unwrap_or_else(|| {
-        cli.profile
-            .as_deref()
-            .map_or_else(config::default_config_path, config::profile_config_path)
-    });
-    config_path
-        .parent()
-        .map_or_else(config::config_dir, Path::to_path_buf)
-        .join("capacity")
 }
 
 async fn load_engines(

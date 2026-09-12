@@ -297,8 +297,6 @@ async fn create_message_non_streaming(
     let reservation = crate::capacity::admit_generation_request(
         &state,
         &req.model,
-        crate::capacity::ExecutionPath::Cold,
-        prompt_tokens.len(),
         prompt_tokens.len(),
         max_tokens,
     )
@@ -431,8 +429,6 @@ async fn create_message_stream(
     let reservation = crate::capacity::admit_generation_request(
         &state,
         &req.model,
-        crate::capacity::ExecutionPath::Cold,
-        prompt_tokens.len(),
         prompt_tokens.len(),
         max_tokens,
     )
