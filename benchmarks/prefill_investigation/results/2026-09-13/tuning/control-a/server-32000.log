@@ -1,0 +1,19 @@
+2026-09-13T20:58:42.757869Z  INFO higgs: boot_capacity_memory_authority limit=Some(32641751449) working_set=Some(26800603136) active=0
+2026-09-13T20:58:42.758190Z  INFO higgs: Resolving model path model=/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2
+2026-09-13T20:58:42.758232Z  INFO higgs: Loading model model=/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2 resolved=/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2
+2026-09-13T20:58:54.136578Z  INFO higgs_engine::simple: Loading model model_dir=/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2
+2026-09-13T20:58:54.165755Z  INFO higgs_models::qwen3_next: eschamoe checkpoint: runtime affine layout derived from checkpoint storage group_size=64 bits=4 dense_bits=8 q8_overrides=302 has_block=false
+2026-09-13T20:58:54.246541Z  WARN higgs_models::qwen3_next: Config enables MTP but checkpoint has no MTP weights; disabling MTP for this load mtp_num_hidden_layers=1
+2026-09-13T20:58:54.246560Z  INFO higgs_models::qwen3_next: Loading qwen3_5_moe model (VLM text backbone via qwen3_next) hidden_size=2048 num_layers=40 num_heads=16 num_kv_heads=2 num_experts=256 vocab_size=248320 full_attention_interval=4
+2026-09-13T20:58:58.171055Z  WARN higgs_models::eschamoe: eschamoe escha_rout |mean| is far from the expected 1.0; the checkpoint may not follow the released convention mean=0.9461436867713928 projection="language_model.model.layers.0.mlp.experts.gate_up_proj"
+2026-09-13T20:58:59.838179Z  INFO higgs_models::eschamoe: Converted eschamoe checkpoint to affine tensors=1434 groups=710 native_layers=40
+2026-09-13T20:58:59.847032Z  INFO higgs_models::qwen3_next: Fused GDN projections (4→2 dispatches per layer) fused_count=180 total_pairs=180
+2026-09-13T20:59:00.329202Z  INFO higgs_models::qwen3_next: Installed native trellis expert weights layers=40
+2026-09-13T20:59:00.329739Z  INFO higgs_models::qwen3_next: Using FUSED GDN projections (2 dispatches per layer)
+2026-09-13T20:59:00.329805Z  INFO higgs_models::qwen3_next: Qwen3.5-MoE model loaded successfully
+2026-09-13T20:59:00.610228Z  INFO higgs_engine::simple: Proved request-specific generation prompt suffixes for prefix cache no_thinking=7 thinking=5 default=7
+2026-09-13T20:59:00.610268Z  INFO higgs_engine::simple: Engine ready model_name=Qwen3.6-35B-A3B-Escha-W2 eos_tokens=[248044, 248046] requested_mlx_profile="throughput" effective_mlx_profile="throughput" chunked_prefill_threshold=1024 chunked_prefill_chunk_size=1024 clear_cache_after_prefill=true mtp_enabled=true mtp_draft_n_max=1
+2026-09-13T20:59:04.483675Z  INFO higgs_engine::simple: Configured MLX wired limit mode="mlx_wired_limit" max_recommended_mb=25559 wired_limit_mb=25559 cache_limit_mb=256 prev_cache_mb=31129 prev_wired_mb=0
+2026-09-13T20:59:04.491926Z  INFO higgs: Model loaded model_name=escha-bench
+2026-09-13T20:59:04.492176Z  INFO higgs::daemon: metrics logging enabled path=/Users/peppi/.config/higgs/logs/metrics.jsonl
+2026-09-13T20:59:04.494311Z  INFO higgs: Starting server addr=127.0.0.1:19093

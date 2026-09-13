@@ -1,0 +1,301 @@
+{
+  "outcome": "finished",
+  "prefill_ms": null,
+  "ttft_seconds": 502.3784566659997,
+  "usage": {
+    "prompt_tokens": 45001,
+    "completion_tokens": 19,
+    "total_tokens": 45020
+  },
+  "finish": "stop",
+  "answer": "Launch key: LANTERN-4729-QZ\nOwner: Neri",
+  "progress": [
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 0,
+      "time_ms": 23
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 1024,
+      "time_ms": 6394
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 2048,
+      "time_ms": 12155
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 3072,
+      "time_ms": 18544
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 4096,
+      "time_ms": 25363
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 5120,
+      "time_ms": 32089
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 6144,
+      "time_ms": 40109
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 7168,
+      "time_ms": 47451
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 8192,
+      "time_ms": 54734
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 9216,
+      "time_ms": 61667
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 10240,
+      "time_ms": 68512
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 11264,
+      "time_ms": 75619
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 12288,
+      "time_ms": 82801
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 13312,
+      "time_ms": 90095
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 14336,
+      "time_ms": 97537
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 15360,
+      "time_ms": 105111
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 16384,
+      "time_ms": 112871
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 17408,
+      "time_ms": 120721
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 18432,
+      "time_ms": 128769
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 19456,
+      "time_ms": 137537
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 20480,
+      "time_ms": 146154
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 21504,
+      "time_ms": 154631
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 22528,
+      "time_ms": 168471
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 23552,
+      "time_ms": 184257
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 24576,
+      "time_ms": 201442
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 25600,
+      "time_ms": 216957
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 26624,
+      "time_ms": 234417
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 27648,
+      "time_ms": 252436
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 28672,
+      "time_ms": 270619
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 29696,
+      "time_ms": 285046
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 30720,
+      "time_ms": 295152
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 31744,
+      "time_ms": 305422
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 32768,
+      "time_ms": 315742
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 33792,
+      "time_ms": 327045
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 34816,
+      "time_ms": 338584
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 35840,
+      "time_ms": 350383
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 36864,
+      "time_ms": 362182
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 37888,
+      "time_ms": 373926
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 38912,
+      "time_ms": 390739
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 39936,
+      "time_ms": 409313
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 40960,
+      "time_ms": 421883
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 41984,
+      "time_ms": 434873
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 43008,
+      "time_ms": 455943
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 44032,
+      "time_ms": 476454
+    },
+    {
+      "total": 45001,
+      "cache": 0,
+      "processed": 44992,
+      "time_ms": 493320
+    }
+  ],
+  "request_seconds": 528.2824063750013,
+  "request_sha256": "c0db89a545fca60123928af5a05a058a990f9ac5477a819c8dd7cfce68c5a110",
+  "before": {
+    "power": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23396451)\t96%; discharging; (no estimate) present: true\n",
+    "swapouts": 1618558
+  },
+  "after": {
+    "power": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23396451)\t93%; discharging; (no estimate) present: true\n",
+    "swapouts": 1618558
+  },
+  "swapouts_delta": 0,
+  "peak_sampled_rss_bytes": 524353536,
+  "exception": null,
+  "peak_physical_footprint_bytes": 17726874384,
+  "peak_wired_bytes": 0,
+  "abort_reasons": [],
+  "semantic_pass": true
+}

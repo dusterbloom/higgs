@@ -1,0 +1,10 @@
+{
+  "binary": "/Users/peppi/.codex/worktrees/4dbe/higgs/target/prefill-investigation/higgs-control",
+  "binary_sha256": "8c4c9fa407e1b89964d80accb434f5d1b7cd442d74618e13d28bc287af3640a0",
+  "config_sha256": "32ddd49a9805c9ee97a4e62581d3a1a0952d57b64faf6f659acaf298737b8199",
+  "git_head": "8c6b5f66ba985b0c823ccca82af6f32d73da5ea4",
+  "machine_before": {
+    "power": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23396451)\t88%; discharging; (no estimate) present: true\n",
+    "swapouts": 1618558
+  }
+}

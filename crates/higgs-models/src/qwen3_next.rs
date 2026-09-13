@@ -47,6 +47,11 @@ thread_local! {
     static FFI_LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
+fn prefill_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("HIGGS_PREFILL_TRACE_DIR").is_some())
+}
+
 /// Error handler registered once with MLX to capture error messages.
 /// Runs on the calling thread, so thread-local storage is safe here.
 #[allow(unsafe_code)]
@@ -4394,6 +4399,8 @@ pub struct Qwen3NextAttention {
     num_attention_heads: i32,
     num_key_value_heads: i32,
     scale: f32,
+    /// True backbone layer identity used only by the opt-in trace writer.
+    trace_layer: Option<i32>,
 }
 
 /// Numerical schedule for short full-attention blocks.
@@ -4475,6 +4482,183 @@ fn dense_prefill_attention(
     ops::concatenate_axis(&blocks.iter().collect::<Vec<_>>(), 2)
 }
 
+thread_local! {
+    /// Provenance marker set only while the model-owned ordinary causal layer
+    /// loop is active. It prevents arbitrary `AttentionMask::Array` values
+    /// from being mistaken for a capture-safe chunked-prefill mask.
+    static PREFILL_TRACE_CAUSAL: std::cell::Cell<Option<(i32, i32)>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+struct PrefillTraceCausalGuard(bool);
+
+impl PrefillTraceCausalGuard {
+    fn new() -> Self {
+        let enabled = prefill_trace_enabled();
+        if enabled {
+            PREFILL_TRACE_CAUSAL.with(|marker| marker.set(None));
+        }
+        Self(enabled)
+    }
+
+    fn mark(&self, query_len: i32, query_offset: i32) {
+        if self.0 {
+            PREFILL_TRACE_CAUSAL.with(|marker| marker.set(Some((query_len, query_offset))));
+        }
+    }
+}
+
+impl Drop for PrefillTraceCausalGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            PREFILL_TRACE_CAUSAL.with(|marker| marker.set(None));
+        }
+    }
+}
+
+/// Persist a compact, self-describing attention stratum for the offline
+/// indexless evaluator. This path is unreachable unless the trace directory
+/// environment variable is explicitly set.
+#[allow(clippy::print_stderr)]
+fn maybe_save_prefill_trace(
+    layer: Option<i32>,
+    query_offset: i32,
+    queries: &Array,
+    cache: &SteppingKeyValueCache,
+    scale: f32,
+) {
+    let (Some(layer), Ok(directory)) = (layer, std::env::var("HIGGS_PREFILL_TRACE_DIR")) else {
+        return;
+    };
+    let offsets =
+        std::env::var("HIGGS_PREFILL_TRACE_OFFSETS").unwrap_or_else(|_| "1024,15360".to_owned());
+    if !offsets
+        .split(',')
+        .filter_map(|value| value.trim().parse::<i32>().ok())
+        .any(|offset| offset == query_offset)
+    {
+        return;
+    }
+    let query_len = queries.shape()[2];
+    let ordinary_causal =
+        PREFILL_TRACE_CAUSAL.with(|marker| marker.get() == Some((query_len, query_offset)));
+    if !ordinary_causal {
+        eprintln!("prefill trace skipped non-canonical mask at offset {query_offset}");
+        return;
+    }
+    let path = std::path::PathBuf::from(directory).join(format!(
+        "layer-{layer:02}-offset-{query_offset:06}.safetensors"
+    ));
+    if path.exists() {
+        return;
+    }
+    let Some((keys, values)) = cache.keys().zip(cache.values()) else {
+        return;
+    };
+    if query_len <= 0 {
+        return;
+    }
+    let mut rows = vec![0, 1, 126, 127, 128, 129];
+    let middle = (query_len / 2 / 128) * 128;
+    let tail = ((query_len - 1) / 128) * 128;
+    for boundary in [middle, tail] {
+        rows.extend([boundary - 2, boundary - 1, boundary, boundary + 1]);
+    }
+    rows.extend([query_len - 2, query_len - 1]);
+    rows.retain(|row| *row >= 0 && *row < query_len);
+    rows.sort_unstable();
+    rows.dedup();
+    rows.truncate(16);
+
+    let indices = Array::from_slice(&rows, &[i32::try_from(rows.len()).unwrap_or(0)]);
+    let visible_len = query_offset + query_len;
+    let q = match queries
+        .take_axis(&indices, 2)
+        .and_then(|array| array.index((0, .., .., ..)).as_dtype(Dtype::Float32))
+        .and_then(|array| array.transpose_axes(&[1, 0, 2]))
+    {
+        Ok(array) => array,
+        Err(error) => {
+            eprintln!("prefill trace query capture failed: {error}");
+            return;
+        }
+    };
+    let k = keys
+        .index((0, .., ..visible_len, ..))
+        .as_dtype(Dtype::Float32);
+    let v = values
+        .index((0, .., ..visible_len, ..))
+        .as_dtype(Dtype::Float32);
+    let (Ok(k), Ok(v)) = (k, v) else {
+        eprintln!("prefill trace K/V conversion failed");
+        return;
+    };
+    let absolute_rows: Vec<i32> = rows.iter().map(|row| query_offset + row).collect();
+    let dtype_code = |dtype: Dtype| -> i32 {
+        if dtype == Dtype::Bfloat16 {
+            1
+        } else if dtype == Dtype::Float16 {
+            2
+        } else if dtype == Dtype::Float32 {
+            3
+        } else {
+            0
+        }
+    };
+    let source_shapes: Vec<i32> = queries
+        .shape()
+        .iter()
+        .chain(keys.shape())
+        .chain(values.shape())
+        .copied()
+        .collect();
+    let tensors = std::collections::HashMap::from([
+        ("q".to_owned(), q),
+        ("k".to_owned(), k),
+        ("v".to_owned(), v),
+        (
+            "query_positions".to_owned(),
+            Array::from_slice(
+                &absolute_rows,
+                &[i32::try_from(absolute_rows.len()).unwrap_or(0)],
+            ),
+        ),
+        ("layer".to_owned(), Array::from_slice(&[layer], &[1])),
+        (
+            "query_offset".to_owned(),
+            Array::from_slice(&[query_offset], &[1]),
+        ),
+        ("scale".to_owned(), Array::from_slice(&[scale], &[1])),
+        (
+            "source_dtype_codes".to_owned(),
+            Array::from_slice(
+                &[
+                    dtype_code(queries.dtype()),
+                    dtype_code(keys.dtype()),
+                    dtype_code(values.dtype()),
+                ],
+                &[3],
+            ),
+        ),
+        (
+            "source_shapes_qkv".to_owned(),
+            Array::from_slice(&source_shapes, &[12]),
+        ),
+    ]);
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            eprintln!("prefill trace directory creation failed: {error}");
+            return;
+        }
+    }
+    if let Err(error) = Array::save_safetensors(&tensors, None, &path) {
+        eprintln!("prefill trace save failed for {}: {error}", path.display());
+    } else {
+        eprintln!("saved prefill trace {}", path.display());
+    }
+}
+
 impl Qwen3NextAttention {
     /// Construct with per-tensor quantization resolved from module paths
     /// (`quant_overrides` / global default; mode-aware). `dense_attention_outputs`
@@ -4493,7 +4677,30 @@ impl Qwen3NextAttention {
         } else {
             o_resolved
         };
-        Self::from_specs(args, q_spec, k_spec, v_spec, o_spec)
+        let mut attention = Self::from_specs(args, q_spec, k_spec, v_spec, o_spec)?;
+        let marker = "language_model.model.layers.";
+        if prefill_trace_enabled()
+            && args.full_attention_interval > 0
+            && let Some(rest) = attn_prefix.strip_prefix(marker)
+        {
+            let layer = rest.split('.').next().and_then(|value| value.parse().ok());
+            let full_layers: Vec<i32> = (0..args.num_hidden_layers)
+                .filter(|index| (index + 1) % args.full_attention_interval == 0)
+                .collect();
+            let selected = full_layers
+                .first()
+                .into_iter()
+                .copied()
+                .chain(
+                    full_layers
+                        .get(full_layers.len().saturating_sub(1) / 2)
+                        .copied(),
+                )
+                .chain(full_layers.last().into_iter().copied())
+                .collect::<Vec<_>>();
+            attention.trace_layer = layer.filter(|index| selected.contains(index));
+        }
+        Ok(attention)
     }
 
     fn from_specs(
@@ -4536,6 +4743,7 @@ impl Qwen3NextAttention {
             num_attention_heads: args.num_attention_heads,
             num_key_value_heads: args.num_key_value_heads,
             scale,
+            trace_layer: None,
         })
     }
 
@@ -4746,6 +4954,9 @@ impl Qwen3NextAttention {
                 None
             };
             let view = cache.update_and_view(keys, values)?;
+            if L > 1 && B == 1 && rope_offset == offset {
+                maybe_save_prefill_trace(self.trace_layer, offset, &queries, cache, self.scale);
+            }
             if let Some(t0) = append_t0 {
                 mlx_rs::transforms::eval(cache.eval_targets())?;
                 PROF_TQ_APPEND_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
@@ -8847,6 +9058,7 @@ impl Qwen3NextCausalLM {
         let T = *shape
             .get(1)
             .ok_or_else(|| Exception::custom("Hidden state must have >= 2 dims"))?;
+        let trace_causal_guard = PrefillTraceCausalGuard::new();
 
         let fa_mask: Option<AttentionMask> = if T > 1 {
             let kv_offset = kv_cache
@@ -8856,6 +9068,7 @@ impl Qwen3NextCausalLM {
                     LayerCache::Arrays(_) => None,
                 })
                 .unwrap_or(0);
+            trace_causal_guard.mark(T, kv_offset);
 
             if kv_offset > 0 {
                 Some(AttentionMask::Array(create_causal_mask(

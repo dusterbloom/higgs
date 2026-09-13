@@ -1,0 +1,133 @@
+{
+  "outcome": "finished",
+  "prefill_ms": null,
+  "ttft_seconds": 118.75202329199965,
+  "usage": {
+    "prompt_tokens": 16345,
+    "completion_tokens": 14,
+    "total_tokens": 16359
+  },
+  "finish": "stop",
+  "answer": "LANTERN-4729-QZ, Neri",
+  "progress": [
+    {
+      "total": 16345,
+      "cache": 0,
+      "processed": 0,
+      "time_ms": 22
+    },
+    {
+      "total": 16345,
+      "cache": 0,
+      "processed": 1024,
+      "time_ms": 6352
+    },
+    {
+      "total": 16345,
+      "cache": 0,
+      "processed": 2048,
+      "time_ms": 12981
+    },
+    {
+      "total": 16345,
+      "cache": 0,
+      "processed": 3072,
+      "time_ms": 19812
+    },
+    {
+      "total": 16345,
+      "cache": 0,
+      "processed": 4096,
+      "time_ms": 26426
+    },
+    {
+      "total": 16345,
+      "cache": 0,
+      "processed": 5120,
+      "time_ms": 32857
+    },
+    {
+      "total": 16345,
+      "cache": 0,
+      "processed": 6144,
+      "time_ms": 40149
+    },
+    {
+      "total": 16345,
+      "cache": 0,
+      "processed": 7168,
+      "time_ms": 47252
+    },
+    {
+      "total": 16345,
+      "cache": 0,
+      "processed": 8192,
+      "time_ms": 54357
+    },
+    {
+      "total": 16345,
+      "cache": 0,
+      "processed": 9216,
+      "time_ms": 62906
+    },
+    {
+      "total": 16345,
+      "cache": 0,
+      "processed": 10240,
+      "time_ms": 70121
+    },
+    {
+      "total": 16345,
+      "cache": 0,
+      "processed": 11264,
+      "time_ms": 77386
+    },
+    {
+      "total": 16345,
+      "cache": 0,
+      "processed": 12288,
+      "time_ms": 84885
+    },
+    {
+      "total": 16345,
+      "cache": 0,
+      "processed": 13312,
+      "time_ms": 92590
+    },
+    {
+      "total": 16345,
+      "cache": 0,
+      "processed": 14336,
+      "time_ms": 100713
+    },
+    {
+      "total": 16345,
+      "cache": 0,
+      "processed": 15360,
+      "time_ms": 108711
+    },
+    {
+      "total": 16345,
+      "cache": 0,
+      "processed": 16320,
+      "time_ms": 117487
+    }
+  ],
+  "request_seconds": 119.40177629199752,
+  "request_sha256": "fe3318328ed80bcef772e80c5a4fad6f3e837b0926f1e6e43ab0dd505ccb169b",
+  "before": {
+    "power": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23396451)\t91%; discharging; (no estimate) present: true\n",
+    "swapouts": 1618558
+  },
+  "after": {
+    "power": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23396451)\t90%; discharging; (no estimate) present: true\n",
+    "swapouts": 1618558
+  },
+  "swapouts_delta": 0,
+  "peak_sampled_rss_bytes": 425066496,
+  "exception": null,
+  "peak_physical_footprint_bytes": 16766428064,
+  "peak_wired_bytes": 0,
+  "abort_reasons": [],
+  "semantic_pass": true
+}

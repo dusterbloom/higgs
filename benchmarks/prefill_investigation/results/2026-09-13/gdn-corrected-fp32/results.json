@@ -1,0 +1,420 @@
+{
+  "mlx_version": "0.30.6",
+  "config": "/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2/config.json",
+  "observed_geometry": {
+    "hidden_size": 2048,
+    "hk": 16,
+    "hv": 32,
+    "dk": 128,
+    "dv": 128
+  },
+  "dims": {
+    "batch": 1,
+    "hk": 16,
+    "hv": 32,
+    "dk": 128,
+    "dv": 128
+  },
+  "input_dtype": "float32",
+  "rows": [
+    {
+      "T": 1024,
+      "threadgroup_y": 1,
+      "median_ms": 9.421584,
+      "samples_ms": [
+        9.095959,
+        10.316708,
+        9.504458,
+        9.394917,
+        9.302459,
+        9.119125,
+        9.421584,
+        9.722084,
+        10.902333
+      ]
+    },
+    {
+      "T": 1024,
+      "threadgroup_y": 2,
+      "median_ms": 11.266,
+      "samples_ms": [
+        10.367958,
+        9.662,
+        11.3725,
+        10.768,
+        11.117958,
+        12.447834,
+        11.332333,
+        11.266,
+        11.307334
+      ]
+    },
+    {
+      "T": 1024,
+      "threadgroup_y": 4,
+      "median_ms": 14.32575,
+      "samples_ms": [
+        12.788709,
+        14.319959,
+        12.687416,
+        14.32575,
+        13.8405,
+        14.500583,
+        15.1235,
+        14.900375,
+        14.34475
+      ]
+    },
+    {
+      "T": 1024,
+      "threadgroup_y": 8,
+      "median_ms": 14.486458,
+      "samples_ms": [
+        14.092542,
+        15.197042,
+        14.223,
+        15.129291,
+        14.486458,
+        15.360291,
+        14.206917,
+        15.199,
+        14.176042
+      ]
+    }
+  ],
+  "scalar_reference_checks": [
+    {
+      "source_T": 1024,
+      "checked_T": 8,
+      "threadgroup_y": 4,
+      "actual_threadgroup": [
+        32,
+        4,
+        1
+      ],
+      "output_max_abs": 9.313225746154785e-10,
+      "state_max_abs": 1.862645149230957e-09
+    }
+  ],
+  "t1024_bitwise_parity": {
+    "1": {
+      "output_bitwise_equal_tg4": true,
+      "state_bitwise_equal_tg4": true
+    },
+    "2": {
+      "output_bitwise_equal_tg4": true,
+      "state_bitwise_equal_tg4": true
+    },
+    "4": {
+      "output_bitwise_equal_tg4": true,
+      "state_bitwise_equal_tg4": true
+    },
+    "8": {
+      "output_bitwise_equal_tg4": true,
+      "state_bitwise_equal_tg4": true
+    }
+  },
+  "paired_candidate": 1,
+  "paired_tg4_vs_candidate": [
+    {
+      "round": 0,
+      "threadgroup_y": 4,
+      "actual_threadgroup": [
+        32,
+        4,
+        1
+      ],
+      "ms": 10.571875
+    },
+    {
+      "round": 0,
+      "threadgroup_y": 1,
+      "actual_threadgroup": [
+        32,
+        1,
+        1
+      ],
+      "ms": 10.829791
+    },
+    {
+      "round": 1,
+      "threadgroup_y": 1,
+      "actual_threadgroup": [
+        32,
+        1,
+        1
+      ],
+      "ms": 11.953209
+    },
+    {
+      "round": 1,
+      "threadgroup_y": 4,
+      "actual_threadgroup": [
+        32,
+        4,
+        1
+      ],
+      "ms": 10.611209
+    },
+    {
+      "round": 2,
+      "threadgroup_y": 4,
+      "actual_threadgroup": [
+        32,
+        4,
+        1
+      ],
+      "ms": 11.856625
+    },
+    {
+      "round": 2,
+      "threadgroup_y": 1,
+      "actual_threadgroup": [
+        32,
+        1,
+        1
+      ],
+      "ms": 12.449209
+    },
+    {
+      "round": 3,
+      "threadgroup_y": 1,
+      "actual_threadgroup": [
+        32,
+        1,
+        1
+      ],
+      "ms": 11.778416
+    },
+    {
+      "round": 3,
+      "threadgroup_y": 4,
+      "actual_threadgroup": [
+        32,
+        4,
+        1
+      ],
+      "ms": 12.893916
+    },
+    {
+      "round": 4,
+      "threadgroup_y": 4,
+      "actual_threadgroup": [
+        32,
+        4,
+        1
+      ],
+      "ms": 13.849291
+    },
+    {
+      "round": 4,
+      "threadgroup_y": 1,
+      "actual_threadgroup": [
+        32,
+        1,
+        1
+      ],
+      "ms": 12.801042
+    },
+    {
+      "round": 5,
+      "threadgroup_y": 1,
+      "actual_threadgroup": [
+        32,
+        1,
+        1
+      ],
+      "ms": 13.057375
+    },
+    {
+      "round": 5,
+      "threadgroup_y": 4,
+      "actual_threadgroup": [
+        32,
+        4,
+        1
+      ],
+      "ms": 13.22475
+    },
+    {
+      "round": 6,
+      "threadgroup_y": 4,
+      "actual_threadgroup": [
+        32,
+        4,
+        1
+      ],
+      "ms": 13.7015
+    },
+    {
+      "round": 6,
+      "threadgroup_y": 1,
+      "actual_threadgroup": [
+        32,
+        1,
+        1
+      ],
+      "ms": 14.227334
+    },
+    {
+      "round": 7,
+      "threadgroup_y": 1,
+      "actual_threadgroup": [
+        32,
+        1,
+        1
+      ],
+      "ms": 14.579875
+    },
+    {
+      "round": 7,
+      "threadgroup_y": 4,
+      "actual_threadgroup": [
+        32,
+        4,
+        1
+      ],
+      "ms": 14.757875
+    },
+    {
+      "round": 8,
+      "threadgroup_y": 4,
+      "actual_threadgroup": [
+        32,
+        4,
+        1
+      ],
+      "ms": 15.828875
+    },
+    {
+      "round": 8,
+      "threadgroup_y": 1,
+      "actual_threadgroup": [
+        32,
+        1,
+        1
+      ],
+      "ms": 16.866625
+    },
+    {
+      "round": 9,
+      "threadgroup_y": 1,
+      "actual_threadgroup": [
+        32,
+        1,
+        1
+      ],
+      "ms": 15.476625
+    },
+    {
+      "round": 9,
+      "threadgroup_y": 4,
+      "actual_threadgroup": [
+        32,
+        4,
+        1
+      ],
+      "ms": 15.908334
+    },
+    {
+      "round": 10,
+      "threadgroup_y": 4,
+      "actual_threadgroup": [
+        32,
+        4,
+        1
+      ],
+      "ms": 15.430416
+    },
+    {
+      "round": 10,
+      "threadgroup_y": 1,
+      "actual_threadgroup": [
+        32,
+        1,
+        1
+      ],
+      "ms": 15.930291
+    },
+    {
+      "round": 11,
+      "threadgroup_y": 1,
+      "actual_threadgroup": [
+        32,
+        1,
+        1
+      ],
+      "ms": 14.970709
+    },
+    {
+      "round": 11,
+      "threadgroup_y": 4,
+      "actual_threadgroup": [
+        32,
+        4,
+        1
+      ],
+      "ms": 15.179792
+    },
+    {
+      "round": 12,
+      "threadgroup_y": 4,
+      "actual_threadgroup": [
+        32,
+        4,
+        1
+      ],
+      "ms": 15.858458
+    },
+    {
+      "round": 12,
+      "threadgroup_y": 1,
+      "actual_threadgroup": [
+        32,
+        1,
+        1
+      ],
+      "ms": 14.798459
+    },
+    {
+      "round": 13,
+      "threadgroup_y": 1,
+      "actual_threadgroup": [
+        32,
+        1,
+        1
+      ],
+      "ms": 15.32425
+    },
+    {
+      "round": 13,
+      "threadgroup_y": 4,
+      "actual_threadgroup": [
+        32,
+        4,
+        1
+      ],
+      "ms": 14.242417
+    },
+    {
+      "round": 14,
+      "threadgroup_y": 4,
+      "actual_threadgroup": [
+        32,
+        4,
+        1
+      ],
+      "ms": 14.31725
+    },
+    {
+      "round": 14,
+      "threadgroup_y": 1,
+      "actual_threadgroup": [
+        32,
+        1,
+        1
+      ],
+      "ms": 14.079208
+    }
+  ]
+}

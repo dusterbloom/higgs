@@ -1,0 +1,10 @@
+{
+  "source_sha256": {
+    "docs/models.md": "1cc5e84e074942b8038296d982e150e8cc9b6bb3f8aa669d536e61ee787a81d3",
+    "crates/higgs-models/src/cache.rs": "9cf872abac39c017cdead187eedc5fcac71a41b310f865d53002ac70cb24a63a",
+    "crates/higgs-models/src/eschamoe.rs": "e00e109cee2534bb15a0a6eb2e6b0de833c9993a84bfa1fb121f1129b3dda80a",
+    "crates/higgs-engine/src/mlx_tuning.rs": "254a8e6b5a868e3e5ecf7934303e68d0023dccce840124a045dafb8960c93175"
+  },
+  "native_user_tokens": 16333,
+  "purpose": "bounded real-activation oracle screen, not behavioral evaluation"
+}

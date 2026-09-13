@@ -1,0 +1,10 @@
+{
+  "binary": "/Users/peppi/.codex/worktrees/4dbe/higgs/target/release/higgs",
+  "binary_sha256": "cd4424a187db959311a522e9c095f410d04f2485161d933c43c6bad6b1649c57",
+  "config_sha256": "32ddd49a9805c9ee97a4e62581d3a1a0952d57b64faf6f659acaf298737b8199",
+  "git_head": "8c6b5f66ba985b0c823ccca82af6f32d73da5ea4",
+  "machine_before": {
+    "power": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23396451)\t91%; discharging; (no estimate) present: true\n",
+    "swapouts": 1618558
+  }
+}

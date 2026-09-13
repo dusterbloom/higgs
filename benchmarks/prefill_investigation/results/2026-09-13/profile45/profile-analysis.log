@@ -1,0 +1,78 @@
+{
+  "chunks": 45,
+  "query_tokens": 45001,
+  "extrapolated_component_ms": {
+    "gdn_attn_ms": 100176.9,
+    "gdn_mlp_ms": 133471.2,
+    "fa_attn_ms": 202609.8,
+    "fa_mlp_ms": 46316.2
+  },
+  "component_fractions": {
+    "gdn_attn_ms": 0.20758863768279318,
+    "gdn_mlp_ms": 0.276581772623106,
+    "fa_attn_ms": 0.4198522050810435,
+    "fa_mlp_ms": 0.09597738461305735
+  },
+  "fa_component_fraction": 0.4198522050810435,
+  "optimistic_fa_elimination_speedup": 1.7236987001556983,
+  "qualification": "Leading attention-cycle timings extrapolated across layers; eval barriers perturb execution. FA includes projections, cache, attention and residual work, so eliminating all FA is more optimistic than eliminating SDPA. These are not uninstrumented wall-time shares.",
+  "thirds": {
+    "0": {
+      "chunks": 15,
+      "query_tokens": 15360,
+      "extrapolated_component_ms": {
+        "gdn_attn_ms": 29736.6,
+        "gdn_mlp_ms": 37505.7,
+        "fa_attn_ms": 21580.3,
+        "fa_mlp_ms": 14053.3
+      },
+      "component_fractions": {
+        "gdn_attn_ms": 0.2890531212849657,
+        "gdn_mlp_ms": 0.3645722661964561,
+        "fa_attn_ms": 0.20977021829213646,
+        "fa_mlp_ms": 0.13660439422644177
+      },
+      "fa_component_fraction": 0.20977021829213646,
+      "optimistic_fa_elimination_speedup": 1.2654547109560665,
+      "qualification": "Leading attention-cycle timings extrapolated across layers; eval barriers perturb execution. FA includes projections, cache, attention and residual work, so eliminating all FA is more optimistic than eliminating SDPA. These are not uninstrumented wall-time shares."
+    },
+    "1": {
+      "chunks": 15,
+      "query_tokens": 15360,
+      "extrapolated_component_ms": {
+        "gdn_attn_ms": 38412.0,
+        "gdn_mlp_ms": 52105.8,
+        "fa_attn_ms": 74952.4,
+        "fa_mlp_ms": 17296.3
+      },
+      "component_fractions": {
+        "gdn_attn_ms": 0.21016980683002628,
+        "gdn_mlp_ms": 0.28509491619087746,
+        "fa_attn_ms": 0.4100992249673764,
+        "fa_mlp_ms": 0.09463605201171987
+      },
+      "fa_component_fraction": 0.4100992249673764,
+      "optimistic_fa_elimination_speedup": 1.6952003494904655,
+      "qualification": "Leading attention-cycle timings extrapolated across layers; eval barriers perturb execution. FA includes projections, cache, attention and residual work, so eliminating all FA is more optimistic than eliminating SDPA. These are not uninstrumented wall-time shares."
+    },
+    "2": {
+      "chunks": 15,
+      "query_tokens": 14281,
+      "extrapolated_component_ms": {
+        "gdn_attn_ms": 32028.3,
+        "gdn_mlp_ms": 43859.7,
+        "fa_attn_ms": 106077.1,
+        "fa_mlp_ms": 14966.6
+      },
+      "component_fractions": {
+        "gdn_attn_ms": 0.16263658923372926,
+        "gdn_mlp_ms": 0.2227152865688967,
+        "fa_attn_ms": 0.538649186494607,
+        "fa_mlp_ms": 0.075998937702767
+      },
+      "fa_component_fraction": 0.538649186494607,
+      "optimistic_fa_elimination_speedup": 2.16754792822818,
+      "qualification": "Leading attention-cycle timings extrapolated across layers; eval barriers perturb execution. FA includes projections, cache, attention and residual work, so eliminating all FA is more optimistic than eliminating SDPA. These are not uninstrumented wall-time shares."
+    }
+  }
+}

@@ -1,0 +1,47 @@
+[
+  {
+    "path": "/Users/peppi/.codex/worktrees/4dbe/higgs/target/prefill-investigation/capture-heterogeneous/traces/layer-03-offset-001024.safetensors",
+    "bytes": 8651570,
+    "sha256": "4c42c01395dcd8fbb22e61133bb7c7bba863221720a223734c8f13b8761bc28a"
+  },
+  {
+    "path": "/Users/peppi/.codex/worktrees/4dbe/higgs/target/prefill-investigation/capture-heterogeneous/traces/layer-03-offset-007168.safetensors",
+    "bytes": 33817407,
+    "sha256": "f883dbcb58dabb7d3772403d6eb9c32df6108cec7086ad12176923d0cd32dd3e"
+  },
+  {
+    "path": "/Users/peppi/.codex/worktrees/4dbe/higgs/target/prefill-investigation/capture-heterogeneous/traces/layer-03-offset-015360.safetensors",
+    "bytes": 67109717,
+    "sha256": "3e018e23d3a1cfff3f9ed9cc424393f0cdda91eae3330851668c004572699bf9"
+  },
+  {
+    "path": "/Users/peppi/.codex/worktrees/4dbe/higgs/target/prefill-investigation/capture-heterogeneous/traces/layer-19-offset-001024.safetensors",
+    "bytes": 8651566,
+    "sha256": "5961d6ad61ab9dbcdbb2969f4eca65d5270fbf1adf97a6c6fa936decbb9ffa54"
+  },
+  {
+    "path": "/Users/peppi/.codex/worktrees/4dbe/higgs/target/prefill-investigation/capture-heterogeneous/traces/layer-19-offset-007168.safetensors",
+    "bytes": 33817357,
+    "sha256": "56b0d402eee0a93b3e15212c95008e0514a9b7353e29373bf0631ed0e30ef1ef"
+  },
+  {
+    "path": "/Users/peppi/.codex/worktrees/4dbe/higgs/target/prefill-investigation/capture-heterogeneous/traces/layer-19-offset-015360.safetensors",
+    "bytes": 67109669,
+    "sha256": "4cce85f5a2953b90f859b1891e2c3a2fae4c06d8f5dd6e6e6cc34c5cff53b8b8"
+  },
+  {
+    "path": "/Users/peppi/.codex/worktrees/4dbe/higgs/target/prefill-investigation/capture-heterogeneous/traces/layer-39-offset-001024.safetensors",
+    "bytes": 8651570,
+    "sha256": "8cddcff32ddd16e79e10c855223cbb3c07f1aeefe9d2ca985e52e12ced7fd76f"
+  },
+  {
+    "path": "/Users/peppi/.codex/worktrees/4dbe/higgs/target/prefill-investigation/capture-heterogeneous/traces/layer-39-offset-007168.safetensors",
+    "bytes": 33817377,
+    "sha256": "5440604c2b88f961f27da68371c772620778dbb2824978ed3b61242c5ff40b5b"
+  },
+  {
+    "path": "/Users/peppi/.codex/worktrees/4dbe/higgs/target/prefill-investigation/capture-heterogeneous/traces/layer-39-offset-015360.safetensors",
+    "bytes": 67109673,
+    "sha256": "ffa99d0c06ff12013e93d64cb3317b3b079ef00f5050df76f236a5dc044a71b3"
+  }
+]

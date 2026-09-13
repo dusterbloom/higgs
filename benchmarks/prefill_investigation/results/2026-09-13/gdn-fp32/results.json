@@ -1,0 +1,264 @@
+{
+  "mlx_version": "0.30.6",
+  "config": "/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2/config.json",
+  "observed_geometry": {
+    "hidden_size": 2048,
+    "hk": 16,
+    "hv": 32,
+    "dk": 128,
+    "dv": 128
+  },
+  "dims": {
+    "batch": 1,
+    "hk": 16,
+    "hv": 32,
+    "dk": 128,
+    "dv": 128
+  },
+  "input_dtype": "float32",
+  "rows": [
+    {
+      "T": 1024,
+      "threadgroup_y": 1,
+      "median_ms": 9.317833,
+      "samples_ms": [
+        9.000708,
+        8.965375,
+        9.388584,
+        8.990459,
+        9.317833,
+        9.18075,
+        10.510458,
+        10.87825,
+        11.471834
+      ]
+    },
+    {
+      "T": 1024,
+      "threadgroup_y": 2,
+      "median_ms": 12.565125,
+      "samples_ms": [
+        10.360584,
+        10.983667,
+        11.409083,
+        12.142167,
+        12.565125,
+        12.79275,
+        13.360625,
+        13.980625,
+        14.258542
+      ]
+    },
+    {
+      "T": 1024,
+      "threadgroup_y": 4,
+      "median_ms": 11.553917,
+      "samples_ms": [
+        10.753625,
+        10.286,
+        10.709875,
+        11.231708,
+        11.553917,
+        12.276416,
+        12.409709,
+        13.01025,
+        13.068625
+      ]
+    },
+    {
+      "T": 1024,
+      "threadgroup_y": 8,
+      "median_ms": 11.853375,
+      "samples_ms": [
+        11.01775,
+        10.837792,
+        11.235375,
+        11.853917,
+        11.576875,
+        11.853375,
+        11.977834,
+        12.115333,
+        12.320791
+      ]
+    }
+  ],
+  "scalar_reference_checks": [
+    {
+      "source_T": 1024,
+      "checked_T": 8,
+      "output_max_abs": 9.313225746154785e-10,
+      "state_max_abs": 1.862645149230957e-09
+    }
+  ],
+  "t1024_bitwise_parity": {
+    "1": {
+      "output_bitwise_equal_tg4": true,
+      "state_bitwise_equal_tg4": true
+    },
+    "2": {
+      "output_bitwise_equal_tg4": true,
+      "state_bitwise_equal_tg4": true
+    },
+    "4": {
+      "output_bitwise_equal_tg4": true,
+      "state_bitwise_equal_tg4": true
+    },
+    "8": {
+      "output_bitwise_equal_tg4": true,
+      "state_bitwise_equal_tg4": true
+    }
+  },
+  "paired_candidate": 1,
+  "paired_tg4_vs_candidate": [
+    {
+      "round": 0,
+      "threadgroup_y": 4,
+      "ms": 11.273292
+    },
+    {
+      "round": 0,
+      "threadgroup_y": 1,
+      "ms": 10.92
+    },
+    {
+      "round": 1,
+      "threadgroup_y": 1,
+      "ms": 10.084875
+    },
+    {
+      "round": 1,
+      "threadgroup_y": 4,
+      "ms": 10.006417
+    },
+    {
+      "round": 2,
+      "threadgroup_y": 4,
+      "ms": 10.343666
+    },
+    {
+      "round": 2,
+      "threadgroup_y": 1,
+      "ms": 10.368791
+    },
+    {
+      "round": 3,
+      "threadgroup_y": 1,
+      "ms": 10.635875
+    },
+    {
+      "round": 3,
+      "threadgroup_y": 4,
+      "ms": 11.476417
+    },
+    {
+      "round": 4,
+      "threadgroup_y": 4,
+      "ms": 11.847958
+    },
+    {
+      "round": 4,
+      "threadgroup_y": 1,
+      "ms": 12.192833
+    },
+    {
+      "round": 5,
+      "threadgroup_y": 1,
+      "ms": 12.569
+    },
+    {
+      "round": 5,
+      "threadgroup_y": 4,
+      "ms": 13.210167
+    },
+    {
+      "round": 6,
+      "threadgroup_y": 4,
+      "ms": 12.948958
+    },
+    {
+      "round": 6,
+      "threadgroup_y": 1,
+      "ms": 13.291625
+    },
+    {
+      "round": 7,
+      "threadgroup_y": 1,
+      "ms": 13.587459
+    },
+    {
+      "round": 7,
+      "threadgroup_y": 4,
+      "ms": 13.549833
+    },
+    {
+      "round": 8,
+      "threadgroup_y": 4,
+      "ms": 13.531292
+    },
+    {
+      "round": 8,
+      "threadgroup_y": 1,
+      "ms": 13.491583
+    },
+    {
+      "round": 9,
+      "threadgroup_y": 1,
+      "ms": 13.48375
+    },
+    {
+      "round": 9,
+      "threadgroup_y": 4,
+      "ms": 13.4435
+    },
+    {
+      "round": 10,
+      "threadgroup_y": 4,
+      "ms": 13.350917
+    },
+    {
+      "round": 10,
+      "threadgroup_y": 1,
+      "ms": 13.2825
+    },
+    {
+      "round": 11,
+      "threadgroup_y": 1,
+      "ms": 13.211916
+    },
+    {
+      "round": 11,
+      "threadgroup_y": 4,
+      "ms": 13.005917
+    },
+    {
+      "round": 12,
+      "threadgroup_y": 4,
+      "ms": 13.1195
+    },
+    {
+      "round": 12,
+      "threadgroup_y": 1,
+      "ms": 13.132125
+    },
+    {
+      "round": 13,
+      "threadgroup_y": 1,
+      "ms": 13.269833
+    },
+    {
+      "round": 13,
+      "threadgroup_y": 4,
+      "ms": 13.026042
+    },
+    {
+      "round": 14,
+      "threadgroup_y": 4,
+      "ms": 12.644875
+    },
+    {
+      "round": 14,
+      "threadgroup_y": 1,
+      "ms": 12.954416
+    }
+  ]
+}

@@ -1,0 +1,264 @@
+{
+  "mlx_version": "0.30.6",
+  "config": "/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2/config.json",
+  "observed_geometry": {
+    "hidden_size": 2048,
+    "hk": 16,
+    "hv": 32,
+    "dk": 128,
+    "dv": 128
+  },
+  "dims": {
+    "batch": 1,
+    "hk": 16,
+    "hv": 32,
+    "dk": 128,
+    "dv": 128
+  },
+  "input_dtype": "bfloat16",
+  "rows": [
+    {
+      "T": 1024,
+      "threadgroup_y": 1,
+      "median_ms": 9.813625,
+      "samples_ms": [
+        8.917625,
+        8.8915,
+        9.209,
+        8.905666,
+        10.098333,
+        9.813625,
+        11.085583,
+        11.634625,
+        12.446834
+      ]
+    },
+    {
+      "T": 1024,
+      "threadgroup_y": 2,
+      "median_ms": 13.126667,
+      "samples_ms": [
+        14.773375,
+        13.893125,
+        13.305917,
+        13.265625,
+        13.126667,
+        12.800875,
+        12.367417,
+        12.437875,
+        12.041708
+      ]
+    },
+    {
+      "T": 1024,
+      "threadgroup_y": 4,
+      "median_ms": 11.967916,
+      "samples_ms": [
+        11.967916,
+        12.134042,
+        11.693833,
+        11.658541,
+        12.108875,
+        12.000167,
+        11.759917,
+        11.925667,
+        12.110416
+      ]
+    },
+    {
+      "T": 1024,
+      "threadgroup_y": 8,
+      "median_ms": 12.367291,
+      "samples_ms": [
+        12.799083,
+        13.214958,
+        13.516375,
+        12.367291,
+        12.314208,
+        12.1765,
+        12.005209,
+        11.93975,
+        12.752917
+      ]
+    }
+  ],
+  "scalar_reference_checks": [
+    {
+      "source_T": 1024,
+      "checked_T": 8,
+      "output_max_abs": 1.5230383723974228e-05,
+      "state_max_abs": 1.862645149230957e-09
+    }
+  ],
+  "t1024_bitwise_parity": {
+    "1": {
+      "output_bitwise_equal_tg4": true,
+      "state_bitwise_equal_tg4": true
+    },
+    "2": {
+      "output_bitwise_equal_tg4": true,
+      "state_bitwise_equal_tg4": true
+    },
+    "4": {
+      "output_bitwise_equal_tg4": true,
+      "state_bitwise_equal_tg4": true
+    },
+    "8": {
+      "output_bitwise_equal_tg4": true,
+      "state_bitwise_equal_tg4": true
+    }
+  },
+  "paired_candidate": 1,
+  "paired_tg4_vs_candidate": [
+    {
+      "round": 0,
+      "threadgroup_y": 4,
+      "ms": 9.601458
+    },
+    {
+      "round": 0,
+      "threadgroup_y": 1,
+      "ms": 9.437667
+    },
+    {
+      "round": 1,
+      "threadgroup_y": 1,
+      "ms": 9.212417
+    },
+    {
+      "round": 1,
+      "threadgroup_y": 4,
+      "ms": 9.773834
+    },
+    {
+      "round": 2,
+      "threadgroup_y": 4,
+      "ms": 9.793916
+    },
+    {
+      "round": 2,
+      "threadgroup_y": 1,
+      "ms": 10.091417
+    },
+    {
+      "round": 3,
+      "threadgroup_y": 1,
+      "ms": 10.244625
+    },
+    {
+      "round": 3,
+      "threadgroup_y": 4,
+      "ms": 10.550042
+    },
+    {
+      "round": 4,
+      "threadgroup_y": 4,
+      "ms": 11.269583
+    },
+    {
+      "round": 4,
+      "threadgroup_y": 1,
+      "ms": 11.780792
+    },
+    {
+      "round": 5,
+      "threadgroup_y": 1,
+      "ms": 12.076416
+    },
+    {
+      "round": 5,
+      "threadgroup_y": 4,
+      "ms": 12.763125
+    },
+    {
+      "round": 6,
+      "threadgroup_y": 4,
+      "ms": 13.107542
+    },
+    {
+      "round": 6,
+      "threadgroup_y": 1,
+      "ms": 12.897167
+    },
+    {
+      "round": 7,
+      "threadgroup_y": 1,
+      "ms": 13.173625
+    },
+    {
+      "round": 7,
+      "threadgroup_y": 4,
+      "ms": 14.296417
+    },
+    {
+      "round": 8,
+      "threadgroup_y": 4,
+      "ms": 13.347625
+    },
+    {
+      "round": 8,
+      "threadgroup_y": 1,
+      "ms": 13.465584
+    },
+    {
+      "round": 9,
+      "threadgroup_y": 1,
+      "ms": 13.463958
+    },
+    {
+      "round": 9,
+      "threadgroup_y": 4,
+      "ms": 13.14675
+    },
+    {
+      "round": 10,
+      "threadgroup_y": 4,
+      "ms": 12.758125
+    },
+    {
+      "round": 10,
+      "threadgroup_y": 1,
+      "ms": 12.807208
+    },
+    {
+      "round": 11,
+      "threadgroup_y": 1,
+      "ms": 12.482917
+    },
+    {
+      "round": 11,
+      "threadgroup_y": 4,
+      "ms": 12.888958
+    },
+    {
+      "round": 12,
+      "threadgroup_y": 4,
+      "ms": 12.172125
+    },
+    {
+      "round": 12,
+      "threadgroup_y": 1,
+      "ms": 12.215042
+    },
+    {
+      "round": 13,
+      "threadgroup_y": 1,
+      "ms": 12.22525
+    },
+    {
+      "round": 13,
+      "threadgroup_y": 4,
+      "ms": 12.053875
+    },
+    {
+      "round": 14,
+      "threadgroup_y": 4,
+      "ms": 12.075041
+    },
+    {
+      "round": 14,
+      "threadgroup_y": 1,
+      "ms": 12.202375
+    }
+  ]
+}

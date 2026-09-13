@@ -1,0 +1,17 @@
+[server]
+host = "127.0.0.1"
+port = 19093
+rate_limit = 0
+timeout = 900
+
+[local]
+raise_wired_limit = true
+
+[[models]]
+path = "/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2"
+name = "escha-bench"
+max_context_tokens = 49152
+mlx_profile = "throughput"
+disk_cache_enabled = false
+kv_max_sessions = 1
+kv_max_session_tokens = 49152

@@ -1,0 +1,64 @@
+import sys,json,time,pathlib,subprocess,urllib.request,os,signal,threading,hashlib
+sys.path.insert(0,str(pathlib.Path('benchmarks/ane_prefill').resolve()))
+sys.path.insert(0,'/Users/peppi/Dev/nanobot-rs/experiments/context-recovery')
+from measure import measure_request, machine_state
+from memory_probe import memory_sample
+root=pathlib.Path('target/prefill-investigation/tuning/control-b').resolve()
+source=pathlib.Path('target/ane-prefill').resolve()
+binary=pathlib.Path('target/prefill-investigation/higgs-control').resolve()
+manifest={'binary':str(binary),'binary_sha256':hashlib.file_digest(binary.open('rb'),'sha256').hexdigest(), 'config_sha256':hashlib.sha256((root/'config.toml').read_bytes()).hexdigest(),'git_head':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'machine_before':machine_state()}
+(root/'manifest.json').write_text(json.dumps(manifest,indent=2))
+for size in [32000]:
+ env={k:v for k,v in os.environ.items() if not k.startswith('HIGGS_')}
+ env.update(HIGGS_ENABLE_THINKING='0',HIGGS_CHUNKED_PREFILL_CHUNK_SIZE='1024',RUST_LOG='info')
+ stop=threading.Event(); memory=[]; sampling=None; abort=[]
+ with (root/f'server-{size}.log').open('w') as log:
+  server=subprocess.Popen([str(binary),'--config',str(root/'config.toml'),'serve'],stdout=log,stderr=subprocess.STDOUT,env=env)
+  (root/'server.pid').write_text(str(server.pid))
+  try:
+   for attempt in range(120):
+    if server.poll() is not None:raise RuntimeError(f'server exited {server.returncode}')
+    try:
+     urllib.request.urlopen('http://127.0.0.1:19093/metrics',timeout=1).close();break
+    except OSError:time.sleep(1)
+   else:raise RuntimeError('server not ready')
+   logs=(root/f'server-{size}.log').read_text()
+   assert 'Configured MLX wired limit' in logs and 'cache_limit_mb=256' in logs,'Memory policy not active'
+   warm=measure_request('http://127.0.0.1:19093',json.loads((source/'request-512.json').read_text()),root/f'warm-{size}',server.pid)
+   assert warm['outcome']=='finished',warm
+   previous=machine_state()['swapouts'];stable=0
+   for attempt in range(30):
+    time.sleep(2);now=machine_state()['swapouts']
+    stable=stable+1 if now==previous else 0;previous=now
+    if stable>=15:break
+   else:raise RuntimeError('swapouts did not settle before timed request')
+   initial=previous
+   def monitor():
+    with (root/f'footprint-{size}.jsonl').open('w') as f:
+     while not stop.is_set():
+      try:
+       sample=memory_sample(server.pid); sample['at']=time.time()
+       sample['capacity']=json.load(urllib.request.urlopen('http://127.0.0.1:19093/metrics',timeout=3))['capacity']
+       memory.append(sample);f.write(json.dumps(sample)+'\n');f.flush()
+       if sample['system_vm_counters']['Swapouts']>initial:
+        abort.append('new system swapouts');server.kill();return
+      except Exception as e:
+       abort.append('sampling_error:'+repr(e));return
+      stop.wait(2)
+   sampling=threading.Thread(target=monitor);sampling.start()
+   result=measure_request('http://127.0.0.1:19093',json.loads((source/f'request-{size}.json').read_text()),root/f'baseline-{size}',server.pid)
+   stop.set();sampling.join()
+   result['peak_physical_footprint_bytes']=max((v['physical_footprint_bytes'] for v in memory),default=None)
+   result['peak_wired_bytes']=max((v['wired_bytes'] for v in memory),default=None)
+   result['abort_reasons']=abort
+   result['semantic_pass']=all(v in result['answer'] for v in ['LANTERN-4729-QZ','Neri'])
+   (root/f'baseline-{size}'/'result.json').write_text(json.dumps(result,indent=2))
+   print('VALIDATION',size,{k:result[k] for k in ['outcome','swapouts_delta','peak_physical_footprint_bytes','peak_wired_bytes','semantic_pass','abort_reasons']},flush=True)
+   assert result['outcome']=='finished' and result['semantic_pass'] and not abort,result
+   assert result['swapouts_delta']==0,'new swapping'
+  finally:
+   stop.set()
+   if sampling:sampling.join(timeout=5)
+   if server.poll() is None:server.send_signal(signal.SIGINT)
+   try:server.wait(timeout=15)
+   except subprocess.TimeoutExpired:server.kill();server.wait()

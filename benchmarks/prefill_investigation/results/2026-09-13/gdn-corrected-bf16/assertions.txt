@@ -1,0 +1,1 @@
+parity=pass actual_threadgroups=pass scalar_oracle_tg4=pass

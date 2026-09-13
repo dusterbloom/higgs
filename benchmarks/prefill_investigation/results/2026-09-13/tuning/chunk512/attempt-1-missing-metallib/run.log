@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/Users/peppi/.codex/worktrees/4dbe/higgs/target/prefill-investigation/tuning/chunk512/run.py", line 20, in <module>
+    if server.poll() is not None:raise RuntimeError(f'server exited {server.returncode}')
+                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: server exited 1

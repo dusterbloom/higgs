@@ -1,0 +1,198 @@
+{
+  "0.0": {
+    "late_layers": [
+      {
+        "layer": 3,
+        "selected_density": 1.0,
+        "selected_density_p99": 1.0,
+        "relative_l2_p99": 2.634070597196114e-07,
+        "relative_l2_max": 3.321438271086663e-07,
+        "cosine_min": 0.9999998807907104
+      },
+      {
+        "layer": 19,
+        "selected_density": 1.0,
+        "selected_density_p99": 1.0,
+        "relative_l2_p99": 2.525478066672804e-07,
+        "relative_l2_max": 3.3137669674943027e-07,
+        "cosine_min": 0.9999998807907104
+      },
+      {
+        "layer": 39,
+        "selected_density": 1.0,
+        "selected_density_p99": 1.0,
+        "relative_l2_p99": 9.626669594808845e-08,
+        "relative_l2_max": 1.932932747195082e-07,
+        "cosine_min": 0.9999998807907104
+      }
+    ]
+  },
+  "0.01": {
+    "late_layers": [
+      {
+        "layer": 3,
+        "selected_density": 0.6527711984841308,
+        "selected_density_p99": 1.0,
+        "relative_l2_p99": 0.061382096260786057,
+        "relative_l2_max": 0.07225703448057175,
+        "cosine_min": 0.9977790713310242
+      },
+      {
+        "layer": 19,
+        "selected_density": 0.31653244907626715,
+        "selected_density_p99": 0.8651554845882866,
+        "relative_l2_p99": 0.09683913737535477,
+        "relative_l2_max": 0.12935450673103333,
+        "cosine_min": 0.9920678734779358
+      },
+      {
+        "layer": 39,
+        "selected_density": 0.6604452865940312,
+        "selected_density_p99": 0.9878292419329936,
+        "relative_l2_p99": 0.021465588361024857,
+        "relative_l2_max": 0.04187709838151932,
+        "cosine_min": 0.999135434627533
+      }
+    ]
+  },
+  "0.03": {
+    "late_layers": [
+      {
+        "layer": 3,
+        "selected_density": 0.46600347386704566,
+        "selected_density_p99": 1.0,
+        "relative_l2_p99": 0.12039335072040558,
+        "relative_l2_max": 0.17179137468338013,
+        "cosine_min": 0.9861177206039429
+      },
+      {
+        "layer": 19,
+        "selected_density": 0.19605242381177956,
+        "selected_density_p99": 0.6614475206656628,
+        "relative_l2_p99": 0.1750132441520691,
+        "relative_l2_max": 0.21356609463691711,
+        "cosine_min": 0.976934015750885
+      },
+      {
+        "layer": 39,
+        "selected_density": 0.4489815253434391,
+        "selected_density_p99": 0.9003923683765533,
+        "relative_l2_p99": 0.03940616920590401,
+        "relative_l2_max": 0.05176471546292305,
+        "cosine_min": 0.9987117648124695
+      }
+    ]
+  },
+  "0.1": {
+    "late_layers": [
+      {
+        "layer": 3,
+        "selected_density": 0.23625453971261645,
+        "selected_density_p99": 0.8965275612078498,
+        "relative_l2_p99": 0.28733277320861816,
+        "relative_l2_max": 0.7028470039367676,
+        "cosine_min": 0.7294424772262573
+      },
+      {
+        "layer": 19,
+        "selected_density": 0.10781620085267646,
+        "selected_density_p99": 0.33706652613880467,
+        "relative_l2_p99": 0.3668234348297119,
+        "relative_l2_max": 0.4412134885787964,
+        "cosine_min": 0.9186019897460938
+      },
+      {
+        "layer": 39,
+        "selected_density": 0.20773724932891205,
+        "selected_density_p99": 0.6402559083862988,
+        "relative_l2_p99": 0.08663152158260345,
+        "relative_l2_max": 0.13806495070457458,
+        "cosine_min": 0.990942656993866
+      }
+    ]
+  },
+  "0.3": {
+    "late_layers": [
+      {
+        "layer": 3,
+        "selected_density": 0.09120480025264488,
+        "selected_density_p99": 0.4793661401822525,
+        "relative_l2_p99": 0.6161270141601562,
+        "relative_l2_max": 0.7381258606910706,
+        "cosine_min": 0.6823261976242065
+      },
+      {
+        "layer": 19,
+        "selected_density": 0.06432970156324017,
+        "selected_density_p99": 0.1300757719052177,
+        "relative_l2_p99": 0.5470157861709595,
+        "relative_l2_max": 0.6895326972007751,
+        "cosine_min": 0.7247346639633179
+      },
+      {
+        "layer": 39,
+        "selected_density": 0.08741512711195326,
+        "selected_density_p99": 0.2775146108889568,
+        "relative_l2_p99": 0.15145835280418396,
+        "relative_l2_max": 0.17912310361862183,
+        "cosine_min": 0.9855534434318542
+      }
+    ]
+  },
+  "0.5": {
+    "late_layers": [
+      {
+        "layer": 3,
+        "selected_density": 0.059087320385283436,
+        "selected_density_p99": 0.2048425347392765,
+        "relative_l2_p99": 0.6780591011047363,
+        "relative_l2_max": 0.7696812748908997,
+        "cosine_min": 0.6385865211486816
+      },
+      {
+        "layer": 19,
+        "selected_density": 0.05435022895941892,
+        "selected_density_p99": 0.09531359545381339,
+        "relative_l2_p99": 0.574008584022522,
+        "relative_l2_max": 0.771496057510376,
+        "cosine_min": 0.6678274273872375
+      },
+      {
+        "layer": 39,
+        "selected_density": 0.061266382441181114,
+        "selected_density_p99": 0.13740711764377875,
+        "relative_l2_p99": 0.16218453645706177,
+        "relative_l2_max": 0.19266493618488312,
+        "cosine_min": 0.9834849834442139
+      }
+    ]
+  },
+  "0.9": {
+    "late_layers": [
+      {
+        "layer": 3,
+        "selected_density": 0.0456339807358282,
+        "selected_density_p99": 0.0638872369722126,
+        "relative_l2_p99": 0.6778602600097656,
+        "relative_l2_max": 0.7748209238052368,
+        "cosine_min": 0.6385865211486816
+      },
+      {
+        "layer": 19,
+        "selected_density": 0.046928785725564505,
+        "selected_density_p99": 0.06506142633567233,
+        "relative_l2_p99": 0.6330228447914124,
+        "relative_l2_max": 0.771496057510376,
+        "cosine_min": 0.6678274273872375
+      },
+      {
+        "layer": 39,
+        "selected_density": 0.04749723669666825,
+        "selected_density_p99": 0.06503470812243026,
+        "relative_l2_p99": 0.18882426619529724,
+        "relative_l2_max": 0.22434884309768677,
+        "cosine_min": 0.9759848713874817
+      }
+    ]
+  }
+}

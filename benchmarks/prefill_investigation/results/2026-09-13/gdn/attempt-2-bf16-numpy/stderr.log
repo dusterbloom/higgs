@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/Users/peppi/.codex/worktrees/4dbe/higgs/benchmarks/gdn_prefill/benchmark.py", line 198, in <module>
+    main()
+  File "/Users/peppi/.codex/worktrees/4dbe/higgs/benchmarks/gdn_prefill/benchmark.py", line 194, in main
+    _run_gpu(p.parse_args())
+  File "/Users/peppi/.codex/worktrees/4dbe/higgs/benchmarks/gdn_prefill/benchmark.py", line 193, in _run_gpu
+    cpu = recurrence_reference(np.array(q[:, :check_t]), np.array(k[:, :check_t]),
+RuntimeError: Item size 2 for PEP 3118 buffer format string B does not match the dtype B item size 1.

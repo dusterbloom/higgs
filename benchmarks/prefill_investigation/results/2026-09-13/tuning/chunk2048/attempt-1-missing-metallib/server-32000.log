@@ -1,0 +1,1 @@
+Error: "mlx.metallib not found next to executable at /Users/peppi/.codex/worktrees/4dbe/higgs/target/prefill-investigation/mlx.metallib\nhint: rebuild Higgs, reinstall the Apple Silicon Homebrew package, or use a release artifact that bundles mlx.metallib"
