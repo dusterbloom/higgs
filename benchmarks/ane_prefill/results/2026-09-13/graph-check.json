@@ -1,0 +1,25 @@
+{
+  "all": {
+    "summary": {
+      "changed_count": 91,
+      "affected_count": 133,
+      "changed_files": 52,
+      "risk_level": "critical"
+    },
+    "partial": false,
+    "truncated": false,
+    "symbol_count": 91
+  },
+  "staged": {
+    "summary": {
+      "changed_count": 29,
+      "affected_count": 0,
+      "changed_files": 38,
+      "risk_level": "low"
+    },
+    "partial": false,
+    "truncated": false,
+    "symbol_count": 29
+  },
+  "note": "Pre-commit snapshot before adding this evidence JSON. The all scope includes unchanged preexisting user edits; only benchmark files are staged. Final checks repeated after staging evidence."
+}

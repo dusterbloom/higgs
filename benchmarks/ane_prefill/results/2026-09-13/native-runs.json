@@ -1,0 +1,3156 @@
+{
+  "32": {
+    "manifest": {
+      "source": {
+        "model.language_model.layers.0.linear_attn.in_proj_z.weight_int8": {
+          "sha256": "99f966b1aa6944cd856829ad927ad7e0608caf86e187d76f8c05916a51161e61",
+          "shape": [
+            4096,
+            2048
+          ],
+          "dtype": "int8"
+        },
+        "model.language_model.layers.0.linear_attn.in_proj_z.weight_scale": {
+          "sha256": "1eb4fcec5addfa3c4ae33070b7c8181127439016582c86e1146a4372ef7f0e72",
+          "shape": [
+            4096
+          ],
+          "dtype": "float16"
+        }
+      },
+      "tokens": 32,
+      "coremltools": "9.0",
+      "variants": {
+        "original": {
+          "input_channels": 2048,
+          "output_channels": [
+            4096
+          ],
+          "nominal_coefficient_bytes_per_core": [
+            1048576
+          ]
+        },
+        "pad_input": {
+          "input_channels": 2080,
+          "output_channels": [
+            4096
+          ],
+          "nominal_coefficient_bytes_per_core": [
+            1064960
+          ]
+        },
+        "pad_output": {
+          "input_channels": 2048,
+          "output_channels": [
+            4160
+          ],
+          "nominal_coefficient_bytes_per_core": [
+            1064960
+          ]
+        },
+        "split_output": {
+          "input_channels": 2048,
+          "output_channels": [
+            2048,
+            2048
+          ],
+          "nominal_coefficient_bytes_per_core": [
+            524288,
+            524288
+          ]
+        }
+      }
+    },
+    "runs": {
+      "original/cpu/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.322666,
+          0.358292,
+          0.409333,
+          0.413125,
+          0.637208,
+          0.283666,
+          0.326167,
+          0.301875,
+          0.3435,
+          0.2995,
+          0.297917,
+          0.271042,
+          0.307667
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLCPUComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              32
+            ],
+            "strides": [
+              131072,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 131072,
+        "load_compile_ms": 78.664625
+      },
+      "original/repeat-1/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.861583,
+          0.731542,
+          0.740792,
+          0.711875,
+          0.835,
+          0.830625,
+          0.809291,
+          0.695542,
+          0.743041,
+          0.747292,
+          0.728416,
+          0.852167,
+          0.860167
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              32
+            ],
+            "strides": [
+              131072,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 131072,
+        "load_compile_ms": 121.763667
+      },
+      "original/repeat-1-post/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.855333,
+          0.887667,
+          0.757167,
+          0.767541,
+          0.745042,
+          0.734,
+          0.795916,
+          0.861208,
+          0.778667,
+          0.741417,
+          0.747042,
+          0.8345,
+          0.878666
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              32
+            ],
+            "strides": [
+              131072,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 131072,
+        "load_compile_ms": 101.809208
+      },
+      "original/repeat-2/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.754417,
+          0.734,
+          0.727458,
+          0.715917,
+          0.831875,
+          0.778917,
+          0.768417,
+          0.754375,
+          0.772334,
+          0.876958,
+          0.811,
+          0.744958,
+          0.746375
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              32
+            ],
+            "strides": [
+              131072,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 131072,
+        "load_compile_ms": 102.333583
+      },
+      "original/repeat-2-post/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.834083,
+          0.750416,
+          0.719542,
+          0.739459,
+          0.826042,
+          0.864583,
+          0.882083,
+          0.720208,
+          0.719125,
+          0.772125,
+          0.814,
+          0.781625,
+          0.773667
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              32
+            ],
+            "strides": [
+              131072,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 131072,
+        "load_compile_ms": 109.233875
+      },
+      "original/repeat-3/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.909916,
+          0.765459,
+          0.726416,
+          0.753292,
+          0.750042,
+          0.762458,
+          0.740041,
+          0.756042,
+          0.708209,
+          0.847834,
+          0.812542,
+          0.746584,
+          0.744166
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              32
+            ],
+            "strides": [
+              131072,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 131072,
+        "load_compile_ms": 106.972792
+      },
+      "original/repeat-3-post/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.76975,
+          0.888125,
+          0.861042,
+          0.734875,
+          0.749416,
+          0.85325,
+          0.832625,
+          0.777583,
+          0.747167,
+          0.737083,
+          0.770208,
+          0.865458,
+          0.793042
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              32
+            ],
+            "strides": [
+              131072,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 131072,
+        "load_compile_ms": 100.993375
+      },
+      "original/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.857458,
+          0.813167,
+          0.780959,
+          0.809625,
+          0.829209,
+          0.838958,
+          0.801333,
+          0.829167,
+          0.961375,
+          0.847583,
+          0.792583,
+          0.848917,
+          0.82875
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              32
+            ],
+            "strides": [
+              131072,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 131072,
+        "load_compile_ms": 545.348584
+      },
+      "pad_input/repeat-1/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.448875,
+          0.4195,
+          0.431917,
+          0.499584,
+          0.487667,
+          0.440459,
+          0.48775,
+          0.4345,
+          0.476959,
+          0.424167,
+          0.438125,
+          0.52,
+          0.453791
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              32
+            ],
+            "strides": [
+              131072,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 133120,
+        "load_compile_ms": 102.780334
+      },
+      "pad_input/repeat-2/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.486083,
+          0.439458,
+          0.426625,
+          0.48925,
+          0.457208,
+          0.451042,
+          0.393834,
+          0.423416,
+          0.423042,
+          0.421125,
+          0.427333,
+          0.491,
+          0.503333
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              32
+            ],
+            "strides": [
+              131072,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 133120,
+        "load_compile_ms": 102.814166
+      },
+      "pad_input/repeat-3/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.492459,
+          0.4305,
+          0.443709,
+          0.440917,
+          0.435,
+          0.432084,
+          0.439417,
+          0.490792,
+          0.525042,
+          0.428375,
+          0.413542,
+          0.428792,
+          0.425833
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              32
+            ],
+            "strides": [
+              131072,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 133120,
+        "load_compile_ms": 105.868625
+      },
+      "pad_input/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.796333,
+          0.620417,
+          0.522333,
+          0.543833,
+          0.51925,
+          0.469792,
+          0.479291,
+          0.454042,
+          0.481208,
+          0.486458,
+          0.497166,
+          0.492917,
+          0.459875
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              32
+            ],
+            "strides": [
+              131072,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 133120,
+        "load_compile_ms": 212.8055
+      },
+      "pad_output/repeat-1/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.468542,
+          0.433666,
+          0.481042,
+          0.454,
+          0.483375,
+          0.441791,
+          0.429541,
+          0.441458,
+          0.420791,
+          0.422042,
+          0.422292,
+          0.469625,
+          0.460667
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4160,
+              1,
+              32
+            ],
+            "strides": [
+              133120,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 131072,
+        "load_compile_ms": 104.754166
+      },
+      "pad_output/repeat-2/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.426667,
+          0.4235,
+          0.416833,
+          0.518291,
+          0.493459,
+          0.451917,
+          0.468209,
+          0.452458,
+          0.438417,
+          0.412917,
+          0.4275,
+          0.450458,
+          0.458542
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4160,
+              1,
+              32
+            ],
+            "strides": [
+              133120,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 131072,
+        "load_compile_ms": 111.251542
+      },
+      "pad_output/repeat-3/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.443542,
+          0.420042,
+          0.552209,
+          0.474041,
+          0.446583,
+          0.438042,
+          0.423458,
+          0.430458,
+          0.455708,
+          0.431458,
+          0.448042,
+          0.44375,
+          0.512
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4160,
+              1,
+              32
+            ],
+            "strides": [
+              133120,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 131072,
+        "load_compile_ms": 112.967167
+      },
+      "pad_output/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.599083,
+          0.593958,
+          0.611167,
+          0.594334,
+          0.670625,
+          0.893584,
+          0.746958,
+          0.691292,
+          0.692458,
+          0.664459,
+          0.736417,
+          0.806042,
+          0.715917
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4160,
+              1,
+              32
+            ],
+            "strides": [
+              133120,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 131072,
+        "load_compile_ms": 221.958875
+      },
+      "split_output/repeat-1/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.506875,
+          0.481125,
+          0.565958,
+          0.464084,
+          0.449167,
+          0.422875,
+          0.426625,
+          0.414625,
+          0.532125,
+          0.461625,
+          0.469959,
+          0.556458,
+          0.447125
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              2048,
+              1,
+              32
+            ],
+            "strides": [
+              65536,
+              32,
+              32,
+              1
+            ]
+          },
+          {
+            "name": "z1",
+            "shape": [
+              1,
+              2048,
+              1,
+              32
+            ],
+            "strides": [
+              65536,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 131072,
+        "load_compile_ms": 104.148417
+      },
+      "split_output/repeat-2/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.460375,
+          0.422084,
+          0.430792,
+          0.524458,
+          0.479666,
+          0.440833,
+          0.472459,
+          0.533833,
+          0.427292,
+          0.421334,
+          0.435542,
+          0.435334,
+          0.423875
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              2048,
+              1,
+              32
+            ],
+            "strides": [
+              65536,
+              32,
+              32,
+              1
+            ]
+          },
+          {
+            "name": "z1",
+            "shape": [
+              1,
+              2048,
+              1,
+              32
+            ],
+            "strides": [
+              65536,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 131072,
+        "load_compile_ms": 105.97575
+      },
+      "split_output/repeat-3/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.457959,
+          0.429375,
+          0.423542,
+          0.423041,
+          0.429791,
+          0.411208,
+          0.485084,
+          0.461166,
+          0.525292,
+          0.460875,
+          0.463541,
+          0.419917,
+          0.440292
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              2048,
+              1,
+              32
+            ],
+            "strides": [
+              65536,
+              32,
+              32,
+              1
+            ]
+          },
+          {
+            "name": "z1",
+            "shape": [
+              1,
+              2048,
+              1,
+              32
+            ],
+            "strides": [
+              65536,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 131072,
+        "load_compile_ms": 108.24975
+      },
+      "split_output/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          0.620333,
+          0.490959,
+          0.522917,
+          0.574708,
+          0.509917,
+          0.595458,
+          0.628042,
+          0.629375,
+          0.597834,
+          0.61125,
+          0.607791,
+          0.596333,
+          0.940917
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              2048,
+              1,
+              32
+            ],
+            "strides": [
+              65536,
+              32,
+              32,
+              1
+            ]
+          },
+          {
+            "name": "z1",
+            "shape": [
+              1,
+              2048,
+              1,
+              32
+            ],
+            "strides": [
+              65536,
+              32,
+              32,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 131072,
+        "load_compile_ms": 187.12375
+      }
+    }
+  },
+  "1024": {
+    "manifest": {
+      "source": {
+        "model.language_model.layers.0.linear_attn.in_proj_z.weight_int8": {
+          "sha256": "99f966b1aa6944cd856829ad927ad7e0608caf86e187d76f8c05916a51161e61",
+          "shape": [
+            4096,
+            2048
+          ],
+          "dtype": "int8"
+        },
+        "model.language_model.layers.0.linear_attn.in_proj_z.weight_scale": {
+          "sha256": "1eb4fcec5addfa3c4ae33070b7c8181127439016582c86e1146a4372ef7f0e72",
+          "shape": [
+            4096
+          ],
+          "dtype": "float16"
+        }
+      },
+      "tokens": 1024,
+      "coremltools": "9.0",
+      "variants": {
+        "original": {
+          "input_channels": 2048,
+          "output_channels": [
+            4096
+          ],
+          "nominal_coefficient_bytes_per_core": [
+            1048576
+          ]
+        },
+        "pad_input": {
+          "input_channels": 2080,
+          "output_channels": [
+            4096
+          ],
+          "nominal_coefficient_bytes_per_core": [
+            1064960
+          ]
+        },
+        "pad_output": {
+          "input_channels": 2048,
+          "output_channels": [
+            4160
+          ],
+          "nominal_coefficient_bytes_per_core": [
+            1064960
+          ]
+        },
+        "split_output": {
+          "input_channels": 2048,
+          "output_channels": [
+            2048,
+            2048
+          ],
+          "nominal_coefficient_bytes_per_core": [
+            524288,
+            524288
+          ]
+        }
+      }
+    },
+    "runs": {
+      "original/cpu/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          10.992833,
+          12.292375,
+          11.18975,
+          12.04525,
+          11.059917,
+          10.689959,
+          12.203084,
+          11.481875,
+          11.328292,
+          12.627292,
+          13.257542,
+          12.506208,
+          12.184416
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLCPUComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              1024
+            ],
+            "strides": [
+              4194304,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4194304,
+        "load_compile_ms": 84.534666
+      },
+      "original/repeat-1/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          2.028,
+          2.553292,
+          1.793333,
+          1.919125,
+          1.922625,
+          1.981542,
+          1.972125,
+          2.005666,
+          2.318833,
+          1.909833,
+          1.899333,
+          2.031166,
+          2.428792
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              1024
+            ],
+            "strides": [
+              4194304,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4194304,
+        "load_compile_ms": 120.639333
+      },
+      "original/repeat-1-post/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          1.962333,
+          2.605791,
+          1.801625,
+          2.1915,
+          1.860583,
+          1.891917,
+          1.74,
+          1.8995,
+          1.827584,
+          1.882334,
+          2.117417,
+          2.029667,
+          2.385417
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              1024
+            ],
+            "strides": [
+              4194304,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4194304,
+        "load_compile_ms": 121.722166
+      },
+      "original/repeat-2/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          1.775042,
+          2.170958,
+          1.986625,
+          1.948084,
+          1.786083,
+          1.927916,
+          1.879791,
+          1.891416,
+          1.941625,
+          1.952458,
+          1.969125,
+          1.927708,
+          1.897333
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              1024
+            ],
+            "strides": [
+              4194304,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4194304,
+        "load_compile_ms": 120.803583
+      },
+      "original/repeat-2-post/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          1.959458,
+          1.858333,
+          2.08875,
+          1.832583,
+          2.130833,
+          1.962166,
+          1.964125,
+          1.853584,
+          2.786916,
+          1.975458,
+          2.054042,
+          2.147916,
+          2.104625
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              1024
+            ],
+            "strides": [
+              4194304,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4194304,
+        "load_compile_ms": 127.479917
+      },
+      "original/repeat-3/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          1.809583,
+          2.127917,
+          1.749709,
+          1.869625,
+          1.886834,
+          1.890083,
+          1.931167,
+          1.930375,
+          1.971792,
+          1.820917,
+          2.374167,
+          1.911958,
+          1.912916
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              1024
+            ],
+            "strides": [
+              4194304,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4194304,
+        "load_compile_ms": 118.800958
+      },
+      "original/repeat-3-post/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          1.873167,
+          1.96775,
+          1.798333,
+          1.880667,
+          2.221834,
+          2.044625,
+          1.9785,
+          1.850916,
+          2.083917,
+          1.894833,
+          2.288542,
+          1.718083,
+          2.221458
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              1024
+            ],
+            "strides": [
+              4194304,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4194304,
+        "load_compile_ms": 123.690875
+      },
+      "original/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          2.927083,
+          2.721583,
+          2.696875,
+          3.061166,
+          2.987167,
+          2.84325,
+          3.078041,
+          2.727541,
+          2.691541,
+          3.129167,
+          3.155709,
+          3.681458,
+          2.74175
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              1024
+            ],
+            "strides": [
+              4194304,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4194304,
+        "load_compile_ms": 202.208334
+      },
+      "pad_input/repeat-1/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          2.14075,
+          2.7065,
+          2.107,
+          2.6115,
+          2.35925,
+          1.943875,
+          2.084041,
+          2.259083,
+          2.794417,
+          1.93125,
+          2.28925,
+          2.066959,
+          2.353125
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              1024
+            ],
+            "strides": [
+              4194304,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4259840,
+        "load_compile_ms": 125.356334
+      },
+      "pad_input/repeat-2/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          2.0055,
+          2.233208,
+          2.1015,
+          2.387166,
+          1.95525,
+          2.277875,
+          2.059083,
+          2.470833,
+          2.091458,
+          2.381625,
+          2.720917,
+          1.974791,
+          2.112
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              1024
+            ],
+            "strides": [
+              4194304,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4259840,
+        "load_compile_ms": 124.248792
+      },
+      "pad_input/repeat-3/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          2.301791,
+          2.1095,
+          2.099333,
+          2.229208,
+          2.085375,
+          2.009667,
+          2.099708,
+          2.222584,
+          2.53425,
+          1.958084,
+          2.212375,
+          2.227584,
+          2.424125
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              1024
+            ],
+            "strides": [
+              4194304,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4259840,
+        "load_compile_ms": 125.280417
+      },
+      "pad_input/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          2.372291,
+          2.954584,
+          2.94725,
+          2.7035,
+          3.787042,
+          2.998084,
+          2.583209,
+          2.884833,
+          2.780083,
+          2.678083,
+          3.65575,
+          3.045917,
+          2.77425
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4096,
+              1,
+              1024
+            ],
+            "strides": [
+              4194304,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4259840,
+        "load_compile_ms": 252.623292
+      },
+      "pad_output/repeat-1/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          2.172875,
+          2.044458,
+          1.972625,
+          1.819958,
+          2.333708,
+          1.99025,
+          1.958166,
+          1.861667,
+          2.066041,
+          1.945125,
+          2.534083,
+          1.819083,
+          2.329417
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4160,
+              1,
+              1024
+            ],
+            "strides": [
+              4259840,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4194304,
+        "load_compile_ms": 122.940959
+      },
+      "pad_output/repeat-2/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          1.991542,
+          2.274166,
+          2.002542,
+          1.934959,
+          1.99125,
+          2.197791,
+          2.088291,
+          2.003625,
+          1.937583,
+          2.11425,
+          2.012042,
+          2.115834,
+          1.967208
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4160,
+              1,
+              1024
+            ],
+            "strides": [
+              4259840,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4194304,
+        "load_compile_ms": 124.468833
+      },
+      "pad_output/repeat-3/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          2.002417,
+          1.835083,
+          2.143083,
+          1.941166,
+          2.121041,
+          1.812875,
+          1.93225,
+          1.97225,
+          2.126542,
+          1.784,
+          1.884667,
+          2.136416,
+          2.8165
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4160,
+              1,
+              1024
+            ],
+            "strides": [
+              4259840,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4194304,
+        "load_compile_ms": 130.393875
+      },
+      "pad_output/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          2.824875,
+          2.735042,
+          2.781541,
+          3.029167,
+          2.936458,
+          3.6095,
+          3.039458,
+          3.037,
+          3.288959,
+          2.808625,
+          3.253041,
+          3.049875,
+          3.501625
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              4160,
+              1,
+              1024
+            ],
+            "strides": [
+              4259840,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4194304,
+        "load_compile_ms": 213.510375
+      },
+      "split_output/repeat-1/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          2.660041,
+          1.790833,
+          1.932583,
+          2.286875,
+          2.110375,
+          1.907709,
+          2.009583,
+          2.079209,
+          1.889083,
+          1.976458,
+          1.901917,
+          1.976,
+          1.9705
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              2048,
+              1,
+              1024
+            ],
+            "strides": [
+              2097152,
+              1024,
+              1024,
+              1
+            ]
+          },
+          {
+            "name": "z1",
+            "shape": [
+              1,
+              2048,
+              1,
+              1024
+            ],
+            "strides": [
+              2097152,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4194304,
+        "load_compile_ms": 122.000208
+      },
+      "split_output/repeat-2/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          1.906834,
+          2.0005,
+          2.174083,
+          1.918833,
+          1.969583,
+          2.066583,
+          2.547167,
+          1.946625,
+          1.988875,
+          1.958834,
+          2.182209,
+          2.111,
+          2.004084
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              2048,
+              1,
+              1024
+            ],
+            "strides": [
+              2097152,
+              1024,
+              1024,
+              1
+            ]
+          },
+          {
+            "name": "z1",
+            "shape": [
+              1,
+              2048,
+              1,
+              1024
+            ],
+            "strides": [
+              2097152,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4194304,
+        "load_compile_ms": 126.736375
+      },
+      "split_output/repeat-3/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          1.962542,
+          1.925666,
+          2.283917,
+          1.894834,
+          1.979875,
+          2.003542,
+          2.082666,
+          1.7385,
+          1.951583,
+          1.796333,
+          1.864959,
+          1.918791,
+          1.873208
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              2048,
+              1,
+              1024
+            ],
+            "strides": [
+              2097152,
+              1024,
+              1024,
+              1
+            ]
+          },
+          {
+            "name": "z1",
+            "shape": [
+              1,
+              2048,
+              1,
+              1024
+            ],
+            "strides": [
+              2097152,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4194304,
+        "load_compile_ms": 125.901375
+      },
+      "split_output/result.json": {
+        "output_backing_reused": true,
+        "prediction_ms": [
+          4.141709,
+          4.075,
+          4.053,
+          3.523917,
+          3.220125,
+          3.354,
+          3.342416,
+          4.632333,
+          4.059625,
+          3.986791,
+          3.613666,
+          3.492292,
+          3.620584
+        ],
+        "placements": [
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "const",
+            "preferred": "unknown"
+          },
+          {
+            "op": "ios16.conv",
+            "preferred": "MLNeuralEngineComputeDevice"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "z0",
+            "shape": [
+              1,
+              2048,
+              1,
+              1024
+            ],
+            "strides": [
+              2097152,
+              1024,
+              1024,
+              1
+            ]
+          },
+          {
+            "name": "z1",
+            "shape": [
+              1,
+              2048,
+              1,
+              1024
+            ],
+            "strides": [
+              2097152,
+              1024,
+              1024,
+              1
+            ]
+          }
+        ],
+        "input_bytes": 4194304,
+        "load_compile_ms": 229.763417
+      }
+    }
+  }
+}

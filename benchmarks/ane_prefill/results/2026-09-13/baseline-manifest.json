@@ -1,0 +1,20 @@
+{
+  "commit": "1904bc3def74de79ac155a7bb4351e171a0eb44b",
+  "dirty": true,
+  "binary_sha256": "8c4c9fa407e1b89964d80accb434f5d1b7cd442d74618e13d28bc287af3640a0",
+  "uname": "Darwin MacBook.local 27.0.0 Darwin Kernel Version 27.0.0: Tue Jul 14 21:40:50 PDT 2026; root:xnu-13432.0.94.501.4~1/RELEASE_ARM64_T8132 arm64\n",
+  "model_files": {
+    "config.json": "18b391bf8335e12b10b4b589760a123ff68711722edd62346edbfb8fe78d94fd",
+    "model.safetensors.index.json": "d1e9d3c911a4f4ed82ba5f094adc0fff375787114cedf4619bd2bb5dc3a35293",
+    "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+  },
+  "preexisting_patch_sha256": "82b2b1e33bb889b19c774ea910ae8ba8964b8f8674b6e6031a948b2623eb4574",
+  "preexisting_patch_local_path": "/Users/peppi/.codex/worktrees/4dbe/higgs/target/ane-prefill/preexisting.patch",
+  "not_run": [
+    "45000-token request: preceding 32K memory gate failed",
+    "production hybrid integration",
+    "GPU/ANE overlap",
+    "release quality/cancellation/cache matrix"
+  ],
+  "baseline_abort": "new swapouts; SIGINT did not immediately stop active prefill, so owned server was SIGKILLed"
+}

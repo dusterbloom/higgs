@@ -1,0 +1,131 @@
+{
+  "outcome": "incomplete",
+  "prefill_ms": null,
+  "ttft_seconds": null,
+  "usage": null,
+  "finish": null,
+  "answer": "",
+  "progress": [
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 0,
+      "time_ms": 33
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 1024,
+      "time_ms": 6422
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 2048,
+      "time_ms": 11919
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 3072,
+      "time_ms": 18024
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 4096,
+      "time_ms": 23834
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 5120,
+      "time_ms": 31205
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 6144,
+      "time_ms": 38231
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 7168,
+      "time_ms": 44950
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 8192,
+      "time_ms": 51234
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 9216,
+      "time_ms": 57636
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 10240,
+      "time_ms": 69233
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 11264,
+      "time_ms": 83307
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 12288,
+      "time_ms": 98257
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 13312,
+      "time_ms": 112420
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 14336,
+      "time_ms": 133394
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 15360,
+      "time_ms": 148941
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 16384,
+      "time_ms": 162472
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 17408,
+      "time_ms": 176990
+    }
+  ],
+  "request_seconds": 177.5378511250001,
+  "request_sha256": "45e32697fa807bc74c4c45aedbb2307f0a4e764890f64a1be1c5b2f74915e760",
+  "before": {
+    "power": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23396451)\t50%; discharging; (no estimate) present: true\n",
+    "swapouts": 1071877
+  },
+  "after": {
+    "power": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23396451)\t48%; discharging; (no estimate) present: true\n",
+    "swapouts": 1551129
+  },
+  "swapouts_delta": 479252,
+  "peak_sampled_rss_bytes": 4908384256,
+  "exception": null
+}

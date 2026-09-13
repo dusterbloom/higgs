@@ -1,0 +1,238 @@
+{
+  "original": {
+    "relative_rmse": 0.0011194036342203617,
+    "max_abs": 0.0010827183723449707,
+    "bitwise_equal_to_original": true,
+    "prediction_median_ms": 0.829167,
+    "cpu_boundary_samples": {
+      "input_pack_ms": [
+        0.028,
+        0.027542,
+        0.023459,
+        0.025291,
+        0.022792,
+        0.025875,
+        0.02375,
+        0.024209,
+        0.02475,
+        0.02575,
+        0.025875,
+        0.02575,
+        0.026833
+      ],
+      "input_copy_ms": [
+        0.0025,
+        0.002417,
+        0.0025,
+        0.003792,
+        0.036541,
+        0.003042,
+        0.003542,
+        0.002583,
+        0.002584,
+        0.002584,
+        0.00275,
+        0.002708,
+        0.002709
+      ],
+      "output_merge_ms": [
+        0.068375,
+        0.072416,
+        0.075,
+        0.070375,
+        0.070709,
+        0.069917,
+        0.069792,
+        0.069875,
+        0.070166,
+        0.070541,
+        0.069791,
+        0.066917,
+        0.068916
+      ]
+    },
+    "cpu_boundary_median_ms": {
+      "input_pack_ms": 0.02575,
+      "input_copy_ms": 0.002708,
+      "output_merge_ms": 0.069917
+    },
+    "caveat": "CPU boundary measured separately on NumPy buffers; no MLX synchronization or overlap measured."
+  },
+  "pad_input": {
+    "relative_rmse": 0.0011194036342203617,
+    "max_abs": 0.0010827183723449707,
+    "bitwise_equal_to_original": true,
+    "prediction_median_ms": 0.492917,
+    "cpu_boundary_samples": {
+      "input_pack_ms": [
+        0.025166,
+        0.026208,
+        0.025542,
+        0.024375,
+        0.024791,
+        0.025334,
+        0.025458,
+        0.025583,
+        0.024667,
+        0.026084,
+        0.0245,
+        0.027,
+        0.025625
+      ],
+      "input_copy_ms": [
+        0.002334,
+        0.002333,
+        0.002583,
+        0.002584,
+        0.002792,
+        0.002875,
+        0.002333,
+        0.0025,
+        0.002375,
+        0.002375,
+        0.003083,
+        0.002375,
+        0.003667
+      ],
+      "output_merge_ms": [
+        0.063416,
+        0.067875,
+        0.067917,
+        0.067875,
+        0.067833,
+        0.067791,
+        0.067834,
+        0.068,
+        0.06275,
+        0.071125,
+        0.065917,
+        0.07,
+        0.06425
+      ]
+    },
+    "cpu_boundary_median_ms": {
+      "input_pack_ms": 0.025458,
+      "input_copy_ms": 0.0025,
+      "output_merge_ms": 0.067834
+    },
+    "caveat": "CPU boundary measured separately on NumPy buffers; no MLX synchronization or overlap measured."
+  },
+  "pad_output": {
+    "relative_rmse": 0.0011194036342203617,
+    "max_abs": 0.0010827183723449707,
+    "bitwise_equal_to_original": true,
+    "prediction_median_ms": 0.691292,
+    "cpu_boundary_samples": {
+      "input_pack_ms": [
+        0.024958,
+        0.025541,
+        0.025125,
+        0.025,
+        0.026083,
+        0.02475,
+        0.02475,
+        0.024584,
+        0.026416,
+        0.025584,
+        0.022917,
+        0.027042,
+        0.028
+      ],
+      "input_copy_ms": [
+        0.002417,
+        0.0025,
+        0.0025,
+        0.002541,
+        0.002708,
+        0.002417,
+        0.0025,
+        0.002458,
+        0.003,
+        0.003708,
+        0.002583,
+        0.003208,
+        0.002583
+      ],
+      "output_merge_ms": [
+        0.068292,
+        0.070334,
+        0.07025,
+        0.076625,
+        0.063417,
+        0.068833,
+        0.063166,
+        0.069,
+        0.077834,
+        0.070542,
+        0.0975,
+        0.069417,
+        0.068542
+      ]
+    },
+    "cpu_boundary_median_ms": {
+      "input_pack_ms": 0.025125,
+      "input_copy_ms": 0.002541,
+      "output_merge_ms": 0.069417
+    },
+    "caveat": "CPU boundary measured separately on NumPy buffers; no MLX synchronization or overlap measured."
+  },
+  "split_output": {
+    "relative_rmse": 0.0011194036342203617,
+    "max_abs": 0.0010827183723449707,
+    "bitwise_equal_to_original": true,
+    "prediction_median_ms": 0.597834,
+    "cpu_boundary_samples": {
+      "input_pack_ms": [
+        0.037666,
+        0.023875,
+        0.024417,
+        0.023875,
+        0.024167,
+        0.024084,
+        0.024042,
+        0.024041,
+        0.023625,
+        0.024833,
+        0.023792,
+        0.024375,
+        0.023416
+      ],
+      "input_copy_ms": [
+        0.002959,
+        0.002583,
+        0.002458,
+        0.002542,
+        0.002583,
+        0.0025,
+        0.0025,
+        0.0025,
+        0.002417,
+        0.002375,
+        0.002458,
+        0.0025,
+        0.002459
+      ],
+      "output_merge_ms": [
+        0.041333,
+        0.039417,
+        0.036958,
+        0.036875,
+        0.037084,
+        0.036916,
+        0.037083,
+        0.036209,
+        0.036791,
+        0.036584,
+        0.036708,
+        0.0365,
+        0.036541
+      ]
+    },
+    "cpu_boundary_median_ms": {
+      "input_pack_ms": 0.024042,
+      "input_copy_ms": 0.0025,
+      "output_merge_ms": 0.036875
+    },
+    "caveat": "CPU boundary measured separately on NumPy buffers; no MLX synchronization or overlap measured."
+  }
+}
