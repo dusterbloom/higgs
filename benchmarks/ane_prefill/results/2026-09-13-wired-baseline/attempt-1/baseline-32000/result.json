@@ -1,0 +1,229 @@
+{
+  "outcome": "finished",
+  "prefill_ms": null,
+  "ttft_seconds": 327.2893675000014,
+  "usage": {
+    "prompt_tokens": 32005,
+    "completion_tokens": 19,
+    "total_tokens": 32024
+  },
+  "finish": "stop",
+  "answer": "Launch Key: LANTERN-4729-QZ\nOwner: Neri",
+  "progress": [
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 0,
+      "time_ms": 27
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 1024,
+      "time_ms": 9913
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 2048,
+      "time_ms": 17292
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 3072,
+      "time_ms": 24992
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 4096,
+      "time_ms": 33849
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 5120,
+      "time_ms": 42367
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 6144,
+      "time_ms": 49804
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 7168,
+      "time_ms": 57576
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 8192,
+      "time_ms": 68105
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 9216,
+      "time_ms": 78467
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 10240,
+      "time_ms": 88203
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 11264,
+      "time_ms": 97423
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 12288,
+      "time_ms": 107885
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 13312,
+      "time_ms": 118744
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 14336,
+      "time_ms": 130098
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 15360,
+      "time_ms": 141767
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 16384,
+      "time_ms": 152362
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 17408,
+      "time_ms": 162722
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 18432,
+      "time_ms": 172539
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 19456,
+      "time_ms": 184118
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 20480,
+      "time_ms": 195048
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 21504,
+      "time_ms": 206752
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 22528,
+      "time_ms": 217899
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 23552,
+      "time_ms": 227674
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 24576,
+      "time_ms": 238473
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 25600,
+      "time_ms": 249329
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 26624,
+      "time_ms": 261160
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 27648,
+      "time_ms": 274545
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 28672,
+      "time_ms": 286730
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 29696,
+      "time_ms": 299856
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 30720,
+      "time_ms": 311305
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 31744,
+      "time_ms": 322579
+    },
+    {
+      "total": 32005,
+      "cache": 0,
+      "processed": 31968,
+      "time_ms": 325409
+    }
+  ],
+  "request_seconds": 328.93664429099954,
+  "request_sha256": "45e32697fa807bc74c4c45aedbb2307f0a4e764890f64a1be1c5b2f74915e760",
+  "before": {
+    "power": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23396451)\t100%; discharging; (no estimate) present: true\n",
+    "swapouts": 1551873
+  },
+  "after": {
+    "power": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23396451)\t100%; discharging; (no estimate) present: true\n",
+    "swapouts": 1551873
+  },
+  "swapouts_delta": 0,
+  "peak_sampled_rss_bytes": 928022528,
+  "exception": null,
+  "peak_physical_footprint_bytes": 16883540800,
+  "peak_wired_bytes": 0,
+  "abort_reasons": [],
+  "semantic_pass": true
+}

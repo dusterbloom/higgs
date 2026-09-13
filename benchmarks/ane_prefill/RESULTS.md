@@ -1,5 +1,11 @@
 # M4 ANE graph-notch screening — 2026-09-13
 
+**Baseline follow-up:** [corrected 32K/45K controls](BASELINE.md) completed with
+zero new swapouts after matching the user's existing wired-limit/cache policy.
+The failed control below is retained as historical evidence; the follow-up
+supersedes its baseline availability and next-step statements. The ANE
+integration decision remains unchanged.
+
 **Decision: do not integrate a production ANE path from this evidence.** The
 public-CoreML graph workarounds help a small tile, but do not consistently help
 the T1024 prefill tile. The fresh whole-model 32K control failed the no-swap gate;

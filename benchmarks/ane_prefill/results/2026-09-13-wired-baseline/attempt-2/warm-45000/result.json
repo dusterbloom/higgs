@@ -1,0 +1,33 @@
+{
+  "outcome": "finished",
+  "prefill_ms": null,
+  "ttft_seconds": 4.281222292000166,
+  "usage": {
+    "prompt_tokens": 521,
+    "completion_tokens": 19,
+    "total_tokens": 540
+  },
+  "finish": "stop",
+  "answer": "Launch Key: LANTERN-4729-QZ\nOwner: Neri",
+  "progress": [
+    {
+      "total": 521,
+      "cache": 0,
+      "processed": 0,
+      "time_ms": 27
+    }
+  ],
+  "request_seconds": 5.2163454170004115,
+  "request_sha256": "82b35499e6590608ffb2b3443ee7fa5a33ece7e0ba1b4d5a680c743826b072ac",
+  "before": {
+    "power": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23396451)\t100%; discharging; (no estimate) present: true\n",
+    "swapouts": 1586370
+  },
+  "after": {
+    "power": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23396451)\t100%; discharging; (no estimate) present: true\n",
+    "swapouts": 1586370
+  },
+  "swapouts_delta": 0,
+  "peak_sampled_rss_bytes": 1280540672,
+  "exception": null
+}

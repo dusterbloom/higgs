@@ -1,0 +1,33 @@
+{
+  "cases": [
+    {
+      "attempt": "attempt-1",
+      "prompt_tokens": 32005,
+      "completion_tokens": 19,
+      "ttft_seconds": 327.2893675000014,
+      "request_seconds": 328.93664429099954,
+      "peak_physical_footprint_bytes": 16883540800,
+      "footprint_samples": 163,
+      "cached_tokens": 0,
+      "swapouts_delta": 0,
+      "pressure": "normal",
+      "semantic_pass": true,
+      "prefill_ms": null
+    },
+    {
+      "attempt": "attempt-2",
+      "prompt_tokens": 45001,
+      "completion_tokens": 19,
+      "ttft_seconds": 418.30119216699677,
+      "request_seconds": 420.4831676670001,
+      "peak_physical_footprint_bytes": 17424606136,
+      "footprint_samples": 209,
+      "cached_tokens": 0,
+      "swapouts_delta": 0,
+      "pressure": "normal",
+      "semantic_pass": true,
+      "prefill_ms": null
+    }
+  ],
+  "qualification": "single valid observation per length, on battery; not a repeated speedup comparison"
+}
