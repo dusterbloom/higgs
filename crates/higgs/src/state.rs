@@ -463,6 +463,28 @@ impl Engine {
         }
     }
 
+    /// Client-facing tool protocol for the loaded model. The engine keeps the
+    /// actual parser private; clients only need to choose native schemas or
+    /// the textual fallback.
+    pub fn tool_call_mode(&self) -> &'static str {
+        match self {
+            Self::Simple(e) => e.tool_call_mode(),
+            Self::Batch(e) => e.tool_call_mode(),
+            #[cfg(test)]
+            Self::Stub(_) => "textual",
+        }
+    }
+
+    /// Client-facing thinking mode for the loaded model.
+    pub fn thinking_mode(&self) -> &'static str {
+        match self {
+            Self::Simple(e) => e.thinking_mode(),
+            Self::Batch(e) => e.thinking_mode(),
+            #[cfg(test)]
+            Self::Stub(_) => "disabled",
+        }
+    }
+
     pub fn is_vlm(&self) -> bool {
         match self {
             Self::Simple(e) => e.is_vlm(),

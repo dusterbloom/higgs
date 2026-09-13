@@ -17,7 +17,7 @@ use crate::{
         Engine, SharedState, build_engine_with_capacity, measure_after_engine_drop,
         release_failed_engine,
     },
-    types::openai::{ModelList, ModelObject},
+    types::openai::{ModelList, ModelObject, ModelRuntimeCapabilities},
 };
 
 /// How long `DELETE /v1/models/{name}` waits for in-flight requests to release a
@@ -187,9 +187,17 @@ impl Drop for ProvisionalEngine {
 pub async fn list_models(State(state): State<SharedState>) -> Json<ModelList> {
     let data = state
         .router
-        .local_models_with_vlm()
+        .local_models_with_runtime_capabilities()
         .into_iter()
-        .map(|(name, vision)| model_object(name, vision))
+        .map(|(name, vision, tool_mode, thinking)| {
+            let context_tokens = state
+                .capacity
+                .snapshot(&name)
+                .ok()
+                .map(|snapshot| snapshot.safe_total_tokens)
+                .and_then(|tokens| u32::try_from(tokens).ok());
+            model_object(name, vision, tool_mode, thinking, context_tokens)
+        })
         .collect();
     Json(ModelList {
         object: "list",
@@ -276,6 +284,8 @@ pub async fn load_model(
     .map_err(|e| ServerError::InternalError(format!("model load task failed: {e}")))?
     .map_err(ServerError::BadRequest)?;
     let vision = engine.is_vlm();
+    let tool_mode = engine.tool_call_mode();
+    let thinking = engine.thinking_mode();
 
     publish_loaded_engine(
         &state,
@@ -287,7 +297,13 @@ pub async fn load_model(
     .await?;
 
     tracing::info!(model_name = %name, "Model loaded at runtime");
-    Ok(Json(model_object(name, vision)))
+    Ok(Json(model_object(
+        name,
+        vision,
+        tool_mode,
+        thinking,
+        Some(model_cfg.max_context_tokens),
+    )))
 }
 
 async fn publish_loaded_engine(
@@ -509,13 +525,24 @@ async fn drain_in_background(mut engine: Arc<Engine>, capacity_drain: Option<Cap
     }
 }
 
-fn model_object(name: String, vision: bool) -> ModelObject {
+fn model_object(
+    name: String,
+    vision: bool,
+    tool_mode: &'static str,
+    thinking: &'static str,
+    context_tokens: Option<u32>,
+) -> ModelObject {
     ModelObject {
         id: name,
         object: "model",
         created: chrono::Utc::now().timestamp(),
         owned_by: "local".to_owned(),
         vision,
+        capabilities: ModelRuntimeCapabilities {
+            tool_mode,
+            thinking,
+            context_tokens,
+        },
     }
 }
 
@@ -935,11 +962,20 @@ mod tests {
 
     #[test]
     fn test_model_objects_have_correct_fields() {
-        let obj = model_object("test-model".to_owned(), false);
+        let obj = model_object(
+            "test-model".to_owned(),
+            false,
+            "native",
+            "disabled",
+            Some(65_536),
+        );
         assert_eq!(obj.object, "model");
         assert_eq!(obj.owned_by, "local");
         assert!(obj.created > 0);
         assert!(!obj.vision);
+        assert_eq!(obj.capabilities.tool_mode, "native");
+        assert_eq!(obj.capabilities.thinking, "disabled");
+        assert_eq!(obj.capabilities.context_tokens, Some(65_536));
     }
 
     #[tokio::test]

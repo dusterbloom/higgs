@@ -567,6 +567,23 @@ pub struct ModelObject {
     pub owned_by: String,
     /// higgs extension (additive): whether this model accepts image input (VLM).
     pub vision: bool,
+    /// higgs extension (additive): facts clients need to select a compatible
+    /// tool/reasoning protocol without maintaining a model-name registry.
+    pub capabilities: ModelRuntimeCapabilities,
+}
+
+/// Runtime facts for a loaded local model.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRuntimeCapabilities {
+    /// `native` means the chat template has a structured tool representation;
+    /// `textual` means nanobot should use its textual tool bridge.
+    pub tool_mode: &'static str,
+    /// `disabled`, `optional`, or `always`.
+    pub thinking: &'static str,
+    /// Fixed prompt-plus-output context ceiling configured for this model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u32>,
 }
 
 /// POST /v1/embeddings request body.
@@ -864,6 +881,11 @@ mod tests {
                 created: 1_234_567_890,
                 owned_by: "local".to_owned(),
                 vision: false,
+                capabilities: ModelRuntimeCapabilities {
+                    tool_mode: "native",
+                    thinking: "disabled",
+                    context_tokens: Some(65_536),
+                },
             }],
             runtime_model_load: false,
         };

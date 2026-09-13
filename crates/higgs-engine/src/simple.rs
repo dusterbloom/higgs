@@ -4848,6 +4848,31 @@ impl SimpleEngine {
         self.enable_thinking
     }
 
+    /// Runtime tool protocol derived from the loaded chat template. Higgs owns
+    /// the model-specific parser, so clients only need the native/textual
+    /// presentation decision.
+    pub fn tool_call_mode(&self) -> &'static str {
+        match self.template.as_ref() {
+            Some(template) if template.supports_tools() => "native",
+            Some(_) => "textual",
+            None => "textual",
+        }
+    }
+
+    /// Runtime thinking mode derived from the loaded template/engine.
+    pub fn thinking_mode(&self) -> &'static str {
+        if self.enable_thinking
+            || self
+                .template
+                .as_ref()
+                .is_some_and(|t| t.supports_thinking())
+        {
+            "optional"
+        } else {
+            "disabled"
+        }
+    }
+
     pub fn last_dflash_accepts(&self) -> Vec<u32> {
         self.last_dflash_accepts
             .lock()

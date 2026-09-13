@@ -20,7 +20,8 @@ use higgs::types::openai::{
     ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionDelta,
     ChatCompletionMessage, ChatCompletionResponse, CompletionChoice, CompletionChunk,
     CompletionChunkChoice, CompletionResponse, CompletionUsage, EmbeddingObject, EmbeddingResponse,
-    EmbeddingUsage, MessageContent, ModelList, ModelObject, ToolCall, ToolCallFunction,
+    EmbeddingUsage, MessageContent, ModelList, ModelObject, ModelRuntimeCapabilities, ToolCall,
+    ToolCallFunction,
 };
 
 fn make_usage(prompt: u32, completion: u32) -> CompletionUsage {
@@ -273,6 +274,11 @@ fn model_list_serialization() {
             created: 1_700_000_000,
             owned_by: "local".to_owned(),
             vision: true,
+            capabilities: ModelRuntimeCapabilities {
+                tool_mode: "native",
+                thinking: "optional",
+                context_tokens: Some(65_536),
+            },
         }],
         runtime_model_load: true,
     };

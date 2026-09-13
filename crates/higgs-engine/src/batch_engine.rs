@@ -350,6 +350,21 @@ impl BatchEngine {
         self.is_vlm
     }
 
+    /// Runtime tool protocol derived from the loaded chat template.
+    pub fn tool_call_mode(&self) -> &'static str {
+        if self.template.supports_tools() {
+            "native"
+        } else {
+            "textual"
+        }
+    }
+
+    /// Batch generation currently does not expose a per-request thinking
+    /// toggle, so report it as disabled even when the template mentions one.
+    pub const fn thinking_mode(&self) -> &'static str {
+        "disabled"
+    }
+
     /// The marker text injected at each image position before tokenization,
     /// if the loaded model supports vision.
     pub const fn image_marker_text(&self) -> Option<&'static str> {

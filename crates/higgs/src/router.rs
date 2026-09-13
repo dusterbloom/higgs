@@ -325,6 +325,27 @@ impl Router {
         models
     }
 
+    /// Sorted runtime protocol facts for all loaded local engines.
+    pub fn local_models_with_runtime_capabilities(
+        &self,
+    ) -> Vec<(String, bool, &'static str, &'static str)> {
+        let mut models: Vec<(String, bool, &'static str, &'static str)> = self
+            .engines_read()
+            .iter()
+            .filter(|(_, entry)| entry.capacity_ready)
+            .map(|(name, entry)| {
+                (
+                    name.clone(),
+                    entry.engine.is_vlm(),
+                    entry.engine.tool_call_mode(),
+                    entry.engine.thinking_mode(),
+                )
+            })
+            .collect();
+        models.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        models
+    }
+
     /// Whether a local engine is currently registered under `name`.
     pub fn contains_engine(&self, name: &str) -> bool {
         self.engines_read()

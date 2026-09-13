@@ -39,6 +39,8 @@ pub struct ChatTemplateRenderer {
     /// Special tokens loaded from `tokenizer_config.json` for template rendering.
     bos_token: String,
     eos_token: String,
+    supports_tools: bool,
+    supports_thinking: bool,
 }
 
 impl ChatTemplateRenderer {
@@ -46,6 +48,10 @@ impl ChatTemplateRenderer {
     pub fn new<S: Into<String>>(template_source: S) -> Result<Self, EngineError> {
         let mut env = Environment::new();
         let template_source = normalize_hf_chat_template(template_source.into());
+        let supports_tools = template_source.contains("tools")
+            || template_source.contains("tool_calls")
+            || template_source.contains("tool_call");
+        let supports_thinking = template_source.contains("enable_thinking");
         // Templates come from model directories (tokenizer_config.json /
         // chat_template.jinja), which are third-party content; bound execution
         // so a hostile template cannot loop forever.
@@ -60,7 +66,19 @@ impl ChatTemplateRenderer {
             env,
             bos_token: String::new(),
             eos_token: String::new(),
+            supports_tools,
+            supports_thinking,
         })
+    }
+
+    /// Whether this template has an explicit native tool representation.
+    pub const fn supports_tools(&self) -> bool {
+        self.supports_tools
+    }
+
+    /// Whether this template exposes the standard `enable_thinking` switch.
+    pub const fn supports_thinking(&self) -> bool {
+        self.supports_thinking
     }
 
     /// Load template from a model directory (`chat_template.jinja` or `tokenizer_config.json`).
@@ -376,6 +394,19 @@ mod tests {
         assert!(result.contains("<|im_start|>user"));
         assert!(result.contains("Hello!"));
         assert!(result.contains("<|im_start|>assistant"));
+    }
+
+    #[test]
+    fn runtime_capabilities_follow_template_markers() {
+        let native =
+            ChatTemplateRenderer::new("{{ tools }} {{ message.tool_calls }} {{ enable_thinking }}")
+                .unwrap();
+        assert!(native.supports_tools());
+        assert!(native.supports_thinking());
+
+        let plain = ChatTemplateRenderer::new("{{ messages }}").unwrap();
+        assert!(!plain.supports_tools());
+        assert!(!plain.supports_thinking());
     }
 
     #[test]
