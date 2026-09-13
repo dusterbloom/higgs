@@ -1,0 +1,45 @@
+   Compiling ring v0.17.14
+   Compiling onig_sys v69.9.1
+   Compiling rustls v0.23.39
+   Compiling rustls-webpki v0.103.13
+   Compiling onig v6.5.1
+   Compiling ureq v2.12.1
+   Compiling hf-hub v0.4.3
+   Compiling tokenizers v0.23.1
+   Compiling higgs-models v1.7.0 (/Users/peppi/.codex/worktrees/4dbe/higgs/crates/higgs-models)
+error[E0599]: no method named `index` found for reference `&mlx_rs::Array` in the current scope
+   --> crates/higgs-models/examples/prefill_dense_tuning.rs:12:15
+    |
+ 12 |             q.index((.., .., start..end, ..)),
+    |               ^^^^^
+    |
+    = help: items from traits can only be used if the trait is in scope
+help: there is a method `index_op` with a similar name, but with different arguments
+   --> /Users/peppi/.cargo/git/checkouts/mlx-rs-d67e68d2fa8659d2/b46423d/mlx-rs/src/ops/indexing/mod.rs:365:5
+    |
+365 |     fn index_op(self) -> ArrayIndexOp<'a>;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: trait `IndexOp` which provides `index` is implemented but not in scope; perhaps you want to import it
+    |
+  3 + use mlx_rs::ops::indexing::IndexOp;
+    |
+
+error[E0599]: no method named `index` found for reference `&mlx_rs::Array` in the current scope
+   --> crates/higgs-models/examples/prefill_dense_tuning.rs:17:22
+    |
+ 17 |                 mask.index((start..end, ..)),
+    |                      ^^^^^
+    |
+    = help: items from traits can only be used if the trait is in scope
+help: there is a method `index_op` with a similar name, but with different arguments
+   --> /Users/peppi/.cargo/git/checkouts/mlx-rs-d67e68d2fa8659d2/b46423d/mlx-rs/src/ops/indexing/mod.rs:365:5
+    |
+365 |     fn index_op(self) -> ArrayIndexOp<'a>;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: trait `IndexOp` which provides `index` is implemented but not in scope; perhaps you want to import it
+    |
+  3 + use mlx_rs::ops::indexing::IndexOp;
+    |
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `higgs-models` (example "prefill_dense_tuning") due to 2 previous errors

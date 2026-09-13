@@ -1,0 +1,9 @@
+{
+  "error": "Target 'Function:crates/higgs-models/examples/prefill_dense_tuning.rs:dense' not found",
+  "target": {
+    "name": "Function:crates/higgs-models/examples/prefill_dense_tuning.rs:dense"
+  },
+  "direction": "upstream",
+  "impactedCount": null,
+  "risk": "UNKNOWN"
+}

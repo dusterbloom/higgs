@@ -1,0 +1,38 @@
+*** Terminating app due to uncaught exception 'NSRangeException', reason: '*** -[__NSArray0 objectAtIndex:]: index 0 beyond bounds for empty array'
+*** First throw call stack:
+(
+	0   CoreFoundation                      0x000000018fe6e448 __exceptionPreprocess + 176
+	1   libobjc.A.dylib                     0x000000018f8cc5e4 objc_exception_throw + 88
+	2   CoreFoundation                      0x000000018fe97668 CFArrayApply + 0
+	3   libmlx.dylib                        0x0000000109733468 _ZN3mlx4core5metal6DeviceC2Ev + 204
+	4   libmlx.dylib                        0x0000000109736c10 _ZN3mlx4core5metal6deviceENS0_6DeviceE + 80
+	5   libmlx.dylib                        0x0000000109709ba8 _ZN3mlx4core5metal14MetalAllocatorC2Ev + 64
+	6   libmlx.dylib                        0x0000000109709a44 _ZN3mlx4core9allocator9allocatorEv + 80
+	7   libmlx.dylib                        0x0000000108a32438 _ZN3mlx4core5array4initIPKjEEvT_ + 64
+	8   libmlx.dylib                        0x0000000108a32370 _ZN3mlx4core5arrayC2IjEESt16initializer_listIT_ENS0_5DtypeE + 152
+	9   libmlx.dylib                        0x0000000108a2b988 _ZN3mlx4core6random3keyEy + 72
+	10  core.cpython-314-darwin.so          0x00000001072359e8 _ZNK3mlx4core5array6nbytesEv + 718024
+	11  core.cpython-314-darwin.so          0x00000001072375b4 _ZNK3mlx4core5array6nbytesEv + 725140
+	12  core.cpython-314-darwin.so          0x000000010717dde0 PyInit_core + 428
+	13  Python                              0x0000000101353af8 PyModule_ExecDef + 188
+	14  Python                              0x000000010146d628 _imp_exec_dynamic + 16
+	15  Python                              0x000000010141fc24 _PyEval_EvalFrameDefault + 24772
+	16  Python                              0x000000010141985c _PyEval_Vector + 268
+	17  Python                              0x00000001012ebd9c object_vacall + 228
+	18  Python                              0x00000001012ebbec PyObject_CallMethodObjArgs + 112
+	19  Python                              0x000000010146a520 PyImport_ImportModuleLevelObject + 3132
+	20  Python                              0x0000000101428ff8 _PyEval_ImportName + 200
+	21  Python                              0x000000010141facc _PyEval_EvalFrameDefault + 24428
+	22  Python                              0x0000000101419664 PyEval_EvalCode + 248
+	23  Python                              0x0000000101491324 run_mod + 172
+	24  Python                              0x000000010148fc90 pyrun_file + 164
+	25  Python                              0x000000010148f214 _PyRun_SimpleFileObject + 256
+	26  Python                              0x000000010148ee78 _PyRun_AnyFileObject + 80
+	27  Python                              0x00000001014bd51c pymain_run_file_obj + 164
+	28  Python                              0x00000001014bd26c pymain_run_file + 72
+	29  Python                              0x00000001014bca5c Py_RunMain + 1048
+	30  Python                              0x00000001014bcdcc pymain_main + 232
+	31  Python                              0x00000001014bce68 Py_BytesMain + 40
+	32  dyld                                0x000000018f967bec start + 6688
+)
+libc++abi: terminating due to uncaught exception of type NSException

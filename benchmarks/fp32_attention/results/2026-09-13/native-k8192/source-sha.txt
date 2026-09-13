@@ -1,0 +1,3 @@
+cab70f8b621a87d5ac7e2c84213c604539eb634a795e0ef381e61098c7349ab4  target/release/examples/prefill_dense_tuning
+85ffaa0958a91e839a88fc9632a17e93066482fd9e715f4f67192bddd2ceff46  target/release/mlx.metallib
+3cc705c1ad4bcdd92e5da04bc2910a9b6d39723fad83c6bf37a1e0d25d01e725  crates/higgs-models/examples/prefill_dense_tuning.rs

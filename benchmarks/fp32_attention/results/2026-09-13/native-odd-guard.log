@@ -1,0 +1,4 @@
+
+thread 'main' (661435) panicked at crates/higgs-models/examples/prefill_dense_tuning.rs:87:5:
+assertion failed: key_len >= 1024 && repeats >= 2 && repeats % 2 == 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

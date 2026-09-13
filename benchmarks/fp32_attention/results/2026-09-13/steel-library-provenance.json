@@ -1,0 +1,14 @@
+{
+  "python": "3.14.3 (main, Feb  3 2026, 15:32:20) [Clang 17.0.0 (clang-1700.6.3.2)]",
+  "executable": "/opt/homebrew/opt/python@3.14/bin/python3.14",
+  "mlx_version": "0.30.6",
+  "sha256": {
+    "/Users/peppi/.codex/worktrees/4dbe/higgs/benchmarks/fp32_attention/steel.py": "fcbd6a7604eb6a373de117fd744fdd98aa96b48559095c3b5085d4e039eb378c",
+    "/Users/peppi/.codex/worktrees/4dbe/higgs/benchmarks/fp32_attention/test_steel.py": "1ad200778eff3cabf47140e6410bc4fbf11367532b54ff8f14a3524c8ec2aec2",
+    "/Users/peppi/Library/Python/3.14/lib/python/site-packages/mlx/core.cpython-314-darwin.so": "45a1e0d57be2ba5203f7b11aa8a8e885ce132a61781cd2e774ae75cf53fe9bfb",
+    "/Users/peppi/Library/Python/3.14/lib/python/site-packages/mlx/lib/libmlx.dylib": "c8f816ca01dfc14fc3a0482e40ff58f31c5ecab543389a83d263f1c5311ddc1d"
+  },
+  "mlx_metal_version": "0.30.6",
+  "qreg_harness_sha256": "b78dfecdc54897b7f7ea9b3283d31fb8c5bd8127a9ad82c0444ef2bd7c1094ac",
+  "qreg_test_sha256": "00eaea4b73c5576b3e0a36050915271fdce2b7ebfc8c11b8d5ab43c22dc1506f"
+}
