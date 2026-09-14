@@ -10904,18 +10904,22 @@ impl Qwen3NextCausalLM {
                 let batch = *entry.tape.qkv_input.shape().first().ok_or_else(|| {
                     Exception::custom("conv rebuild: qkv input missing batch dim")
                 })?;
-                let prefix = entry.layer.chronological_conv_state(
-                    &mut staged,
-                    batch,
-                    entry.tape.qkv_input.dtype(),
-                )?;
-                let full = ops::concatenate_axis(&[&prefix, &qkv_slice], 1)?;
-                let total_len = *full
-                    .shape()
-                    .get(1)
-                    .ok_or_else(|| Exception::custom("conv rebuild: missing seq dim"))?;
-                let cs_start = total_len - n_keep;
-                let cs = full.index((.., cs_start.., ..));
+                // Once the accepted prefix covers the convolution history,
+                // its tail is already the complete post-rollback state. This
+                // avoids materializing `prefix + qkv_slice` and slicing it
+                // back down on the common partial-accept path.
+                let cs = if n_accepted >= n_keep {
+                    qkv_slice.index((.., (n_accepted - n_keep).., ..))
+                } else {
+                    let prefix = entry.layer.chronological_conv_state(
+                        &mut staged,
+                        batch,
+                        entry.tape.qkv_input.dtype(),
+                    )?;
+                    let prefix_start = n_accepted;
+                    let prefix_tail = prefix.index((.., prefix_start.., ..));
+                    ops::concatenate_axis(&[&prefix_tail, &qkv_slice], 1)?
+                };
                 let cs_shape = cs.shape().to_vec();
                 staged.conv_state = Some(cs.flatten(None, None)?.reshape(&cs_shape)?);
                 staged.conv_pos = n_keep - 1;
