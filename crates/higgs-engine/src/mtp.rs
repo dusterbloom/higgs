@@ -8,7 +8,8 @@
 
 use higgs_models::mlx_exec::eval;
 use higgs_models::{
-    AnyCache, AnyModel, MtpCache, SamplingParams, apply_penalties, deep_clone_mtp_cache, sample,
+    AnyCache, AnyCacheRollbackCheckpoint, AnyModel, MtpCache, SamplingParams, apply_penalties,
+    deep_clone_mtp_cache, sample,
 };
 use mlx_rs::{
     Array, argmax_axis,
@@ -21,12 +22,18 @@ const fn draft_matches_target(draft_token_id: u32, target_id: u32) -> bool {
     draft_token_id == target_id
 }
 
-fn capture_backbone_checkpoint(cache: &AnyCache) -> Option<AnyCache> {
-    cache.checkpoint_for_rollback()
+fn capture_backbone_checkpoint(cache: &AnyCache) -> AnyCacheRollbackCheckpoint {
+    cache.checkpoint_for_rollback_light()
 }
 
-fn rollback_backbone(cache: &mut AnyCache, checkpoint: Option<AnyCache>, verify_len: usize) {
-    cache.rollback(checkpoint, verify_len);
+fn rollback_backbone(
+    cache: &mut AnyCache,
+    checkpoint: AnyCacheRollbackCheckpoint,
+    verify_len: usize,
+) -> Result<(), EngineError> {
+    cache
+        .rollback_light(checkpoint, verify_len)
+        .map_err(EngineError::Mlx)
 }
 
 /// Aggregate MTP decode counters.
@@ -228,7 +235,7 @@ pub fn mtp_prompt_lookup_cycle(
         })?;
         (verify_hidden, next)
     } else {
-        rollback_backbone(cache, base_cache, verify_tokens.len());
+        rollback_backbone(cache, base_cache, verify_tokens.len())?;
         let (replay_hidden, replay_targets) = backbone_verify_batch(model, cache, &tokens)?;
         let next = *replay_targets.get(accepted_drafts).ok_or_else(|| {
             EngineError::Generation(format!(
@@ -388,7 +395,7 @@ pub fn prompt_lookup_cycle(
             ))
         })?
     } else {
-        rollback_backbone(cache, base_cache, verify_tokens.len());
+        rollback_backbone(cache, base_cache, verify_tokens.len())?;
         let replay_logits = model
             .forward_all_logits(&token_input(&tokens)?, None, cache)
             .map_err(EngineError::Mlx)?;
@@ -928,7 +935,7 @@ fn mtp_cycle_inner(
         // Taps cover the verify batch == the emitted tokens on full accept.
         (verify_hidden, next, verify_taps)
     } else {
-        rollback_backbone(cache, base_cache, verify_tokens.len());
+        rollback_backbone(cache, base_cache, verify_tokens.len())?;
         let (replay_hidden, replay_targets, replay_taps) = backbone_verify_batch_tapped(
             model,
             cache,

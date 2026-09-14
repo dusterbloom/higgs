@@ -119,3 +119,28 @@ replay probe to `0.923x` of the old layout at L=4 and `0.929x` at L=8 (about
 7--8% faster). The production replay kernel now uses this form. These are
 isolated rollback-kernel timings; whole-model MTP speedup still needs a paired
 partial-rejection trace.
+
+Hybrid rollback checkpoint
+--------------------------
+
+`AnyCache::checkpoint_for_rollback_light` copies only GDN recurrent state and
+records KV offsets; rollback trims KV storage in place and restores the copied
+SSM state. At the Qwen3.6-35B-A3B geometry (30 GDN layers, 10 full-attention
+layers, BF16 KV, FP32 SSM), the guarded synthetic benchmark measured:
+
+* 2,048 resident tokens: `106.3 MB` full clone versus `64.4 MB` recurrent copy;
+  `26.0 ms` versus `16.2 ms`.
+* 8,192 resident tokens: `232.2 MB` full clone versus `64.4 MB` recurrent copy;
+  `34.5 ms` versus `18.7 ms`.
+
+The checkpoint path is covered by an exact restore test and is now used by the
+MTP rollback helpers. These numbers are cache-transaction measurements, not
+whole-model decode speedups.
+
+A recorded decay/gate tape was also prototyped in the standalone packed replay
+kernel. Loading one precomputed gate per threadgroup was `0.826x` the shared
+recompute time in one BF16 L=8 run, but the host-side gate differed by up to
+`2e-6` because it did not reuse the forward kernel's exact operation sequence.
+Shipping that variant would require extending the forward tape to emit the
+Metal-computed gate and adding a second replay-kernel ABI; the exact shared-gate
+kernel remains the production path until that contract is implemented.

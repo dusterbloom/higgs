@@ -61,6 +61,7 @@ use mlx_rs::{Array, argmax_axis, array, categorical, error::Exception};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::cache::KeyValueCache;
 use crate::error::ModelError;
 pub use crate::cache::set_turboquant_activation_threshold;
 use crate::turboquant::KvCacheConfig;
@@ -192,6 +193,35 @@ pub enum AnyCache {
     Hybrid(Vec<Option<LayerCache>>),
 }
 
+/// Lightweight rollback checkpoint for speculative verification.
+///
+/// KV buffers are append-only and can be rewound by their offsets. Hybrid
+/// checkpoints therefore copy only recurrent `ArraysCache` state and retain
+/// the KV offsets, avoiding a device-side copy of every attention buffer.
+pub struct AnyCacheRollbackCheckpoint {
+    kind: AnyCacheRollbackCheckpointKind,
+    recurrent_bytes: usize,
+}
+
+enum AnyCacheRollbackCheckpointKind {
+    Kv(Vec<Option<(i32, i32)>>),
+    Hybrid(Vec<Option<AnyCacheRollbackLayer>>),
+}
+
+enum AnyCacheRollbackLayer {
+    Kv { offset: i32, position_offset: i32 },
+    Arrays(qwen3_next::ArraysCache),
+}
+
+impl AnyCacheRollbackCheckpoint {
+    /// Device bytes copied into this checkpoint. KV-only checkpoints are zero
+    /// bytes; Hybrid checkpoints count only recurrent state copies.
+    #[must_use]
+    pub const fn recurrent_bytes(&self) -> usize {
+        self.recurrent_bytes
+    }
+}
+
 impl AnyCache {
     /// Trim every layer cache by `count` tokens, discarding the most recent
     /// entries. Used after speculative-decode verify to roll back rejected
@@ -239,6 +269,117 @@ impl AnyCache {
             *self = base;
         } else {
             self.trim_by(advanced_by);
+        }
+    }
+
+    /// Capture a rollback point while copying only recurrent Hybrid state.
+    ///
+    /// This is safe for KV layers because rollback trims offsets and never
+    /// mutates or donates the underlying buffers. The existing full-clone API
+    /// remains available to callers that need an independent cache snapshot.
+    #[must_use]
+    pub fn checkpoint_for_rollback_light(&self) -> AnyCacheRollbackCheckpoint {
+        match self {
+            Self::KV(layers) => AnyCacheRollbackCheckpoint {
+                kind: AnyCacheRollbackCheckpointKind::Kv(
+                    layers
+                        .iter()
+                        .map(|layer| layer.as_ref().map(|kv| (kv.offset(), kv.position_offset())))
+                        .collect(),
+                ),
+                recurrent_bytes: 0,
+            },
+            Self::Hybrid(layers) => {
+                let mut recurrent_bytes = 0usize;
+                let saved = layers
+                    .iter()
+                    .map(|layer| {
+                        layer.as_ref().map(|layer| match layer {
+                            LayerCache::KV(kv) => AnyCacheRollbackLayer::Kv {
+                                offset: kv.offset(),
+                                position_offset: kv.position_offset(),
+                            },
+                            LayerCache::Arrays(arrays) => {
+                                recurrent_bytes = recurrent_bytes
+                                    .saturating_add(arrays.estimated_bytes());
+                                AnyCacheRollbackLayer::Arrays(arrays.deep_clone())
+                            }
+                        })
+                    })
+                    .collect();
+                AnyCacheRollbackCheckpoint {
+                    kind: AnyCacheRollbackCheckpointKind::Hybrid(saved),
+                    recurrent_bytes,
+                }
+            }
+        }
+    }
+
+    /// Restore a lightweight checkpoint, trimming KV offsets and replacing
+    /// copied recurrent state. Errors fail closed on cache-shape mismatches.
+    pub fn rollback_light(
+        &mut self,
+        checkpoint: AnyCacheRollbackCheckpoint,
+        _advanced_by: usize,
+    ) -> Result<(), Exception> {
+        match (&mut *self, checkpoint.kind) {
+            (Self::KV(layers), AnyCacheRollbackCheckpointKind::Kv(saved)) => {
+                if layers.len() != saved.len() {
+                    return Err(Exception::custom("KV rollback checkpoint layer mismatch"));
+                }
+                for (layer, saved) in layers.iter_mut().zip(saved) {
+                    let Some(saved) = saved else { continue };
+                    let Some(kv) = layer else {
+                        return Err(Exception::custom("KV rollback checkpoint missing layer"));
+                    };
+                    let delta = kv.offset().checked_sub(saved.0).ok_or_else(|| {
+                        Exception::custom("KV cache moved before rollback checkpoint")
+                    })?;
+                    kv.trim_by(usize::try_from(delta).unwrap_or(usize::MAX));
+                    if kv.position_offset() != saved.1 {
+                        kv.set_position_offset(saved.1)?;
+                    }
+                }
+                Ok(())
+            }
+            (Self::Hybrid(layers), AnyCacheRollbackCheckpointKind::Hybrid(saved)) => {
+                if layers.len() != saved.len() {
+                    return Err(Exception::custom("Hybrid rollback checkpoint layer mismatch"));
+                }
+                for (layer, saved) in layers.iter_mut().zip(saved) {
+                    let Some(saved) = saved else { continue };
+                    let Some(layer) = layer else {
+                        return Err(Exception::custom("Hybrid rollback checkpoint missing layer"));
+                    };
+                    match (layer, saved) {
+                        (
+                            LayerCache::KV(kv),
+                            AnyCacheRollbackLayer::Kv {
+                                offset,
+                                position_offset,
+                            },
+                        ) => {
+                            let delta = kv.offset().checked_sub(offset).ok_or_else(|| {
+                                Exception::custom("Hybrid KV moved before rollback checkpoint")
+                            })?;
+                            kv.trim_by(usize::try_from(delta).unwrap_or(usize::MAX));
+                            if kv.position_offset() != position_offset {
+                                kv.set_position_offset(position_offset)?;
+                            }
+                        }
+                        (LayerCache::Arrays(arrays), AnyCacheRollbackLayer::Arrays(saved)) => {
+                            *arrays = saved;
+                        }
+                        _ => {
+                            return Err(Exception::custom(
+                                "Hybrid rollback checkpoint cache variant mismatch",
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(Exception::custom("rollback checkpoint cache variant mismatch")),
         }
     }
 
@@ -3279,6 +3420,106 @@ mod tests {
     fn any_cache_hybrid_variant() {
         let cache = AnyCache::Hybrid(Vec::new());
         assert!(matches!(cache, AnyCache::Hybrid(_)));
+    }
+
+    #[test]
+    fn hybrid_light_checkpoint_copies_recurrent_state_and_trims_kv() {
+        let _exec = crate::mlx_exec::acquire();
+        let mut kv = kv_cache_at(3);
+        kv.set_position_offset(7).unwrap();
+        let recurrent = qwen3_next::ArraysCache {
+            conv_state: None,
+            ssm_state: Some(Array::zeros::<f32>(&[1, 2, 2, 2]).unwrap()),
+            conv_pos: 2,
+            offset: 3,
+        };
+        let mut cache = AnyCache::Hybrid(vec![
+            Some(LayerCache::KV(kv)),
+            Some(LayerCache::Arrays(recurrent)),
+        ]);
+        let checkpoint = cache.checkpoint_for_rollback_light();
+        assert_eq!(checkpoint.recurrent_bytes(), 1 * 2 * 2 * 2 * 4);
+
+        let AnyCache::Hybrid(layers) = &mut cache else {
+            panic!("expected Hybrid cache");
+        };
+        let Some(LayerCache::KV(kv)) = layers.first_mut().and_then(Option::as_mut) else {
+            panic!("expected KV layer");
+        };
+        kv.update_and_fetch(
+            Array::zeros::<f32>(&[1, 1, 2, 4]).unwrap(),
+            Array::zeros::<f32>(&[1, 1, 2, 4]).unwrap(),
+        )
+        .unwrap();
+        let Some(LayerCache::Arrays(arrays)) = layers.get_mut(1).and_then(Option::as_mut) else {
+            panic!("expected recurrent layer");
+        };
+        arrays.offset = 9;
+        arrays.conv_pos = 8;
+
+        cache.rollback_light(checkpoint, 2).unwrap();
+        let AnyCache::Hybrid(layers) = cache else {
+            panic!("expected Hybrid cache");
+        };
+        let Some(LayerCache::KV(kv)) = layers.first().and_then(Option::as_ref) else {
+            panic!("expected KV layer");
+        };
+        assert_eq!(kv.offset(), 3);
+        assert_eq!(kv.position_offset(), 7);
+        let Some(LayerCache::Arrays(arrays)) = layers.get(1).and_then(Option::as_ref) else {
+            panic!("expected recurrent layer");
+        };
+        assert_eq!(arrays.offset, 3);
+        assert_eq!(arrays.conv_pos, 2);
+        assert_eq!(arrays.ssm_state.as_ref().unwrap().as_slice::<f32>(), &[0.0; 8]);
+    }
+
+    #[test]
+    #[ignore = "bench: compare full Hybrid checkpoint with recurrent-only copy"]
+    fn bench_hybrid_checkpoint_copy_breakdown() {
+        use std::time::Instant;
+
+        let _exec = crate::mlx_exec::acquire();
+        let seq = std::env::var("HIGGS_BENCH_CHECKPOINT_SEQ")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2048);
+        let mut layers = Vec::with_capacity(40);
+        for layer in 0..40 {
+            if layer % 4 == 3 {
+                let mut kv = cache::SteppingKeyValueCache::new();
+                let keys = Array::zeros::<half::bf16>(&[1, 2, seq, 256]).unwrap();
+                let values = Array::zeros::<half::bf16>(&[1, 2, seq, 256]).unwrap();
+                kv.update_and_fetch(keys, values).unwrap();
+                layers.push(Some(LayerCache::KV(kv)));
+            } else {
+                layers.push(Some(LayerCache::Arrays(qwen3_next::ArraysCache {
+                    conv_state: Some(Array::zeros::<half::bf16>(&[1, 3, 8192]).unwrap()),
+                    ssm_state: Some(Array::zeros::<f32>(&[1, 32, 128, 128]).unwrap()),
+                    conv_pos: 2,
+                    offset: seq,
+                })));
+            }
+        }
+        let cache = AnyCache::Hybrid(layers);
+        crate::mlx_exec::eval(cache.eval_targets()).unwrap();
+        let full_bytes = cache.estimated_bytes();
+
+        let start = Instant::now();
+        let full = cache.checkpoint_for_rollback();
+        crate::mlx_exec::eval(full.as_ref().unwrap().eval_targets()).unwrap();
+        let full_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        let start = Instant::now();
+        let light = cache.checkpoint_for_rollback_light();
+        let light_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        println!(
+            "HYBRID CHECKPOINT [seq={seq}]: cache={full_bytes}B full_copy={full_bytes}B light_recurrent={}B full={full_ms:.3}ms light={light_ms:.3}ms saved_bytes={}B",
+            light.recurrent_bytes(),
+            full_bytes.saturating_sub(light.recurrent_bytes()),
+        );
     }
 
     #[test]
