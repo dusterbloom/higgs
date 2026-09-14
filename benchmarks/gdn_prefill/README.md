@@ -139,6 +139,10 @@ DFlash `replay_tape_rollback` path, which already restores GDN state from its
 per-layer transaction tape. These numbers are cache-transaction measurements,
 not whole-model decode speedups.
 
+The generic path uses the lightweight checkpoint by default. Set
+`HIGGS_MTP_FULL_CHECKPOINT=1` to force the previous full-clone transaction for
+compatibility comparisons.
+
 Generic MTP also has a guarded `HIGGS_MTP_TAPE_VERIFY=1` seam that returns the
 first verify's hidden rows, logits, taps, and GDN transaction data together.
 On partial rejection it repairs the Hybrid cache from that transaction and

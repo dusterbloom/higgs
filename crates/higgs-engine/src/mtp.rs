@@ -22,18 +22,35 @@ const fn draft_matches_target(draft_token_id: u32, target_id: u32) -> bool {
     draft_token_id == target_id
 }
 
-fn capture_backbone_checkpoint(cache: &AnyCache) -> AnyCacheRollbackCheckpoint {
-    cache.checkpoint_for_rollback_light()
+enum BackboneCheckpoint {
+    Light(AnyCacheRollbackCheckpoint),
+    Full(Option<AnyCache>),
+}
+
+fn capture_backbone_checkpoint(cache: &AnyCache) -> BackboneCheckpoint {
+    if parse_enabled_flag(std::env::var("HIGGS_MTP_FULL_CHECKPOINT").ok().as_deref())
+        .unwrap_or(false)
+    {
+        BackboneCheckpoint::Full(cache.checkpoint_for_rollback())
+    } else {
+        BackboneCheckpoint::Light(cache.checkpoint_for_rollback_light())
+    }
 }
 
 fn rollback_backbone(
     cache: &mut AnyCache,
-    checkpoint: AnyCacheRollbackCheckpoint,
+    checkpoint: BackboneCheckpoint,
     verify_len: usize,
 ) -> Result<(), EngineError> {
-    cache
-        .rollback_light(checkpoint, verify_len)
-        .map_err(EngineError::Mlx)
+    match checkpoint {
+        BackboneCheckpoint::Light(checkpoint) => cache
+            .rollback_light(checkpoint, verify_len)
+            .map_err(EngineError::Mlx),
+        BackboneCheckpoint::Full(checkpoint) => {
+            cache.rollback(checkpoint, verify_len);
+            Ok(())
+        }
+    }
 }
 
 /// Aggregate MTP decode counters.
