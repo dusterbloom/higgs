@@ -60,3 +60,27 @@ records the same preflight in its JSON output. Set
 Projection cost remains a separate measurement: reuse
 `benchmarks/ane_prefill/gpu_projection.py` for the QKVZ projection. This probe
 only bounds the recurrence share of the observed whole-GDN layer latency.
+
+ReplaySSM feasibility probe
+---------------------------
+
+`replayssm_probe.py` checks the exact affine form of the GDN state update before
+attempting a Metal implementation. It compares the serial recurrence with a
+dense composition of `S_t = A_t S_{t-1} + c_t` at the production geometry:
+
+```bash
+benchmarks/prefill_investigation/run_safe.sh \
+  python3 benchmarks/gdn_prefill/replayssm_probe.py --lengths 1 2 4 --repeats 5
+```
+
+The L=1 case is bit-identical. At L=2 and L=4, dense composition is roughly
+73--83x slower than serial and produces state differences up to `2.2e-4` in
+float32, so it cannot replace exact tape replay. A low-rank/WY formulation
+would need to avoid materializing the 128x128 transition matrices and preserve
+the serial operation order near token-acceptance ties. No production path is
+enabled by this probe.
+
+The existing guarded Metal tape benchmark (`accept=10/16`) measured replay at
+`1.4247 ms` versus `0.7025 ms` for an SSM-only forward (`2.03x` slower). Its
+whole-model value comes from skipping projections and other forward work, not
+from the replay kernel itself.
