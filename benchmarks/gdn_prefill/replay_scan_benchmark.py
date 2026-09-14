@@ -56,6 +56,53 @@ def source(scan: bool) -> str:
     ).replace("*out_ptr = prefix * (s + weighted);", "*out_ptr = s;")
 
 
+def shared_gate_source(scan: bool) -> str:
+    """Share the per-head gate across a replay threadgroup.
+
+    Every lane in a production replay threadgroup handles a different Dk/Dv
+    element but the gate depends only on (batch, head, timestep).  This keeps
+    the recurrence and its operation order unchanged while avoiding a repeated
+    softplus/exp sequence in every lane.
+    """
+    body = source(scan)
+    body = body.replace(
+        "float s = static_cast<float>(*state_ptr);\nfloat prefix = 1.0f;",
+        "float s = static_cast<float>(*state_ptr);\nthreadgroup float gate_shared;\nfloat prefix = 1.0f;",
+    )
+    body = body.replace(
+        "  float gate = GATE(a_[0], dt_bias[hv_idx], a_log[hv_idx]);",
+        "  if (thread_index_in_threadgroup == 0) {\n"
+        "    gate_shared = GATE(a_[0], dt_bias[hv_idx], a_log[hv_idx]);\n"
+        "  }\n"
+        "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "  float gate = gate_shared;",
+    )
+    # Ensure no lane starts the next timestep before the shared value has been
+    # consumed by every lane in this timestep.
+    body = body.replace("  a_ += Hv;\n}", "  a_ += Hv;\n  threadgroup_barrier(mem_flags::mem_threadgroup);\n}")
+    return body
+
+
+def packed_shared_gate_source(scan: bool) -> str:
+    """Packed Dk-lane variant with one shared gate per threadgroup."""
+    body = packed_source(scan)
+    body = body.replace(
+        "for (int lane = 0; lane < n_per_t; ++lane) {",
+        "threadgroup float gate_shared;\nfor (int lane = 0; lane < n_per_t; ++lane) {",
+        1,
+    )
+    body = body.replace(
+        "  float gate = GATE(a_[0], dt_bias[hv_idx], a_log[hv_idx]);",
+        "  if (thread_index_in_threadgroup == 0) {\n"
+        "    gate_shared = GATE(a_[0], dt_bias[hv_idx], a_log[hv_idx]);\n"
+        "  }\n"
+        "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "  float gate = gate_shared;",
+    )
+    body = body.replace("  a_ += Hv;\n}", "  a_ += Hv;\n  threadgroup_barrier(mem_flags::mem_threadgroup);\n}")
+    return body
+
+
 def packed_source(scan: bool) -> str:
     """Pack four Dk lanes per thread, matching the production 32x4 layout."""
     body = source(scan)
@@ -109,12 +156,24 @@ def main():
         inputs = [tape, k, a, a_log, dt_bias, state, mx.array(steps, mx.int32)]
         kernels = {}
         kwargs = {}
-        for name, is_scan, packed in (("serial", False, False), ("scan", True, False),
-                                      ("serial32", False, True), ("scan32", True, True)):
+        for name, is_scan, packed, shared in (
+            ("serial", False, False, False),
+            ("scan", True, False, False),
+            ("serial32", False, True, False),
+            ("scan32", True, True, False),
+            ("serial_shared", False, False, True),
+            ("serial32_shared", False, True, True),
+        ):
+            if shared and packed:
+                kernel_source = packed_shared_gate_source(is_scan)
+            elif shared:
+                kernel_source = shared_gate_source(is_scan)
+            else:
+                kernel_source = packed_source(is_scan) if packed else source(is_scan)
             kernel = mx.fast.metal_kernel(
                 name=f"higgs_replay_{name}_t{steps}",
                 input_names=["tape", "k", "a", "a_log", "dt_bias", "state_in", "T"],
-                output_names=["state_out"], source=packed_source(is_scan) if packed else source(is_scan),
+                output_names=["state_out"], source=kernel_source,
                 ensure_row_contiguous=True,
             )
             kernels[name] = kernel
@@ -130,12 +189,15 @@ def main():
             for _ in range(args.warmup):
                 mx.eval(*kernel(**kwargs[name]))
         serial = kernels["serial32"](**kwargs["serial32"]); mx.eval(*serial)
+        shared = kernels["serial32_shared"](**kwargs["serial32_shared"]); mx.eval(*shared)
         scan = kernels["scan32"](**kwargs["scan32"]); mx.eval(*scan)
-        serial_np = np.asarray(serial[0]); scan_np = np.asarray(scan[0])
+        serial_np = np.asarray(serial[0]); shared_np = np.asarray(shared[0]); scan_np = np.asarray(scan[0])
         serial_times, scan_times, serial32_times, scan32_times = [], [], [], []
+        serial_shared_times, serial32_shared_times = [], []
         for round_i in range(args.repeats):
             order = (("serial", serial_times), ("scan", scan_times),
-                     ("serial32", serial32_times), ("scan32", scan32_times))
+                     ("serial32", serial32_times), ("scan32", scan32_times),
+                     ("serial_shared", serial_shared_times), ("serial32_shared", serial32_shared_times))
             if round_i % 2:
                 order = tuple(reversed(order))
             for name, out in order:
@@ -145,6 +207,8 @@ def main():
         rows.append({"length": steps, "dtype": args.dtype,
                      "state_max_abs": float(np.max(np.abs(serial_np - scan_np))),
                      "state_bitwise_equal": bool(np.array_equal(serial_np, scan_np)),
+                     "shared_gate_state_max_abs": float(np.max(np.abs(serial_np - shared_np))),
+                     "shared_gate_bitwise_equal": bool(np.array_equal(serial_np, shared_np)),
                      "state_in_unchanged": bool(np.array_equal(np.asarray(state), state_in_before)),
                      "accepted_token_decision_parity": "not_measured_without_lm_head",
                      "serial_median_ms": float(np.median(serial_times)),
@@ -152,6 +216,9 @@ def main():
                      "scan_over_serial": float(np.median(scan_times) / np.median(serial_times)),
                      "serial32_median_ms": float(np.median(serial32_times)),
                      "scan32_median_ms": float(np.median(scan32_times)),
+                     "serial_shared_median_ms": float(np.median(serial_shared_times)),
+                     "serial32_shared_median_ms": float(np.median(serial32_shared_times)),
+                     "serial32_shared_over_serial32": float(np.median(serial32_shared_times) / np.median(serial32_times)),
                      "scan32_over_serial32": float(np.median(scan32_times) / np.median(serial32_times)),
                      "scan32_state_max_abs": float(np.max(np.abs(serial_np - scan_np))),
                      "scan32_bitwise_equal": bool(np.array_equal(serial_np, scan_np))})

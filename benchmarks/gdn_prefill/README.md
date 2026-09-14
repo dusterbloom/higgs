@@ -111,3 +111,11 @@ packed 32x4 layout. Scan/serial ratios were `1.02x` and `1.11x`; the obvious
 input/state traffic, kernel dispatch, and output materialization. State error
 remained below `3.8e-9`, but the scan has no repeatable latency win, so it is
 not wired into the linear MTP path.
+
+The replay kernel also has a safe decomposition win: its gate is constant for
+all lanes in a `(batch, head, timestep)` threadgroup. Sharing that scalar with
+threadgroup memory preserves bitwise state output and reduced the packed BF16
+replay probe to `0.923x` of the old layout at L=4 and `0.929x` at L=8 (about
+7--8% faster). The production replay kernel now uses this form. These are
+isolated rollback-kernel timings; whole-model MTP speedup still needs a paired
+partial-rejection trace.

@@ -2877,13 +2877,24 @@ for (int i = 0; i < n_per_t; ++i) {
   state[i] = static_cast<float>(i_state[s_idx]);
 }
 
+// The gate depends only on (batch, head, timestep), while each packed
+// threadgroup covers four Dv rows and all 32 Dk lanes. Compute it once and
+// share it instead of repeating softplus/exp in every lane.
+threadgroup float gate_shared;
+
 // a_log and dt_bias are [B * Hv] when batched across layers
 float a_log_val = static_cast<float>(a_log[b_idx * Hv + hv_idx]);
 float dt_bias_val = static_cast<float>(dt_bias[b_idx * Hv + hv_idx]);
 auto a_ = a + b_idx * T * Hv;
 
 for (int t = 0; t < T; ++t) {
-  HIGGS_GDN_GATE(g_val, a_[hv_idx], dt_bias_val, a_log_val);
+  if (thread_index_in_threadgroup == 0) {
+    float x = static_cast<float>(a_[hv_idx]) + dt_bias_val;
+    float sp = fmax(x, 0.0f) + log1p(exp(-fabs(x)));
+    gate_shared = exp(-exp(a_log_val) * sp);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float g_val = gate_shared;
 
   auto delta = tape_[dv_idx];
   // Replay the forward kernel's EXACT op sequence (decay as a separate
@@ -2895,6 +2906,7 @@ for (int t = 0; t < T; ++t) {
     HIGGS_GDN_DECAY(state[i], g_val);
     HIGGS_GDN_UPDATE(state[i], k_[s_idx], delta);
   }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   tape_ += Hv * Dv;
   k_ += Hk * Dk;
   a_ += Hv;
