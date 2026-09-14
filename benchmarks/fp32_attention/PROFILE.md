@@ -51,3 +51,11 @@ This measurement changes the next kernel decision: do not increase the cached Q
 tile further. The qreg64 design already keeps 64 additional FP32 scalars per lane,
 and Metal has now recorded actual spills. Any future exact kernel should reduce
 live state or use a different decomposition before trying a larger query tile.
+
+## Live-state reduction and decomposition follow-up
+
+The opt-in `qstream64k16` revision removes the full-D Q register cache while keeping BQ64/BK16 and reloads one 8-column Q MMA fragment per D chunk. It passed all 14 synthetic/layout correctness cases (maximum absolute error `2.70e-6`, maximum row relative L2 `1.46e-6`). In paired runs, median kernel latency was 88.4 ms versus 94.3 ms for dense128 at K=8192, and 190.8 ms versus 184.2 ms at K=16384. The earlier qreg64 comparison was 226.3 ms and 379.6 ms on the same harness invocation, so streaming removed most of the qreg penalty but did not create a large whole-attention speedup over dense128. Noncontiguous view timings tracked the contiguous results and all runs had zero swapout delta.
+
+The qstream64 Metal trace still has nine compiler spill events, but each is 816 bytes (7,344 bytes total), down from qreg64's 1,104 bytes per event (9,936 bytes). The shader is `custom_kernel_higgs_steel_qstream64k16`. Occupancy, active warps, and per-barrier time remain unavailable: the exported shader profiler table is empty and this trace exposes no compute counter intervals.
+
+To test decomposition after reducing live state, qstream16k16 and qstream32k16 use the same streamed Q body with 64 and 128 threads respectively. Both are correct, but slower: at K=8192 their contiguous medians were 142.5 ms and 93.3 ms (qstream64 was 88.4 ms); at K=16384 they were 309.7 ms and 198.6 ms (qstream64 was 190.8 ms). The smaller-row decompositions therefore do not improve this M4 workload. Keep all qstream variants benchmark-only until a serving-shaped trace validates a different decomposition.

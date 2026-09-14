@@ -14,7 +14,10 @@ import numpy as np
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_MLX = ROOT / 'target/release/build/mlx-sys-60edabe453143de4/out/build/_deps/mlx-src'
 VARIANTS = {'q8k16': (8, 16, 1, 1), 'q16k8': (16, 8, 2, 1),
-            'qreg32k16': (32, 16, 4, 1), 'qreg64k16': (64, 16, 8, 1)}
+            'qreg32k16': (32, 16, 4, 1), 'qreg64k16': (64, 16, 8, 1),
+            'qstream16k16': (16, 16, 2, 1),
+            'qstream32k16': (32, 16, 4, 1),
+            'qstream64k16': (64, 16, 8, 1)}
 PREFIX = 'mlx/backend/metal/kernels/steel/'
 
 
@@ -52,7 +55,7 @@ def launch_config(variant, shape):
             'grid': [((q + bq - 1) // bq) * threads, h, b],
             'threadgroup': [threads, 1, 1],
             'q_cache_fp32_scalars_per_thread': 64 if variant.startswith('qreg') else 0,
-            'threadgroup_bytes': 4 * ((0 if variant.startswith('qreg') else bq * (d + 4)) + max((bk + 4) * d, bk * (d + 4)))}
+            'threadgroup_bytes': 4 * ((0 if variant.startswith(('qreg', 'qstream')) else bq * (d + 4)) + max((bk + 4) * d, bk * (d + 4)))}
 
 
 def extract_source(root):
@@ -102,6 +105,45 @@ def register_q_body(body):
     return body
 
 
+def stream_q_body(body):
+    """Keep one Q MMA fragment live and reload it for each D chunk."""
+    replacements = [
+        ('  threadgroup T Q_smem[BQ * (BD + padQ)];', ''),
+        ('  threadgroup T* Qs = Q_smem;', ''),
+        ('  using QBlockLoader = BlockLoaderT<\n'
+         '      /* typename T = */ T,\n'
+         '      /* short BROWS = */ BQ,\n'
+         '      /* short BCOLS = */ BD,\n'
+         '      /* short kDstStrRow = */ LDQ_tgp,\n'
+         '      /* short kDstStrCol = */ 1,\n'
+         '      /* short reduction_dim = */ 1,\n'
+         '      /* short tgp_size = */ WM * WN * 32>;', ''),
+        ('  QBlockLoader loader_q(\n'
+         '      Q, params->Q_strides[2], Qs, simd_group_id, simd_lane_id);', ''),
+        ('  const short Qs_offset = (tm + sm) * LDQ_tgp + sn;\n', ''),
+        ('  constexpr short Qs_tile_stride = kFragSize;\n', ''),
+        ('  // Load Q blocks\n'
+         '  if (!align_Q && int(tid.x) == (params->NQ_aligned)) {\n'
+         '    loader_q.load_safe(short2(BD, params->qL_rem));\n'
+         '  } else {\n'
+         '    loader_q.load_unsafe();\n'
+         '  }',
+         "  // Stream one Q fragment at a time; no full-D register cache.\n"
+         "  const int rows_left = min(BQ, params->qL - int(tid.x) * BQ) - (tm + sm);"),
+        ('      Qtile.template load<T, 1, 1, LDQ_tgp, 1>(\n'
+         '          &Qs[Qs_offset + dd * Qs_tile_stride]);',
+         '      Qtile.template load_safe<T, 1, 1>(\n'
+         '          Q + (tm + sm) * params->Q_strides[2] + dd * kFragSize + sn,\n'
+         '          params->Q_strides[2],\n'
+         '          short2(BD - (dd * kFragSize + sn), short(rows_left)));'),
+    ]
+    for old, new in replacements:
+        if body.count(old) != 1:
+            raise ValueError('upstream Q staging changed; refusing ambiguous streaming transformation')
+        body = body.replace(old, new)
+    return body
+
+
 def make_candidate(mx, variant, qshape, kshape, scale, root, causal):
     launch = launch_config(variant, qshape)
     b, h, ql, d = qshape
@@ -110,6 +152,8 @@ def make_candidate(mx, variant, qshape, kshape, scale, root, causal):
     header, body, hashes = extract_source(root)
     if variant.startswith('qreg'):
         body = register_q_body(body)
+    elif variant.startswith('qstream'):
+        body = stream_q_body(body)
     prelude = f'''
     using T = float; using AccumType = float; using MaskType = bool;
     constexpr int BQ = {bq}, BK = {bk}, BD = 256, WM = {wm}, WN = {wn};
@@ -258,6 +302,8 @@ def main():
               'harness_sha256': hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest(), 'cases': []}
     if any(v.startswith('qreg') for v in args.variants):
         result['transformations'].append('qreg only: replace shared Q staging with safe full-Q register cache')
+    if any(v.startswith('qstream') for v in args.variants):
+        result['transformations'].append('qstream only: remove Q staging and reload one safe Q MMA fragment per D chunk')
     args.output.parent.mkdir(parents=True, exist_ok=True)
     result['before'] = counters() if args.mode != 'prepare' else None
     args.output.write_text(json.dumps(result, indent=2))
@@ -267,6 +313,8 @@ def main():
             for variant in args.variants:
                 if variant.startswith('qreg'):
                     args.output.with_name(args.output.stem + '-' + variant + '.metal').write_text(header + '\n' + register_q_body(body))
+                elif variant.startswith('qstream'):
+                    args.output.with_name(args.output.stem + '-' + variant + '.metal').write_text(header + '\n' + stream_q_body(body))
         else:
             import mlx.core as mx
             result['device'] = str(mx.device_info())

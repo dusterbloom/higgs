@@ -1,0 +1,88 @@
+{
+  "k8192": {
+    "cases": [
+      {
+        "source_view": false,
+        "medians_ms": {
+          "dense128": 94.274104,
+          "full_sdpa": 90.05377100000001,
+          "qstream16k16": 142.458646,
+          "qstream32k16": 93.2967295,
+          "qstream64k16": 88.3673335
+        },
+        "timing_valid": true,
+        "case_swapouts_delta": 0
+      },
+      {
+        "source_view": true,
+        "medians_ms": {
+          "dense128": 93.90350000000001,
+          "full_sdpa": 95.5656045,
+          "qstream16k16": 141.018083,
+          "qstream16k16_with_copy": 145.778167,
+          "qstream32k16": 93.14085399999999,
+          "qstream32k16_with_copy": 93.5291875,
+          "qstream64k16": 90.7488955,
+          "qstream64k16_with_copy": 90.75827100000001,
+          "materialize_only": 1.4427295
+        },
+        "timing_valid": true,
+        "case_swapouts_delta": 0
+      }
+    ]
+  },
+  "k16384": {
+    "cases": [
+      {
+        "source_view": false,
+        "medians_ms": {
+          "dense128": 184.20375,
+          "full_sdpa": 193.8335835,
+          "qstream16k16": 309.7307915,
+          "qstream32k16": 198.596292,
+          "qstream64k16": 190.803146
+        },
+        "timing_valid": true,
+        "case_swapouts_delta": 0
+      },
+      {
+        "source_view": true,
+        "medians_ms": {
+          "dense128": 189.6144165,
+          "full_sdpa": 197.278,
+          "qstream16k16": 303.49677099999997,
+          "qstream16k16_with_copy": 303.873729,
+          "qstream32k16": 205.72395799999998,
+          "qstream32k16_with_copy": 199.27602100000001,
+          "qstream64k16": 191.40447899999998,
+          "qstream64k16_with_copy": 191.4587085,
+          "materialize_only": 2.4742295
+        },
+        "timing_valid": true,
+        "case_swapouts_delta": 0
+      }
+    ]
+  },
+  "correctness": {
+    "case_count": 14,
+    "max_abs": 2.7003066200848025e-06,
+    "max_row_rel_l2": 1.4582376011981725e-06
+  },
+  "trace": {
+    "spill_event_count": 9,
+    "spilled_bytes": [
+      816,
+      816,
+      816,
+      816,
+      816,
+      816,
+      816,
+      816,
+      816
+    ],
+    "spilled_bytes_total": 7344,
+    "shader": "custom_kernel_higgs_steel_qstream64k16",
+    "source": "qstream64-toc.xml"
+  }
+}

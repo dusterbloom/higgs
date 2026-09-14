@@ -43,6 +43,21 @@ class Contracts(unittest.TestCase):
             self.assertEqual(launch['threadgroup_bytes'], 20480)
             self.assertEqual(launch['q_cache_fp32_scalars_per_thread'], 64)
 
+    def test_stream_q_launch_and_source_drop_full_q_state(self):
+        for name, threads, grid_x in [('qstream16k16', 64, 192), ('qstream32k16', 128, 256), ('qstream64k16', 256, 256)]:
+            self.assertIn(name, steel.VARIANTS)
+            launch = steel.launch_config(name, (1, 4, 33, 256))
+            self.assertEqual(tuple(launch['grid']), (grid_x, 4, 1))
+            self.assertEqual(launch['threadgroup'], [threads, 1, 1])
+            self.assertEqual(launch['threadgroup_bytes'], 20480)
+            self.assertEqual(launch['q_cache_fp32_scalars_per_thread'], 0)
+        _, body, _ = steel.extract_source(steel.DEFAULT_MLX)
+        body = steel.stream_q_body(body)
+        self.assertNotIn('Q_smem', body)
+        self.assertNotIn('loader_q', body)
+        self.assertNotIn('Qcache', body)
+        self.assertIn('Qtile.template load_safe', body)
+
     def test_launch_covers_partial_tiles_within_shared_memory(self):
         self.assertIsNotNone(steel, 'Steel experiment is missing')
         for variant, wanted in [('q8k16', (96, 4, 1)), ('q16k8', (128, 4, 1))]:

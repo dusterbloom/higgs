@@ -62,3 +62,5 @@ It found compiler spill events for qreg64k16 and none for a matched dense128 con
 while this machine exposed no occupancy or per-barrier counters. Compact exported
 tables are under `results/2026-09-14/`; the native trace bundle remains in the local
 temporary profiling directory because it is about 40 MB compressed.
+
+The live-state follow-up is selected with `--variants qstream16k16 qstream32k16 qstream64k16`. These variants remove Q shared staging and reload one safe Q MMA fragment per D chunk; they do not change serving defaults. qstream64k16 is the strongest measured choice, near dense128 latency while reducing the observed spill payload. The smaller-row decompositions are retained as evidence and were slower on the M4. See [PROFILE.md](PROFILE.md) and `results/2026-09-14/qstream-summary.json` for the paired results.
