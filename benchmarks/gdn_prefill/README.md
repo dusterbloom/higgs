@@ -84,3 +84,9 @@ The existing guarded Metal tape benchmark (`accept=10/16`) measured replay at
 `1.4247 ms` versus `0.7025 ms` for an SSM-only forward (`2.03x` slower). Its
 whole-model value comes from skipping projections and other forward work, not
 from the replay kernel itself.
+
+The follow-up matrix-free low-rank composition avoids dense matrices, but at
+this geometry it remains `4.1--5.8x` slower than serial for L=1, 2, and 4 in
+the CPU probe. It has the same float32 drift for L>1, so it is not an exact
+rollback replacement. A useful Metal implementation would need a genuinely
+parallel triangular solve and an explicit policy for near-tie token changes.

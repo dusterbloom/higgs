@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from replayssm_probe import affine_chain, gates, serial_chain
+from replayssm_probe import affine_chain, gates, low_rank_chain, serial_chain
 
 
 class ReplaySsmProbeTests(unittest.TestCase):
@@ -16,8 +16,11 @@ class ReplaySsmProbeTests(unittest.TestCase):
         state = np.zeros((4, 3, 4), dtype=np.float32)
         serial = serial_chain(k, v, q, g, beta, state)
         affine = affine_chain(k, v, q, g, beta, state)
+        low_rank = low_rank_chain(k, v, q, g, beta, state)
         np.testing.assert_array_equal(serial[0], affine[0])
         np.testing.assert_array_equal(serial[1], affine[1])
+        np.testing.assert_array_equal(serial[0], low_rank[0])
+        np.testing.assert_array_equal(serial[1], low_rank[1])
 
     def test_affine_chain_preserves_production_shapes(self):
         rng = np.random.default_rng(4)

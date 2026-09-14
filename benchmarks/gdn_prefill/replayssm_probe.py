@@ -56,6 +56,41 @@ def affine_chain(k, v, q, g, beta, state):
     return np.stack(outputs), final_state
 
 
+def low_rank_chain(k, v, q, g, beta, state):
+    """Compose maps without dense matrices; rank grows by one per token."""
+    hv, dv, d = state.shape
+    factors_u = [np.empty((d, 0), dtype=np.float32) for _ in range(hv)]
+    factors_v = [np.empty((d, 0), dtype=np.float32) for _ in range(hv)]
+    scale = np.ones(hv, dtype=np.float32)
+    offset = np.zeros((hv, dv, d), dtype=np.float32)
+    initial = np.array(state, dtype=np.float32, copy=True)
+    outputs = []
+    repeat = hv // k.shape[1]
+    for t in range(k.shape[0]):
+        kt = np.repeat(k[t], repeat, axis=0)
+        qt = np.repeat(q[t], repeat, axis=0)
+        state_t = np.empty_like(initial)
+        for h in range(hv):
+            uh, vh = factors_u[h], factors_v[h]
+            kh = kt[h]
+            if uh.shape[1]:
+                new_v = -beta[t, h] * (kh + vh @ (uh.T @ kh))
+                transformed = initial[h] + (initial[h] @ vh) @ uh.T
+            else:
+                new_v = -beta[t, h] * kh[:, None]
+                transformed = initial[h]
+            factors_u[h] = np.column_stack((uh, kh))
+            factors_v[h] = np.column_stack((vh, new_v))
+            old_dot = offset[h] @ kh
+            offset[h] = g[t, h] * (offset[h] - beta[t, h] * old_dot[:, None] * kh)
+            offset[h] += beta[t, h] * v[t, h, :, None] * kh
+            scale[h] *= g[t, h]
+            state_t[h] = scale[h] * transformed + offset[h]
+        outputs.append(np.einsum("vd,vhd->vh", qt, state_t))
+    final_state = state_t
+    return np.stack(outputs), final_state
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--lengths", type=int, nargs="+", default=[2, 4])
@@ -77,16 +112,22 @@ def main():
 
         serial_out, serial_state = serial_chain(k, v, q, g, beta, state)
         affine_out, affine_state = affine_chain(k, v, q, g, beta, state)
+        lowrank_out, lowrank_state = low_rank_chain(k, v, q, g, beta, state)
         rows.append({
             "length": length,
             "output_max_abs": float(np.max(np.abs(serial_out - affine_out))),
             "state_max_abs": float(np.max(np.abs(serial_state - affine_state))),
             "output_allclose": bool(np.allclose(serial_out, affine_out, rtol=2e-5, atol=2e-5)),
             "state_allclose": bool(np.allclose(serial_state, affine_state, rtol=2e-5, atol=2e-5)),
+            "lowrank_output_max_abs": float(np.max(np.abs(serial_out - lowrank_out))),
+            "lowrank_state_max_abs": float(np.max(np.abs(serial_state - lowrank_state))),
+            "lowrank_output_allclose": bool(np.allclose(serial_out, lowrank_out, rtol=2e-5, atol=2e-5)),
+            "lowrank_state_allclose": bool(np.allclose(serial_state, lowrank_state, rtol=2e-5, atol=2e-5)),
         })
 
         serial_times = []
         affine_times = []
+        lowrank_times = []
         for _ in range(args.repeats):
             start = time.perf_counter_ns()
             serial_chain(k, v, q, g, beta, state)
@@ -94,10 +135,15 @@ def main():
             start = time.perf_counter_ns()
             affine_chain(k, v, q, g, beta, state)
             affine_times.append((time.perf_counter_ns() - start) / 1e6)
+            start = time.perf_counter_ns()
+            low_rank_chain(k, v, q, g, beta, state)
+            lowrank_times.append((time.perf_counter_ns() - start) / 1e6)
         rows[-1].update({
             "serial_median_ms": float(np.median(serial_times)),
             "affine_median_ms": float(np.median(affine_times)),
             "affine_over_serial": float(np.median(affine_times) / np.median(serial_times)),
+            "lowrank_median_ms": float(np.median(lowrank_times)),
+            "lowrank_over_serial": float(np.median(lowrank_times) / np.median(serial_times)),
         })
     print(json.dumps({"geometry": {"Hk": hk, "Hv": hv, "Dk": dk, "Dv": dv}, "rows": rows}, indent=2))
 
