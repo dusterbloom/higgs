@@ -104,3 +104,10 @@ respectively. State error stayed below `3.8e-9`, and the input checkpoint was
 unchanged, but there is no consistent speed win. The isolated kernel has no
 LM-head logits, so accepted-token decisions are explicitly not measured here;
 the exact production tape path remains the fallback.
+
+The follow-up end-to-end reconstruction run tested BF16 L=4 and L=8 with the
+packed 32x4 layout. Scan/serial ratios were `1.02x` and `1.11x`; the obvious
+32x2 layout iteration was `1.12x` and `1.13x`. These timings include synchronized
+input/state traffic, kernel dispatch, and output materialization. State error
+remained below `3.8e-9`, but the scan has no repeatable latency win, so it is
+not wired into the linear MTP path.

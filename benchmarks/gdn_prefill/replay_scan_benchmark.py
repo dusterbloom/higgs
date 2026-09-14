@@ -88,6 +88,7 @@ def main():
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="float32")
     parser.add_argument("--repeats", type=int, default=15)
     parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--packed-threadgroup-y", type=int, default=4)
     args = parser.parse_args()
     memory = memory_preflight()
 
@@ -122,7 +123,7 @@ def main():
                 template=[("InT", dtype), ("Dk", d["dk"]), ("Dv", d["dv"]),
                           ("Hk", d["hk"]), ("Hv", d["hv"])],
                 grid=(32 if packed else d["dk"], d["dv"], d["hv"]),
-                threadgroup=(32, 4, 1) if packed else (d["dk"], 1, 1),
+                threadgroup=(32, args.packed_threadgroup_y, 1) if packed else (d["dk"], 1, 1),
                 output_shapes=[(1, d["hv"], d["dv"], d["dk"])],
                 output_dtypes=[mx.float32],
             )
