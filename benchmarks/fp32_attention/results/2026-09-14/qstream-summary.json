@@ -29,7 +29,12 @@
         "timing_valid": true,
         "case_swapouts_delta": 0
       }
-    ]
+    ],
+    "pair_ratio_median": {
+      "qstream16k16": 1.559911,
+      "qstream32k16": 1.025673,
+      "qstream64k16": 0.925225
+    }
   },
   "k16384": {
     "cases": [
@@ -61,7 +66,12 @@
         "timing_valid": true,
         "case_swapouts_delta": 0
       }
-    ]
+    ],
+    "pair_ratio_median": {
+      "qstream16k16": 1.648916,
+      "qstream32k16": 1.080493,
+      "qstream64k16": 1.110786
+    }
   },
   "correctness": {
     "case_count": 14,
