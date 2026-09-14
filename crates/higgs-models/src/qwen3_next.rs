@@ -2192,9 +2192,26 @@ for (int i = 0; i < n_per_t; ++i) {
 }
 ";
 
+/// Add a compile-time temporal unroll hint for the benchmark-only tiled path.
+/// The loop body and pointer update remain identical, so recurrence order and
+/// final state semantics are unchanged.
+fn gated_delta_forward_source(temporal_tile: bool) -> String {
+    if !temporal_tile {
+        return GATED_DELTA_FORWARD_KERNEL_SOURCE.to_owned();
+    }
+    let marker = "for (int t = 0; t < T; ++t) {";
+    let replacement = "#pragma clang loop unroll_count(4)\nfor (int t = 0; t < T; ++t) {";
+    assert_eq!(
+        GATED_DELTA_FORWARD_KERNEL_SOURCE.matches(marker).count(),
+        1,
+        "GDN recurrence loop changed; refusing ambiguous tiled transform"
+    );
+    GATED_DELTA_FORWARD_KERNEL_SOURCE.replacen(marker, replacement, 1)
+}
+
 /// Create the `mlx_fast_metal_kernel` object from kernel source and names.
 #[allow(unsafe_code)]
-fn create_gated_delta_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+fn create_gated_delta_kernel_variant(temporal_tile: bool) -> mlx_sys::mlx_fast_metal_kernel {
     let input_names: [&std::ffi::CStr; 9] = [
         c"q",
         c"k",
@@ -2211,10 +2228,14 @@ fn create_gated_delta_kernel() -> mlx_sys::mlx_fast_metal_kernel {
     let input_ptrs: Vec<*const c_char> = input_names.iter().map(|s| s.as_ptr()).collect();
     let output_ptrs: Vec<*const c_char> = output_names.iter().map(|s| s.as_ptr()).collect();
 
-    let source = gdn_metal_source(
-        "#define HIGGS_GDN_RECORD_TAPE 0\n",
-        GATED_DELTA_FORWARD_KERNEL_SOURCE,
-    );
+    let defines = "#define HIGGS_GDN_RECORD_TAPE 0\n";
+    let body = gated_delta_forward_source(temporal_tile);
+    let source = gdn_metal_source(defines, &body);
+    let name = if temporal_tile {
+        c"gated_delta_step_t4"
+    } else {
+        c"gated_delta_step"
+    };
 
     unsafe {
         let in_vec =
@@ -2222,7 +2243,7 @@ fn create_gated_delta_kernel() -> mlx_sys::mlx_fast_metal_kernel {
         let out_vec =
             mlx_sys::mlx_vector_string_new_data(output_ptrs.as_ptr().cast_mut(), output_ptrs.len());
         let kernel = mlx_sys::mlx_fast_metal_kernel_new(
-            c"gated_delta_step".as_ptr(),
+            name.as_ptr(),
             in_vec,
             out_vec,
             source.as_ptr(),
@@ -2234,6 +2255,16 @@ fn create_gated_delta_kernel() -> mlx_sys::mlx_fast_metal_kernel {
         mlx_sys::mlx_vector_string_free(out_vec);
         kernel
     }
+}
+
+#[allow(unsafe_code)]
+fn create_gated_delta_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    create_gated_delta_kernel_variant(false)
+}
+
+#[allow(unsafe_code)]
+fn create_gated_delta_tiled_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    create_gated_delta_kernel_variant(true)
 }
 
 /// Configure template args, grid, threadgroup, and output shapes for the kernel.
@@ -2420,7 +2451,12 @@ fn gated_delta_kernel_ffi(
     let stream = Stream::task_local_or_default();
     let in_dtype = unsafe { mlx_sys::mlx_array_dtype(q.as_ptr()) };
 
-    let cached = GATED_DELTA_KERNEL.get_or_init(|| CachedMetalKernel(create_gated_delta_kernel()));
+    let cached = if gated_delta_temporal_tile_enabled() {
+        GATED_DELTA_TILED_KERNEL
+            .get_or_init(|| CachedMetalKernel(create_gated_delta_tiled_kernel()))
+    } else {
+        GATED_DELTA_KERNEL.get_or_init(|| CachedMetalKernel(create_gated_delta_kernel()))
+    };
     let (config, config_is_cached) = gated_delta_kernel_config(
         in_dtype,
         batch,
@@ -3393,6 +3429,7 @@ static QGEMV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static QGEMV_CONFIG_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
 static GATED_DELTA_CONFIG_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
 static GATED_DELTA_TAPE_CONFIG_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
+static GATED_DELTA_TILED_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 static CANONICAL_CONV_ENABLED: OnceLock<bool> = OnceLock::new();
 static DECODE_GEMV_ENABLED: OnceLock<bool> = OnceLock::new();
 static QGEMV_NSG_OVERRIDE: OnceLock<Option<i32>> = OnceLock::new();
@@ -3581,6 +3618,11 @@ fn gated_delta_config_cache_enabled() -> bool {
 fn gated_delta_tape_config_cache_enabled() -> bool {
     *GATED_DELTA_TAPE_CONFIG_CACHE_ENABLED
         .get_or_init(|| truthy_env_var("HIGGS_DFLASH_GDN_CONFIG_CACHE"))
+}
+
+fn gated_delta_temporal_tile_enabled() -> bool {
+    // Benchmark-only opt-in; production keeps the established kernel.
+    truthy_env_var("HIGGS_BENCH_GDN_TILED_T4")
 }
 
 fn qgemv_nsg_override() -> Option<i32> {
@@ -14552,6 +14594,20 @@ mod tests {
         new_state.eval().unwrap();
         assert_eq!(y.shape(), &[1, 1, 4, 32]);
         assert_eq!(new_state.shape(), &[1, 4, 32, 32]);
+    }
+
+    #[test]
+    fn test_gated_delta_tiled_source_is_opt_in_and_preserves_loop_body() {
+        let plain = gated_delta_forward_source(false);
+        let tiled = gated_delta_forward_source(true);
+        assert!(!plain.contains("unroll_count(4)"));
+        assert!(tiled.contains("#pragma clang loop unroll_count(4)"));
+        assert_eq!(
+            plain.replace("for (int t = 0; t < T; ++t) {", ""),
+            tiled
+                .replace("#pragma clang loop unroll_count(4)\n", "")
+                .replace("for (int t = 0; t < T; ++t) {", "")
+        );
     }
 
     #[test]

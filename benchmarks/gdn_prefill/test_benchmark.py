@@ -1,14 +1,34 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
-from benchmark import recurrence_reference, render_kernel, run_paired
+from benchmark import memory_preflight, recurrence_reference, render_kernel, run_paired
 
 
 class BenchmarkTests(unittest.TestCase):
     def test_launch_variant_rejects_unknown_threadgroup(self):
         with self.assertRaises(ValueError):
             render_kernel(3)
+
+    def test_memory_preflight_fails_closed_below_threshold(self):
+        result = type("Result", (), {"stdout": "System-wide memory free percentage: 12%\n"})()
+        with patch("benchmark.subprocess.run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "only 12% memory free"):
+                memory_preflight(30)
+
+    def test_temporal_tile_is_opt_in_source_transform(self):
+        plain = render_kernel(4)
+        tiled = render_kernel(4, temporal_tile=4)
+        self.assertNotIn("unroll_count(4)", plain)
+        self.assertIn("#pragma clang loop unroll_count(4)", tiled)
+        self.assertEqual(
+            plain.replace("// threadgroup_y=4 temporal_tile=0\n", "")
+            .replace("for (int t = 0; t < T; ++t) {", ""),
+            tiled.replace("// threadgroup_y=4 temporal_tile=4\n", "")
+            .replace("#pragma clang loop unroll_count(4)\n", "")
+            .replace("for (int t = 0; t < T; ++t) {", ""),
+        )
 
     def test_scalar_reference_returns_every_output_and_final_state(self):
         q = np.array([[[[1.0, 0.0]], [[0.0, 1.0]]]], dtype=np.float32)

@@ -13,10 +13,16 @@ The four variants change only threadgroup Y (`32x1`, `32x2`, `32x4`, `32x8`).
 They test launch grouping/occupancy without changing arithmetic. They are not a
 parallel scan or a prediction of its speedup.
 
+The temporal-tile candidate is opt-in. It adds a compiler unroll hint to the
+existing serial time loop while preserving the arithmetic and state layout.
+Set `HIGGS_BENCH_GDN_TILED_T4=1` only when exercising the Rust model path; the
+standalone probe reports plain and tiled variants together.
+
 ```bash
 python3 -m unittest discover -s benchmarks/gdn_prefill -p 'test_*.py'
 
-/opt/homebrew/bin/python3 \
+benchmarks/prefill_investigation/run_safe.sh \
+  /opt/homebrew/bin/python3 \
   benchmarks/gdn_prefill/benchmark.py --check
 ```
 
@@ -26,9 +32,11 @@ remains BF16 to reproduce the original kernel campaign.
 Corrected paired reruns (after obtaining the serialized hardware slot):
 
 ```bash
-/opt/homebrew/bin/python3 benchmarks/gdn_prefill/benchmark.py \
+benchmarks/prefill_investigation/run_safe.sh \
+  /opt/homebrew/bin/python3 benchmarks/gdn_prefill/benchmark.py \
   --dtype bfloat16 --lengths 1024 --check --repeats 9 --paired-repeats 15
-/opt/homebrew/bin/python3 benchmarks/gdn_prefill/benchmark.py \
+benchmarks/prefill_investigation/run_safe.sh \
+  /opt/homebrew/bin/python3 benchmarks/gdn_prefill/benchmark.py \
   --dtype float32 --lengths 1024 --check --repeats 9 --paired-repeats 15
 ```
 
@@ -42,7 +50,12 @@ NumPy sequential reference, including every output and final FP32 state.
 The recorded campaign provenance and raw-result caveats live in
 `target/prefill-investigation/gdn/PROVENANCE.md`. Flat `vm.swapusage` alone is
 not evidence of zero new swapouts; a promotion run must capture cumulative
-`vm_stat` swapout counters at both endpoints.
+`vm_stat` swapout counters at both endpoints. The `run_safe.sh` wrapper records
+those endpoints and refuses to start below 30% free memory or 700,000
+reclaimable VM pages (`HIGGS_BENCH_MIN_FREE_PCT` and
+`HIGGS_BENCH_MIN_RECLAIMABLE_PAGES` change the thresholds). The Python probe
+records the same preflight in its JSON output. Set
+`HIGGS_BENCH_ALLOW_LOW_MEMORY=1` only for an intentional, supervised override.
 
 Projection cost remains a separate measurement: reuse
 `benchmarks/ane_prefill/gpu_projection.py` for the QKVZ projection. This probe

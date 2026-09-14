@@ -7,6 +7,7 @@ import argparse
 import importlib.metadata
 import json
 import os
+import subprocess
 import time
 
 import numpy as np
@@ -15,6 +16,8 @@ DIMS = {"batch": 1, "hk": 16, "hv": 32, "dk": 128, "dv": 128}
 VARIANTS = (1, 2, 4, 8)
 LENGTHS = (128, 512, 1024)
 DEFAULT_CONFIG = "/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2/config.json"
+DEFAULT_MIN_FREE_PCT = 30
+DEFAULT_MIN_RECLAIMABLE_PAGES = 700_000
 
 # Verbatim arithmetic/body from crates/higgs-models/src/qwen3_next.rs at
 # 8c6b5f66ba985b0c823ccca82af6f32d73da5ea4 (GDN_RECURRENCE_METAL_PREAMBLE
@@ -91,10 +94,15 @@ for (int i = 0; i < n_per_t; ++i) {
 """
 
 
-def render_kernel(threadgroup_y: int) -> str:
+def render_kernel(threadgroup_y: int, temporal_tile: int = 0) -> str:
     if threadgroup_y not in VARIANTS:
         raise ValueError(f"threadgroup_y must be one of {VARIANTS}")
-    return f"// threadgroup_y={threadgroup_y}\n{KERNEL_SOURCE}"
+    if temporal_tile not in (0, 4):
+        raise ValueError("temporal_tile must be 0 or 4")
+    marker = "for (int t = 0; t < T; ++t) {"
+    pragma = "#pragma clang loop unroll_count(4)\n" if temporal_tile == 4 else ""
+    source = KERNEL_SOURCE.replace(marker, pragma + marker, 1)
+    return f"// threadgroup_y={threadgroup_y} temporal_tile={temporal_tile}\n{source}"
 
 
 def recurrence_reference(q, k, v, a, b, a_log, dt_bias, state):
@@ -137,7 +145,52 @@ def run_paired(kernels, launch_kwargs, candidate, repeats, evaluate, clock_ns=ti
     return rows
 
 
+def memory_preflight(min_free_pct=DEFAULT_MIN_FREE_PCT,
+                     min_reclaimable_pages=DEFAULT_MIN_RECLAIMABLE_PAGES):
+    """Refuse a run when macOS reports too little unified-memory headroom."""
+    try:
+        pressure = subprocess.run(
+            ["memory_pressure", "-Q"], capture_output=True, text=True, check=True
+        ).stdout
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("memory preflight unavailable; refusing to start benchmark") from exc
+    marker = "System-wide memory free percentage:"
+    line = next((line for line in pressure.splitlines() if marker in line), None)
+    if line is None:
+        raise RuntimeError(f"memory preflight returned no free-percentage line: {pressure!r}")
+    free_pct = int(line.split(":", 1)[1].strip().rstrip("%"))
+    if free_pct < min_free_pct and os.environ.get("HIGGS_BENCH_ALLOW_LOW_MEMORY") != "1":
+        raise RuntimeError(
+            f"refusing benchmark: only {free_pct}% memory free; need {min_free_pct}% "
+            "(set HIGGS_BENCH_ALLOW_LOW_MEMORY=1 only for an intentional override)"
+        )
+    vm_stat = subprocess.run(["vm_stat"], capture_output=True, text=True, check=True).stdout
+    page_values = {}
+    for line in vm_stat.splitlines():
+        if ":" not in line:
+            continue
+        label, value = line.split(":", 1)
+        try:
+            page_values[label] = int(value.strip().rstrip("."))
+        except ValueError:
+            pass
+    reclaimable_pages = sum(page_values.get(label, 0) for label in
+                            ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"))
+    if (reclaimable_pages < min_reclaimable_pages
+            and os.environ.get("HIGGS_BENCH_ALLOW_LOW_MEMORY") != "1"):
+        raise RuntimeError(
+            f"refusing benchmark: only {reclaimable_pages} reclaimable VM pages; "
+            f"need {min_reclaimable_pages}"
+        )
+    swap_line = next((line for line in vm_stat.splitlines() if line.startswith("Swapouts:")), "")
+    swapouts = int(swap_line.split(":", 1)[1].strip().rstrip(".")) if swap_line else None
+    return {"free_pct": free_pct, "vm_stat": vm_stat, "swapouts": swapouts,
+            "reclaimable_pages": reclaimable_pages,
+            "min_free_pct": min_free_pct, "min_reclaimable_pages": min_reclaimable_pages}
+
+
 def _run_gpu(args):
+    memory = memory_preflight(args.min_free_pct, args.min_reclaimable_pages)
     import mlx.core as mx
 
     to_numpy = lambda value: np.asarray(value.astype(mx.float32))
@@ -160,6 +213,7 @@ def _run_gpu(args):
     long_outputs = {}
     long_launch_kwargs = {}
     long_kernels = {}
+    long_tiled_kernels = {}
     kernels = {}
     scalar_checks = []
     for steps in args.lengths:
@@ -183,6 +237,12 @@ def _run_gpu(args):
                 ensure_row_contiguous=True,
             )
             kernels[tg_y] = kernel
+            tiled_kernel = mx.fast.metal_kernel(
+                name=f"higgs_gdn_prefill_t4_tg{tg_y}",
+                input_names=["q", "k", "v", "a_log", "a", "dt_bias", "b", "state_in", "T"],
+                output_names=["y", "state_out"], source=render_kernel(tg_y, temporal_tile=4),
+                ensure_row_contiguous=True,
+            )
             kwargs = dict(
                 inputs=inputs,
                 template=[("InT", q.dtype), ("Dk", d["dk"]), ("Dv", d["dv"]),
@@ -196,6 +256,7 @@ def _run_gpu(args):
             step_launch_kwargs[tg_y] = kwargs
             for _ in range(args.warmup):
                 mx.eval(*kernel(**kwargs))
+                mx.eval(*tiled_kernel(**kwargs))
             samples = []
             last = None
             for _ in range(args.repeats):
@@ -209,6 +270,7 @@ def _run_gpu(args):
                 long_outputs[tg_y] = last
                 long_launch_kwargs[tg_y] = kwargs
                 long_kernels[tg_y] = kernel
+                long_tiled_kernels[tg_y] = tiled_kernel
         # CPU oracle only on a small prefix; full T1024 NumPy oracle is intentionally optional.
         if args.check:
             check_t = min(steps, args.check_tokens)
@@ -240,17 +302,38 @@ def _run_gpu(args):
             "output_bitwise_equal_tg4": bool(np.array_equal(to_numpy(output[0]), to_numpy(baseline[0]))),
             "state_bitwise_equal_tg4": bool(np.array_equal(to_numpy(output[1]), to_numpy(baseline[1]))),
         }
+    tiled_outputs = {}
+    tiled_parity = {}
+    for tg_y, kwargs in long_launch_kwargs.items():
+        tiled_outputs[tg_y] = long_tiled_kernels[tg_y](**kwargs)
+        mx.eval(*tiled_outputs[tg_y])
+        tiled_parity[str(tg_y)] = {
+            "output_bitwise_equal_tg4": bool(np.array_equal(to_numpy(tiled_outputs[tg_y][0]), to_numpy(baseline[0]))),
+            "state_bitwise_equal_tg4": bool(np.array_equal(to_numpy(tiled_outputs[tg_y][1]), to_numpy(baseline[1]))),
+        }
     t1024 = [row for row in rows if row["T"] == 1024]
     candidate = min((row for row in t1024 if row["threadgroup_y"] != 4),
                     key=lambda row: row["median_ms"])["threadgroup_y"]
     paired = run_paired(long_kernels, long_launch_kwargs, candidate, args.paired_repeats,
                         lambda output: mx.eval(*output))
+    tiled_paired = run_paired(
+        {4: long_kernels[4], "tiled4": long_tiled_kernels[4]},
+        {4: long_launch_kwargs[4], "tiled4": long_launch_kwargs[4]},
+        "tiled4", args.paired_repeats, lambda output: mx.eval(*output))
+    tiled_tg1_paired = run_paired(
+        {4: long_kernels[4], "tiled1": long_tiled_kernels[1]},
+        {4: long_launch_kwargs[4], "tiled1": long_launch_kwargs[1]},
+        "tiled1", args.paired_repeats, lambda output: mx.eval(*output))
     print(json.dumps({"mlx_version": importlib.metadata.version("mlx"), "config": os.path.realpath(args.config),
                       "observed_geometry": observed, "dims": DIMS,
                       "input_dtype": args.dtype, "rows": rows,
                       "scalar_reference_checks": scalar_checks,
                       "t1024_bitwise_parity": parity,
-                      "paired_candidate": candidate, "paired_tg4_vs_candidate": paired}, indent=2))
+                      "t1024_tiled4_bitwise_parity": tiled_parity,
+                      "paired_candidate": candidate, "paired_tg4_vs_candidate": paired,
+                      "paired_tg4_vs_tiled4": tiled_paired,
+                      "paired_tg4_vs_tiled1": tiled_tg1_paired,
+                      "memory_preflight": memory}, indent=2))
 
 
 def main():
@@ -264,6 +347,8 @@ def main():
     p.add_argument("--config", default=DEFAULT_CONFIG)
     p.add_argument("--check", action="store_true")
     p.add_argument("--check-tokens", type=int, default=8)
+    p.add_argument("--min-free-pct", type=int, default=DEFAULT_MIN_FREE_PCT)
+    p.add_argument("--min-reclaimable-pages", type=int, default=DEFAULT_MIN_RECLAIMABLE_PAGES)
     _run_gpu(p.parse_args())
 
 
