@@ -56,3 +56,9 @@ operation order, and safe-loads query tails directly from device memory. Synthet
 checks also include Q65/K83 consecutive and sampled positions to cross both new
 query tile boundaries. Preparation and CPU tests pass; hardware status is recorded
 in the accompanying experiment report, not inferred from these static calculations.
+
+The follow-up Metal System Trace profile is documented in [PROFILE.md](PROFILE.md).
+It found compiler spill events for qreg64k16 and none for a matched dense128 control,
+while this machine exposed no occupancy or per-barrier counters. Compact exported
+tables are under `results/2026-09-14/`; the native trace bundle remains in the local
+temporary profiling directory because it is about 40 MB compressed.

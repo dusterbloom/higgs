@@ -1,0 +1,34 @@
+{
+  "host": "Apple M4 MacBook Pro, 34359738368 bytes RAM",
+  "xcode": "27.0 (27A5228h)",
+  "mlx": "0.30.6",
+  "workload": "FP32 D256 GQA Q=1024 K=16384",
+  "qreg_trace": {
+    "duration_seconds": 8.808147,
+    "process_exit": 0,
+    "shader": "custom_kernel_higgs_steel_qreg64k16",
+    "compiler_spill_event_count": 9,
+    "compiler_spilled_bytes_each": 1104,
+    "compiler_spilled_bytes_total": 9936,
+    "shader_timeline_interval_count": 149,
+    "top_level_intervals_over_100ms": [168.76, 247.68, 258.68, 265.64, 253.36],
+    "static_threadgroup_barrier_sites": 6,
+    "static_simdgroup_barrier_sites": 7
+  },
+  "dense_control_trace": {
+    "workload": "FP32 D256 dense128 tiled SDPA Q=1024 K=16384",
+    "duration_seconds": 1.728802,
+    "process_exit": 0,
+    "compiler_spill_event_count": 0
+  },
+  "counter_availability": {
+    "metal_gpu_counters_instrument": true,
+    "counter_profile": 3,
+    "populated_counter_metadata": ["RT Unit Active"],
+    "gpu_counter_profile_rows": 0,
+    "gpu_counter_interval_rows": 0,
+    "shader_profiler_samples": 0,
+    "occupancy_measured": false,
+    "per_barrier_timestamps_measured": false
+  }
+}

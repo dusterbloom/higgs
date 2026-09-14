@@ -5,6 +5,9 @@ numerical checks but all lost to their paired dense controls. The native dense
 tile sweep found a modest operator gain at the cost of larger temporary matrices.
 Serving code and defaults remain unchanged.
 
+The subsequent register, occupancy and barrier measurement is documented in
+[PROFILE.md](PROFILE.md).
+
 This continues the [prefill bottleneck investigation](../prefill_investigation/RESULTS.md)
 on an Apple M4 with 32 GiB memory. That investigation traced native Escha attention
 to FP32 Q/K/V with 16 query heads, two KV heads, and head dimension 256. The pinned
