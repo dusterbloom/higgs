@@ -96,3 +96,11 @@ For replay specifically, the fixed innovation tape reduces the update to
 serial replay within `9.3e-10` at L=1, 2, and 4. Its NumPy implementation is
 `8--11x` slower because it is not parallelized, but it preserves the exact
 replay algebra and is the candidate for the next guarded Metal scan prototype.
+
+The guarded Metal prototype is in `replay_scan_benchmark.py` and uses both a
+128x1 lane layout and the production-style packed 32x4 layout. The packed scan
+was `0.93x` serial at BF16 L=2 but `1.38x` at L=4; FP32 was `1.08x` and `1.00x`
+respectively. State error stayed below `3.8e-9`, and the input checkpoint was
+unchanged, but there is no consistent speed win. The isolated kernel has no
+LM-head logits, so accepted-token decisions are explicitly not measured here;
+the exact production tape path remains the fallback.
