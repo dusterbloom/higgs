@@ -2,7 +2,15 @@ import unittest
 
 import numpy as np
 
-from replayssm_probe import affine_chain, gates, low_rank_chain, serial_chain
+from replayssm_probe import (
+    affine_chain,
+    forward_with_tape,
+    gates,
+    low_rank_chain,
+    replay_scan,
+    replay_serial,
+    serial_chain,
+)
 
 
 class ReplaySsmProbeTests(unittest.TestCase):
@@ -31,6 +39,17 @@ class ReplaySsmProbeTests(unittest.TestCase):
         out, state = affine_chain(k, v, q, g, beta, np.zeros((4, 3, 4), np.float32))
         self.assertEqual(out.shape, (2, 4, 3))
         self.assertEqual(state.shape, (4, 3, 4))
+
+    def test_replay_scan_matches_serial_replay(self):
+        rng = np.random.default_rng(5)
+        k = rng.normal(size=(4, 2, 4)).astype(np.float32)
+        v = rng.normal(size=(4, 4, 3)).astype(np.float32)
+        g, beta = gates(np.zeros((4, 4), np.float32), np.zeros((4, 4), np.float32))
+        state = np.zeros((4, 3, 4), np.float32)
+        delta, _ = forward_with_tape(k, v, g, beta, state)
+        serial = replay_serial(k, delta, g, state)
+        scan = replay_scan(k, delta, g, state)
+        np.testing.assert_allclose(serial, scan, rtol=2e-5, atol=2e-5)
 
 
 if __name__ == "__main__":

@@ -90,3 +90,9 @@ this geometry it remains `4.1--5.8x` slower than serial for L=1, 2, and 4 in
 the CPU probe. It has the same float32 drift for L>1, so it is not an exact
 rollback replacement. A useful Metal implementation would need a genuinely
 parallel triangular solve and an explicit policy for near-tie token changes.
+
+For replay specifically, the fixed innovation tape reduces the update to
+`s_t = g_t s_{t-1} + k_t delta_t`. The probe's prefix-product scan reproduces
+serial replay within `9.3e-10` at L=1, 2, and 4. Its NumPy implementation is
+`8--11x` slower because it is not parallelized, but it preserves the exact
+replay algebra and is the candidate for the next guarded Metal scan prototype.

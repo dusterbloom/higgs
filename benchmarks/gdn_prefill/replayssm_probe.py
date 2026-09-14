@@ -34,6 +34,44 @@ def serial_chain(k, v, q, g, beta, state):
     return np.stack(outputs), state
 
 
+def forward_with_tape(k, v, g, beta, state):
+    """Produce the fixed innovations consumed by replay verification."""
+    state = np.array(state, dtype=np.float32, copy=True)
+    deltas = []
+    repeat = state.shape[0] // k.shape[1]
+    for t in range(k.shape[0]):
+        kt = np.repeat(k[t], repeat, axis=0)
+        delta = (v[t] - np.einsum("vd,vhd->vh", kt, state)) * beta[t, :, None]
+        state = state * g[t, :, None, None] + delta[:, :, None] * kt[:, None, :]
+        deltas.append(delta)
+    return np.stack(deltas), state
+
+
+def replay_serial(k, delta, g, state):
+    state = np.array(state, dtype=np.float32, copy=True)
+    repeat = state.shape[0] // k.shape[1]
+    for t in range(k.shape[0]):
+        kt = np.repeat(k[t], repeat, axis=0)
+        state = state * g[t, :, None, None] + delta[t, :, :, None] * kt[:, None, :]
+    return state
+
+
+def replay_scan(k, delta, g, state):
+    """Prefix-product scan for fixed-innovation replay.
+
+    For each head, p_t=prod(g[:t]); then s_t=p_t*(s0 + cumsum(k_t*delta_t/p_t)).
+    """
+    state = np.array(state, dtype=np.float32, copy=True)
+    hv, dv, _ = state.shape
+    repeat = hv // k.shape[1]
+    kh = np.repeat(k, repeat, axis=1)
+    prefix = np.cumprod(g, axis=0, dtype=np.float32)
+    injected = delta[:, :, :, None] * kh[:, :, None, :]
+    weighted = injected / prefix[:, :, None, None]
+    summed = np.cumsum(weighted, axis=0, dtype=np.float32)
+    return (prefix[:, :, None, None] * (state[None] + summed))[-1]
+
+
 def affine_chain(k, v, q, g, beta, state):
     """Compose exact token maps, retaining each prefix for output recovery."""
     d = k.shape[-1]
@@ -111,6 +149,9 @@ def main():
         state = np.zeros((hv, dv, dk), dtype=np.float32)
 
         serial_out, serial_state = serial_chain(k, v, q, g, beta, state)
+        delta, replay_state = forward_with_tape(k, v, g, beta, state)
+        replay_state_serial = replay_serial(k, delta, g, state)
+        replay_state_scan = replay_scan(k, delta, g, state)
         affine_out, affine_state = affine_chain(k, v, q, g, beta, state)
         lowrank_out, lowrank_state = low_rank_chain(k, v, q, g, beta, state)
         rows.append({
@@ -119,6 +160,9 @@ def main():
             "state_max_abs": float(np.max(np.abs(serial_state - affine_state))),
             "output_allclose": bool(np.allclose(serial_out, affine_out, rtol=2e-5, atol=2e-5)),
             "state_allclose": bool(np.allclose(serial_state, affine_state, rtol=2e-5, atol=2e-5)),
+            "replay_serial_state_max_abs": float(np.max(np.abs(replay_state - replay_state_serial))),
+            "replay_scan_state_max_abs": float(np.max(np.abs(replay_state - replay_state_scan))),
+            "replay_scan_state_allclose": bool(np.allclose(replay_state, replay_state_scan, rtol=2e-5, atol=2e-5)),
             "lowrank_output_max_abs": float(np.max(np.abs(serial_out - lowrank_out))),
             "lowrank_state_max_abs": float(np.max(np.abs(serial_state - lowrank_state))),
             "lowrank_output_allclose": bool(np.allclose(serial_out, lowrank_out, rtol=2e-5, atol=2e-5)),
@@ -128,6 +172,8 @@ def main():
         serial_times = []
         affine_times = []
         lowrank_times = []
+        replay_serial_times = []
+        replay_scan_times = []
         for _ in range(args.repeats):
             start = time.perf_counter_ns()
             serial_chain(k, v, q, g, beta, state)
@@ -138,12 +184,21 @@ def main():
             start = time.perf_counter_ns()
             low_rank_chain(k, v, q, g, beta, state)
             lowrank_times.append((time.perf_counter_ns() - start) / 1e6)
+            start = time.perf_counter_ns()
+            replay_serial(k, delta, g, state)
+            replay_serial_times.append((time.perf_counter_ns() - start) / 1e6)
+            start = time.perf_counter_ns()
+            replay_scan(k, delta, g, state)
+            replay_scan_times.append((time.perf_counter_ns() - start) / 1e6)
         rows[-1].update({
             "serial_median_ms": float(np.median(serial_times)),
             "affine_median_ms": float(np.median(affine_times)),
             "affine_over_serial": float(np.median(affine_times) / np.median(serial_times)),
             "lowrank_median_ms": float(np.median(lowrank_times)),
             "lowrank_over_serial": float(np.median(lowrank_times) / np.median(serial_times)),
+            "replay_serial_median_ms": float(np.median(replay_serial_times)),
+            "replay_scan_median_ms": float(np.median(replay_scan_times)),
+            "replay_scan_over_serial": float(np.median(replay_scan_times) / np.median(replay_serial_times)),
         })
     print(json.dumps({"geometry": {"Hk": hk, "Hv": hv, "Dk": dk, "Dv": dv}, "rows": rows}, indent=2))
 
