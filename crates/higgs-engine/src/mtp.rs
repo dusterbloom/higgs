@@ -836,7 +836,8 @@ fn mtp_cycle_inner(
 ) -> Result<(MtpCycleResult, Option<Vec<Array>>), EngineError> {
     let draft_limit = draft_n_max.max(1);
     let base_cache = capture_backbone_checkpoint(cache);
-    let base_mtp_cache = deep_clone_mtp_cache(mtp_cache);
+    let mirror_verify = mtp_mirror_verify_enabled();
+    let base_mtp_cache = mirror_verify.then(|| deep_clone_mtp_cache(mtp_cache));
     let mut speculative_mtp_cache = deep_clone_mtp_cache(mtp_cache);
     let mut confirmed_mtp_cache: Option<MtpCache> = None;
     let mut speculative_hidden = hidden.clone();
@@ -948,11 +949,13 @@ fn mtp_cycle_inner(
     };
 
     let h_last = hidden_row(&accepted_hidden_rows, accepted_drafts)?;
-    if mtp_mirror_verify_enabled() {
+    if mirror_verify {
         mirror_verified_mtp_cache(
             model,
             mtp_cache,
-            base_mtp_cache,
+            base_mtp_cache.ok_or_else(|| {
+                EngineError::Generation("MTP mirror verification checkpoint missing".to_owned())
+            })?,
             hidden,
             &verify_hidden_for_mtp,
             &verify_tokens,
