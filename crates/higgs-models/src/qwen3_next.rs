@@ -10373,6 +10373,29 @@ impl Qwen3NextCausalLM {
         max_layers: Option<usize>,
         row_schedule: DFlashRowSchedule,
     ) -> Result<(Array, Vec<Array>, Vec<Option<GdnLayerTape>>), Exception> {
+        let (_hidden, logits, taps, layer_tapes) = self
+            .forward_with_hidden_taps_tape_scheduled(
+                inputs,
+                _mask,
+                kv_cache,
+                tap_layers,
+                max_layers,
+                row_schedule,
+            )?;
+        Ok((logits, taps, layer_tapes))
+    }
+
+    /// Tape-recording verify with the final hidden rows included.
+    #[allow(non_snake_case)]
+    pub fn forward_with_hidden_taps_tape_scheduled(
+        &mut self,
+        inputs: &Array,
+        _mask: Option<&Array>,
+        kv_cache: &mut Vec<Option<LayerCache>>,
+        tap_layers: &[usize],
+        max_layers: Option<usize>,
+        row_schedule: DFlashRowSchedule,
+    ) -> Result<(Array, Array, Vec<Array>, Vec<Option<GdnLayerTape>>), Exception> {
         if max_layers.is_some() {
             return Err(Exception::custom(
                 "partial-layer tape verification is disabled: the transaction cannot represent skipped layers",
@@ -10656,7 +10679,7 @@ impl Qwen3NextCausalLM {
             }
         }
 
-        Ok((logits, taps, layer_tapes))
+        Ok((h, logits, taps, layer_tapes))
     }
 
     /// Replay accepted steps from recorded tape data on partial rejection.
@@ -18352,6 +18375,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn hidden_tape_verify_seam_matches_existing_tape_outputs() {
+        let mut hidden_model = deterministic_hybrid_q1_model();
+        let mut regular_model = hidden_model.clone();
+        let tokens = Array::from_slice(&[5_u32, 9, 13], &[1, 3]);
+        let tap_layers = [0_usize, 1_usize];
+        let mut hidden_cache = hidden_model.make_cache();
+        let mut regular_cache = regular_model.make_cache();
+
+        let (hidden, hidden_logits, hidden_taps, _) = hidden_model
+            .forward_with_hidden_taps_tape_scheduled(
+                &tokens,
+                None,
+                &mut hidden_cache,
+                &tap_layers,
+                None,
+                DFlashRowSchedule::CanonicalS1,
+            )
+            .unwrap();
+        let (regular_logits, regular_taps, _) = regular_model
+            .forward_with_taps_tape_scheduled(
+                &tokens,
+                None,
+                &mut regular_cache,
+                &tap_layers,
+                None,
+                DFlashRowSchedule::CanonicalS1,
+            )
+            .unwrap();
+        mlx_rs::transforms::eval(
+            std::iter::once(&hidden)
+                .chain(std::iter::once(&hidden_logits))
+                .chain(hidden_taps.iter())
+                .chain(std::iter::once(&regular_logits))
+                .chain(regular_taps.iter()),
+        )
+        .unwrap();
+        assert_canonical_array_exact("hidden-tape logits", &hidden_logits, &regular_logits);
+        assert_eq!(hidden_taps.len(), regular_taps.len());
+        for (index, (actual, expected)) in hidden_taps.iter().zip(&regular_taps).enumerate() {
+            assert_canonical_array_exact(&format!("hidden-tape tap {index}"), actual, expected);
+        }
+        assert_eq!(hidden.shape(), &[1, 3, hidden_model.args.hidden_size]);
     }
 
     fn canonical_conv_bf16_pattern(shape: &[i32], salt: i32, modulus: i32, divisor: f32) -> Array {

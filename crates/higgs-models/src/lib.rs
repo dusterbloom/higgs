@@ -850,6 +850,14 @@ fn make_turboquant_kv_cache(
 /// Output of [`AnyModel::forward_with_taps_tape`]: logits, tap hiddens, per-layer GDN tape.
 pub type TapsTapeOutput = (Array, Vec<Array>, Vec<Option<qwen3_next::GdnLayerTape>>);
 
+/// Tape verify output including the final backbone hidden rows.
+pub type HiddenTapsTapeOutput = (
+    Array,
+    Array,
+    Vec<Array>,
+    Vec<Option<qwen3_next::GdnLayerTape>>,
+);
+
 impl AnyModel {
     pub fn forward(
         &mut self,
@@ -1753,6 +1761,34 @@ impl AnyModel {
             ),
             _ => Err(Exception::custom(
                 "forward_with_taps_tape_scheduled requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Tape-recording verify that also returns final hidden rows for a generic
+    /// MTP transaction. Unsupported model/cache pairs fail closed.
+    pub fn forward_with_hidden_taps_tape_scheduled(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+        max_layers: Option<usize>,
+        row_schedule: qwen3_next::DFlashRowSchedule,
+    ) -> Result<HiddenTapsTapeOutput, Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_hidden_taps_tape_scheduled(
+                    inputs,
+                    mask,
+                    c,
+                    tap_layers,
+                    max_layers,
+                    row_schedule,
+                )
+            }
+            _ => Err(Exception::custom(
+                "forward_with_hidden_taps_tape requires Qwen3Next + Hybrid cache",
             )),
         }
     }

@@ -291,6 +291,10 @@ fn mtp_mirror_verify_enabled() -> bool {
     parse_enabled_flag(std::env::var("HIGGS_MTP_MIRROR_VERIFY").ok().as_deref()).unwrap_or(false)
 }
 
+fn mtp_tape_verify_enabled() -> bool {
+    parse_enabled_flag(std::env::var("HIGGS_MTP_TAPE_VERIFY").ok().as_deref()).unwrap_or(false)
+}
+
 fn accepted_draft_prefix_len(drafts: &[u32], verifier_targets: &[u32]) -> usize {
     drafts
         .iter()
@@ -882,14 +886,31 @@ fn mtp_cycle_inner(
         v.push(confirmed_token_id);
         v
     });
-    let (verify_hidden, verifier_targets, verify_taps) = backbone_verify_batch_tapped(
-        model,
-        cache,
-        &verify_tokens,
-        tap_layers,
-        sampling,
-        chain_history.as_deref(),
-    )?;
+    let (verify_hidden, verifier_targets, verify_taps, verify_layer_tapes) =
+        if mtp_tape_verify_enabled() {
+            let (hidden, logits, taps, tapes) = model
+                .forward_with_hidden_taps_tape_scheduled(
+                    &token_input(&verify_tokens)?,
+                    None,
+                    cache,
+                    tap_layers.unwrap_or(&[]),
+                    None,
+                    higgs_models::qwen3_next::DFlashRowSchedule::NativeBatch,
+                )
+                .map_err(EngineError::Mlx)?;
+            let targets = verify_targets(&logits, sampling, chain_history.as_deref())?;
+            (hidden, targets, tap_layers.map(|_| taps), Some(tapes))
+        } else {
+            let (hidden, targets, taps) = backbone_verify_batch_tapped(
+                model,
+                cache,
+                &verify_tokens,
+                tap_layers,
+                sampling,
+                chain_history.as_deref(),
+            )?;
+            (hidden, targets, taps, None)
+        };
     let verify_hidden_for_mtp = verify_hidden.clone();
     if verifier_targets.len() < verify_tokens.len() {
         return Err(EngineError::Generation(format!(
@@ -935,24 +956,50 @@ fn mtp_cycle_inner(
         // Taps cover the verify batch == the emitted tokens on full accept.
         (verify_hidden, next, verify_taps)
     } else {
-        rollback_backbone(cache, base_cache, verify_tokens.len())?;
-        let (replay_hidden, replay_targets, replay_taps) = backbone_verify_batch_tapped(
-            model,
-            cache,
-            &tokens,
-            tap_layers,
-            sampling,
-            chain_history.as_deref(),
-        )?;
-        let next = *replay_targets.get(accepted_drafts).ok_or_else(|| {
-            EngineError::Generation(format!(
-                "MTP replay returned {} target ids for accepted index {}",
-                replay_targets.len(),
-                accepted_drafts
-            ))
-        })?;
-        // The replay batch is exactly the emitted tokens, so its taps align 1:1.
-        (replay_hidden, next, replay_taps)
+        if let Some(layer_tapes) = verify_layer_tapes.as_ref() {
+            let accepted_len = i32::try_from(tokens.len())
+                .map_err(|_| EngineError::Generation("MTP accepted span too large".to_owned()))?;
+            let rollback_len = i32::try_from(verify_tokens.len().saturating_sub(tokens.len()))
+                .map_err(|_| EngineError::Generation("MTP rollback span too large".to_owned()))?;
+            model
+                .replay_tape_rollback(layer_tapes, cache, accepted_len, rollback_len)
+                .map_err(EngineError::Mlx)?;
+            let replay_hidden = hidden_rows(&verify_hidden, 0, tokens.len())?;
+            let replay_taps = verify_taps
+                .map(|taps| {
+                    taps.into_iter()
+                        .map(|tap| hidden_rows(&tap, 0, tokens.len()))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?;
+            let next = *verifier_targets.get(accepted_drafts).ok_or_else(|| {
+                EngineError::Generation(format!(
+                    "MTP tape replay returned {} target ids for accepted index {}",
+                    verifier_targets.len(),
+                    accepted_drafts
+                ))
+            })?;
+            (replay_hidden, next, replay_taps)
+        } else {
+            rollback_backbone(cache, base_cache, verify_tokens.len())?;
+            let (replay_hidden, replay_targets, replay_taps) = backbone_verify_batch_tapped(
+                model,
+                cache,
+                &tokens,
+                tap_layers,
+                sampling,
+                chain_history.as_deref(),
+            )?;
+            let next = *replay_targets.get(accepted_drafts).ok_or_else(|| {
+                EngineError::Generation(format!(
+                    "MTP replay returned {} target ids for accepted index {}",
+                    replay_targets.len(),
+                    accepted_drafts
+                ))
+            })?;
+            // The replay batch is exactly the emitted tokens, so its taps align 1:1.
+            (replay_hidden, next, replay_taps)
+        }
     };
 
     let h_last = hidden_row(&accepted_hidden_rows, accepted_drafts)?;

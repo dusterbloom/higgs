@@ -134,8 +134,18 @@ layers, BF16 KV, FP32 SSM), the guarded synthetic benchmark measured:
   `34.5 ms` versus `18.7 ms`.
 
 The checkpoint path is covered by an exact restore test and is now used by the
-MTP rollback helpers. These numbers are cache-transaction measurements, not
-whole-model decode speedups.
+generic MTP and prompt-lookup rollback helpers. It is separate from the
+DFlash `replay_tape_rollback` path, which already restores GDN state from its
+per-layer transaction tape. These numbers are cache-transaction measurements,
+not whole-model decode speedups.
+
+Generic MTP also has a guarded `HIGGS_MTP_TAPE_VERIFY=1` seam that returns the
+first verify's hidden rows, logits, taps, and GDN transaction data together.
+On partial rejection it repairs the Hybrid cache from that transaction and
+slices the already-computed outputs instead of launching a second backbone
+verify; unset the flag to retain the original full-reverify fallback. The seam
+is covered by a deterministic Qwen3Next model-level parity test. A real MTP
+cycle comparison still needs a loader-supported MTP fixture.
 
 A recorded decay/gate tape was also prototyped in the standalone packed replay
 kernel. Loading one precomputed gate per threadgroup was `0.826x` the shared
