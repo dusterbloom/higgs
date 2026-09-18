@@ -1036,12 +1036,15 @@ fn check_hadamard_manifest(model_dir: &std::path::Path, label: &str, result: &mu
     let schema_version = config
         .get("schema_version")
         .and_then(serde_json::Value::as_i64);
-    if schema_version != Some(1) {
+    // Pack config schema 1 = original preview, 2 = re-release (adds
+    // vision/components metadata; text path unaffected). The Hadamard
+    // manifest contract is versioned separately in hadamard.json (v1 in both).
+    if !matches!(schema_version, Some(1) | Some(2)) {
         fail(
             &format!(
                 "model {label} has a `modules` Hadamard-rotation manifest but schema_version is \
-                 {schema_version:?} (expected 1); refusing to guess at an unrecognized rotation \
-                 contract"
+                 {schema_version:?} (expected 1 or 2); refusing to guess at an unrecognized \
+                 rotation contract"
             ),
             result,
         );
@@ -1075,6 +1078,14 @@ fn check_hadamard_manifest(model_dir: &std::path::Path, label: &str, result: &mu
         HashMap::new()
     };
 
+    // Manifest paths are relative to the model trunk; the checkpoint stores
+    // them under the `language_model.` prefix. Accept both forms.
+    let lookup = |path: &str| -> Option<&Vec<i64>> {
+        tensor_shapes
+            .get(&format!("language_model.{path}"))
+            .or_else(|| tensor_shapes.get(path))
+    };
+
     let mut rotated_modules = 0usize;
     let mut ok = true;
     for module in modules {
@@ -1104,7 +1115,7 @@ fn check_hadamard_manifest(model_dir: &std::path::Path, label: &str, result: &mu
             ok = false;
             continue;
         }
-        let Some(weight_shape) = tensor_shapes.get(&format!("{path}.weight")) else {
+        let Some(weight_shape) = lookup(&format!("{path}.weight")) else {
             fail(
                 &format!(
                     "model {label}: {path} is in the Hadamard manifest but has no `.weight` \
@@ -1130,7 +1141,7 @@ fn check_hadamard_manifest(model_dir: &std::path::Path, label: &str, result: &mu
             ok = false;
             continue;
         };
-        let Some(signs_shape) = tensor_shapes.get(&format!("{path}.signs")) else {
+        let Some(signs_shape) = lookup(&format!("{path}.signs")) else {
             fail(
                 &format!(
                     "model {label}: {path} declares Hadamard block={block} but has no `.signs` \
@@ -2579,12 +2590,24 @@ mod tests {
     fn test_hadamard_manifest_bad_schema_version_fails() {
         let dir = write_model_dir(&[(
             "config.json",
-            r#"{"schema_version":2,"model_type":"prism_hadamard_qwen35",
+            r#"{"schema_version":3,"model_type":"prism_hadamard_qwen35",
                 "modules":[{"path":"model.layers.0.mlp.down_proj","block":512,"embedding":false}]}"#,
         )]);
         let mut result = empty_result();
         check_hadamard_manifest(dir.path(), "test", &mut result);
         assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn test_hadamard_manifest_schema_version_2_is_accepted() {
+        let dir = write_model_dir(&[(
+            "config.json",
+            r#"{"schema_version":2,"model_type":"prism_hadamard_qwen35",
+                "modules":[{"path":"model.layers.0.mlp.down_proj","block":0,"embedding":false}]}"#,
+        )]);
+        let mut result = empty_result();
+        check_hadamard_manifest(dir.path(), "test", &mut result);
+        assert_eq!(result.failures, 0);
     }
 
     /// A module listed with `block: 0` is declared but not rotated (today's
