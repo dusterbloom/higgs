@@ -12,6 +12,7 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 | Qwen3 | `qwen3` | Qwen3 |
 | Qwen3.5 (dense) | `qwen3_5` | Qwen3.5 dense MLX checkpoints |
 | Qwen3.5 / Qwen3.6 MoE | `qwen3_5_moe` | Qwen3.5-35B-A3B, Qwen3.6-35B-A3B |
+| Bonsai-2 Hadamard Q2 | `prism_hadamard_qwen35` | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` |
 | Qwen3-Next | `qwen3_next` | Qwen3-Coder hybrid checkpoints |
 | Qwen3-MoE | `qwen3_moe` | Qwen3-30B-A3B |
 | Nanbeige | `nanbeige` | Nanbeige4.2 |
@@ -30,6 +31,7 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 | Qwen3 | `qwen3` | Qwen3 | none |
 | Qwen3.5+ (dense) | `qwen3_5`, `qwen3_5_text` | Qwen3.5 dense checkpoints; Qwen3.8-27B | none |
 | Qwen3.5+ (MoE) | `qwen3_5_moe`, `qwen3_5_text_moe` | Qwen3.5-35B-A3B, Qwen3.6-35B-A3B | none |
+| Bonsai-2 Hadamard Q2 | `prism_hadamard_qwen35` | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` | none‡ |
 | Qwen3-Next | `qwen3_next` | Qwen3-Coder hybrid checkpoints | none |
 | Qwen3-MoE | `qwen3_moe` | Qwen3-30B-A3B | none |
 | Qwen-VL | `qwen3_5_vl`, `qwen3_vl`, `qwen2_5_vl` | Qwen2.5-VL / Qwen3-VL / Qwen3.5-VL | supported |
@@ -46,6 +48,11 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 `vision: tower-ignored` even though the runtime loads the tower and runs
 pan-and-scan image input; `gemma3_text` / `gemma4_text` checkpoints show
 `vision: none`.
+
+‡ The upstream `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` pack's `text_config`
+describes a text-only backbone; the vision tower bundled with the base
+Qwen3.8-27B model is not part of this Q2 pack, so there is nothing for Higgs
+to skip. See [Bonsai-2 Hadamard Q2 notes](#bonsai-2-hadamard-q2-notes) below.
 
 ### Gemma 3 / Gemma 4 notes
 
@@ -148,6 +155,39 @@ Nanbeige uses repeated shared-weight decoder loops with loop-aware KV cache slot
 - `mlx-community/Qwen3.8-27B-4bit` (27B dense, 4-bit) is verified working through its top-level `qwen3_5` wrapper and nested `qwen3_5_text` config.
 - The cached-model smoke matrix covered `mlx-community/Qwen3.6-35B-A3B-4bit` plus `mlx-community/Llama-3.2-1B-Instruct-4bit`, `mlx-community/Qwen2.5-3B-Instruct-4bit`, `mlx-community/Qwen3-1.7B-4bit`, and `mlx-community/Qwen3-Coder-Next-4bit`.
 - OpenAI-style chat requests use non-thinking mode by default for `Qwen3.6` unless the request explicitly opts into reasoning.
+
+## Bonsai-2 Hadamard Q2 notes
+
+`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` (`model_type: "prism_hadamard_qwen35"`)
+is a Qwen3.8-27B-based checkpoint from the same family as the
+[Bonsai-27B / dSpark](BONSAI_Q1.md) releases, quantized to the same packed
+affine 2-bit layout `bonsai_q2.rs` already handles — plus a per-tensor Fast
+Walsh-Hadamard rotation on a subset of Linear/Embedding modules, applied to
+activations immediately before (Linear) or after (Embedding, inverse
+direction) the quantized matmul. The rotated modules, their block size
+(512/1024/2048/4096), and a `±1` sign vector per tensor (`<path>.signs`) are
+declared in the pack's top-level `modules` manifest, alongside a normal
+`qwen3_5`-shaped `text_config` — Higgs resolves it through the same
+`text_config`-wrapper path described above, folding `modules` into the
+per-tensor `QuantSpec.hadamard_block` resolution that already carries
+`quant_overrides`. The rotation itself reuses MLX's native
+`hadamard_transform` op, matching the checkpoint's own reference Python
+loader bit-for-bit in normalization convention.
+
+The checkpoint's own model card is explicit that an ordinary affine loader
+"skips the activation transform... returns wrong output rather than an
+error" — a truncated or hand-edited pack that is missing a `.signs` tensor
+would otherwise load "successfully" and decode silently wrong text. `higgs
+doctor` verifies the manifest (schema version, valid block sizes, and that
+every rotated module's `.signs` tensor is present with the shape its
+`.weight` tensor implies) from the safetensors header alone, before the
+server starts.
+
+This adapter is covered by unit and property tests (config resolution,
+manifest validation, and a numerical round-trip proving the rotation is
+self-inverse) but has not yet been run end-to-end against the real
+downloaded checkpoint — that verification, including a parity check against
+the pack's bundled Python loader, is still open.
 
 ## EschaLabs `eschamoe` Checkpoints
 

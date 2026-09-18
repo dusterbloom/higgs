@@ -4555,7 +4555,9 @@ impl SimpleEngine {
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return false,
         };
-        lock_or_recover(&self.retained).remove(&session_id).is_some()
+        lock_or_recover(&self.retained)
+            .remove(&session_id)
+            .is_some()
     }
 
     /// Evict retained caches idle longer than `ttl`; returns how many were
@@ -16783,14 +16785,22 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let worker_engine = std::sync::Arc::clone(&engine);
         let worker = std::thread::spawn(move || {
-            tx.send(worker_engine.try_drop_retained_session(SESSION_ID)).unwrap();
+            tx.send(worker_engine.try_drop_retained_session(SESSION_ID))
+                .unwrap();
         });
         let busy = rx.recv_timeout(std::time::Duration::from_millis(250));
         // Release even on regression so the worker can finish before the assertion.
         drop(guard);
         worker.join().unwrap();
-        assert_eq!(busy, Ok(false), "eager release must return while generation owns the lock");
-        assert_eq!(engine.retained_session_tokens(SESSION_ID), Some(vec![9, 10, 11]));
+        assert_eq!(
+            busy,
+            Ok(false),
+            "eager release must return while generation owns the lock"
+        );
+        assert_eq!(
+            engine.retained_session_tokens(SESSION_ID),
+            Some(vec![9, 10, 11])
+        );
         assert!(engine.try_drop_retained_session(SESSION_ID));
         assert_eq!(engine.retained_session_tokens(SESSION_ID), None);
     }

@@ -2037,7 +2037,7 @@ mod tests {
         .unwrap();
         assert_eq!(facts.model_fingerprint, "sha256:exact");
         assert_eq!(facts.architectural_max_tokens, 8192);
-        assert_eq!(facts.configured_total_token_ceiling, Some(32_768));
+        assert_eq!(facts.configured_total_token_ceiling, Some(65_536));
         assert_eq!(facts.prefix_cache_bytes_ceiling, 1_073_741_824);
         assert_eq!(facts.retained_bytes_ceiling, 2_147_483_648);
     }

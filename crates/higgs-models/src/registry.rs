@@ -36,6 +36,7 @@ pub fn is_supported(model_type: &str) -> bool {
             | "qwen3_moe"
             | "qwen3_5"
             | "qwen3_5_moe"
+            | "prism_hadamard_qwen35"
             | "qwen3_5_vl"
             | "qwen3_vl"
             | "qwen2_5_vl"
@@ -184,6 +185,20 @@ mod tests {
     #[test]
     fn test_is_supported_qwen3_5_moe() {
         assert!(is_supported("qwen3_5_moe"));
+    }
+
+    #[test]
+    fn test_is_supported_prism_hadamard_qwen35() {
+        assert!(is_supported("prism_hadamard_qwen35"));
+    }
+
+    #[test]
+    fn test_detect_model_type_prism_hadamard_qwen35() {
+        let dir = write_model_type_config("prism_hadamard_qwen35");
+        assert_eq!(
+            detect_model_type(dir.path()).unwrap(),
+            "prism_hadamard_qwen35"
+        );
     }
 
     #[test]

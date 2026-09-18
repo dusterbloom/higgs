@@ -67,6 +67,16 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::Qwen3Next(model))
         }
+        // `prism-ml`'s Bonsai-2 Hadamard-rotated Q2 packs: a `text_config`-wrapped
+        // qwen3_5-shaped checkpoint (own top-level `model_type`, handled like the
+        // `qwen3_5` VLM wrapper) plus a `modules` manifest that `load_qwen3_5_model`
+        // already folds into per-path `QuantSpec.hadamard_block` overrides — no
+        // separate loader needed.
+        "prism_hadamard_qwen35" => {
+            let model = higgs_models::qwen3_next::load_qwen3_5_model(&config.model_dir)
+                .map_err(EngineError::Model)?;
+            Ok(AnyModel::Qwen3Next(model))
+        }
         "qwen3_moe" => {
             let model = higgs_models::qwen3_moe::load_qwen3_moe_model(&config.model_dir)
                 .map_err(EngineError::Model)?;

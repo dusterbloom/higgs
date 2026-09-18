@@ -644,7 +644,7 @@ impl CapacityRegistry {
 fn fixed_total(facts: &ModelCapacityFacts) -> u64 {
     facts
         .configured_total_token_ceiling
-        .unwrap_or(32768)
+        .unwrap_or(u64::from(crate::config::default_max_context_tokens()))
         .min(facts.architectural_max_tokens)
 }
 fn cache_bounds(facts: &ModelCapacityFacts) -> (u64, u64) {

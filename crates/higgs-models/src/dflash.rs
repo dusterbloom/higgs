@@ -123,6 +123,7 @@ impl DFlashConfig {
                 group_size: 0,
                 bits: 0,
                 mode: crate::quant_mode::QuantMode::Dense,
+                hadamard_block: 0,
             },
         }
     }

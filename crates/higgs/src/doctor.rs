@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::time::Instant;
 
 use crate::config::HiggsConfig;
@@ -734,6 +735,7 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                     result,
                 );
                 check_eschamoe_checkpoint(&resolved, &label, result);
+                check_hadamard_manifest(&resolved, &label, result);
             }
             Err(err) => fail(&format!("model {label} not found: {err}"), result),
         }
@@ -1004,6 +1006,202 @@ fn total_system_ram_bytes() -> Option<u64> {
 #[cfg(not(target_os = "macos"))]
 const fn total_system_ram_bytes() -> Option<u64> {
     None
+}
+
+// -- Hadamard-rotation manifest checks (prism_hadamard_qwen35 packs) --
+
+/// Check a `prism_hadamard_qwen35` pack's `modules` manifest before the
+/// server starts.
+///
+/// The manifest names Linear/Embedding tensors that carry a Fast
+/// Walsh-Hadamard rotation (see `higgs_models::qwen3_next::hadamard_rotate`)
+/// around their otherwise-ordinary affine Q2 matmul, driven by a per-tensor
+/// `<path>.signs` array in the checkpoint. The checkpoint's own reference
+/// loader is explicit that skipping this transform "returns wrong output
+/// rather than an error" — a truncated or hand-edited checkpoint that is
+/// missing a `.signs` tensor would otherwise load "successfully" and decode
+/// silently wrong text. This check reads only the safetensors header (tensor
+/// names/shapes, no weight data) so it stays cheap even for a multi-GB pack.
+fn check_hadamard_manifest(model_dir: &std::path::Path, label: &str, result: &mut DoctorResult) {
+    let Ok(config_text) = std::fs::read_to_string(model_dir.join("config.json")) else {
+        return; // model resolution already failed/warned above
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_text) else {
+        return;
+    };
+    let Some(modules) = config.get("modules").and_then(serde_json::Value::as_array) else {
+        return; // not a Hadamard-manifest pack
+    };
+
+    let schema_version = config
+        .get("schema_version")
+        .and_then(serde_json::Value::as_i64);
+    if schema_version != Some(1) {
+        fail(
+            &format!(
+                "model {label} has a `modules` Hadamard-rotation manifest but schema_version is \
+                 {schema_version:?} (expected 1); refusing to guess at an unrecognized rotation \
+                 contract"
+            ),
+            result,
+        );
+        return;
+    }
+
+    // Nothing to verify against the checkpoint if every listed module has
+    // `block == 0` (declared but not rotated) — skip the (possibly
+    // multi-shard) header read entirely in that case.
+    let any_rotated = modules.iter().any(|module| {
+        module
+            .get("block")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|block| block != 0)
+    });
+    let tensor_shapes = if any_rotated {
+        match read_safetensors_header_shapes(model_dir) {
+            Ok(shapes) => shapes,
+            Err(err) => {
+                fail(
+                    &format!(
+                        "model {label}: could not read the safetensors header to verify the \
+                         Hadamard manifest: {err}"
+                    ),
+                    result,
+                );
+                return;
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+
+    let mut rotated_modules = 0usize;
+    let mut ok = true;
+    for module in modules {
+        let Some(path) = module.get("path").and_then(serde_json::Value::as_str) else {
+            fail(
+                &format!("model {label}: a `modules` manifest entry is missing `path`"),
+                result,
+            );
+            ok = false;
+            continue;
+        };
+        let block = module
+            .get("block")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        if block == 0 {
+            continue; // listed but not rotated — nothing to verify
+        }
+        if !matches!(block, 512 | 1024 | 2048 | 4096) {
+            fail(
+                &format!(
+                    "model {label}: {path} declares Hadamard block={block}, not one of \
+                     512/1024/2048/4096"
+                ),
+                result,
+            );
+            ok = false;
+            continue;
+        }
+        let Some(weight_shape) = tensor_shapes.get(&format!("{path}.weight")) else {
+            fail(
+                &format!(
+                    "model {label}: {path} is in the Hadamard manifest but has no `.weight` \
+                     tensor in the checkpoint"
+                ),
+                result,
+            );
+            ok = false;
+            continue;
+        };
+        // Packed 2-bit affine layout (matches `bonsai_q2.rs`): `weight` is
+        // `[rows, in_features/16]` for both a Linear (`rows` = out_features)
+        // and an Embedding (`rows` = vocab_size) — the rotated axis is
+        // always the packed one.
+        let Some(in_features) = weight_shape.get(1).map(|packed| packed * 16) else {
+            fail(
+                &format!(
+                    "model {label}: {path}.weight has shape {weight_shape:?}, expected 2 \
+                     dimensions ([rows, in_features/16])"
+                ),
+                result,
+            );
+            ok = false;
+            continue;
+        };
+        let Some(signs_shape) = tensor_shapes.get(&format!("{path}.signs")) else {
+            fail(
+                &format!(
+                    "model {label}: {path} declares Hadamard block={block} but has no `.signs` \
+                     tensor — the checkpoint is incomplete; loading it would silently skip the \
+                     rotation and decode wrong text"
+                ),
+                result,
+            );
+            ok = false;
+            continue;
+        };
+        if signs_shape.as_slice() != [in_features] {
+            fail(
+                &format!(
+                    "model {label}: {path}.signs has shape {signs_shape:?}, expected \
+                     [{in_features}] to match {path}.weight's packed in_features"
+                ),
+                result,
+            );
+            ok = false;
+            continue;
+        }
+        rotated_modules += 1;
+    }
+
+    if ok {
+        pass(
+            &format!(
+                "model {label} is a prism_hadamard_qwen35 pack; Hadamard manifest verified \
+                 ({rotated_modules} rotated module(s), every `.signs` tensor present with the \
+                 expected shape)"
+            ),
+            result,
+        );
+    }
+}
+
+/// Read every safetensors shard/sidecar's header (tensor name -> shape),
+/// without loading any tensor data. Manual minimal parse of the safetensors
+/// format (an 8-byte little-endian header length, then that many bytes of
+/// JSON) rather than `safetensors::SafeTensors::read_metadata`, which
+/// additionally validates that the buffer's length matches the full file
+/// size — exactly the multi-GB read this check exists to avoid.
+fn read_safetensors_header_shapes(
+    model_dir: &std::path::Path,
+) -> Result<HashMap<String, Vec<i64>>, String> {
+    let mut shapes = HashMap::new();
+    for file_path in
+        higgs_models::collect_safetensors_files(model_dir).map_err(|e| e.to_string())?
+    {
+        let mut file = std::fs::File::open(&file_path).map_err(|e| e.to_string())?;
+        let mut len_bytes = [0u8; 8];
+        file.read_exact(&mut len_bytes).map_err(|e| e.to_string())?;
+        let header_len = u64::from_le_bytes(len_bytes);
+        let mut header_bytes = vec![0u8; usize::try_from(header_len).map_err(|e| e.to_string())?];
+        file.read_exact(&mut header_bytes)
+            .map_err(|e| e.to_string())?;
+        let header: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&header_bytes).map_err(|e| e.to_string())?;
+        for (name, info) in header {
+            if name == "__metadata__" {
+                continue;
+            }
+            let Some(shape) = info.get("shape").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            let shape: Vec<i64> = shape.iter().filter_map(serde_json::Value::as_i64).collect();
+            shapes.insert(name, shape);
+        }
+    }
+    Ok(shapes)
 }
 
 /// Catch `[local]` keys mistakenly written under `[server]`.
@@ -2269,6 +2467,139 @@ mod tests {
         );
         assert_eq!(result.passes, 0);
         assert_eq!(result.warnings, 0);
+        assert_eq!(result.failures, 0);
+    }
+
+    /// Write a minimal valid safetensors file: an 8-byte little-endian header
+    /// length, then the JSON header itself, then one zero byte of "data" per
+    /// declared tensor (offsets aren't validated by `read_safetensors_header_shapes`,
+    /// which only reads the header).
+    fn write_fake_safetensors(dir: &std::path::Path, tensors: &[(&str, &[i64])]) {
+        let mut header = serde_json::Map::new();
+        for (name, shape) in tensors {
+            header.insert(
+                (*name).to_owned(),
+                serde_json::json!({"dtype": "U32", "shape": shape, "data_offsets": [0, 1]}),
+            );
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut file = Vec::new();
+        file.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        file.extend_from_slice(&header_bytes);
+        std::fs::write(dir.join("model.safetensors"), file).unwrap();
+    }
+
+    /// A checkpoint with no `modules` key is not a Hadamard-manifest pack —
+    /// the check must stay completely silent (no pass/warn/fail), same as
+    /// `test_non_eschamoe_dir_is_silent` for the unrelated eschamoe check.
+    #[test]
+    fn test_hadamard_manifest_absent_is_silent() {
+        let dir = write_model_dir(&[("config.json", r#"{"model_type":"llama"}"#)]);
+        let mut result = empty_result();
+        check_hadamard_manifest(dir.path(), "test", &mut result);
+        assert_eq!(result.passes, 0);
+        assert_eq!(result.warnings, 0);
+        assert_eq!(result.failures, 0);
+    }
+
+    #[test]
+    fn test_hadamard_manifest_valid_passes() {
+        let dir = write_model_dir(&[(
+            "config.json",
+            r#"{"schema_version":1,"model_type":"prism_hadamard_qwen35",
+                "modules":[{"path":"model.layers.0.mlp.down_proj","block":512,"embedding":false}]}"#,
+        )]);
+        write_fake_safetensors(
+            dir.path(),
+            &[
+                ("model.layers.0.mlp.down_proj.weight", &[64, 32]),
+                ("model.layers.0.mlp.down_proj.signs", &[512]),
+            ],
+        );
+        let mut result = empty_result();
+        check_hadamard_manifest(dir.path(), "test", &mut result);
+        assert_eq!(result.passes, 1);
+        assert_eq!(result.failures, 0);
+    }
+
+    /// The exact failure mode this check exists to catch: a manifest names a
+    /// rotated module but the checkpoint is missing its `.signs` tensor.
+    /// Loading this checkpoint would silently skip the rotation and decode
+    /// wrong text rather than error — doctor must fail closed instead.
+    #[test]
+    fn test_hadamard_manifest_missing_signs_tensor_fails() {
+        let dir = write_model_dir(&[(
+            "config.json",
+            r#"{"schema_version":1,"model_type":"prism_hadamard_qwen35",
+                "modules":[{"path":"model.layers.0.mlp.down_proj","block":512,"embedding":false}]}"#,
+        )]);
+        write_fake_safetensors(
+            dir.path(),
+            &[("model.layers.0.mlp.down_proj.weight", &[64, 32])],
+        );
+        let mut result = empty_result();
+        check_hadamard_manifest(dir.path(), "test", &mut result);
+        assert_eq!(result.failures, 1);
+        assert_eq!(result.passes, 0);
+    }
+
+    #[test]
+    fn test_hadamard_manifest_wrong_signs_shape_fails() {
+        let dir = write_model_dir(&[(
+            "config.json",
+            r#"{"schema_version":1,"model_type":"prism_hadamard_qwen35",
+                "modules":[{"path":"model.layers.0.mlp.down_proj","block":512,"embedding":false}]}"#,
+        )]);
+        write_fake_safetensors(
+            dir.path(),
+            &[
+                ("model.layers.0.mlp.down_proj.weight", &[64, 32]),
+                ("model.layers.0.mlp.down_proj.signs", &[256]),
+            ],
+        );
+        let mut result = empty_result();
+        check_hadamard_manifest(dir.path(), "test", &mut result);
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn test_hadamard_manifest_bad_block_size_fails() {
+        let dir = write_model_dir(&[(
+            "config.json",
+            r#"{"schema_version":1,"model_type":"prism_hadamard_qwen35",
+                "modules":[{"path":"model.layers.0.mlp.down_proj","block":777,"embedding":false}]}"#,
+        )]);
+        write_fake_safetensors(dir.path(), &[]);
+        let mut result = empty_result();
+        check_hadamard_manifest(dir.path(), "test", &mut result);
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn test_hadamard_manifest_bad_schema_version_fails() {
+        let dir = write_model_dir(&[(
+            "config.json",
+            r#"{"schema_version":2,"model_type":"prism_hadamard_qwen35",
+                "modules":[{"path":"model.layers.0.mlp.down_proj","block":512,"embedding":false}]}"#,
+        )]);
+        let mut result = empty_result();
+        check_hadamard_manifest(dir.path(), "test", &mut result);
+        assert_eq!(result.failures, 1);
+    }
+
+    /// A module listed with `block: 0` is declared but not rotated (today's
+    /// plain Bonsai-Q2 behavior) — nothing to verify, no safetensors file
+    /// even needed.
+    #[test]
+    fn test_hadamard_manifest_zero_block_is_ignored() {
+        let dir = write_model_dir(&[(
+            "config.json",
+            r#"{"schema_version":1,"model_type":"prism_hadamard_qwen35",
+                "modules":[{"path":"model.layers.0.mlp.up_proj","block":0,"embedding":false}]}"#,
+        )]);
+        let mut result = empty_result();
+        check_hadamard_manifest(dir.path(), "test", &mut result);
+        assert_eq!(result.passes, 1);
         assert_eq!(result.failures, 0);
     }
 

@@ -331,6 +331,10 @@ const fn default_max_tokens() -> u32 {
     32768
 }
 
+pub(crate) const fn default_max_context_tokens() -> u32 {
+    65_536
+}
+
 const fn default_timeout() -> f64 {
     300.0
 }
@@ -429,7 +433,7 @@ impl Default for LocalConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// Fixed prompt-plus-output context limit, capped by model architecture.
-    #[serde(default = "default_max_tokens")]
+    #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: u32,
     /// Filesystem path or Hugging Face reference for the model.
     pub path: String,
@@ -950,7 +954,7 @@ impl ModelConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
-            max_context_tokens: default_max_tokens(),
+            max_context_tokens: default_max_context_tokens(),
             path: String::new(),
             name: None,
             generation_defaults: GenerationDefaults::default(),
@@ -1207,7 +1211,7 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
         .models
         .iter()
         .map(|p| ModelConfig {
-            max_context_tokens: default_max_tokens(),
+            max_context_tokens: default_max_context_tokens(),
             path: p.clone(),
             name: None,
             generation_defaults: GenerationDefaults::default(),
@@ -1349,7 +1353,7 @@ fn extract_config(
                 .models
                 .iter()
                 .map(|p| ModelConfig {
-                    max_context_tokens: default_max_tokens(),
+                    max_context_tokens: default_max_context_tokens(),
                     path: p.clone(),
                     name: None,
                     generation_defaults: GenerationDefaults::default(),
@@ -1581,7 +1585,7 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
     let path = config.auto_router.model.clone();
     let name = path_basename(&path);
     config.models.push(ModelConfig {
-        max_context_tokens: default_max_tokens(),
+        max_context_tokens: default_max_context_tokens(),
         path,
         name: Some(name.clone()),
         generation_defaults: GenerationDefaults::default(),
@@ -1756,7 +1760,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({"path": "/tmp/model"})).unwrap();
         assert_eq!(
             serde_json::to_value(&model).unwrap()["max_context_tokens"],
-            32_768
+            65_536
         );
         let config: HiggsConfig = serde_json::from_value(
             serde_json::json!({"models": [{"path": "/tmp/model", "max_context_tokens": 0}]}),
@@ -1881,7 +1885,7 @@ mod tests {
     fn disk_directory_rejects_batch_before_model_load() {
         let mut config = HiggsConfig::default();
         config.models.push(ModelConfig {
-            max_context_tokens: default_max_tokens(),
+            max_context_tokens: default_max_context_tokens(),
             path: "/missing/model".to_owned(),
             kv_disk_dir: Some("/tmp/higgs-config-prefix".to_owned()),
             batch: true,

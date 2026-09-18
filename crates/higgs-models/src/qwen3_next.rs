@@ -161,11 +161,16 @@ pub struct QuantizationConfig {
 
 impl QuantizationConfig {
     /// Convenience: build a `QuantSpec` from this config.
+    ///
+    /// `hadamard_block` is not part of `QuantizationConfig` (it comes from a
+    /// separate `modules` manifest, not the `quantization` map) — always 0
+    /// here; `Qwen3NextModelArgs::quant_spec_for` fills it in per-path.
     pub(crate) const fn spec(&self) -> QuantSpec {
         QuantSpec {
             group_size: self.group_size,
             bits: self.bits,
             mode: self.mode,
+            hadamard_block: 0,
         }
     }
 }
@@ -180,6 +185,10 @@ pub(crate) struct QuantSpec {
     pub group_size: i32,
     pub bits: i32,
     pub mode: crate::quant_mode::QuantMode,
+    /// Fast Walsh-Hadamard rotation block size for `prism_hadamard_qwen35`
+    /// packs (`modules` manifest); 0 for every other checkpoint — the
+    /// existing affine/mxfp4/dense forward paths are unaffected.
+    pub hadamard_block: i32,
 }
 
 impl Default for QuantSpec {
@@ -188,6 +197,7 @@ impl Default for QuantSpec {
             group_size: 64,
             bits: 4,
             mode: crate::quant_mode::QuantMode::Affine,
+            hadamard_block: 0,
         }
     }
 }
@@ -283,9 +293,26 @@ pub struct Qwen3NextModelArgs {
     #[serde(default)]
     pub quant_overrides: BTreeMap<String, QuantizationConfig>,
 
+    /// Fast Walsh-Hadamard rotation block size per module path, from a
+    /// `prism_hadamard_qwen35` pack's top-level `modules` manifest (lifted by
+    /// the loader the same way `quant_overrides` is; empty for every other
+    /// checkpoint). Consumed by [`Qwen3NextModelArgs::quant_spec_for`], which
+    /// folds it into `QuantSpec.hadamard_block` alongside the resolved
+    /// bits/group_size/mode.
+    #[serde(default)]
+    pub hadamard_overrides: BTreeMap<String, i32>,
+
     /// Use separate GDN projections (qwen3.5-style) instead of combined (qwen3_next-style).
     #[serde(default)]
     pub use_separate_gdn_projections: bool,
+
+    /// Fuse the dense MLP `gate_proj`+`up_proj` into one `gate_up_proj` matmul
+    /// (rows concatenated in gate,up order — no permutation). Set for
+    /// `prism_hadamard_qwen35` packs at load-args time: gate and up share the
+    /// input activation and Hadamard signs, so one fused qmm replaces two and
+    /// the fused kernel amortizes launch cost (measured 1.79x on the pair).
+    #[serde(default)]
+    pub mlp_gate_up_fusion: bool,
 
     /// Store attention output projections (`self_attn.o_proj`, `linear_attn.out_proj`,
     /// `linear_attn.in_proj_a`, `linear_attn.in_proj_b`, `linear_attn.in_proj_ba`)
@@ -332,8 +359,11 @@ impl Qwen3NextModelArgs {
     /// `QuantSpec::default()` (affine 4-bit gs=64) if no quantization config
     /// is present at all.
     pub(crate) fn quant_spec_for(&self, path: &str) -> QuantSpec {
-        self.quant_override_for(path)
-            .map_or_else(|| self.default_quant_spec(), QuantizationConfig::spec)
+        let mut spec = self
+            .quant_override_for(path)
+            .map_or_else(|| self.default_quant_spec(), QuantizationConfig::spec);
+        spec.hadamard_block = self.hadamard_block_for(path);
+        spec
     }
 
     /// Look up a per-tensor override, accepting either key form.
@@ -348,6 +378,25 @@ impl Qwen3NextModelArgs {
         path.strip_prefix("language_model.").map_or_else(
             || self.quant_overrides.get(&format!("language_model.{path}")),
             |stripped| self.quant_overrides.get(stripped),
+        )
+    }
+
+    /// Look up a per-tensor Hadamard rotation block size, accepting either
+    /// key form (same dual-form lookup as [`Self::quant_override_for`]).
+    /// Returns 0 (no rotation) for every path absent from `hadamard_overrides`
+    /// — i.e. every checkpoint other than a `prism_hadamard_qwen35` pack.
+    fn hadamard_block_for(&self, path: &str) -> i32 {
+        if let Some(&block) = self.hadamard_overrides.get(path) {
+            return block;
+        }
+        path.strip_prefix("language_model.").map_or_else(
+            || {
+                self.hadamard_overrides
+                    .get(&format!("language_model.{path}"))
+                    .copied()
+                    .unwrap_or(0)
+            },
+            |stripped| self.hadamard_overrides.get(stripped).copied().unwrap_or(0),
         )
     }
 
@@ -448,13 +497,25 @@ pub fn resolved_dense_runtime_selections_with(
     cpu_brand: Option<&str>,
 ) -> ResolvedDenseRuntimeSelections {
     let q2_simd_decode_policy = q2_simd_decode_policy(q2_simd_raw, is_eschamoe_checkpoint, args);
-    ResolvedDenseRuntimeSelections {
-        q2_simd_decode_policy,
-        gate_up_fused: dense_ffn_gate_up_fused(
+    // Prism hadamard packs: gate and up share the input activation and the
+    // fixed ±1 signs, so the fused single-qmm path is both correct and
+    // measurably faster (1.79x on the pair) — enable by default on every
+    // platform, overriding base-M4 safe defaults. An explicit env value still
+    // wins (`0`/`separate` keep the split projections).
+    let env_separate = matches!(
+        gate_up_raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("separate" | "split" | "0" | "false" | "off")
+    );
+    let prism_pack = !args.hadamard_overrides.is_empty();
+    let gate_up_fused = (prism_pack && !env_separate)
+        || dense_ffn_gate_up_fused(
             gate_up_raw,
             q2_simd_decode_policy,
             !should_force_dense_decode_safe_defaults_for_brand(cpu_brand),
-        ),
+        );
+    ResolvedDenseRuntimeSelections {
+        q2_simd_decode_policy,
+        gate_up_fused,
     }
 }
 
@@ -848,11 +909,20 @@ pub(crate) struct QLinear {
     pub(crate) scales: Param<Array>,
     #[param]
     pub(crate) biases: Param<Array>,
+    /// Per-tensor `±1` sign vector for the `prism_hadamard_qwen35` Hadamard
+    /// manifest, shape `[in_features]`. Empty `[0]` placeholder (like
+    /// `biases`/`scales` for mxfp4/dense modes) when `hadamard_block == 0`;
+    /// otherwise loaded from the checkpoint's `<path>.signs` tensor by the
+    /// same generic weight loader that fills `weight`/`scales`/`biases`.
+    #[param]
+    pub(crate) signs: Param<Array>,
     pub(crate) group_size: i32,
     pub(crate) bits: i32,
     /// Quantization format. `Affine` (default) keeps the existing mlx-rs fast
     /// path; `MxFp4` routes through the FFI bypass in [`crate::quant_mode`].
     pub(crate) mode: crate::quant_mode::QuantMode,
+    /// Fast Walsh-Hadamard rotation block size (0 = none). See [`QuantSpec`].
+    pub(crate) hadamard_block: i32,
     weight_layout: QLinearWeightLayout,
     q2_row2: OnceLock<crate::metal_kernel::BonsaiQ2Row2>,
     /// Model-local Q2 decode choice. Only dense Escha Qwen3.8 gate/up
@@ -888,7 +958,9 @@ impl QLinear {
 
     /// Construct from a resolved [`QuantSpec`] (`group_size` + bits + mode).
     pub(crate) fn new_spec(spec: QuantSpec) -> Result<Self, Exception> {
-        Self::new_with_mode(spec.group_size, spec.bits, spec.mode)
+        let mut linear = Self::new_with_mode(spec.group_size, spec.bits, spec.mode)?;
+        linear.hadamard_block = spec.hadamard_block;
+        Ok(linear)
     }
 
     /// Construct with an explicit quantization mode. Used by loaders that read
@@ -920,9 +992,11 @@ impl QLinear {
             weight,
             scales: scales_param,
             biases: biases_param,
+            signs: Param::new(Array::from_slice::<f32>(&[], &[0])),
             group_size,
             bits,
             mode,
+            hadamard_block: 0,
             weight_layout: QLinearWeightLayout::Canonical,
             q2_row2: OnceLock::new(),
             q2_simd_decode: Q2SimdDecodePolicy::Stock,
@@ -1076,6 +1150,20 @@ impl QLinear {
     }
 
     pub(crate) fn forward(&self, x: &Array) -> Result<Array, Exception> {
+        // `prism_hadamard_qwen35` packs rotate the input before the packed
+        // matmul (Fast Walsh-Hadamard, per-`hadamard_block` chunks, signed by
+        // `self.signs`). Applied first so every fast path below it (row4,
+        // q2_row2, crossrow_qmv, the standard affine/mxfp4/dense matmuls)
+        // transparently operates on the rotated activation, matching the
+        // checkpoint's reference Python loader. No-op (0 branches taken) for
+        // every other checkpoint, where `hadamard_block == 0`.
+        let rotated;
+        let x: &Array = if self.hadamard_block > 0 {
+            rotated = hadamard_rotate(x, self.hadamard_block, &self.signs, false)?;
+            &rotated
+        } else {
+            x
+        };
         if let Some(packed) = self.bonsai_row4()? {
             if packed.accepts_input(x) {
                 return crate::metal_kernel::bonsai_q1_tg_lut4_qmm_view(x, packed);
@@ -1190,6 +1278,15 @@ impl QLinear {
     pub(crate) fn forward_rows(&self, x: &Array, rows: &Array) -> Result<Array, Exception> {
         use mlx_rs::ops::indexing::take_axis;
 
+        // Row-gather (MoE expert) forward bypasses `forward`'s Hadamard hook
+        // entirely — fail closed rather than silently skip the rotation. No
+        // `prism_hadamard_qwen35` checkpoint currently routes MoE experts
+        // through this path (the released packs are dense).
+        if self.hadamard_block > 0 {
+            return Err(Exception::custom(
+                "QLinear::forward_rows does not implement the Hadamard-rotation manifest",
+            ));
+        }
         if self.mode != crate::quant_mode::QuantMode::Affine || self.bits == 1 {
             return Err(Exception::custom(
                 "QLinear::forward_rows currently supports affine bits>=2 only",
@@ -1310,6 +1407,49 @@ impl QLinear {
             self.forward(x)
         }
     }
+}
+
+/// Fast Walsh-Hadamard rotation for `prism_hadamard_qwen35` `modules` entries.
+///
+/// Reshapes the trailing axis into `block`-sized chunks and runs MLX's native
+/// Hadamard transform (`Array::hadamard_transform`, default `1/sqrt(block)`
+/// normalization — matching MLX's own `mx.hadamard_transform` default, which
+/// the checkpoint's reference Python loader also relies on) over each chunk,
+/// with a `±1` `signs` vector applied elementwise either before the transform
+/// (`inverse = false`, a `QLinear` input) or after it (`inverse = true`, a
+/// `QEmbedding` lookup's dequantized output). `signs` is cast to `x`'s dtype
+/// first, matching the dtype-alignment idiom used elsewhere in this module
+/// (e.g. [`dense_linear_no_bias_forward`]).
+fn hadamard_rotate(
+    x: &Array,
+    block: i32,
+    signs: &Array,
+    inverse: bool,
+) -> Result<Array, Exception> {
+    let shape = x.shape().to_vec();
+    let last = *shape
+        .last()
+        .ok_or_else(|| Exception::custom("hadamard_rotate: scalar input"))?;
+    // `reshape(-1, block)` only respects last-axis chunk boundaries (no
+    // cross-token/cross-row mixing) when `block` evenly divides the last
+    // axis — the same precondition the checkpoint's reference Python loader
+    // enforces before calling its own `fwht`.
+    if last % block != 0 {
+        return Err(Exception::custom(format!(
+            "hadamard_rotate: block={block} does not divide last axis={last}"
+        )));
+    }
+    let signs = signs.as_dtype(x.dtype())?;
+    let y = if inverse {
+        x.clone()
+    } else {
+        x.multiply(&signs)?
+    };
+    let y = y
+        .reshape(&[-1, block])?
+        .hadamard_transform(None)?
+        .reshape(&shape)?;
+    if inverse { y.multiply(&signs) } else { Ok(y) }
 }
 
 fn crossrow_qmv_result<T>(result: Result<T, Exception>) -> Option<T> {
@@ -1435,9 +1575,19 @@ pub(crate) struct QEmbedding {
     scales: Param<Array>,
     #[param]
     biases: Param<Array>,
+    /// Per-tensor `±1` sign vector for the `prism_hadamard_qwen35` Hadamard
+    /// manifest (see [`QLinear::signs`]). Empty `[0]` placeholder when
+    /// `hadamard_block == 0`.
+    #[param]
+    signs: Param<Array>,
     pub(crate) group_size: i32,
     pub(crate) bits: i32,
     mode: crate::quant_mode::QuantMode,
+    /// Fast Walsh-Hadamard rotation block size (0 = none). When set, `forward`
+    /// applies the *inverse* rotation to the dequantized embedding rows —
+    /// `QEmbedding` is only ever used for index lookups in this codebase, so
+    /// (unlike `QLinear`) a single direction is unambiguous. See [`QuantSpec`].
+    hadamard_block: i32,
 }
 
 impl QEmbedding {
@@ -1453,6 +1603,7 @@ impl QEmbedding {
             group_size,
             bits,
             mode,
+            hadamard_block: 0,
         }))
     }
 
@@ -1468,9 +1619,11 @@ impl QEmbedding {
             ),
             scales: Param::new(Array::from_slice::<f32>(&[], &[0])),
             biases: Param::new(Array::from_slice::<f32>(&[], &[0])),
+            signs: Param::new(Array::from_slice::<f32>(&[], &[0])),
             group_size: 0,
             bits: 0,
             mode: crate::quant_mode::QuantMode::Dense,
+            hadamard_block: 0,
         })
     }
 
@@ -1491,9 +1644,11 @@ impl QEmbedding {
             weight,
             scales: scales_param,
             biases: biases_param,
+            signs: Param::new(Array::from_slice::<f32>(&[], &[0])),
             group_size: spec.group_size,
             bits: spec.bits,
             mode: spec.mode,
+            hadamard_block: spec.hadamard_block,
         }
     }
 
@@ -1531,12 +1686,30 @@ impl QEmbedding {
             // Dense: weights are already full-precision; just gather rows.
             crate::quant_mode::QuantMode::Dense => w,
         };
+        // `prism_hadamard_qwen35` packs store the token embedding pre-rotated;
+        // undo the rotation (inverse direction) on the dequantized rows before
+        // reshaping back to the caller's index shape.
+        let out = if self.hadamard_block > 0 {
+            hadamard_rotate(&out, self.hadamard_block, &self.signs, true)?
+        } else {
+            out
+        };
         let mut ret_shape: Vec<i32> = shape;
         ret_shape.push(-1);
         out.reshape(&ret_shape)
     }
 
     pub(crate) fn as_linear(&self, x: &Array) -> Result<Array, Exception> {
+        // Tied-embedding-as-lm_head is unimplemented for the Hadamard
+        // manifest (the released `prism_hadamard_qwen35` packs use an
+        // explicit, untied `output.weight`/`lm_head` — a separate `QLinear`
+        // that already gets the forward-direction rotation via `QLinear::forward`).
+        // Fail closed rather than silently return an unrotated projection.
+        if self.hadamard_block > 0 {
+            return Err(Exception::custom(
+                "QEmbedding::as_linear does not implement the Hadamard-rotation manifest (tied embeddings)",
+            ));
+        }
         match self.mode {
             crate::quant_mode::QuantMode::MxFp4 => crate::quant_mode::quantized_matmul(
                 x,
@@ -4489,6 +4662,7 @@ impl Qwen3NextAttention {
                 group_size: o_resolved.group_size,
                 bits: 0,
                 mode: crate::quant_mode::QuantMode::Dense,
+                hadamard_block: o_resolved.hadamard_block,
             }
         } else {
             o_resolved
@@ -5013,12 +5187,17 @@ impl DenseQwen3NextAttention {
 
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct Qwen3NextMLP {
+    /// Fused gate+up projection (rows in gate,up order) when
+    /// [`Qwen3NextModelArgs::mlp_gate_up_fusion`] is set; then `gate_proj`
+    /// and `up_proj` stay `None`.
     #[param]
-    gate_proj: QLinear,
+    gate_up_proj: Option<QLinear>,
+    #[param]
+    gate_proj: Option<QLinear>,
     #[param]
     down_proj: QLinear,
     #[param]
-    up_proj: QLinear,
+    up_proj: Option<QLinear>,
 }
 
 pub(crate) fn new_mlp_projections(
@@ -5032,6 +5211,49 @@ pub(crate) fn new_mlp_projections(
         QLinear::new_spec(g_spec)?,
         QLinear::new_spec(d_spec)?,
         QLinear::new_spec(u_spec)?,
+    ))
+}
+
+/// Dense-MLP projections with optional gate+up fusion (prism packs): when
+/// `mlp_gate_up_fusion` is set and gate/up resolve to identical specs, one
+/// fused `gate_up_proj` QLinear replaces the pair. Returns
+/// `(gate_up, down, gate, up)` with the unfused pair `None` when fused.
+fn new_dense_mlp_projections(
+    args: &Qwen3NextModelArgs,
+    mlp_prefix: &str,
+) -> Result<(Option<QLinear>, QLinear, Option<QLinear>, Option<QLinear>), Exception> {
+    let d_spec = resolve_quant_for(args, &format!("{mlp_prefix}.down_proj"));
+    if args.mlp_gate_up_fusion {
+        let g_spec = resolve_quant_for(args, &format!("{mlp_prefix}.gate_proj"));
+        let u_spec = resolve_quant_for(args, &format!("{mlp_prefix}.up_proj"));
+        let specs_agree = g_spec.group_size == u_spec.group_size
+            && g_spec.bits == u_spec.bits
+            && g_spec.mode == u_spec.mode
+            && g_spec.hadamard_block == u_spec.hadamard_block;
+        if specs_agree {
+            let mut fused = g_spec;
+            // Resolve the rotation from the fused path; refuse to build the
+            // fused module without it — the packed halves are rotated, so a
+            // rotation-less fused matmul would be silently wrong.
+            fused.hadamard_block =
+                args.hadamard_block_for(&format!("{mlp_prefix}.gate_up_proj"));
+            if fused.hadamard_block > 0 {
+                return Ok((
+                    Some(QLinear::new_spec(fused)?),
+                    QLinear::new_spec(d_spec)?,
+                    None,
+                    None,
+                ));
+            }
+        }
+    }
+    let g_spec = resolve_quant_for(args, &format!("{mlp_prefix}.gate_proj"));
+    let u_spec = resolve_quant_for(args, &format!("{mlp_prefix}.up_proj"));
+    Ok((
+        None,
+        QLinear::new_spec(d_spec)?,
+        Some(QLinear::new_spec(g_spec)?),
+        Some(QLinear::new_spec(u_spec)?),
     ))
 }
 
@@ -5061,13 +5283,16 @@ pub(crate) fn new_mlp_projections_from_quant(
         group_size: ql,
         bits: qb,
         mode: crate::quant_mode::QuantMode::Affine,
+        hadamard_block: 0,
     })
 }
 
 impl Qwen3NextMLP {
     fn new(args: &Qwen3NextModelArgs, mlp_prefix: &str) -> Result<Self, Exception> {
-        let (gate_proj, down_proj, up_proj) = new_mlp_projections(args, mlp_prefix)?;
+        let (gate_up_proj, down_proj, gate_proj, up_proj) =
+            new_dense_mlp_projections(args, mlp_prefix)?;
         Ok(Self {
+            gate_up_proj,
             gate_proj,
             down_proj,
             up_proj,
@@ -5075,9 +5300,28 @@ impl Qwen3NextMLP {
     }
 
     fn forward(&self, x: &Array) -> Result<Array, Exception> {
-        let gate_out = self.gate_proj.forward(x)?;
-        let up_out = self.up_proj.forward(x)?;
-        let activated = swiglu(&gate_out, &up_out)?;
+        let activated = if let Some(gate_up) = self.gate_up_proj.as_ref() {
+            let fused = gate_up.forward(x)?;
+            let split_at = fused.dim(-1) / 2;
+            let parts = fused.split_axis(&[split_at], Some(-1))?;
+            let gate_out = parts.first().ok_or_else(|| {
+                Exception::custom("gate_up split produced no gate half")
+            })?;
+            let up_out = parts.get(1).ok_or_else(|| {
+                Exception::custom("gate_up split produced no up half")
+            })?;
+            swiglu(gate_out, up_out)?
+        } else {
+            let gate_out = self
+                .gate_proj
+                .as_ref()
+                .ok_or_else(|| Exception::custom("MLP has neither fused nor split gate"))?;
+            let up_out = self
+                .up_proj
+                .as_ref()
+                .ok_or_else(|| Exception::custom("MLP has neither fused nor split up"))?;
+            swiglu(&gate_out.forward(x)?, &up_out.forward(x)?)?
+        };
         self.down_proj.forward(&activated)
     }
 }
@@ -6019,6 +6263,7 @@ impl GatedDeltaNet {
                     group_size: resolved.group_size,
                     bits: 0,
                     mode: crate::quant_mode::QuantMode::Dense,
+                    hadamard_block: resolved.hadamard_block,
                 }
             } else {
                 resolved
@@ -7312,6 +7557,34 @@ impl FfnBlock {
         {
             return self.dense_hidden_separate(x);
         }
+        let fused_hadamard: Option<i32> = loop {
+            let Some(gp) = self.gate_proj.as_ref() else {
+                return self.dense_hidden_separate(x);
+            };
+            let Some(up) = self.up_proj.as_ref() else {
+                return self.dense_hidden_separate(x);
+            };
+            let block = gp.hadamard_block;
+            if block == 0 {
+                break None;
+            }
+            // The packed halves share the fixed ±1 signs over the same input
+            // (prism pack contract); a fused qmm must apply that rotation to
+            // the input exactly once. Anything else falls back to separate.
+            if up.hadamard_block != block || gp.signs.shape() != up.signs.shape() {
+                return self.dense_hidden_separate(x);
+            }
+            let diff = gp
+                .signs
+                .subtract(&up.signs)?
+                .abs()?
+                .max(None)?
+                .item::<f32>();
+            if diff != 0.0 {
+                return self.dense_hidden_separate(x);
+            }
+            break Some(block);
+        };
         if self.fused_gate_up.is_none() {
             let gp = self
                 .gate_proj
@@ -7343,6 +7616,17 @@ impl FfnBlock {
             .gate_proj
             .as_ref()
             .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
+
+        // Prism packs: the packed halves live in the rotated basis, so the
+        // shared input rotation is applied exactly once here (the fused qmm
+        // bypasses QLinear::forward, which would rotate per projection).
+        let rotated_input;
+        let x = if let Some(block) = fused_hadamard {
+            rotated_input = hadamard_rotate(x, block, &gp.signs, false)?;
+            &rotated_input
+        } else {
+            x
+        };
 
         let fused_out = match gp.mode {
             crate::quant_mode::QuantMode::MxFp4 => crate::quant_mode::quantized_matmul(
@@ -10802,28 +11086,68 @@ pub fn resolve_runtime_model_args(
 /// Unsloth-UD-dense layout). Quantized checkpoints (Ornith, stock MLX quants)
 /// keep `.scales`, so those projections must stay on the quantized forward
 /// path (`bits != 0`). A missing or unreadable index defaults to `false`.
-fn detect_dense_attention_outputs(model_dir: &Path) -> bool {
+/// Tensor names present in a checkpoint: from `model.safetensors.index.json`
+/// when present, otherwise from each `*.safetensors` shard header (single-shard
+/// packs carry no index; the names live in the 8-byte-prefixed JSON header).
+/// Reads headers only — never tensor data.
+fn checkpoint_tensor_names(model_dir: &Path) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
     let index_path = model_dir.join("model.safetensors.index.json");
-    let Ok(file) = std::fs::File::open(&index_path) else {
-        return false;
+    if let Ok(file) = std::fs::File::open(&index_path) {
+        if let Ok(index) = serde_json::from_reader::<_, serde_json::Value>(file) {
+            if let Some(weight_map) = index.get("weight_map").and_then(serde_json::Value::as_object)
+            {
+                names.extend(weight_map.keys().cloned());
+                return names;
+            }
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(model_dir) else {
+        return names;
     };
-    let Ok(index) = serde_json::from_reader::<_, serde_json::Value>(file) else {
-        return false;
-    };
-    let Some(weight_map) = index
-        .get("weight_map")
-        .and_then(serde_json::Value::as_object)
-    else {
-        return false;
-    };
-    let mut saw_output = false;
-    for key in weight_map.keys() {
-        let Some(base) = key.strip_suffix(".weight") else {
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("safetensors") {
+            continue;
+        }
+        let Ok(mut file) = std::fs::File::open(&path) else {
             continue;
         };
+        let mut len_buf = [0u8; 8];
+        if std::io::Read::read_exact(&mut file, &mut len_buf).is_err() {
+            continue;
+        }
+        let header_len = u64::from_le_bytes(len_buf) as usize;
+        if header_len == 0 || header_len > 100_000_000 {
+            continue;
+        }
+        let mut header_buf = vec![0u8; header_len];
+        if std::io::Read::read_exact(&mut file, &mut header_buf).is_err() {
+            continue;
+        }
+        if let Ok(header) = serde_json::from_slice::<serde_json::Value>(&header_buf) {
+            if let Some(obj) = header.as_object() {
+                names.extend(
+                    obj.keys()
+                        .filter(|k| k.as_str() != "__metadata__")
+                        .cloned(),
+                );
+            }
+        }
+    }
+    names
+}
+
+fn detect_dense_attention_outputs(model_dir: &Path) -> bool {
+    let names = checkpoint_tensor_names(model_dir);
+    if names.is_empty() {
+        return false;
+    }
+    let mut saw_output = false;
+    for base in names.iter().filter_map(|k| k.strip_suffix(".weight")) {
         if base.ends_with("o_proj") || base.ends_with("out_proj") {
             saw_output = true;
-            if weight_map.contains_key(&format!("{base}.scales")) {
+            if names.contains(&format!("{base}.scales")) {
                 return false; // quantized output projection -> not dense
             }
         }
@@ -11497,6 +11821,112 @@ pub(crate) fn load_qwen3_5_text_config_args_from_value(
         );
     }
 
+    // `prism_hadamard_qwen35` packs (e.g. `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`)
+    // carry a top-level `modules` manifest naming the Linear/Embedding paths that
+    // get a Fast Walsh-Hadamard rotation (with a per-tensor `<path>.signs` array)
+    // applied around their otherwise-ordinary affine quantized matmul. Lift it into
+    // `hadamard_overrides` (path -> block size) so `quant_spec_for` resolves it
+    // alongside bits/group_size/mode, same mechanism as `quant_overrides` above.
+    if let Some(modules) = config.get("modules").and_then(serde_json::Value::as_array) {
+        let schema_version = config
+            .get("schema_version")
+            .and_then(serde_json::Value::as_i64);
+        // Pack config schema 1 = original preview, 2 = re-release (adds
+        // vision/components metadata; text path unaffected). The Hadamard
+        // manifest contract itself is versioned separately in `hadamard.json`
+        // (`prism.hadamard.version`) and is v1 in both.
+        if !matches!(schema_version, Some(1) | Some(2)) {
+            return Err(ModelError::UnsupportedModel(format!(
+                "Hadamard-rotation manifest (`modules`) requires schema_version 1 or 2, found {schema_version:?}"
+            )));
+        }
+        let mut hadamard_overrides = serde_json::Map::new();
+        for module in modules {
+            let path = module.get("path").and_then(serde_json::Value::as_str);
+            let block = module
+                .get("block")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let Some(path) = path else {
+                return Err(ModelError::UnsupportedModel(
+                    "modules manifest entry missing `path`".into(),
+                ));
+            };
+            if block == 0 {
+                continue;
+            }
+            let stripped = path.strip_prefix("language_model.").unwrap_or(path);
+            hadamard_overrides.insert(stripped.to_owned(), serde_json::Value::from(block));
+        }
+        // The fused loader concatenates the split `in_proj_qkv`/`in_proj_z`
+        // tensors into one `in_proj_qkvz` matmul, so the rotation must be
+        // keyed on the fused path or the fused dispatch silently skips it
+        // (the manifest names the split tensors only). Split entries carry
+        // the same block in every known pack; refuse to guess if they differ.
+        let fused_qkvz: Vec<(String, i64)> = hadamard_overrides
+            .iter()
+            .filter_map(|(k, v)| {
+                let prefix = k.strip_suffix(".in_proj_qkv")?;
+                let block = v.as_i64()?;
+                let z_block = hadamard_overrides
+                    .get(&format!("{prefix}.in_proj_z"))?
+                    .as_i64()?;
+                if z_block != block {
+                    return None;
+                }
+                Some((format!("{prefix}.in_proj_qkvz"), block))
+            })
+            .collect();
+        for (key, block) in fused_qkvz {
+            hadamard_overrides
+                .entry(key)
+                .or_insert(serde_json::Value::from(block));
+        }
+        // Same treatment for the fused MLP projection: gate and up share the
+        // input and signs, so the fused `gate_up_proj` inherits their block.
+        let fused_gate_up: Vec<(String, i64)> = hadamard_overrides
+            .iter()
+            .filter_map(|(k, v)| {
+                let prefix = k.strip_suffix(".mlp.gate_proj")?;
+                let block = v.as_i64()?;
+                let up_block = hadamard_overrides
+                    .get(&format!("{prefix}.mlp.up_proj"))?
+                    .as_i64()?;
+                if up_block != block {
+                    return None;
+                }
+                Some((format!("{prefix}.mlp.gate_up_proj"), block))
+            })
+            .collect();
+        for (key, block) in fused_gate_up {
+            hadamard_overrides
+                .entry(key)
+                .or_insert(serde_json::Value::from(block));
+        }
+        // Enable the fused MLP construction only when every layer actually
+        // got a fused key (all layers carry the manifest in known packs).
+        let fused_gate_up_layers = hadamard_overrides
+            .keys()
+            .filter(|k| k.contains(".mlp.gate_up_proj"))
+            .count();
+        if fused_gate_up_layers > 0 {
+            map.insert(
+                "mlp_gate_up_fusion".to_owned(),
+                serde_json::Value::from(true),
+            );
+            tracing::info!(
+                layers = fused_gate_up_layers,
+                "Fusing MLP gate+up projections into single matmuls"
+            );
+        }
+        if !hadamard_overrides.is_empty() {
+            map.insert(
+                "hadamard_overrides".to_owned(),
+                serde_json::Value::Object(hadamard_overrides),
+            );
+        }
+    }
+
     let mut args: Qwen3NextModelArgs = serde_json::from_value(obj)?;
     if let Some(yarn) = yarn_rope_params(&args) {
         tracing::info!(
@@ -11572,13 +12002,10 @@ fn detect_dense_gdn_projections(
     model_dir: &Path,
     overrides: &mut BTreeMap<String, QuantizationConfig>,
 ) {
-    let index_path = model_dir.join("model.safetensors.index.json");
-    let Ok(index_text) = std::fs::read_to_string(&index_path) else {
-        return; // single-shard models have no index; nothing to scan
-    };
-    let Ok(index) = serde_json::from_str::<crate::WeightMapIndex>(&index_text) else {
+    let keys = checkpoint_tensor_names(model_dir);
+    if keys.is_empty() {
         return;
-    };
+    }
 
     // Collect all tensor keys that have `.scales` (i.e. are quantized).
     // Any GDN projection path that has `.weight` but NOT `.scales` is dense.
@@ -11589,9 +12016,8 @@ fn detect_dense_gdn_projections(
     fn strip_prefix(k: &str) -> &str {
         k.strip_prefix("language_model.").unwrap_or(k)
     }
-    let quantized_paths: std::collections::HashSet<&str> = index
-        .weight_map
-        .keys()
+    let quantized_paths: std::collections::HashSet<&str> = keys
+        .iter()
         .filter_map(|k| k.strip_suffix(".scales"))
         .map(strip_prefix)
         .collect();
@@ -11603,7 +12029,7 @@ fn detect_dense_gdn_projections(
     };
 
     let mut added = 0usize;
-    for weight_key in index.weight_map.keys() {
+    for weight_key in keys.iter() {
         // Look for GDN projection weights: ...linear_attn.in_proj_{a,b}.weight
         let Some(base) = strip_prefix(weight_key).strip_suffix(".weight") else {
             continue;
@@ -12619,6 +13045,13 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     // Key format: "model.layers.N.linear_attn.in_proj_qkvz.{weight|scales|biases}"
     let mut gdn_parts: HashMap<String, (Option<Array>, Option<Array>)> = HashMap::new();
 
+    // MLP gate+up fusion: when the model was built with a fused
+    // `mlp.gate_up_proj` QLinear, collect the split checkpoint tensors and
+    // concatenate them (rows in gate,up order — no permutation).
+    let mlp_fusion = params.contains_key("model.layers.0.mlp.gate_up_proj.weight");
+    let mut mlp_parts: HashMap<String, (Option<Array>, Option<Array>)> = HashMap::new();
+
+
     let gdn_remap: &[(&str, &str, &str)] = &[
         ("in_proj_qkv", "in_proj_z", "in_proj_qkvz"),
         ("in_proj_b", "in_proj_a", "in_proj_ba"),
@@ -12631,6 +13064,24 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
             };
 
             let mut handled = false;
+            if mlp_fusion {
+                for (split_name, is_up) in [("gate_proj", false), ("up_proj", true)] {
+                    let needle = format!(".mlp.{split_name}.");
+                    if let Some(pos) = stripped.find(&needle) {
+                        let pfx = &stripped[..pos];
+                        let sfx = &stripped[pos + needle.len()..];
+                        let map_key = format!("{pfx}.mlp.gate_up_proj.{sfx}");
+                        let entry = mlp_parts.entry(map_key).or_insert((None, None));
+                        if is_up {
+                            entry.1 = Some(value.clone());
+                        } else {
+                            entry.0 = Some(value.clone());
+                        }
+                        handled = true;
+                        break;
+                    }
+                }
+            }
             for &(part_a_name, part_b_name, combined_name) in gdn_remap {
                 for (is_b, split_name) in [(false, part_a_name), (true, part_b_name)] {
                     let needle = format!(".{split_name}.");
@@ -12690,6 +13141,16 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
             );
             continue;
         };
+        if combined_key.ends_with(".signs") {
+            // Sign vectors index the shared input activation (width =
+            // in_features), not the fused output rows: qkv and z store the
+            // same fixed ±1 signs, so the fused module takes one copy
+            // unchanged. Concatenating would double the width, and the row
+            // permutation applies to output rows only.
+            **param = a.clone();
+            fused_count += 1;
+            continue;
+        }
         let perm = if combined_key.contains("in_proj_qkvz") {
             &qkvz_perm
         } else {
@@ -12729,6 +13190,32 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
         total_pairs = gdn_parts.len(),
         "Fused GDN projections (4→2 dispatches per layer)"
     );
+
+    if mlp_fusion {
+        let mlp_fused_layers = mlp_parts.len() / 4;
+        for (combined_key, (part_a, part_b)) in mlp_parts {
+            let (Some(a), Some(b)) = (part_a, part_b) else {
+                return Err(crate::error::ModelError::Io(std::io::Error::other(
+                    format!("Incomplete MLP gate/up pair for key: {combined_key}"),
+                )));
+            };
+            let Some(param) = params.get_mut(combined_key.as_str()) else {
+                return Err(crate::error::ModelError::Io(std::io::Error::other(
+                    format!("MLP fusion: no fused target for key {combined_key}"),
+                )));
+            };
+            if combined_key.ends_with(".signs") {
+                // gate and up share the fixed ±1 signs over the same input;
+                // take one copy unchanged (see the GDN signs branch above).
+                **param = a;
+            } else {
+                **param = ops::concatenate_axis(&[&a, &b], 0)
+                    .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+            }
+        }
+        tracing::info!(layers = mlp_fused_layers, "Fused MLP gate+up projections");
+    }
+
     // In the native escha mode, the expert affine params get no tensors.
     // The forward pass uses the native weights in their place. Thus the
     // completeness check must not flag the `switch_mlp` placeholders.
@@ -15359,7 +15846,7 @@ mod tests {
             "shared_expert.down_proj override applied"
         );
         assert_eq!(
-            shared.gate_proj.bits, 4,
+            shared.gate_proj.as_ref().expect("gate_proj present").bits, 4,
             "shared_expert.gate_proj falls back to global"
         );
     }
@@ -16336,8 +16823,14 @@ mod tests {
         for proj in [
             &mut block.shared_expert.gate_proj,
             &mut block.shared_expert.up_proj,
-            &mut block.shared_expert.down_proj,
         ] {
+            let proj = proj.as_mut().expect("shared expert proj present");
+            *proj.weight = sw.clone();
+            *proj.scales = ss.clone();
+            *proj.biases = sb.clone();
+        }
+        {
+            let proj = &mut block.shared_expert.down_proj;
             *proj.weight = sw.clone();
             *proj.scales = ss.clone();
             *proj.biases = sb.clone();
@@ -16504,6 +16997,69 @@ mod tests {
             max_diff < 1e-5,
             "compiled sigmoid_mul differs from raw by {max_diff}"
         );
+    }
+
+    /// Fused `gate_up_proj` (one qmm + split) must match two separate gate/up
+    /// qmms through the same swiglu + down path.
+    #[test]
+    fn test_fused_mlp_gate_up_matches_split_projections() {
+        let (d, inter) = (64i32, 128i32);
+        let make_weight = |rows: i32| {
+            mlx_rs::random::uniform::<f32, f32>(-0.5, 0.5, &[rows, d], None)
+                .unwrap()
+                .as_dtype(mlx_rs::Dtype::Float16)
+                .unwrap()
+        };
+        let w_gate = make_weight(inter);
+        let w_up = make_weight(inter);
+        let w_down = mlx_rs::random::uniform::<f32, f32>(-0.5, 0.5, &[d, inter], None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        let x = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 1, d], None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+
+        let dense = QuantSpec {
+            group_size: 0,
+            bits: 0,
+            mode: crate::quant_mode::QuantMode::Dense,
+            hadamard_block: 0,
+        };
+        // Under test: the concat + split math, so no rotation on either path.
+        let fused_spec = dense;
+
+        // Split reference path.
+        let mut gate = QLinear::new_spec(QuantSpec { hadamard_block: 0, ..dense }).unwrap();
+        gate.weight = Param::new(w_gate);
+        let mut up = QLinear::new_spec(QuantSpec { hadamard_block: 0, ..dense }).unwrap();
+        up.weight = Param::new(w_up);
+        let mut down = QLinear::new_spec(QuantSpec { hadamard_block: 0, ..dense }).unwrap();
+        down.weight = Param::new(w_down);
+        let gate_out = gate.forward(&x).unwrap();
+        let up_out = up.forward(&x).unwrap();
+        let reference = down
+            .forward(&nn::silu(&gate_out).unwrap().multiply(&up_out).unwrap())
+            .unwrap();
+
+        // Fused path: rows concatenated in gate,up order, split at inter.
+        let mut fused = QLinear::new_spec(fused_spec).unwrap();
+        let fused_w =
+            ops::concatenate_axis(&[&gate.weight, &up.weight], 0).unwrap();
+        fused.weight = Param::new(fused_w);
+        let fused_out = fused.forward(&x).unwrap();
+        let parts = fused_out.split_axis(&[inter as i32], Some(-1)).unwrap();
+        let f_gate = parts.first().unwrap();
+        let f_up = parts.get(1).unwrap();
+        let fused_activated =
+            nn::silu(f_gate).unwrap().multiply(f_up).unwrap();
+        let fused_result = down.forward(&fused_activated).unwrap();
+
+        mlx_rs::transforms::eval([&reference, &fused_result]).unwrap();
+        let diff = reference.subtract(&fused_result).unwrap().abs().unwrap();
+        let max_diff: f32 = diff.max(None).unwrap().item();
+        assert!(max_diff < 1e-2, "fused MLP differs from split by {max_diff}");
     }
 
     #[test]
@@ -18661,6 +19217,44 @@ mod tests {
         assert_eq!(state2.shape(), &[1, 4, 32, 32]);
     }
 
+    /// Step 0 timing probe: gated-delta decode kernel at Bonsai-2-27B real
+    /// dims (48 v-heads, head_k=256, head_v=128, T=1). Run with:
+    /// cargo test --release -p higgs-models bench_gdn_decode_step_real_dims -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_gdn_decode_step_real_dims() {
+        // Bonsai-2-27B real GDN dims: 8 k-heads x 256, 48 v-heads x 128.
+        let (nh, hk, hv) = (8usize, 256usize, 48usize);
+        let (nh32, hk32, hv32, dv32) = (8i32, 256i32, 48i32, 128i32);
+        let q = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 1, nh32, hk32], None).unwrap();
+        let k = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 1, nh32, hk32], None).unwrap();
+        let v = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 1, hv32, dv32], None).unwrap();
+        let a_log = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[nh32], None).unwrap();
+        let a = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 1, nh32], None).unwrap();
+        let dt_bias = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[nh32], None).unwrap();
+        let b = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 1, nh32], None).unwrap();
+        let state0 = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, hv32, dv32, hk32], None).unwrap();
+
+        // Warmup (kernel compile + allocation).
+        let (y, mut state) =
+            gated_delta_kernel_ffi(&q, &k, &v, &a_log, &a, &dt_bias, &b, &state0, 1, 1, nh32, hk32, hv32, dv32)
+                .unwrap();
+        y.eval().unwrap();
+
+        let iters = 100;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let (y, s) = gated_delta_kernel_ffi(
+                &q, &k, &v, &a_log, &a, &dt_bias, &b, &state, 1, 1, nh32, hk32, hv32, dv32,
+            )
+            .unwrap();
+            y.eval().unwrap();
+            state = s;
+        }
+        let per = t0.elapsed().as_micros() as f64 / iters as f64;
+        eprintln!("GDN-KERNEL decode step [Hk={nh} Dk={hk} Hv={hv} Dv={dv32}]: {per:.1}us x48 layers = {:.2}ms/token", per * 48.0 / 1000.0);
+    }
+
     /// Reference ops implementation of a single gated delta step (for comparison tests).
     fn gated_delta_step_ref(
         q: &Array,
@@ -19744,9 +20338,11 @@ mod tests {
                 weight: Param::new(w),
                 scales: Param::new(s),
                 biases: Param::new(b),
+                signs: Param::new(Array::from_slice::<f32>(&[], &[0])),
                 group_size: gs,
                 bits,
                 mode: crate::quant_mode::QuantMode::Affine,
+                hadamard_block: 0,
                 weight_layout: QLinearWeightLayout::Canonical,
                 q2_row2: std::sync::OnceLock::new(),
                 q2_simd_decode: Q2SimdDecodePolicy::Stock,
@@ -19763,9 +20359,11 @@ mod tests {
                 weight: Param::new(w),
                 scales: Param::new(s),
                 biases: Param::new(b),
+                signs: Param::new(Array::from_slice::<f32>(&[], &[0])),
                 group_size: gs,
                 bits,
                 mode: crate::quant_mode::QuantMode::Affine,
+                hadamard_block: 0,
                 weight_layout: QLinearWeightLayout::Canonical,
                 q2_row2: std::sync::OnceLock::new(),
                 q2_simd_decode: Q2SimdDecodePolicy::Stock,
@@ -19784,8 +20382,9 @@ mod tests {
                     escha: None,
                 },
                 shared_expert: Qwen3NextMLP {
-                    gate_proj: make_ql(d, shared_inter * 2, gs, bits),
-                    up_proj: make_ql(d, shared_inter * 2, gs, bits),
+                    gate_up_proj: None,
+                    gate_proj: Some(make_ql(d, shared_inter * 2, gs, bits)),
+                    up_proj: Some(make_ql(d, shared_inter * 2, gs, bits)),
                     down_proj: make_ql(shared_inter * 2, d, gs, bits),
                 },
                 shared_expert_gate: make_ql(d, 1, gs, bits),
@@ -19843,14 +20442,56 @@ mod tests {
                         moe.switch_mlp.down_proj.biases.value.clone(),
                     ),
                     se_gate: (
-                        moe.shared_expert.gate_proj.weight.value.clone(),
-                        moe.shared_expert.gate_proj.scales.value.clone(),
-                        moe.shared_expert.gate_proj.biases.value.clone(),
+                        moe
+                            .shared_expert
+                            .gate_proj
+                            .as_ref()
+                            .expect("gate_proj present")
+                            .weight
+                            .value
+                            .clone(),
+                        moe
+                            .shared_expert
+                            .gate_proj
+                            .as_ref()
+                            .expect("gate_proj present")
+                            .scales
+                            .value
+                            .clone(),
+                        moe
+                            .shared_expert
+                            .gate_proj
+                            .as_ref()
+                            .expect("gate_proj present")
+                            .biases
+                            .value
+                            .clone(),
                     ),
                     se_up: (
-                        moe.shared_expert.up_proj.weight.value.clone(),
-                        moe.shared_expert.up_proj.scales.value.clone(),
-                        moe.shared_expert.up_proj.biases.value.clone(),
+                        moe
+                            .shared_expert
+                            .up_proj
+                            .as_ref()
+                            .expect("up_proj present")
+                            .weight
+                            .value
+                            .clone(),
+                        moe
+                            .shared_expert
+                            .up_proj
+                            .as_ref()
+                            .expect("up_proj present")
+                            .scales
+                            .value
+                            .clone(),
+                        moe
+                            .shared_expert
+                            .up_proj
+                            .as_ref()
+                            .expect("up_proj present")
+                            .biases
+                            .value
+                            .clone(),
                     ),
                     se_down: (
                         moe.shared_expert.down_proj.weight.value.clone(),
@@ -26328,12 +26969,14 @@ mod tests {
             group_size: 32,
             bits: 4,
             mode: crate::quant_mode::QuantMode::MxFp4,
+            hadamard_block: 0,
         })
         .unwrap();
         let affine = QLinear::new_spec(QuantSpec {
             group_size: 64,
             bits: 4,
             mode: crate::quant_mode::QuantMode::Affine,
+            hadamard_block: 0,
         })
         .unwrap();
 
@@ -26393,6 +27036,173 @@ mod tests {
         let q = args.quant_spec_for("model.layers.3.self_attn.q_proj");
         assert_eq!(q.bits, 4);
         assert!(q.mode.is_mxfp4());
+    }
+
+    /// `hadamard_overrides` resolves the same way `quant_overrides` does
+    /// (direct match, then `language_model.`-prefix dual-form lookup) and is
+    /// folded into `quant_spec_for`'s result. A path with no entry gets
+    /// `hadamard_block == 0` — every checkpoint other than a
+    /// `prism_hadamard_qwen35` pack, unaffected by this feature entirely.
+    #[test]
+    fn quant_spec_for_resolves_hadamard_overrides() {
+        let mut args = valid_causal_lm_args();
+        args.quantization = Some(QuantizationConfig {
+            group_size: 128,
+            bits: 2,
+            mode: crate::quant_mode::QuantMode::Affine,
+        });
+        args.hadamard_overrides.insert(
+            "language_model.model.layers.3.mlp.down_proj".to_owned(),
+            1024,
+        );
+
+        // Checkpoint form in the map, model-parameter form in the lookup.
+        let rotated = args.quant_spec_for("model.layers.3.mlp.down_proj");
+        assert_eq!(rotated.hadamard_block, 1024);
+        assert_eq!(rotated.bits, 2);
+        assert_eq!(rotated.group_size, 128);
+
+        // No entry for this path.
+        let plain = args.quant_spec_for("model.layers.3.mlp.up_proj");
+        assert_eq!(plain.hadamard_block, 0);
+    }
+
+    /// End-to-end: a `prism_hadamard_qwen35`-shaped `config.json` (top-level
+    /// `text_config` + `modules` manifest + `quantization`, matching
+    /// `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`'s real pack layout) resolves
+    /// through the same `text_config`-unwrap path every Qwen3.5 VLM wrapper
+    /// config already uses, with `modules` folded into `hadamard_overrides`.
+    #[test]
+    fn load_qwen3_5_text_config_args_resolves_hadamard_modules_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: serde_json::Value = serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "model_type": "prism_hadamard_qwen35",
+                "quantization": {"bits": 2, "group_size": 128, "mode": "affine"},
+                "modules": [
+                    {"path": "model.layers.0.mlp.down_proj", "block": 512, "embedding": false, "dtype": "float16"},
+                    {"path": "model.layers.0.mlp.up_proj", "block": 0, "embedding": false, "dtype": "float16"},
+                    {"path": "model.embed_tokens", "block": 1024, "embedding": true, "dtype": "float16"}
+                ],
+                "text_config": {
+                    "model_type": "qwen3_5",
+                    "hidden_size": 256,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 512,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "head_dim": 64,
+                    "rms_norm_eps": 1e-06,
+                    "vocab_size": 1024,
+                    "max_position_embeddings": 512,
+                    "full_attention_interval": 1
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let args = load_qwen3_5_text_config_args_from_value(dir.path(), &config).unwrap();
+
+        // Listed with a nonzero block -> rotation active.
+        let down = args.quant_spec_for("model.layers.0.mlp.down_proj");
+        assert_eq!(down.hadamard_block, 512);
+        assert_eq!(down.bits, 2);
+        assert_eq!(down.group_size, 128);
+
+        // Listed with block == 0 -> explicitly not rotated (today's plain
+        // Bonsai-Q2 behavior, unaffected).
+        assert_eq!(
+            args.quant_spec_for("model.layers.0.mlp.up_proj")
+                .hadamard_block,
+            0
+        );
+
+        // Not listed at all -> also not rotated.
+        assert_eq!(
+            args.quant_spec_for("model.layers.0.self_attn.q_proj")
+                .hadamard_block,
+            0
+        );
+
+        // Embedding manifest entry resolves the same way.
+        assert_eq!(
+            args.quant_spec_for("model.embed_tokens").hadamard_block,
+            1024
+        );
+    }
+
+    /// A `modules` manifest without `schema_version: 1` is rejected rather
+    /// than silently ignored — an unrecognized pack version could carry a
+    /// different (incompatible) rotation contract.
+    #[test]
+    fn load_qwen3_5_text_config_args_rejects_unknown_hadamard_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: serde_json::Value = serde_json::from_str(
+            r#"{
+                "model_type": "prism_hadamard_qwen35",
+                "modules": [
+                    {"path": "model.layers.0.mlp.down_proj", "block": 512, "embedding": false, "dtype": "float16"}
+                ],
+                "text_config": {
+                    "model_type": "qwen3_5",
+                    "hidden_size": 256,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 512,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "head_dim": 64,
+                    "rms_norm_eps": 1e-06,
+                    "vocab_size": 1024,
+                    "max_position_embeddings": 512,
+                    "full_attention_interval": 1
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let err = load_qwen3_5_text_config_args_from_value(dir.path(), &config).unwrap_err();
+        assert!(err.to_string().contains("schema_version"));
+    }
+
+    /// `hadamard_rotate` is a self-inverse transform: rotating forward then
+    /// inverse must recover the original activation (general property, not a
+    /// fixed golden value — matches [`fwht_normalized`]'s own involution test
+    /// in `turboquant.rs`). Exercises real, non-trivial (non-constant, non-
+    /// aligned-to-one-block) shapes across every valid block size.
+    #[test]
+    fn hadamard_rotate_forward_then_inverse_recovers_input() {
+        for block in [512_i32, 1024, 2048, 4096] {
+            let x = mlx_rs::random::normal::<f32>(&[2, 3, block * 2], None, None, None).unwrap();
+            let signs_data: Vec<f32> = (0..block * 2)
+                .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+                .collect();
+            let signs = Array::from_slice(&signs_data, &[block * 2]);
+
+            let rotated = hadamard_rotate(&x, block, &signs, false).unwrap();
+            let recovered = hadamard_rotate(&rotated, block, &signs, true).unwrap();
+
+            let error = ops::abs(&ops::subtract(&recovered, &x).unwrap())
+                .unwrap()
+                .max(None)
+                .unwrap();
+            mlx_rs::transforms::eval([&error]).unwrap();
+            assert!(
+                error.item::<f32>() < 1e-4,
+                "block={block}: forward+inverse did not recover input, max abs error={}",
+                error.item::<f32>()
+            );
+        }
+    }
+
+    /// A block size that doesn't evenly divide the last axis must error, not
+    /// silently mix chunks across the boundary (the exact failure mode the
+    /// checkpoint's own reference loader also guards against).
+    #[test]
+    fn hadamard_rotate_rejects_block_not_dividing_last_axis() {
+        let x = Array::from_slice(&[0.0_f32; 300], &[300]);
+        let signs = Array::from_slice(&[1.0_f32; 300], &[300]);
+        assert!(hadamard_rotate(&x, 128, &signs, false).is_err());
     }
 
     /// Dense-GDN detection keys on `.scales` presence, comparing prefix-
@@ -26468,6 +27278,7 @@ mod tests {
             group_size,
             bits: 4,
             mode: crate::quant_mode::QuantMode::MxFp4,
+            hadamard_block: 0,
         });
         *emb.weight = wq.clone();
         *emb.scales = scales.clone();

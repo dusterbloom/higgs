@@ -2649,9 +2649,9 @@ pub(crate) fn collect_base_safetensors_files(
 }
 
 /// Collect base checkpoint files plus at most one optional MTP sidecar.
-pub(crate) fn collect_safetensors_files(
-    model_path: &Path,
-) -> Result<Vec<std::path::PathBuf>, ModelError> {
+/// List a model directory's safetensors shard/sidecar files (base shards
+/// plus any recognized auxiliary sidecar, e.g. an MTP head), sorted.
+pub fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>, ModelError> {
     let mut files = collect_base_safetensors_files(model_path)?;
     let auxiliary_files = AUXILIARY_SAFETENSORS_FILES
         .iter()
