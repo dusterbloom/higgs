@@ -408,6 +408,240 @@ mod tests {
     /// Phase 3B foundation gate: `bonsai_q2_qmv` must match the CPU oracle
     /// bit-for-bit (within fp16 epsilon) across multiple shapes including the
     /// dominant Bonsai-27B verifier shapes.
+
+    /// Phase C1' go/no-go: stock affine-2bit qmm vs convert-unpack JIT vs
+    /// staged-x JIT at the checkpoint's dominant decode shapes (M=1, f16).
+    /// Run: cargo test --release -p higgs-models q2_qmv_go_no_go -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn q2_qmv_go_no_go() {
+        let _exec = crate::mlx_exec::acquire();
+        use std::time::Instant;
+
+        let mut st = 0x7777_7777_u64;
+        let lcg = |st: &mut u64| {
+            *st = st
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((*st >> 32) as u32)
+        };
+        let f16_vec = |n: usize, st: &mut u64| -> Vec<half::f16> {
+            (0..n)
+                .map(|_| half::f16::from_f32((lcg(st) as f32 / u32::MAX as f32).mul_add(0.2, -0.1)))
+                .collect()
+        };
+        let time = |f: &mut dyn FnMut() -> mlx_rs::Array| {
+            let _ = f().eval().unwrap();
+            let t0 = Instant::now();
+            for _ in 0..30 {
+                let _ = f().eval().unwrap();
+            }
+            t0.elapsed().as_micros() as f64 / 30.0
+        };
+
+        for (rows, k, label) in [
+            (34_816usize, 5_120usize, "gate_up-fused"),
+            (16_384, 5_120, "qkvz-fused"),
+            (17_408, 5_120, "gate/up"),
+            (5_120, 17_408, "down"),
+        ] {
+            let packed_cols = k / 16;
+            let n_groups = k / GROUP_SIZE;
+            let w = mlx_rs::Array::from_slice(
+                &(0..rows * packed_cols).map(|_| lcg(&mut st)).collect::<Vec<u32>>(),
+                &[rows as i32, packed_cols as i32],
+            );
+            let s = mlx_rs::Array::from_slice(&f16_vec(rows * n_groups, &mut st), &[rows as i32, n_groups as i32]);
+            let b = mlx_rs::Array::from_slice(&f16_vec(rows * n_groups, &mut st), &[rows as i32, n_groups as i32]);
+            let x = mlx_rs::Array::from_slice(&f16_vec(k, &mut st), &[1, k as i32]);
+
+            let stock = time(&mut || {
+                crate::quant_mode::quantized_matmul(
+                    &x, &w, &s, Some(&b), true, 128, 2, crate::quant_mode::QuantMode::Affine,
+                )
+                .unwrap()
+            });
+            let convert = time(&mut || {
+                crate::metal_kernel::bonsai_q2_qmv(&x, &w, &s, &b, GROUP_SIZE as i32).unwrap()
+            });
+            let staged = time(&mut || {
+                crate::metal_kernel::bonsai_q2_qmv_staged(&x, &w, &s, &b, GROUP_SIZE as i32)
+                    .unwrap()
+            });
+            println!(
+                "Q2PROBE {label} [{rows},K={k}] M=1: stock={stock:.0}us convert={convert:.0}us staged={staged:.0}us staged-vs-stock={:.2}x",
+                stock / staged
+            );
+        }
+
+        // bf16 activation sweep (server reality): the two fused shapes only.
+        for (rows, k, label) in [(34_816usize, 5_120usize, "gate_up-fused"), (16_384, 5_120, "qkvz-fused")] {
+            let packed_cols = k / 16;
+            let n_groups = k / GROUP_SIZE;
+            let w = mlx_rs::Array::from_slice(
+                &(0..rows * packed_cols).map(|_| lcg(&mut st)).collect::<Vec<u32>>(),
+                &[rows as i32, packed_cols as i32],
+            );
+            let s = mlx_rs::Array::from_slice(&f16_vec(rows * n_groups, &mut st), &[rows as i32, n_groups as i32]);
+            let b = mlx_rs::Array::from_slice(&f16_vec(rows * n_groups, &mut st), &[rows as i32, n_groups as i32]);
+            let x = mlx_rs::Array::from_slice(&f16_vec(k, &mut st), &[1, k as i32])
+                .as_dtype(mlx_rs::Dtype::Bfloat16)
+                .unwrap();
+
+            let stock = time(&mut || {
+                crate::quant_mode::quantized_matmul(
+                    &x, &w, &s, Some(&b), true, 128, 2, crate::quant_mode::QuantMode::Affine,
+                )
+                .unwrap()
+            });
+            let convert = time(&mut || {
+                crate::metal_kernel::bonsai_q2_qmv(&x, &w, &s, &b, GROUP_SIZE as i32).unwrap()
+            });
+            let staged = time(&mut || {
+                crate::metal_kernel::bonsai_q2_qmv_staged(&x, &w, &s, &b, GROUP_SIZE as i32)
+                    .unwrap()
+            });
+            println!(
+                "Q2PROBE-BF16 {label} [{rows},K={k}] M=1: stock={stock:.0}us convert={convert:.0}us staged={staged:.0}us convert-vs-stock={:.2}x",
+                stock / convert
+            );
+        }
+    }
+
+    /// Controlled f16 vs bf16 stock-qmm comparison at the dominant decode
+    /// shapes, interleaved (ABAB) to cancel thermal/drift, median of 5 trials.
+    /// Run: cargo test --release -p higgs-models q2_qmm_dtype_f16_vs_bf16 -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn q2_qmm_dtype_f16_vs_bf16() {
+        let _exec = crate::mlx_exec::acquire();
+        use std::time::Instant;
+
+        let mut st = 0x4242_4242_u64;
+        let lcg = |st: &mut u64| {
+            *st = st
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((*st >> 32) as u32)
+        };
+        let f16_vec = |n: usize, st: &mut u64| -> Vec<half::f16> {
+            (0..n)
+                .map(|_| half::f16::from_f32((lcg(st) as f32 / u32::MAX as f32).mul_add(0.2, -0.1)))
+                .collect()
+        };
+
+        // (rows, k, calls_per_token)
+        let shapes: &[(usize, usize, usize)] = &[
+            (34_816, 5_120, 64),  // gate_up-fused
+            (16_384, 5_120, 48),  // qkvz-fused
+            (17_408, 5_120, 0),   // gate/up reference (unfused shape)
+            (5_120, 17_408, 64),  // down
+            (248_320, 5_120, 1),  // lm_head
+        ];
+
+        for &(rows, k, calls) in shapes {
+            let packed_cols = k / 16;
+            let n_groups = k / GROUP_SIZE;
+            let w = mlx_rs::Array::from_slice(
+                &(0..rows * packed_cols).map(|_| lcg(&mut st)).collect::<Vec<u32>>(),
+                &[rows as i32, packed_cols as i32],
+            );
+            let s = mlx_rs::Array::from_slice(&f16_vec(rows * n_groups, &mut st), &[rows as i32, n_groups as i32]);
+            let b = mlx_rs::Array::from_slice(&f16_vec(rows * n_groups, &mut st), &[rows as i32, n_groups as i32]);
+            let x_f16 = mlx_rs::Array::from_slice(&f16_vec(k, &mut st), &[1, k as i32]);
+            let x_bf16 = x_f16
+                .as_dtype(mlx_rs::Dtype::Bfloat16)
+                .unwrap();
+
+            let run = |x: &mlx_rs::Array, iters: usize| -> f64 {
+                for _ in 0..5 {
+                    let _ = crate::quant_mode::quantized_matmul(
+                        x, &w, &s, Some(&b), true, 128, 2, crate::quant_mode::QuantMode::Affine,
+                    )
+                    .unwrap()
+                    .eval()
+                    .unwrap();
+                }
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    let _ = crate::quant_mode::quantized_matmul(
+                        x, &w, &s, Some(&b), true, 128, 2, crate::quant_mode::QuantMode::Affine,
+                    )
+                    .unwrap()
+                    .eval()
+                    .unwrap();
+                }
+                t0.elapsed().as_micros() as f64 / iters as f64
+            };
+
+            // Interleaved ABAB, 5 trials each.
+            let mut f16_ts = Vec::with_capacity(5);
+            let mut bf16_ts = Vec::with_capacity(5);
+            for _ in 0..5 {
+                f16_ts.push(run(&x_f16, 20));
+                bf16_ts.push(run(&x_bf16, 20));
+            }
+            f16_ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            bf16_ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let f16_med = f16_ts[2];
+            let bf16_med = bf16_ts[2];
+            println!(
+                "DTYPE [{rows},K={k}] calls={calls}: f16={f16_med:.0}us bf16={bf16_med:.0}us ratio={:.2}x (bf16/f16) per-token={:.2}ms@f16 / {:.2}ms@bf16",
+                bf16_med / f16_med,
+                f16_med * calls as f64 / 1000.0,
+                bf16_med * calls as f64 / 1000.0,
+            );
+        }
+    }
+
+    /// Staged-x variant must satisfy the same oracle gate as the base kernel.
+    #[test]
+    fn q2_qmv_staged_kernel_matches_cpu_reference() {
+        let _exec = crate::mlx_exec::acquire();
+
+        for &(out_f, in_f, seed) in &[
+            (96usize, 256usize, 0x1234_5678_u64),
+            (96usize, 1280usize, 0x5EED_5EED_u64), // main block + tail in one launch
+            (130usize, 4096usize, 0x0BAD_F00D_u64),
+            (5120usize, 5120usize, 0xCAFEBABE_u64),
+        ] {
+            let p = make_packed_q2(out_f, in_f, seed);
+            let (w, s, b) = upload_to_mlx(&p);
+
+            let mut st = 0xABCD_EF01_u64;
+            let x_f32: Vec<f32> = (0..in_f)
+                .map(|_| (lcg(&mut st) as f32 / u32::MAX as f32).mul_add(2.0, -1.0))
+                .collect();
+            let x = mlx_rs::Array::from_slice(&x_f32, &[1, in_f as i32])
+                .as_dtype(mlx_rs::Dtype::Float16)
+                .unwrap();
+            let x_ref: Vec<f32> = x_f32
+                .iter()
+                .map(|&v| half::f16::from_f32(v).to_f32())
+                .collect();
+
+            let y =
+                crate::metal_kernel::bonsai_q2_qmv_staged(&x, &w, &s, &b, GROUP_SIZE as i32)
+                    .unwrap();
+            y.eval().unwrap();
+            let got = y.as_slice::<half::f16>();
+
+            let want = dense_matvec_reference(&p, &x_ref);
+            let mut max_rel = 0f32;
+            for r in 0..out_f {
+                let gv = got[r].to_f32();
+                let wv = want[r];
+                if wv != 0.0 {
+                    max_rel = max_rel.max((gv - wv).abs() / wv.abs());
+                }
+            }
+            assert!(
+                max_rel < 1e-2,
+                "staged qmv relative error {max_rel} at {out_f}x{in_f}"
+            );
+        }
+    }
+
     #[test]
     fn q2_qmv_kernel_matches_cpu_reference() {
         let _exec = crate::mlx_exec::acquire();

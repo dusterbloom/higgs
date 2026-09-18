@@ -761,6 +761,14 @@ fn affine_q2_simd_forward(
 /// the Phase 3D TG-LUT4 M=5 specialization, where one packed-word load is
 /// shared across 5 verifier rows via the 2-LUT identity.
 ///
+/// Re-confirmed 2026-09-18 on Ternary-Bonsai-2-27B shapes (M=1, f16, M4 base,
+/// `q2_qmv_go_no_go`): stock beats `bonsai_q2_qmv` by 30-50% at every
+/// dominant shape (gate_up-fused 1062us vs 1283us; qkvz 657us vs 951us; down
+/// 925us vs 2062us), and a threadgroup-staged-x variant (`bonsai_q2_qmv_staged`)
+/// loses by even more — the per-simdgroup x re-reads are already absorbed by
+/// cache. Two independent attempts have now lost to stock; do not retry
+/// without a fundamentally different primitive (e.g. a stock-internal change).
+///
 /// Kept here as `#[allow(dead_code)]` so Phase 3D can wire it in for verifier
 /// M=5+ only without re-implementing the dispatch logic. The narrow Q2 kernels
 /// (`bonsai_q2_qmv`, `bonsai_q2_qmm`) remain bit-exact-validated against the
@@ -1794,6 +1802,29 @@ fn compiled_gdn_decode_enabled() -> bool {
     })
 }
 
+fn gdn_state_dtype() -> Dtype {
+    static ENABLED: OnceLock<Dtype> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        match std::env::var("HIGGS_GDN_STATE")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("f16" | "float16") => Dtype::Float16,
+            Some("bf16" | "bfloat16") => Dtype::Bfloat16,
+            _ => Dtype::Float32,
+        }
+    })
+}
+
+fn gdn_state_mlx_dtype() -> mlx_sys::mlx_dtype {
+    match gdn_state_dtype() {
+        Dtype::Float16 => mlx_sys::mlx_dtype__MLX_FLOAT16,
+        Dtype::Bfloat16 => mlx_sys::mlx_dtype__MLX_BFLOAT16,
+        _ => mlx_sys::mlx_dtype__MLX_FLOAT32,
+    }
+}
+
 fn async_layer_state_eval_enabled() -> bool {
     *ASYNC_LAYER_STATE_EVAL_ENABLED.get_or_init(|| {
         !matches!(
@@ -2298,8 +2329,8 @@ auto dv_idx = thread_position_in_grid.y;
 
 // state_in/state_out are float32 buffers for numerical stability,
 // but the kernel signature types them as InT*. Reinterpret to float*.
-auto i_state = reinterpret_cast<const device float*>(state_in) + (n * Dv + dv_idx) * Dk;
-auto o_state = reinterpret_cast<device float*>(state_out) + (n * Dv + dv_idx) * Dk;
+auto i_state = reinterpret_cast<const device StateT*>(state_in) + (n * Dv + dv_idx) * Dk;
+auto o_state = reinterpret_cast<device StateT*>(state_out) + (n * Dv + dv_idx) * Dk;
 
 float state[n_per_t];
 for (int i = 0; i < n_per_t; ++i) {
@@ -2356,7 +2387,7 @@ for (int t = 0; t < T; ++t) {
 }
 for (int i = 0; i < n_per_t; ++i) {
   auto s_idx = n_per_t * dk_idx + i;
-  o_state[s_idx] = state[i];
+  o_state[s_idx] = static_cast<StateT>(state[i]);
 }
 ";
 
@@ -2408,6 +2439,7 @@ fn create_gated_delta_kernel() -> mlx_sys::mlx_fast_metal_kernel {
 #[allow(unsafe_code)]
 fn configure_gated_delta_kernel(
     in_dtype: mlx_sys::mlx_dtype,
+    state_dtype: mlx_sys::mlx_dtype,
     batch: i32,
     seq_len: i32,
     num_k_heads: i32,
@@ -2422,6 +2454,11 @@ fn configure_gated_delta_kernel(
             config,
             c"InT".as_ptr(),
             in_dtype,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"StateT".as_ptr(),
+            state_dtype,
         );
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
             config,
@@ -2459,7 +2496,7 @@ fn configure_gated_delta_kernel(
             config,
             state_shape.as_ptr(),
             state_shape.len(),
-            mlx_sys::mlx_dtype__MLX_FLOAT32,
+            state_dtype,
         );
 
         config
@@ -2468,6 +2505,7 @@ fn configure_gated_delta_kernel(
 
 fn gated_delta_kernel_config(
     in_dtype: mlx_sys::mlx_dtype,
+    state_dtype: mlx_sys::mlx_dtype,
     batch: i32,
     seq_len: i32,
     num_k_heads: i32,
@@ -2479,6 +2517,7 @@ fn gated_delta_kernel_config(
         return (
             configure_gated_delta_kernel(
                 in_dtype,
+                state_dtype,
                 batch,
                 seq_len,
                 num_k_heads,
@@ -2492,6 +2531,7 @@ fn gated_delta_kernel_config(
 
     let key = GatedDeltaKernelConfigKey {
         in_dtype,
+        state_dtype,
         batch,
         seq_len,
         num_k_heads,
@@ -2504,6 +2544,7 @@ fn gated_delta_kernel_config(
         *cache_map.entry(key).or_insert_with(|| {
             configure_gated_delta_kernel(
                 in_dtype,
+                state_dtype,
                 batch,
                 seq_len,
                 num_k_heads,
@@ -2519,6 +2560,7 @@ fn gated_delta_kernel_config(
 fn validate_gdn_kernel_state(
     operation: &str,
     state: &Array,
+    state_dtype: Dtype,
     batch: i32,
     seq_len: i32,
     num_k_heads: i32,
@@ -2539,9 +2581,9 @@ fn validate_gdn_kernel_state(
             "{operation}: invalid GDN Metal geometry B={batch} T={seq_len} Hk={num_k_heads} Dk={head_k_dim} Hv={num_v_heads} Dv={head_v_dim}"
         )));
     }
-    if state.dtype() != Dtype::Float32 {
+    if state.dtype() != state_dtype {
         return Err(Exception::custom(format!(
-            "{operation}: state must be Float32, got {:?}",
+            "{operation}: state must be {state_dtype:?}, got {:?}",
             state.dtype()
         )));
     }
@@ -2576,6 +2618,7 @@ fn gated_delta_kernel_ffi(
     validate_gdn_kernel_state(
         "gated_delta_kernel",
         state_in,
+        gdn_state_dtype(),
         batch,
         seq_len,
         num_k_heads,
@@ -2591,6 +2634,7 @@ fn gated_delta_kernel_ffi(
     let cached = GATED_DELTA_KERNEL.get_or_init(|| CachedMetalKernel(create_gated_delta_kernel()));
     let (config, config_is_cached) = gated_delta_kernel_config(
         in_dtype,
+        gdn_state_mlx_dtype(),
         batch,
         seq_len,
         num_k_heads,
@@ -2769,6 +2813,11 @@ fn configure_gated_delta_tape_kernel(
             c"InT".as_ptr(),
             in_dtype,
         );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"StateT".as_ptr(),
+            mlx_sys::mlx_dtype__MLX_FLOAT32,
+        );
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
             config,
             c"Dk".as_ptr(),
@@ -2895,6 +2944,7 @@ pub(crate) fn gated_delta_kernel_ffi_with_tape(
     validate_gdn_kernel_state(
         "gated_delta_tape_kernel",
         state_in,
+        Dtype::Float32,
         batch,
         seq_len,
         num_k_heads,
@@ -3088,6 +3138,7 @@ pub(crate) fn tape_replay_kernel_ffi(
     validate_gdn_kernel_state(
         "tape_replay_kernel",
         state_in,
+        Dtype::Float32,
         batch,
         seq_len,
         num_k_heads,
@@ -3588,6 +3639,7 @@ struct QgemvKernelConfigKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GatedDeltaKernelConfigKey {
     in_dtype: mlx_sys::mlx_dtype,
+    state_dtype: mlx_sys::mlx_dtype,
     batch: i32,
     seq_len: i32,
     num_k_heads: i32,
@@ -6695,7 +6747,7 @@ impl GatedDeltaNet {
             if cache.ssm_state.is_none() {
                 cache.ssm_state = Some(ops::zeros_dtype(
                     &[B, self.num_v_heads, self.head_v_dim, self.head_k_dim],
-                    Dtype::Float32,
+                    gdn_state_dtype(),
                 )?);
             }
 
@@ -6734,7 +6786,7 @@ impl GatedDeltaNet {
             Some(state) => state,
             None => ops::zeros_dtype(
                 &[B, self.num_v_heads, self.head_v_dim, self.head_k_dim],
-                Dtype::Float32,
+                gdn_state_dtype(),
             )?,
         };
         // Fused kernel: computes g, beta, AND runs the full recurrence in one dispatch.
@@ -7015,7 +7067,7 @@ impl GatedDeltaNet {
             Some(s) => s.clone(),
             None => ops::zeros_dtype(
                 &[B, self.num_v_heads, self.head_v_dim, self.head_k_dim],
-                Dtype::Float32,
+                gdn_state_dtype(),
             )?,
         };
         let (y, _unchanged_state) = gated_delta_kernel_ffi_stateless(
@@ -7258,7 +7310,7 @@ impl GatedDeltaNet {
             Some(s) => s,
             None => ops::zeros_dtype(
                 &[B, self.num_v_heads, self.head_v_dim, self.head_k_dim],
-                Dtype::Float32,
+                gdn_state_dtype(),
             )?,
         };
         let (y, new_state, delta_tape) = gated_delta_kernel_ffi_with_tape(
@@ -19253,6 +19305,171 @@ mod tests {
         }
         let per = t0.elapsed().as_micros() as f64 / iters as f64;
         eprintln!("GDN-KERNEL decode step [Hk={nh} Dk={hk} Hv={hv} Dv={dv32}]: {per:.1}us x48 layers = {:.2}ms/token", per * 48.0 / 1000.0);
+    }
+
+    /// Phase C0: decompose the per-layer GDN decode cost — sync round-trip
+    /// floor, delta-kernel GPU time (pipelined), conv kernel, norm/repeat glue.
+    /// Run: cargo test --release -p higgs-models bench_gdn_decode_c0 -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_gdn_decode_c0_decomposition() {
+        let (nh32, hk32, hv32, dv32) = (8i32, 256i32, 48i32, 128i32);
+        let conv_dim = 10240i32;
+
+        let q = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 1, nh32, hk32], None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        let k = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 1, nh32, hk32], None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        let v = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 1, hv32, dv32], None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        let a_log = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[nh32], None).unwrap();
+        let a = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 1, nh32], None).unwrap();
+        let dt_bias = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[nh32], None).unwrap();
+        let b = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 1, nh32], None).unwrap();
+        let state0 = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, hv32, dv32, hk32], None)
+            .unwrap()
+            .as_dtype(gdn_state_dtype())
+            .unwrap();
+
+        let delta = |state: &Array| {
+            gated_delta_kernel_ffi(
+                &q, &k, &v, &a_log, &a, &dt_bias, &b, state, 1, 1, nh32, hk32, hv32, dv32,
+            )
+        };
+
+        // eval-only floor: price the per-iteration sync round-trip.
+        let warm = state0.clone();
+        warm.eval().unwrap();
+        let iters = 200;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            warm.eval().unwrap();
+        }
+        let eval_floor_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        // delta kernel, per-call sync (3 trials).
+        let mut sync_us = Vec::new();
+        for _ in 0..3 {
+            let (y, mut state) = delta(&state0).unwrap();
+            y.eval().unwrap();
+            let t0 = std::time::Instant::now();
+            for _ in 0..100 {
+                let (y, s) = delta(&state).unwrap();
+                y.eval().unwrap();
+                state = s;
+            }
+            sync_us.push(t0.elapsed().as_micros() as f64 / 100.0);
+        }
+
+        // delta kernel, pipelined: 200 chained submissions, one eval.
+        let (y, mut state) = delta(&state0).unwrap();
+        y.eval().unwrap();
+        let t0 = std::time::Instant::now();
+        for i in 0..iters {
+            let (y, s) = delta(&state).unwrap();
+            state = s;
+            if i == iters - 1 {
+                y.eval().unwrap();
+            }
+        }
+        let pipelined_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        // conv kernel: canonical preactivation at S=1, sync + pipelined.
+        let mixed_qkv =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 1, conv_dim], None)
+                .unwrap()
+                .as_dtype(mlx_rs::Dtype::Bfloat16)
+                .unwrap();
+        let history =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 3, conv_dim], None)
+                .unwrap()
+                .as_dtype(mlx_rs::Dtype::Bfloat16)
+                .unwrap();
+        let weight_t =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[4, conv_dim], None)
+                .unwrap()
+                .as_dtype(mlx_rs::Dtype::Bfloat16)
+                .unwrap();
+        let conv = || {
+            canonical_conv_preactivation_ffi(
+                &mixed_qkv,
+                &history,
+                &weight_t,
+                3,
+                1,
+                1,
+                conv_dim,
+                4,
+                CanonicalConvReduction::AppendStableWindow,
+            )
+        };
+        let _ = conv().unwrap().eval().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            conv().unwrap().eval().unwrap();
+        }
+        let conv_sync_us = t0.elapsed().as_micros() as f64 / iters as f64;
+        let t0 = std::time::Instant::now();
+        let mut last = None;
+        for i in 0..iters {
+            last = Some(conv().unwrap());
+            if i == iters - 1 {
+                last.as_ref().unwrap().eval().unwrap();
+            }
+        }
+        let conv_pipelined_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        // glue: rms_norm q/k pair and q/k head-repeat.
+        let nq_w = Array::ones::<f32>(&[hk32]).unwrap().as_dtype(mlx_rs::Dtype::Float16).unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let n1 = fast::rms_norm(&q, &nq_w, 1e-6).unwrap();
+            let n2 = fast::rms_norm(&k, &nq_w, 1e-6).unwrap();
+            mlx_rs::transforms::eval([&n1, &n2]).unwrap();
+        }
+        let norms_us = t0.elapsed().as_micros() as f64 / iters as f64;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let r1 = ops::repeat_axis::<half::f16>(q.clone(), 6, -2).unwrap();
+            let r2 = ops::repeat_axis::<half::f16>(k.clone(), 6, -2).unwrap();
+            mlx_rs::transforms::eval([&r1, &r2]).unwrap();
+        }
+        let repeat_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        eprintln!("C0 eval-only sync floor: {eval_floor_us:.1}us");
+        eprintln!(
+            "C0 delta kernel: sync={:.1}us (trials {sync_us:?}) pipelined={pipelined_us:.1}us",
+            sync_us.iter().sum::<f64>() / sync_us.len() as f64
+        );
+        eprintln!("C0 conv kernel: sync={conv_sync_us:.1}us pipelined={conv_pipelined_us:.1}us");
+        eprintln!("C0 rms_norm pair: {norms_us:.1}us  q/k repeat pair: {repeat_us:.1}us");
+        // Bandwidth floor reference: a pure read+write of the same volume as
+        // the delta kernel (state [48,128,256] f32 = 6.29MB read + 6.29MB write).
+        // Bandwidth ceiling: one large f32 copy (read + write 1.61GB each way)
+        // amortizes sync so the number reflects DRAM throughput, not round-trip.
+        let big = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[256, hv32, dv32, hk32], None).unwrap();
+        let one = mlx_rs::Array::from_slice(&[1.0001f32], &[1]);
+        let copy_us = {
+            big.multiply(&one).unwrap().eval().unwrap();
+            let t0 = std::time::Instant::now();
+            for _ in 0..5 {
+                big.multiply(&one).unwrap().eval().unwrap();
+            }
+            t0.elapsed().as_micros() as f64 / 5.0
+        };
+        let gb_s = (2.0 * 256.0 * 6.29e6) / (copy_us * 1e-6) / 1e9;
+        eprintln!(
+            "C0 bandwidth ceiling: {gb_s:.0} GB/s -> delta-kernel floor (12.6MB) = {:.0}us (pipelined 328us = {:.2}x floor)",
+            12.58e6 / (gb_s * 1e9) * 1e6,
+            328.0 / (12.58e6 / (gb_s * 1e9) * 1e6)
+        );
+
     }
 
     /// Reference ops implementation of a single gated delta step (for comparison tests).

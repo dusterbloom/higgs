@@ -2471,6 +2471,199 @@ for (int r = 0; r < RPS; ++r) {
 
 static FAST_Q2_QMV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 
+/// Staged variant of `FAST_Q2_QMV_KERNEL_SOURCE`: the input activation block
+/// is staged once per threadgroup in threadgroup memory (BLK fp32 = 4 KB)
+/// instead of being re-read from device memory by every simdgroup (nsg=8
+/// simdgroups re-read the same 1024 elements otherwise). The redundant x
+/// traffic scales with row count and shows up exactly on wide fused
+/// projections (gate_up [34816,5120]).
+const FAST_Q2_QMV_STAGED_SOURCE: &str = r"
+constexpr int VPT = 32;          // values_per_thread (TWO packed u32 words per lane, matches Q1's register footprint)
+constexpr int RPS = 4;           // results_per_simdgroup
+constexpr int WPT = VPT / 16;    // packed uint32 words per thread (2)
+constexpr int BLK = VPT * 32;    // block_size = 1024 (same iteration count as Q1)
+
+threadgroup float x_sh[BLK];
+
+uint tgx = threadgroup_position_in_grid.x;
+uint sg  = simdgroup_index_in_threadgroup;
+uint lid = thread_index_in_simdgroup;
+uint nsg = simdgroups_per_threadgroup;
+uint tid = thread_index_in_threadgroup;
+uint tg_sz = nsg * 32u;
+uint batch = threadgroup_position_in_grid.z;
+
+int out_row = int(tgx) * (int(nsg) * RPS) + int(sg) * RPS;
+auto x_row = x + int(batch) * K;
+
+float xt[VPT];
+float result[RPS];
+for (int r = 0; r < RPS; ++r) { result[r] = 0.0f; }
+
+int aligned_end = (K / BLK) * BLK;
+
+// Main loop: full 1024-element blocks (same iteration count as Q1).
+for (int k = 0; k < aligned_end; k += BLK) {
+    for (uint i = tid; i < uint(BLK); i += tg_sz) {
+        x_sh[i] = float(x_row[k + int(i)]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int xbase = k + int(lid) * VPT;
+    float sum = 0.0f;
+    for (int i = 0; i < VPT; ++i) { float v = x_sh[xbase - k + i]; xt[i] = v; sum += v; }
+
+    int wcol = (k / 16) + int(lid) * WPT;
+    int g = xbase / GroupSize;   // all VPT=32 values still fall in one 128-wide group
+
+    for (int r = 0; r < RPS; ++r) {
+        int row = out_row + r;
+        if constexpr (!AlignedN) {
+            if (row >= n_param) { continue; }
+        }
+        float accum = 0.0f;
+        for (int wp = 0; wp < WPT; ++wp) {
+            uint packed = w[row * KPacked + wcol + wp];
+            int xo = wp * 16;
+            // Unrolled 16-way 2-bit unpack + fma per word. Metal compiler unrolls fully.
+            accum += float((packed >>  0u) & 0x3u) * xt[xo +  0];
+            accum += float((packed >>  2u) & 0x3u) * xt[xo +  1];
+            accum += float((packed >>  4u) & 0x3u) * xt[xo +  2];
+            accum += float((packed >>  6u) & 0x3u) * xt[xo +  3];
+            accum += float((packed >>  8u) & 0x3u) * xt[xo +  4];
+            accum += float((packed >> 10u) & 0x3u) * xt[xo +  5];
+            accum += float((packed >> 12u) & 0x3u) * xt[xo +  6];
+            accum += float((packed >> 14u) & 0x3u) * xt[xo +  7];
+            accum += float((packed >> 16u) & 0x3u) * xt[xo +  8];
+            accum += float((packed >> 18u) & 0x3u) * xt[xo +  9];
+            accum += float((packed >> 20u) & 0x3u) * xt[xo + 10];
+            accum += float((packed >> 22u) & 0x3u) * xt[xo + 11];
+            accum += float((packed >> 24u) & 0x3u) * xt[xo + 12];
+            accum += float((packed >> 26u) & 0x3u) * xt[xo + 13];
+            accum += float((packed >> 28u) & 0x3u) * xt[xo + 14];
+            accum += float((packed >> 30u) & 0x3u) * xt[xo + 15];
+        }
+        float s_val = float(sc[row * NumGroups + g]);
+        float b_val = float(bi[row * NumGroups + g]);
+        result[r] += s_val * accum + b_val * sum;
+    }
+}
+
+// Tail: only exercised by tests with K < 1024 or K % 1024 != 0.
+if (aligned_end < K) {
+    // Main-loop reads must drain before the tail overwrites x_sh.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < uint(BLK); i += tg_sz) {
+        int gi = int(i);
+        x_sh[i] = (aligned_end + gi < K) ? float(x_row[aligned_end + gi]) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int xbase = aligned_end + int(lid) * VPT;
+    bool in_bounds = xbase < K;
+    float sum = 0.0f;
+    for (int i = 0; i < VPT; ++i) {
+        float v = (in_bounds && (xbase + i) < K) ? x_sh[xbase - aligned_end + i] : 0.0f;
+        xt[i] = v;
+        sum += v;
+    }
+    int wcol = (aligned_end / 16) + int(lid) * WPT;
+    int g = in_bounds ? (xbase / GroupSize) : 0;
+    for (int r = 0; r < RPS; ++r) {
+        int row = out_row + r;
+        if constexpr (AlignedN) {
+            if (!in_bounds) { continue; }
+        } else {
+            if (row >= n_param || !in_bounds) { continue; }
+        }
+        float accum = 0.0f;
+        for (int wp = 0; wp < WPT; ++wp) {
+            int widx = wcol + wp;
+            if (widx >= KPacked) { continue; }
+            uint packed = w[row * KPacked + widx];
+            int xo = wp * 16;
+            // Tail bounds-check: each code may be past K.
+            int codes_in_bounds = (xo + 16 <= K - xbase) ? 16 : max(0, K - xbase - xo);
+            if (codes_in_bounds >  0) { accum += float((packed >>  0u) & 0x3u) * xt[xo +  0]; }
+            if (codes_in_bounds >  1) { accum += float((packed >>  2u) & 0x3u) * xt[xo +  1]; }
+            if (codes_in_bounds >  2) { accum += float((packed >>  4u) & 0x3u) * xt[xo +  2]; }
+            if (codes_in_bounds >  3) { accum += float((packed >>  6u) & 0x3u) * xt[xo +  3]; }
+            if (codes_in_bounds >  4) { accum += float((packed >>  8u) & 0x3u) * xt[xo +  4]; }
+            if (codes_in_bounds >  5) { accum += float((packed >> 10u) & 0x3u) * xt[xo +  5]; }
+            if (codes_in_bounds >  6) { accum += float((packed >> 12u) & 0x3u) * xt[xo +  6]; }
+            if (codes_in_bounds >  7) { accum += float((packed >> 14u) & 0x3u) * xt[xo +  7]; }
+            if (codes_in_bounds >  8) { accum += float((packed >> 16u) & 0x3u) * xt[xo +  8]; }
+            if (codes_in_bounds >  9) { accum += float((packed >> 18u) & 0x3u) * xt[xo +  9]; }
+            if (codes_in_bounds > 10) { accum += float((packed >> 20u) & 0x3u) * xt[xo + 10]; }
+            if (codes_in_bounds > 11) { accum += float((packed >> 22u) & 0x3u) * xt[xo + 11]; }
+            if (codes_in_bounds > 12) { accum += float((packed >> 24u) & 0x3u) * xt[xo + 12]; }
+            if (codes_in_bounds > 13) { accum += float((packed >> 26u) & 0x3u) * xt[xo + 13]; }
+            if (codes_in_bounds > 14) { accum += float((packed >> 28u) & 0x3u) * xt[xo + 14]; }
+            if (codes_in_bounds > 15) { accum += float((packed >> 30u) & 0x3u) * xt[xo + 15]; }
+        }
+        float s_val = float(sc[row * NumGroups + g]);
+        float b_val = float(bi[row * NumGroups + g]);
+        result[r] += s_val * accum + b_val * sum;
+    }
+}
+
+for (int r = 0; r < RPS; ++r) {
+    int row = out_row + r;
+    float v = simd_sum(result[r]);
+    if (lid == 0u) {
+        if constexpr (AlignedN) {
+            y[int(batch) * n_param + row] = OutT(v);
+        } else if (row < n_param) {
+            y[int(batch) * n_param + row] = OutT(v);
+        }
+    }
+}
+";
+
+static FAST_Q2_QMV_STAGED_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+#[allow(unsafe_code)]
+fn create_fast_q2_qmv_staged_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"w", c"sc", c"bi", c"x", c"n_param"]);
+    let out_vec = cstr_vec(&[c"y"]);
+    let source = CString::new(FAST_Q2_QMV_STAGED_SOURCE).unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_bonsai_q2_qmv_staged".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,  // raw pointer arithmetic requires row-contiguous inputs
+            false, // atomic_outputs
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+/// Staged-x variant of [`bonsai_q2_qmv`] — same signature and semantics.
+pub fn bonsai_q2_qmv_staged(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+) -> Result<Array, Exception> {
+    bonsai_q2_qmv_fast_impl_kernel(
+        x,
+        weight,
+        scales,
+        biases,
+        group_size,
+        use_aligned_fast_qmv(),
+        &FAST_Q2_QMV_STAGED_KERNEL,
+        create_fast_q2_qmv_staged_kernel,
+        "bonsai_q2_qmv_staged",
+    )
+}
+
 #[allow(unsafe_code)]
 fn create_fast_q2_qmv_kernel() -> mlx_sys::mlx_fast_metal_kernel {
     let in_vec = cstr_vec(&[c"w", c"sc", c"bi", c"x", c"n_param"]);
@@ -2600,6 +2793,31 @@ fn bonsai_q2_qmv_fast_impl(
     group_size: i32,
     prefer_aligned: bool,
 ) -> Result<Array, Exception> {
+    bonsai_q2_qmv_fast_impl_kernel(
+        x,
+        weight,
+        scales,
+        biases,
+        group_size,
+        prefer_aligned,
+        &FAST_Q2_QMV_KERNEL,
+        create_fast_q2_qmv_kernel,
+        "bonsai_q2_qmv_fast",
+    )
+}
+
+#[allow(unsafe_code)]
+fn bonsai_q2_qmv_fast_impl_kernel(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+    prefer_aligned: bool,
+    kernel_cell: &OnceLock<CachedMetalKernel>,
+    create: fn() -> mlx_sys::mlx_fast_metal_kernel,
+    label: &str,
+) -> Result<Array, Exception> {
     ensure_ffi_error_handler();
 
     let x_shape = x.shape();
@@ -2633,7 +2851,7 @@ fn bonsai_q2_qmv_fast_impl(
     let stream = Stream::task_local_or_default();
     let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
 
-    let cached = FAST_Q2_QMV_KERNEL.get_or_init(|| CachedMetalKernel(create_fast_q2_qmv_kernel()));
+    let cached = kernel_cell.get_or_init(|| CachedMetalKernel(create()));
     let config =
         configure_fast_q2_qmv_kernel(out_dtype, n_rows, m_rows, k_dim, group_size, prefer_aligned);
 
@@ -2661,7 +2879,7 @@ fn bonsai_q2_qmv_fast_impl(
 
     let result = if status != 0 {
         Err(Exception::custom(format!(
-            "bonsai_q2_qmv_fast failed: {}",
+            "{label} failed: {}",
             take_last_error()
         )))
     } else {
