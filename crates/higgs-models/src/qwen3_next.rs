@@ -1255,6 +1255,21 @@ impl QLinear {
                         self.group_size,
                     );
                 }
+                // Ternary prism packs (`bias == -scale`): select-based no-bias
+                // qmv. `hadamard_block > 0` is the pack marker and guarantees
+                // codes {0,1,2}; M=1 (decode) only, prefill stays on stock.
+                if self.bits == 2 && self.hadamard_block > 0 && ternary_qmv_enabled() {
+                    let row_count: i32 =
+                        x.shape().iter().take(x.ndim().saturating_sub(1)).product();
+                    if row_count == 1 {
+                        return crate::metal_kernel::bonsai_q2_qmv_ternary(
+                            x,
+                            &self.weight,
+                            &self.scales,
+                            self.group_size,
+                        );
+                    }
+                }
                 // DIAGNOSTIC (HIGGS_DIAG_DEQUANT=1): force the dense dequantized
                 // matmul (row-independent) instead of quantized_matmul, to test
                 // whether quantized_matmul's length-dependence is the divergence
@@ -1825,6 +1840,38 @@ fn gdn_state_mlx_dtype() -> mlx_sys::mlx_dtype {
     }
 }
 
+/// Whether the ternary no-bias qmv kernel is used for prism-pack decode
+/// (bits=2 affine, hadamard-rotated, `bias == -scale`). Default on; the
+/// select-based kernel reads fewer bytes than stock and measured 1.3-1.8x
+/// faster at M=1 across all dominant shapes. Kill-switch: HIGGS_TERNARY_QMV=0.
+fn ternary_qmv_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("HIGGS_TERNARY_QMV").map_or(true, |v| v != "0"))
+}
+
+/// Whether the reduced-precision state store applies stochastic rounding
+/// (1 = yes). Only meaningful when `gdn_state_dtype() != Float32`. NVIDIA
+/// Nemotron's "Mamba State Quantization" recipe selects exactly this
+/// (FP16 + stochastic rounding, Philox<5>) because round-to-nearest bias
+/// accumulates across the per-token recurrence; SR keeps the error zero-mean.
+/// Kill-switch: HIGGS_GDN_STATE_SR=0.
+fn gdn_state_stochastic() -> i32 {
+    static ENABLED: OnceLock<i32> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if gdn_state_dtype() == Dtype::Float32 {
+            return 0;
+        }
+        let disabled = matches!(
+            std::env::var("HIGGS_GDN_STATE_SR")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("0" | "false" | "off" | "no")
+        );
+        if disabled { 0 } else { 1 }
+    })
+}
+
 fn async_layer_state_eval_enabled() -> bool {
     *ASYNC_LAYER_STATE_EVAL_ENABLED.get_or_init(|| {
         !matches!(
@@ -2387,7 +2434,19 @@ for (int t = 0; t < T; ++t) {
 }
 for (int i = 0; i < n_per_t; ++i) {
   auto s_idx = n_per_t * dk_idx + i;
-  o_state[s_idx] = static_cast<StateT>(state[i]);
+  if constexpr (StateStoch != 0) {
+    // Stochastic round to StateT: decorrelated zero-mean dither at the target
+    // LSB scale breaks the round-to-nearest bias that otherwise accumulates
+    // across the recurrent state. Dither derives from the pre-round state bits
+    // so it varies per step without a step counter; the mixing rounds are the
+    // integer-finalizer (xxHash/Appleby) constants.
+    uint h = as_type<uint>(state[i]);
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+    float r = float(h >> 8) * 1.1920928955078125e-7f;  // 1/2^23 -> [0,1)
+    o_state[s_idx] = static_cast<StateT>(state[i] * (1.0f + (r - 0.5f) * 9.765625e-4f));
+  } else {
+    o_state[s_idx] = static_cast<StateT>(state[i]);
+  }
 }
 ";
 
@@ -2459,6 +2518,11 @@ fn configure_gated_delta_kernel(
             config,
             c"StateT".as_ptr(),
             state_dtype,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"StateStoch".as_ptr(),
+            gdn_state_stochastic(),
         );
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
             config,
@@ -2817,6 +2881,11 @@ fn configure_gated_delta_tape_kernel(
             config,
             c"StateT".as_ptr(),
             mlx_sys::mlx_dtype__MLX_FLOAT32,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"StateStoch".as_ptr(),
+            0,
         );
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
             config,
@@ -7696,6 +7765,10 @@ impl FfnBlock {
             crate::quant_mode::QuantMode::Affine => {
                 if gp.bits == 1 {
                     affine_q1_forward(x, fw, fs, fb, gp.group_size)?
+                } else if fused_hadamard.is_some() && ternary_qmv_enabled() {
+                    // Ternary prism pack: fused gate_up on the rotated input,
+                    // no bias read. `x` is already hadamard-rotated above.
+                    crate::metal_kernel::bonsai_q2_qmv_ternary(x, fw, fs, gp.group_size)?
                 } else if use_fused_gemv {
                     qgemv_4bit(x, fw, fs, fb, gp.group_size)?
                 } else {

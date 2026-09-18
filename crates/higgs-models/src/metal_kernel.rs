@@ -2743,6 +2743,231 @@ fn configure_fast_q2_qmv_kernel(
     }
 }
 
+/// Ternary-select, no-bias probe kernel. Reads only packed weights + scales
+/// (bias omitted — the checkpoint's ternary contract is `bias = -scale`
+/// exactly, so `w = scale*(q-1)` with q in {0,1,2} -> {-1,0,+1}*scale). The
+/// select-based unpack folds the bias into the sign of x (no bias load, no
+/// int->float convert, no multiply). Fewer bytes read = the point: decode is
+/// DRAM-bound, so dropping the 0.25 bits/weight of biases should translate
+/// ~1:1 into speed. This is the falsification probe for the trit-packing
+/// thesis before committing to a 1.6-bit loader repack.
+const FAST_Q2_TERNARY_QMV_KERNEL_SOURCE: &str = r"
+constexpr int VPT = 32;
+constexpr int RPS = 4;
+constexpr int WPT = VPT / 16;
+constexpr int BLK = VPT * 32;
+
+uint tgx = threadgroup_position_in_grid.x;
+uint sg  = simdgroup_index_in_threadgroup;
+uint lid = thread_index_in_simdgroup;
+uint nsg = simdgroups_per_threadgroup;
+uint batch = threadgroup_position_in_grid.z;
+
+int out_row = int(tgx) * (int(nsg) * RPS) + int(sg) * RPS;
+auto x_row = x + int(batch) * K;
+
+float xt[VPT];
+float result[RPS];
+for (int r = 0; r < RPS; ++r) { result[r] = 0.0f; }
+
+int aligned_end = (K / BLK) * BLK;
+
+for (int k = 0; k < aligned_end; k += BLK) {
+    int xbase = k + int(lid) * VPT;
+    for (int i = 0; i < VPT; ++i) { xt[i] = float(x_row[xbase + i]); }
+
+    int wcol = (k / 16) + int(lid) * WPT;
+    int g = xbase / GroupSize;
+
+    for (int r = 0; r < RPS; ++r) {
+        int row = out_row + r;
+        float pos = 0.0f;
+        float neg = 0.0f;
+        for (int wp = 0; wp < WPT; ++wp) {
+            uint packed = w[row * KPacked + wcol + wp];
+            int xo = wp * 16;
+            uint c0 = (packed >>  0u) & 3u; pos += (c0 == 2u) ? xt[xo+0] : 0.0f; neg += (c0 == 0u) ? xt[xo+0] : 0.0f;
+            uint c1 = (packed >>  2u) & 3u; pos += (c1 == 2u) ? xt[xo+1] : 0.0f; neg += (c1 == 0u) ? xt[xo+1] : 0.0f;
+            uint c2 = (packed >>  4u) & 3u; pos += (c2 == 2u) ? xt[xo+2] : 0.0f; neg += (c2 == 0u) ? xt[xo+2] : 0.0f;
+            uint c3 = (packed >>  6u) & 3u; pos += (c3 == 2u) ? xt[xo+3] : 0.0f; neg += (c3 == 0u) ? xt[xo+3] : 0.0f;
+            uint c4 = (packed >>  8u) & 3u; pos += (c4 == 2u) ? xt[xo+4] : 0.0f; neg += (c4 == 0u) ? xt[xo+4] : 0.0f;
+            uint c5 = (packed >> 10u) & 3u; pos += (c5 == 2u) ? xt[xo+5] : 0.0f; neg += (c5 == 0u) ? xt[xo+5] : 0.0f;
+            uint c6 = (packed >> 12u) & 3u; pos += (c6 == 2u) ? xt[xo+6] : 0.0f; neg += (c6 == 0u) ? xt[xo+6] : 0.0f;
+            uint c7 = (packed >> 14u) & 3u; pos += (c7 == 2u) ? xt[xo+7] : 0.0f; neg += (c7 == 0u) ? xt[xo+7] : 0.0f;
+            uint c8 = (packed >> 16u) & 3u; pos += (c8 == 2u) ? xt[xo+8] : 0.0f; neg += (c8 == 0u) ? xt[xo+8] : 0.0f;
+            uint c9 = (packed >> 18u) & 3u; pos += (c9 == 2u) ? xt[xo+9] : 0.0f; neg += (c9 == 0u) ? xt[xo+9] : 0.0f;
+            uint ca = (packed >> 20u) & 3u; pos += (ca == 2u) ? xt[xo+10] : 0.0f; neg += (ca == 0u) ? xt[xo+10] : 0.0f;
+            uint cb = (packed >> 22u) & 3u; pos += (cb == 2u) ? xt[xo+11] : 0.0f; neg += (cb == 0u) ? xt[xo+11] : 0.0f;
+            uint cc = (packed >> 24u) & 3u; pos += (cc == 2u) ? xt[xo+12] : 0.0f; neg += (cc == 0u) ? xt[xo+12] : 0.0f;
+            uint cd = (packed >> 26u) & 3u; pos += (cd == 2u) ? xt[xo+13] : 0.0f; neg += (cd == 0u) ? xt[xo+13] : 0.0f;
+            uint ce = (packed >> 28u) & 3u; pos += (ce == 2u) ? xt[xo+14] : 0.0f; neg += (ce == 0u) ? xt[xo+14] : 0.0f;
+            uint cf = (packed >> 30u) & 3u; pos += (cf == 2u) ? xt[xo+15] : 0.0f; neg += (cf == 0u) ? xt[xo+15] : 0.0f;
+        }
+        float s_val = float(sc[row * NumGroups + g]);
+        result[r] += s_val * (pos - neg);
+    }
+}
+
+if (aligned_end < K) {
+    int xbase = aligned_end + int(lid) * VPT;
+    bool in_bounds = xbase < K;
+    for (int i = 0; i < VPT; ++i) {
+        xt[i] = (in_bounds && (xbase + i) < K) ? float(x_row[xbase + i]) : 0.0f;
+    }
+    int wcol = (aligned_end / 16) + int(lid) * WPT;
+    int g = in_bounds ? (xbase / GroupSize) : 0;
+    for (int r = 0; r < RPS; ++r) {
+        int row = out_row + r;
+        if constexpr (AlignedN) {
+            if (!in_bounds) { continue; }
+        } else {
+            if (row >= n_param || !in_bounds) { continue; }
+        }
+        float pos = 0.0f;
+        float neg = 0.0f;
+        for (int wp = 0; wp < WPT; ++wp) {
+            int widx = wcol + wp;
+            if (widx >= KPacked) { continue; }
+            uint packed = w[row * KPacked + widx];
+            int xo = wp * 16;
+            uint c0 = (packed >>  0u) & 3u; pos += (c0 == 2u) ? xt[xo+0] : 0.0f; neg += (c0 == 0u) ? xt[xo+0] : 0.0f;
+            uint c1 = (packed >>  2u) & 3u; pos += (c1 == 2u) ? xt[xo+1] : 0.0f; neg += (c1 == 0u) ? xt[xo+1] : 0.0f;
+            uint c2 = (packed >>  4u) & 3u; pos += (c2 == 2u) ? xt[xo+2] : 0.0f; neg += (c2 == 0u) ? xt[xo+2] : 0.0f;
+            uint c3 = (packed >>  6u) & 3u; pos += (c3 == 2u) ? xt[xo+3] : 0.0f; neg += (c3 == 0u) ? xt[xo+3] : 0.0f;
+            uint c4 = (packed >>  8u) & 3u; pos += (c4 == 2u) ? xt[xo+4] : 0.0f; neg += (c4 == 0u) ? xt[xo+4] : 0.0f;
+            uint c5 = (packed >> 10u) & 3u; pos += (c5 == 2u) ? xt[xo+5] : 0.0f; neg += (c5 == 0u) ? xt[xo+5] : 0.0f;
+            uint c6 = (packed >> 12u) & 3u; pos += (c6 == 2u) ? xt[xo+6] : 0.0f; neg += (c6 == 0u) ? xt[xo+6] : 0.0f;
+            uint c7 = (packed >> 14u) & 3u; pos += (c7 == 2u) ? xt[xo+7] : 0.0f; neg += (c7 == 0u) ? xt[xo+7] : 0.0f;
+            uint c8 = (packed >> 16u) & 3u; pos += (c8 == 2u) ? xt[xo+8] : 0.0f; neg += (c8 == 0u) ? xt[xo+8] : 0.0f;
+            uint c9 = (packed >> 18u) & 3u; pos += (c9 == 2u) ? xt[xo+9] : 0.0f; neg += (c9 == 0u) ? xt[xo+9] : 0.0f;
+            uint ca = (packed >> 20u) & 3u; pos += (ca == 2u) ? xt[xo+10] : 0.0f; neg += (ca == 0u) ? xt[xo+10] : 0.0f;
+            uint cb = (packed >> 22u) & 3u; pos += (cb == 2u) ? xt[xo+11] : 0.0f; neg += (cb == 0u) ? xt[xo+11] : 0.0f;
+            uint cc = (packed >> 24u) & 3u; pos += (cc == 2u) ? xt[xo+12] : 0.0f; neg += (cc == 0u) ? xt[xo+12] : 0.0f;
+            uint cd = (packed >> 26u) & 3u; pos += (cd == 2u) ? xt[xo+13] : 0.0f; neg += (cd == 0u) ? xt[xo+13] : 0.0f;
+            uint ce = (packed >> 28u) & 3u; pos += (ce == 2u) ? xt[xo+14] : 0.0f; neg += (ce == 0u) ? xt[xo+14] : 0.0f;
+            uint cf = (packed >> 30u) & 3u; pos += (cf == 2u) ? xt[xo+15] : 0.0f; neg += (cf == 0u) ? xt[xo+15] : 0.0f;
+        }
+        float s_val = float(sc[row * NumGroups + g]);
+        result[r] += s_val * (pos - neg);
+    }
+}
+
+for (int r = 0; r < RPS; ++r) {
+    int row = out_row + r;
+    float v = simd_sum(result[r]);
+    if (lid == 0u) {
+        if constexpr (AlignedN) {
+            y[int(batch) * n_param + row] = OutT(v);
+        } else if (row < n_param) {
+            y[int(batch) * n_param + row] = OutT(v);
+        }
+    }
+}
+";
+
+static FAST_Q2_TERNARY_QMV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+#[allow(unsafe_code)]
+fn create_fast_q2_ternary_qmv_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"w", c"sc", c"x", c"n_param"]);
+    let out_vec = cstr_vec(&[c"y"]);
+    let source = CString::new(FAST_Q2_TERNARY_QMV_KERNEL_SOURCE).unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_bonsai_q2_qmv_ternary".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+/// Ternary-select qmv: `y = x @ dequant(weight).T` for a checkpoint that
+/// stores `w = scale*q + bias` with `bias == -scale` (codes {0,1,2} only).
+/// Reads weights + scales only (no biases).
+#[allow(unsafe_code)]
+pub fn bonsai_q2_qmv_ternary(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    group_size: i32,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let x_shape = x.shape();
+    let weight_shape = weight.shape();
+    let n_rows = *weight_shape
+        .first()
+        .ok_or_else(|| Exception::custom("ternary qmv: weight has no rows"))?;
+    let k_packed = *weight_shape
+        .get(1)
+        .ok_or_else(|| Exception::custom("ternary qmv: weight has no columns"))?;
+    let k_dim = k_packed * 16;
+    let m_rows: i32 = x_shape
+        .iter()
+        .take(x_shape.len().saturating_sub(1))
+        .product();
+
+    let x_flat = x.reshape(&[m_rows, k_dim])?;
+    let w_flat = weight.reshape(&[-1])?;
+    let s_flat = scales.flatten(None, None)?;
+
+    let stream = Stream::task_local_or_default();
+    let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+
+    let cached =
+        FAST_Q2_TERNARY_QMV_KERNEL.get_or_init(|| CachedMetalKernel(create_fast_q2_ternary_qmv_kernel()));
+    let config = configure_fast_q2_qmv_kernel(out_dtype, n_rows, m_rows, k_dim, group_size, use_aligned_fast_qmv());
+
+    let n_scalar = unsafe { mlx_sys::mlx_array_new_int(n_rows) };
+    let input_ptrs = [w_flat.as_ptr(), s_flat.as_ptr(), x_flat.as_ptr(), n_scalar];
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        )
+    };
+
+    let result = if status != 0 {
+        Err(Exception::custom(format!(
+            "bonsai_q2_qmv_ternary failed: {}",
+            take_last_error()
+        )))
+    } else {
+        let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe { mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0) };
+        let y = unsafe { Array::from_ptr(y_ptr) };
+        let trim_to = x_shape.len().saturating_sub(1);
+        let mut out_shape = x_shape
+            .get(..trim_to)
+            .ok_or_else(|| Exception::custom("ternary qmv: x_shape too small"))?
+            .to_vec();
+        out_shape.push(n_rows);
+        y.reshape(&out_shape)
+    };
+
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        mlx_sys::mlx_array_free(n_scalar);
+    }
+    result
+}
+
 /// Fused 2-bit quantized matvec: `y = x @ dequant(weight).T` for narrow M.
 ///
 /// `weight` is the packed `[out_features, in_features/16]` uint32 matrix (each

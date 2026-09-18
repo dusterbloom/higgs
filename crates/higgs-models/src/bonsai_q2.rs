@@ -594,6 +594,184 @@ mod tests {
         }
     }
 
+    /// Ternary-select (no-bias) kernel: bit-gate against the CPU reference on
+    /// ternary data (codes {0,1,2}, bias == -scale exactly).
+    #[test]
+    fn q2_qmv_ternary_matches_cpu_reference() {
+        let _exec = crate::mlx_exec::acquire();
+
+        let make_ternary = |out_f: usize, in_f: usize, seed: u64| {
+            let packed_cols = in_f / WEIGHTS_PER_WORD;
+            let n_groups = in_f / GROUP_SIZE;
+            let mut st = seed;
+            let w_packed: Vec<u32> = (0..out_f * packed_cols)
+                .map(|_| {
+                    let mut word = 0u32;
+                    for sh in 0..16 {
+                        let c = lcg(&mut st) % 3; // {0,1,2}
+                        word |= c << (2 * sh);
+                    }
+                    word
+                })
+                .collect();
+            let scales: Vec<f16> = (0..out_f * n_groups)
+                .map(|i| f16::from_f32(0.05 + 0.013 * ((i % 7) as f32)))
+                .collect();
+            let biases: Vec<f16> = scales.iter().map(|&sv| f16::from_f32(-sv.to_f32())).collect();
+            PackedQ2Linear { w_packed, scales, biases, out_features: out_f, in_features: in_f }
+        };
+
+        for &(out_f, in_f, seed) in &[
+            (96usize, 256usize, 0x1234_5678_u64),
+            (96usize, 1280usize, 0x5EED_5EED_u64),
+            (130usize, 4096usize, 0x0BAD_F00D_u64),
+            (5120usize, 5120usize, 0xCAFEBABE_u64),
+        ] {
+            let p = make_ternary(out_f, in_f, seed);
+            let (w, s, _b) = upload_to_mlx(&p);
+
+            let mut st = 0xABCD_EF01_u64;
+            let x_f32: Vec<f32> = (0..in_f)
+                .map(|_| (lcg(&mut st) as f32 / u32::MAX as f32).mul_add(2.0, -1.0))
+                .collect();
+            let x = mlx_rs::Array::from_slice(&x_f32, &[1, in_f as i32])
+                .as_dtype(mlx_rs::Dtype::Float16)
+                .unwrap();
+            let x_ref: Vec<f32> = x_f32
+                .iter()
+                .map(|&v| half::f16::from_f32(v).to_f32())
+                .collect();
+
+            let y = crate::metal_kernel::bonsai_q2_qmv_ternary(&x, &w, &s, GROUP_SIZE as i32)
+                .unwrap();
+            y.eval().unwrap();
+            let got = y.as_slice::<half::f16>();
+            let want = dense_matvec_reference(&p, &x_ref);
+            let mut max_rel = 0f32;
+            for r in 0..out_f {
+                let gv = got[r].to_f32();
+                let wv = want[r];
+                if wv != 0.0 {
+                    max_rel = max_rel.max((gv - wv).abs() / wv.abs());
+                }
+            }
+            assert!(
+                max_rel < 1e-2,
+                "ternary qmv relative error {max_rel} at {out_f}x{in_f}"
+            );
+        }
+    }
+
+    /// Go/no-go: does dropping the bias read (ternary no-bias kernel) beat
+    /// stock MLX at the dominant M=1 shapes? This falsifies (or confirms) the
+    /// "decode is DRAM-bound, fewer bytes = faster" thesis before the trit
+    /// repack. Run: cargo test --release -p higgs-models q2_qmv_ternary_go_no_go -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn q2_qmv_ternary_go_no_go() {
+        let _exec = crate::mlx_exec::acquire();
+        use std::time::Instant;
+
+        let mut st = 0x7777_7777_u64;
+        let lcg2 = |st: &mut u64| {
+            *st = st
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((*st >> 32) as u32)
+        };
+        let f16_vec = |n: usize, st: &mut u64| -> Vec<half::f16> {
+            (0..n)
+                .map(|_| half::f16::from_f32((lcg2(st) as f32 / u32::MAX as f32).mul_add(0.2, -0.1)))
+                .collect()
+        };
+        let time = |f: &mut dyn FnMut() -> mlx_rs::Array| {
+            let _ = f().eval().unwrap();
+            let t0 = Instant::now();
+            for _ in 0..30 {
+                let _ = f().eval().unwrap();
+            }
+            t0.elapsed().as_micros() as f64 / 30.0
+        };
+
+        for (rows, k, label) in [
+            (34_816usize, 5_120usize, "gate_up-fused"),
+            (16_384, 5_120, "qkvz-fused"),
+            (17_408, 5_120, "gate/up"),
+            (5_120, 17_408, "down"),
+        ] {
+            let packed_cols = k / 16;
+            let n_groups = k / GROUP_SIZE;
+            let mut w: Vec<u32> = Vec::with_capacity(rows * packed_cols);
+            for _ in 0..rows * packed_cols {
+                let mut word = 0u32;
+                for sh in 0..16 {
+                    let c = lcg2(&mut st) % 3;
+                    word |= c << (2 * sh);
+                }
+                w.push(word);
+            }
+            let w = mlx_rs::Array::from_slice(&w, &[rows as i32, packed_cols as i32]);
+            let s = mlx_rs::Array::from_slice(&f16_vec(rows * n_groups, &mut st), &[rows as i32, n_groups as i32]);
+            let b = mlx_rs::Array::from_slice(
+                &s.as_slice::<half::f16>().iter().map(|&v| half::f16::from_f32(-v.to_f32())).collect::<Vec<_>>(),
+                &[rows as i32, n_groups as i32],
+            );
+            let x = mlx_rs::Array::from_slice(&f16_vec(k, &mut st), &[1, k as i32]);
+
+            let stock = time(&mut || {
+                crate::quant_mode::quantized_matmul(
+                    &x, &w, &s, Some(&b), true, 128, 2, crate::quant_mode::QuantMode::Affine,
+                )
+                .unwrap()
+            });
+            let ternary = time(&mut || {
+                crate::metal_kernel::bonsai_q2_qmv_ternary(&x, &w, &s, GROUP_SIZE as i32).unwrap()
+            });
+            println!(
+                "TERNARY-PROBE {label} [{rows},K={k}] M=1: stock={stock:.0}us ternary={ternary:.0}us ternary-vs-stock={:.2}x",
+                stock / ternary
+            );
+        }
+
+        // bf16 activation confirmation (server reality) on the two dominant shapes.
+        for (rows, k, label) in [(34_816usize, 5_120usize, "gate_up-fused"), (16_384, 5_120, "qkvz-fused")] {
+            let packed_cols = k / 16;
+            let n_groups = k / GROUP_SIZE;
+            let mut w: Vec<u32> = Vec::with_capacity(rows * packed_cols);
+            for _ in 0..rows * packed_cols {
+                let mut word = 0u32;
+                for sh in 0..16 {
+                    let c = lcg2(&mut st) % 3;
+                    word |= c << (2 * sh);
+                }
+                w.push(word);
+            }
+            let w = mlx_rs::Array::from_slice(&w, &[rows as i32, packed_cols as i32]);
+            let s = mlx_rs::Array::from_slice(&f16_vec(rows * n_groups, &mut st), &[rows as i32, n_groups as i32]);
+            let b = mlx_rs::Array::from_slice(
+                &s.as_slice::<half::f16>().iter().map(|&v| half::f16::from_f32(-v.to_f32())).collect::<Vec<_>>(),
+                &[rows as i32, n_groups as i32],
+            );
+            let x = mlx_rs::Array::from_slice(&f16_vec(k, &mut st), &[1, k as i32])
+                .as_dtype(mlx_rs::Dtype::Bfloat16)
+                .unwrap();
+
+            let stock = time(&mut || {
+                crate::quant_mode::quantized_matmul(
+                    &x, &w, &s, Some(&b), true, 128, 2, crate::quant_mode::QuantMode::Affine,
+                )
+                .unwrap()
+            });
+            let ternary = time(&mut || {
+                crate::metal_kernel::bonsai_q2_qmv_ternary(&x, &w, &s, GROUP_SIZE as i32).unwrap()
+            });
+            println!(
+                "TERNARY-PROBE-BF16 {label} [{rows},K={k}] M=1: stock={stock:.0}us ternary={ternary:.0}us ternary-vs-stock={:.2}x",
+                stock / ternary
+            );
+        }
+    }
+
     /// Staged-x variant must satisfy the same oracle gate as the base kernel.
     #[test]
     fn q2_qmv_staged_kernel_matches_cpu_reference() {
