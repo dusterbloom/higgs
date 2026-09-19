@@ -1,3 +1,6 @@
+// Model forward passes eval under the engine MLX gate (structurally on-gate); see clippy.toml.
+#![allow(clippy::disallowed_methods)]
+
 //! Starcoder2 model implementation.
 //!
 //! Differs from the standard transformer in several ways:
@@ -10,7 +13,7 @@
 use std::path::Path;
 
 use mlx_rs::{
-    Array, array,
+    Array, arange, array,
     builder::Builder,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
@@ -118,8 +121,8 @@ fn create_sliding_causal_mask(
     let offset = kv_len - query_len;
 
     let q_pos =
-        ops::arange::<_, f32>(offset, offset + query_len, None)?.reshape(&[query_len, 1])?;
-    let k_pos = ops::arange::<_, f32>(None, kv_len, None)?.reshape(&[1, kv_len])?;
+        arange!(start = offset, stop = offset + query_len)?.reshape(&[query_len, 1])?;
+    let k_pos = arange!(stop = kv_len)?.reshape(&[1, kv_len])?;
 
     // diff[q, k] = q_abs - k; visible when 0 <= diff < window
     let diff = q_pos.subtract(&k_pos)?;

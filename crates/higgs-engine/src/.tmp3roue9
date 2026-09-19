@@ -1,0 +1,652 @@
+//! Batch engine with interleaved request processing.
+//!
+//! Unlike [`SimpleEngine`](crate::simple::SimpleEngine) which serializes requests
+//! through a mutex, `BatchEngine` runs a dedicated background loop that interleaves
+//! decode steps across multiple active requests. Each request gets one token per
+//! iteration, so concurrent clients see tokens as soon as possible rather than
+//! waiting for prior requests to fully complete.
+
+use std::path::Path;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+
+use higgs_models::mlx_exec::{async_eval, eval};
+use higgs_models::{
+    AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample,
+    turboquant::KvCacheConfig,
+    vision::{ImageBatch, ImageInput, VisionCapabilities, VisionError, VisionModel},
+};
+use mlx_rs::{
+    Array, Stream,
+    ops::indexing::{IndexOp, NewAxis},
+    with_new_default_stream,
+};
+use tokenizers::Tokenizer;
+
+use crate::{
+    chat_template::{ChatMessage, ChatPromptMode, ChatTemplateRenderer},
+    engine::{GenerationOutput, StreamingOutput},
+    error::EngineError,
+    model_loader,
+    prompt_cache::PrefixCache,
+    simple::{IncrementalDetok, find_stop_in_tail},
+};
+
+/// Default maximum number of cached prefixes.
+const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
+
+/// Maximum number of pending requests in the submission queue.
+const REQUEST_QUEUE_CAPACITY: usize = 128;
+static NEXT_PREFILL_ID: AtomicU64 = AtomicU64::new(1);
+
+// ---------------------------------------------------------------------------
+// Request types
+// ---------------------------------------------------------------------------
+
+/// A generation request submitted to the batch engine.
+struct BatchRequest {
+    prompt_tokens: Vec<u32>,
+    max_tokens: u32,
+    params: SamplingParams,
+    stop_sequences: Vec<String>,
+    logprobs: bool,
+    top_logprobs: Option<u32>,
+    constraint: Option<crate::constrained::ConstrainedGenerator>,
+    /// Raw decoded images for multimodal requests. The worker preprocesses
+    /// them (inside [`start_prefill`], where the `AnyModel` lives) into an
+    /// `ImageBatch` and expands the family marker tokens in the prompt. When
+    /// present, the prompt is prefilled in a single merged-embedding forward
+    /// (image features cannot span chunk boundaries) and the prefix cache is
+    /// bypassed.
+    image_inputs: Vec<ImageInput>,
+    response_tx: tokio::sync::mpsc::Sender<StreamingOutput>,
+}
+
+/// An in-flight request being actively decoded.
+struct ActiveRequest {
+    cache: AnyCache,
+    current_token: Array,
+    generated_tokens: Vec<u32>,
+    max_tokens: u32,
+    params: SamplingParams,
+    stop_sequences: Vec<String>,
+    logprob_top_n: Option<u32>,
+    constraint: Option<crate::constrained::ConstrainedGenerator>,
+    response_tx: tokio::sync::mpsc::Sender<StreamingOutput>,
+    prompt_len: u32,
+    detok: IncrementalDetok,
+}
+
+/// A request whose prompt is being fed through the model over multiple turns
+/// of the worker loop.
+struct PendingPrefill {
+    request_id: u64,
+    req: BatchRequest,
+    prompt_len: u32,
+    tokens: Vec<u32>,
+    offset: usize,
+    cache: AnyCache,
+    /// Worker-produced `ImageBatch` for multimodal requests (see
+    /// [`start_prefill`]); `None` for text-only requests.
+    image_batch: Option<ImageBatch>,
+}
+
+enum PrefillAdvance {
+    InFlight(PendingPrefill),
+    Complete(Option<ActiveRequest>),
+}
+
+#[cfg(test)]
+fn prefill_chunk_ranges(token_count: usize, quantum: usize) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < token_count {
+        let end = start.saturating_add(quantum).min(token_count);
+        ranges.push(start..end);
+        start = end;
+    }
+    ranges
+}
+
+// ---------------------------------------------------------------------------
+// BatchEngine
+// ---------------------------------------------------------------------------
+
+/// Inference engine with interleaved request processing.
+///
+/// Provides the same public API as `SimpleEngine` but runs all inference on a
+/// dedicated background thread. Concurrent requests are interleaved at the
+/// token level instead of being fully serialized.
+pub struct BatchEngine {
+    request_tx: tokio::sync::mpsc::Sender<BatchRequest>,
+    tokenizer: Tokenizer,
+    template: ChatTemplateRenderer,
+    model_name: String,
+    eos_token_ids: Vec<u32>,
+    hidden_size: AtomicI32,
+    /// Whether the loaded model is a vision-language model. Captured at load
+    /// time because the `AnyModel` is moved into the worker thread and the
+    /// handle cannot lock it afterwards.
+    is_vlm: bool,
+    /// The family marker text injected at each image position before
+    /// tokenization, if the loaded model supports vision.
+    image_marker_text: Option<&'static str>,
+    /// Capability metadata for the loaded model, if it supports vision.
+    vision_capabilities: Option<VisionCapabilities>,
+}
+
+impl BatchEngine {
+    /// Load a model and start the background processing loop.
+    pub fn load<P: AsRef<Path>>(
+        dir: P,
+        kv_cache_config: KvCacheConfig,
+        raise_wired_limit: bool,
+        prefill_yield_tokens: Option<u32>,
+        disable_vision: bool,
+    ) -> Result<Self, EngineError> {
+        if kv_cache_config.is_turboquant() {
+            return Err(EngineError::Generation(
+                "TurboQuant is not supported with the batch engine".to_owned(),
+            ));
+        }
+        let model_dir = dir.as_ref();
+        let model_name = crate::simple::derive_model_name(model_dir);
+
+        tracing::info!(model_dir = %model_dir.display(), "Loading model (batch engine)");
+
+        // `disable_vision` is a no-op on nightly (deferred): nightly's
+        // `model_loader::load_model` keeps its single-argument signature and
+        // loads vision-capable checkpoints with their vision tower (see
+        // model_loader.rs). The parameter is retained so the state/main call
+        // chain stays shape-compatible.
+        let _ = disable_vision;
+        let model = model_loader::load_model(model_dir)?;
+        let tokenizer = model_loader::load_tokenizer(model_dir)?;
+        let template = ChatTemplateRenderer::from_model_dir(model_dir)?;
+        let eos_token_ids = crate::simple::extract_eos_tokens(model_dir);
+        let hidden_size = model.hidden_size();
+
+        // Capture vision metadata before the model is moved into the worker
+        // thread; the handle needs it for route-level capability gating and
+        // marker rendering but can never lock the model afterwards.
+        let (is_vlm, image_marker_text, vision_capabilities) =
+            capture_vision_capabilities(model.as_vision());
+
+        crate::simple::set_wired_limit_to_max(raise_wired_limit);
+
+        let (request_tx, request_rx) = tokio::sync::mpsc::channel(REQUEST_QUEUE_CAPACITY);
+        let eos_ids = eos_token_ids.clone();
+        let tok = tokenizer.clone();
+
+        std::thread::Builder::new()
+            .name("batch-engine".into())
+            .spawn(move || {
+                worker_loop(
+                    model,
+                    &tok,
+                    &eos_ids,
+                    request_rx,
+                    kv_cache_config.kv_cache_bytes,
+                    prefill_yield_tokens.unwrap_or(0),
+                );
+            })
+            .map_err(|e| EngineError::Generation(format!("Failed to spawn worker: {e}")))?;
+
+        tracing::info!(
+            model_name = %model_name,
+            eos_tokens = ?eos_token_ids,
+            "Batch engine ready"
+        );
+
+        Ok(Self {
+            request_tx,
+            tokenizer,
+            template,
+            model_name,
+            eos_token_ids,
+            hidden_size: AtomicI32::new(hidden_size),
+            is_vlm,
+            image_marker_text,
+            vision_capabilities,
+        })
+    }
+
+    pub fn model_name(&self) -> &str {
+        &self.model_name
+    }
+
+    pub const fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
+    pub fn eos_token_ids(&self) -> &[u32] {
+        &self.eos_token_ids
+    }
+
+    pub fn hidden_size(&self) -> i32 {
+        self.hidden_size.load(Ordering::Relaxed)
+    }
+
+    /// Whether the loaded model is a vision-language model.
+    pub const fn is_vlm(&self) -> bool {
+        self.is_vlm
+    }
+
+    /// The marker text injected at each image position before tokenization,
+    /// if the loaded model supports vision.
+    pub const fn image_marker_text(&self) -> Option<&'static str> {
+        self.image_marker_text
+    }
+
+    /// Capability metadata for the loaded model, if it supports vision.
+    pub fn vision_capabilities(&self) -> Option<VisionCapabilities> {
+        self.vision_capabilities.clone()
+    }
+
+    /// Apply chat template and tokenize messages.
+    pub fn prepare_chat_prompt_with_thinking(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        _enable_thinking: bool,
+    ) -> Result<Vec<u32>, EngineError> {
+        self.prepare_chat_prompt(messages, tools)
+    }
+
+    /// Apply chat template and tokenize messages.
+    pub fn prepare_chat_prompt(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+    ) -> Result<Vec<u32>, EngineError> {
+        self.prepare_chat_prompt_for_mode(messages, tools, ChatPromptMode::Generation)
+    }
+
+    pub fn prepare_chat_prompt_for_mode(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        mode: ChatPromptMode,
+    ) -> Result<Vec<u32>, EngineError> {
+        let prompt = self
+            .template
+            .apply(messages, tools, mode.add_generation_prompt())?;
+        let encoding = self
+            .tokenizer
+            .encode(prompt.as_str(), false)
+            .map_err(|e| EngineError::Tokenization(e.to_string()))?;
+        Ok(encoding.get_ids().to_vec())
+    }
+
+    /// Generate a complete (non-streaming) response.
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    pub fn generate(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        constraint: Option<crate::constrained::ConstrainedGenerator>,
+        image_inputs: Option<Vec<ImageInput>>,
+    ) -> Result<GenerationOutput, EngineError> {
+        self.generate_with_thinking(
+            prompt_tokens,
+            max_tokens,
+            params,
+            stop_sequences,
+            logprobs,
+            top_logprobs,
+            false,
+            constraint,
+            image_inputs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    pub fn generate_with_thinking(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        _enable_thinking: bool,
+        constraint: Option<crate::constrained::ConstrainedGenerator>,
+        image_inputs: Option<Vec<ImageInput>>,
+    ) -> Result<GenerationOutput, EngineError> {
+        if prompt_tokens.is_empty() {
+            return Err(EngineError::Generation("Prompt is empty".to_owned()));
+        }
+
+        let prompt_len: u32 = prompt_tokens
+            .len()
+            .try_into()
+            .map_err(|_| EngineError::Generation("Prompt too long".to_owned()))?;
+
+        if max_tokens == 0 {
+            return Ok(GenerationOutput {
+                text: String::new(),
+                finish_reason: "length".to_owned(),
+                prompt_tokens: prompt_len,
+                completion_tokens: 0,
+                token_logprobs: None,
+                reasoning_content: None,
+                cached_prompt_tokens: 0,
+            });
+        }
+
+        // Submit request and collect all streaming outputs.
+        let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel(32);
+
+        self.request_tx
+            .blocking_send(BatchRequest {
+                prompt_tokens: prompt_tokens.to_vec(),
+                max_tokens,
+                params: params.clone(),
+                stop_sequences: stop_sequences.to_vec(),
+                logprobs,
+                top_logprobs,
+                constraint,
+                image_inputs: image_inputs.unwrap_or_default(),
+                response_tx: internal_tx,
+            })
+            .map_err(|_| EngineError::Generation("Engine shut down".to_owned()))?;
+
+        let mut full_text = String::new();
+        let mut finish_reason = "length".to_owned();
+        let mut completion_tokens: u32 = 0;
+        let mut all_logprobs: Option<Vec<higgs_models::TokenLogprobInfo>> = logprobs.then(Vec::new);
+        // The worker reports the post-preprocess prompt length on every chunk;
+        // capture it from the first one so multimodal usage matches the
+        // sentinel-expanded token count actually prefilled.
+        let mut reported_prompt_len: Option<u32> = None;
+
+        while let Some(output) = internal_rx.blocking_recv() {
+            // Worker-sent error chunks (prefill/decode failures) fail the
+            // request instead of surfacing as an empty success.
+            if matches!(
+                output.finish_reason.as_deref(),
+                Some(WORKER_ERROR_FINISH | WORKER_ERROR_FINISH_VISION)
+            ) {
+                return Err(worker_error_from_output(&output));
+            }
+            if reported_prompt_len.is_none() {
+                reported_prompt_len = Some(output.prompt_tokens);
+            }
+            full_text.push_str(&output.new_text);
+            completion_tokens = output.completion_tokens;
+            if let Some(ref reason) = output.finish_reason {
+                finish_reason.clone_from(reason);
+            }
+            if let (Some(all_lp), Some(lp)) = (&mut all_logprobs, output.token_logprob) {
+                all_lp.push(lp);
+            }
+            if output.finished {
+                break;
+            }
+        }
+
+        Ok(GenerationOutput {
+            text: full_text,
+            finish_reason,
+            prompt_tokens: reported_prompt_len.unwrap_or(prompt_len),
+            completion_tokens,
+            token_logprobs: all_logprobs,
+            reasoning_content: None,
+            cached_prompt_tokens: 0,
+        })
+    }
+
+    /// Generate tokens one at a time via the provided channel.
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    pub fn generate_streaming(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        constraint: Option<crate::constrained::ConstrainedGenerator>,
+        image_inputs: Option<Vec<ImageInput>>,
+    ) -> Result<(), EngineError> {
+        self.generate_streaming_with_thinking(
+            prompt_tokens,
+            max_tokens,
+            params,
+            stop_sequences,
+            logprobs,
+            top_logprobs,
+            sender,
+            false,
+            false,
+            constraint,
+            image_inputs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    pub fn generate_streaming_with_thinking(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        params: &SamplingParams,
+        stop_sequences: &[String],
+        logprobs: bool,
+        top_logprobs: Option<u32>,
+        sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
+        _enable_thinking: bool,
+        // Batch engine does not emit prefill progress; accepts the flag to
+        // share the streaming interface with SimpleEngine.
+        _return_progress: bool,
+        constraint: Option<crate::constrained::ConstrainedGenerator>,
+        image_inputs: Option<Vec<ImageInput>>,
+    ) -> Result<(), EngineError> {
+        if prompt_tokens.is_empty() {
+            return Err(EngineError::Generation("Prompt is empty".to_owned()));
+        }
+
+        let prompt_len: u32 = prompt_tokens
+            .len()
+            .try_into()
+            .map_err(|_| EngineError::Generation("Prompt too long".to_owned()))?;
+
+        if max_tokens == 0 {
+            let _ = sender.blocking_send(StreamingOutput {
+                new_text: String::new(),
+                finished: true,
+                finish_reason: Some("length".to_owned()),
+                prompt_tokens: prompt_len,
+                completion_tokens: 0,
+                token_logprob: None,
+                prefill_progress: None,
+            });
+            return Ok(());
+        }
+
+        // Submit request -- the background loop sends tokens directly to
+        // an internal channel, and we forward them to the caller's sender.
+        let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel(32);
+
+        self.request_tx
+            .blocking_send(BatchRequest {
+                prompt_tokens: prompt_tokens.to_vec(),
+                max_tokens,
+                params: params.clone(),
+                stop_sequences: stop_sequences.to_vec(),
+                logprobs,
+                top_logprobs,
+                constraint,
+                image_inputs: image_inputs.unwrap_or_default(),
+                response_tx: internal_tx,
+            })
+            .map_err(|_| EngineError::Generation("Engine shut down".to_owned()))?;
+
+        while let Some(output) = internal_rx.blocking_recv() {
+            // Worker-sent error chunks (prefill/decode failures) fail the
+            // request; the caller surfaces the failure (the route sends an
+            // error-finish chunk to the SSE stream).
+            if matches!(
+                output.finish_reason.as_deref(),
+                Some(WORKER_ERROR_FINISH | WORKER_ERROR_FINISH_VISION)
+            ) {
+                return Err(worker_error_from_output(&output));
+            }
+            let finished = output.finished;
+            if sender.blocking_send(output).is_err() {
+                break; // Client disconnected
+            }
+            if finished {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Compute embeddings (delegates to a single forward pass).
+    pub fn embed(&self, _token_ids: &[u32]) -> Result<Vec<f32>, EngineError> {
+        // Embeddings require direct model access. For now, return an error.
+        // A proper implementation would submit an embed request to the worker.
+        Err(EngineError::Generation(
+            "Embeddings not yet supported in batch engine".to_owned(),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background worker loop
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_lines)]
+fn worker_loop(
+    mut model: AnyModel,
+    tokenizer: &Tokenizer,
+    eos_token_ids: &[u32],
+    mut request_rx: tokio::sync::mpsc::Receiver<BatchRequest>,
+    prefix_cache_bytes: usize,
+    prefill_yield_tokens: u32,
+) {
+    let mut prefix_cache =
+        PrefixCache::new(DEFAULT_PREFIX_CACHE_SIZE).with_max_bytes(prefix_cache_bytes);
+    let mut active: Vec<ActiveRequest> = Vec::new();
+    let mut pending_prefill: Option<PendingPrefill> = None;
+
+    // This dedicated worker thread is the sole owner of `model` (it was moved
+    // in), so it is already serialized by single-thread ownership. Hold the
+    // MLX-execution gate for its entire life anyway: it is uncontended here
+    // (no other thread evals while BatchEngine is the active engine — the two
+    // engines are mutually exclusive), so it is free, and it keeps the
+    // sanctioned-eval invariant uniform — the `eval`/`async_eval` wrappers'
+    // debug_assert holds without a BatchEngine carve-out.
+    let _mlx_gate = higgs_models::mlx_exec::acquire();
+
+    loop {
+        // 1. Prefill at most one pending request per iteration.
+        //    This interleaves prefill with decode so long prefills don't
+        //    starve active requests, keeping TTFT low for new arrivals
+        //    while maintaining token throughput for in-flight requests.
+        if pending_prefill.is_none() {
+            if let Ok(req) = request_rx.try_recv() {
+                if prefill_yield_tokens == 0 {
+                    let response_tx = req.response_tx.clone();
+                    match prefill_request(
+                        &mut model,
+                        &mut prefix_cache,
+                        tokenizer,
+                        eos_token_ids,
+                        req,
+                    ) {
+                        Ok(Some(ar)) => active.push(ar),
+                        Ok(None) => {}
+                        Err(e) => {
+                            send_prefill_error(&response_tx, &e);
+                            tracing::error!(error = %e, "Prefill failed");
+                        }
+                    }
+                } else {
+                    let response_tx = req.response_tx.clone();
+                    match start_prefill(&model, tokenizer, &mut prefix_cache, req) {
+                        Ok(prefill) => pending_prefill = Some(prefill),
+                        Err(e) => {
+                            send_prefill_error(&response_tx, &e);
+                            tracing::error!(error = %e, "Prefill failed");
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(prefill) = pending_prefill.take() {
+            let response_tx = prefill.req.response_tx.clone();
+            match advance_prefill(
+                &mut model,
+                &mut prefix_cache,
+                tokenizer,
+                eos_token_ids,
+                prefill,
+                prefill_yield_tokens,
+            ) {
+                Ok(PrefillAdvance::InFlight(resumed_prefill)) => {
+                    pending_prefill = Some(resumed_prefill);
+                }
+                Ok(PrefillAdvance::Complete(Some(ar))) => active.push(ar),
+                Ok(PrefillAdvance::Complete(None)) => {}
+                Err(e) => {
+                    send_prefill_error(&response_tx, &e);
+                    tracing::error!(error = %e, "Prefill failed");
+                }
+            }
+        }
+
+        // 2. If no active requests, block until one arrives.
+        if active.is_empty() && pending_prefill.is_none() {
+            if let Some(req) = request_rx.blocking_recv() {
+                if prefill_yield_tokens == 0 {
+                    let response_tx = req.response_tx.clone();
+                    match prefill_request(
+                        &mut model,
+                        &mut prefix_cache,
+                        tokenizer,
+                        eos_token_ids,
+                        req,
+                    ) {
+                        Ok(Some(ar)) => active.push(ar),
+                        Ok(None) => continue,
+                        Err(e) => {
+                            send_prefill_error(&response_tx, &e);
+                            tracing::error!(error = %e, "Prefill failed");
+                            continue;
+                        }
+                    }
+                } else {
+                    let response_tx = req.response_tx.clone();
+                    match start_prefill(&model, tokenizer, &mut prefix_cache, req) {
+                        Ok(prefill) => pending_prefill = Some(prefill),
+                        Err(e) => {
+                            send_prefill_error(&response_tx, &e);
+                            tracing::error!(error = %e, "Prefill failed");
+                        }
+                    }
+                    continue;
+                }
+            } else {
+                tracing::info!("Request channel closed, worker shutting down");
+                return;
+            }
+        }
+
+        // 3. Run one decode step per active request.
+        //    Use batched decode when possible (Transformer architecture, >1
+        //    request, no constrained generation). Falls back to pipelined
+        //    sequential decode otherwise.
+        let mut finished_indices = Vec::new();
+        let use_batched = active.len() > 1
+            && model.supports_batched_decode()
+            && active.iter().all(|ar| ar.constraint.is_none());
+
+        if use_batched {
+            if let Err(e) = 

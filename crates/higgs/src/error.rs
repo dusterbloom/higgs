@@ -28,41 +28,111 @@ pub enum ServerError {
     #[error("Bad request: {0}")]
     BadRequest(String),
 
+    #[error(
+        "Rendered prompt has {prompt_tokens} tokens, exceeding max_prompt_tokens={max_prompt_tokens}"
+    )]
+    ContextLengthExceeded {
+        prompt_tokens: usize,
+        max_prompt_tokens: u32,
+    },
+
+    #[error("Retained session {0} is unavailable for required continuation")]
+    RetainedSessionUnavailable(u64),
+
     #[error("Model not found: {0}")]
     ModelNotFound(String),
+
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
 
     #[error("Internal error: {0}")]
     InternalError(String),
 
     #[error("Proxy error: {0}")]
     ProxyError(String),
+
+    #[error("Request exceeds the current capacity envelope")]
+    CapacityExceeded(crate::capacity::CapacityExceededError),
+
+    #[error("Capacity is temporarily unavailable")]
+    CapacityUnavailable(crate::capacity::CapacityUnavailableError),
 }
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
-        let (status, error_type, message) = match &self {
+        match self {
+            Self::CapacityExceeded(error) => {
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(crate::capacity::CapacityErrorEnvelope::new(error)),
+                )
+                    .into_response();
+            }
+            Self::CapacityUnavailable(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(crate::capacity::CapacityErrorEnvelope::new(error)),
+                )
+                    .into_response();
+            }
+            other => other.into_standard_response(),
+        }
+    }
+}
+
+impl ServerError {
+    fn into_standard_response(self) -> Response {
+        let (status, error_type, message, code) = match &self {
             Self::Engine(e) => {
                 tracing::error!(error = %e, "Engine error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "server_error",
                     "Internal server error".to_owned(),
+                    None,
                 )
             }
             Self::BadRequest(msg) => (
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 msg.clone(),
+                None,
             ),
-            Self::ModelNotFound(message) => {
-                (StatusCode::NOT_FOUND, "model_not_found", message.clone())
-            }
+            Self::ContextLengthExceeded {
+                prompt_tokens,
+                max_prompt_tokens,
+            } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!(
+                    "Rendered prompt has {prompt_tokens} tokens, exceeding max_prompt_tokens={max_prompt_tokens}"
+                ),
+                Some("context_length_exceeded"),
+            ),
+            Self::RetainedSessionUnavailable(session_id) => (
+                StatusCode::CONFLICT,
+                "conflict",
+                format!("Retained session {session_id} is unavailable for required continuation"),
+                Some("retained_session_unavailable"),
+            ),
+            Self::ModelNotFound(model) => (
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+                format!("Model '{model}' is not loaded"),
+                None,
+            ),
+            Self::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg.clone(), None),
+            Self::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.clone(), None),
             Self::InternalError(msg) => {
                 tracing::error!(error = %msg, "Internal error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "server_error",
                     "Internal server error".to_owned(),
+                    None,
                 )
             }
             Self::ProxyError(msg) => {
@@ -71,7 +141,11 @@ impl IntoResponse for ServerError {
                     StatusCode::BAD_GATEWAY,
                     "proxy_error",
                     "Upstream provider error".to_owned(),
+                    None,
                 )
+            }
+            Self::CapacityExceeded(_) | Self::CapacityUnavailable(_) => {
+                unreachable!("typed capacity errors return before standard error serialization")
             }
         };
 
@@ -79,7 +153,7 @@ impl IntoResponse for ServerError {
             error: ErrorDetail {
                 message,
                 r#type: error_type.to_owned(),
-                code: None,
+                code: code.map(str::to_owned),
             },
         });
 
@@ -162,6 +236,66 @@ mod tests {
         let (_, body) = response_status_and_body(resp).await;
 
         assert!(body["error"]["code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn context_limit_and_required_continuation_have_stable_codes() {
+        let (status, body) = response_status_and_body(
+            ServerError::ContextLengthExceeded {
+                prompt_tokens: 4,
+                max_prompt_tokens: 3,
+            }
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "context_length_exceeded");
+
+        let (status, body) =
+            response_status_and_body(ServerError::RetainedSessionUnavailable(42).into_response())
+                .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "retained_session_unavailable");
+    }
+
+    #[tokio::test]
+    async fn capacity_admission_errors_preserve_exact_typed_envelopes() {
+        let exceeded =
+            crate::capacity::CapacityExceededError::new(1_024, 2_048, "boot-a".to_owned(), 7);
+        let (status, body) =
+            response_status_and_body(ServerError::CapacityExceeded(exceeded).into_response()).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": {
+                    "type": "higgs_capacity_exceeded",
+                    "code": "compact_and_retry",
+                    "safePromptTokens": 1024,
+                    "safeTotalTokens": 2048,
+                    "bootId": "boot-a",
+                    "generation": 7
+                }
+            })
+        );
+
+        let unavailable = crate::capacity::CapacityUnavailableError::new("boot-b".to_owned(), 9);
+        let (status, body) =
+            response_status_and_body(ServerError::CapacityUnavailable(unavailable).into_response())
+                .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": {
+                    "type": "higgs_capacity_unavailable",
+                    "code": "capacity_unavailable",
+                    "bootId": "boot-b",
+                    "generation": 9,
+                    "retryAfterMs": 5000
+                }
+            })
+        );
     }
 
     #[tokio::test]

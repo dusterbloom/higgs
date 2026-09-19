@@ -5,11 +5,19 @@ use serde::{Deserialize, Serialize};
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatCompletionMessage>,
+    /// Optional Higgs extension controlling prefix-cache participation.
+    /// `"bypass"` still runs inference but neither reads nor writes the
+    /// stateless prefix cache.
+    #[serde(default)]
+    pub cache_mode: Option<String>,
     /// Maximum number of tokens to generate.
     ///
     /// Accepts `max_completion_tokens` and `max_output_tokens` aliases.
     #[serde(default, alias = "max_completion_tokens", alias = "max_output_tokens")]
     pub max_tokens: Option<u32>,
+    /// Reject when the fully rendered prompt exceeds this exact token count.
+    #[serde(default)]
+    pub max_prompt_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
@@ -20,10 +28,22 @@ pub struct ChatCompletionRequest {
     pub min_p: Option<f32>,
     #[serde(default)]
     pub repetition_penalty: Option<f32>,
+    /// llama.cpp/Ollama alias for [`Self::repetition_penalty`]. Accepted as a
+    /// separate field (never an `alias`) so clients that send both names — e.g.
+    /// some local backends emit `repeat_penalty` alongside a vLLM-style
+    /// `repetition_penalty` — don't get a "duplicate field" 400. Merged at
+    /// sampling-param build time, with `repetition_penalty` taking precedence.
+    #[serde(default)]
+    pub repeat_penalty: Option<f32>,
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
     #[serde(default)]
     pub presence_penalty: Option<f32>,
+    /// Per-request speculative-decoding method: `auto` (default), `dflash`,
+    /// `mtp`, or `none`. `auto` uses the `DFlash` drafter when one is loaded
+    /// (including while streaming), else the built-in MTP head.
+    #[serde(default)]
+    pub speculation: Option<String>,
     #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]
@@ -32,6 +52,8 @@ pub struct ChatCompletionRequest {
     pub stop: Option<StopSequence>,
     #[serde(default)]
     pub tools: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub tool_choice: Option<ToolChoice>,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
     #[serde(default)]
@@ -49,6 +71,96 @@ pub struct ChatCompletionRequest {
     /// processed, time_ms}`). Ignored for non-streaming requests.
     #[serde(default)]
     pub return_progress: Option<bool>,
+    /// Optional Higgs extension naming a disk prefix-cache checkpoint to load/store.
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
+    /// Max `<think>` tokens before `</think>` is force-closed (de-facto local
+    /// extension; sent by clients like nanobot's `/thinking N`). `None` falls
+    /// back to the engine default budget.
+    #[serde(default)]
+    pub reasoning_budget: Option<u32>,
+    /// Jinja chat-template kwargs (vLLM/Qwen convention). Only
+    /// `enable_thinking` is honored: it overrides per-request whether the model
+    /// reasons.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// Top-level alias for `chat_template_kwargs.enable_thinking`, accepted
+    /// because many OpenAI-compatible clients send the toggle here. When both
+    /// are present, `chat_template_kwargs.enable_thinking` wins; otherwise this
+    /// value is used.
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+    /// Opt-in multi-turn KV-cache reuse. When set (non-streaming, Simple engine
+    /// only) the conversation's KV cache is retained across turns so that a
+    /// continued turn prefills only the new suffix instead of the full history.
+    /// Omitted by default — behavior is unchanged when absent.
+    #[serde(default)]
+    pub session_id: Option<u64>,
+    /// Best-effort idle-eviction lease for an already retained session.
+    #[serde(default)]
+    pub session_lease: Option<SessionLease>,
+    /// Whether a missing retained continuation may cold-prefill.
+    #[serde(default)]
+    pub session_cache_policy: Option<SessionCachePolicy>,
+    /// Optional Higgs extension: drop a retained per-session KV cache before
+    /// serving this request. This is for logical session resets; it does not
+    /// clear exact radix/disk prefix caches.
+    #[serde(default)]
+    pub drop_session_id: Option<u64>,
+    /// Optional Higgs extension: drop multiple retained per-session KV caches
+    /// before serving this request. This is the batched form of
+    /// `drop_session_id`; both fields may be supplied and are de-duplicated by
+    /// the route.
+    #[serde(default)]
+    pub drop_session_ids: Option<Vec<u64>>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct SessionLease {
+    pub session_id: u64,
+    pub ttl_seconds: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCachePolicy {
+    BestEffort,
+    RequireContinuation,
+}
+
+/// Subset of `chat_template_kwargs` that Higgs acts on.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatTemplateKwargs {
+    /// Per-request override for the model's reasoning mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_thinking: Option<bool>,
+}
+
+/// OpenAI-compatible policy for whether the model may or must call a tool.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    Mode(ToolChoiceMode),
+    Named(NamedToolChoice),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoiceMode {
+    Auto,
+    None,
+    Required,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NamedToolChoice {
+    pub r#type: String,
+    pub function: NamedToolChoiceFunction,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NamedToolChoiceFunction {
+    pub name: String,
 }
 
 /// Optional request-level controls for streaming responses.
@@ -135,6 +247,9 @@ pub enum ContentPart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageUrl {
     pub url: String,
+    /// `OpenAI` `detail` resolution control (`auto` / `low` / `high`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<higgs_models::vision::ImageDetail>,
 }
 
 /// A message in a chat conversation.
@@ -307,6 +422,13 @@ pub struct CompletionRequest {
     pub min_p: Option<f32>,
     #[serde(default)]
     pub repetition_penalty: Option<f32>,
+    /// llama.cpp/Ollama alias for [`Self::repetition_penalty`]. Accepted as a
+    /// separate field (never an `alias`) so clients that send both names don't
+    /// get a "duplicate field" 400. Merged at sampling-param build time via
+    /// [`merge_repetition_penalty`], taking the stronger (higher) control so a
+    /// weaker default can't defeat a repetition-loop safeguard.
+    #[serde(default)]
+    pub repeat_penalty: Option<f32>,
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
     #[serde(default)]
@@ -319,6 +441,23 @@ pub struct CompletionRequest {
     pub logprobs: Option<bool>,
     #[serde(default)]
     pub top_logprobs: Option<u32>,
+    /// Optional Higgs extension naming a disk prefix-cache checkpoint to load/store.
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
+}
+
+/// Merge an OpenAI/vLLM `repetition_penalty` with the llama.cpp/Ollama
+/// `repeat_penalty` alias. Some clients (e.g. nanobot) send both on the same
+/// request — `repetition_penalty` from a model-config default and
+/// `repeat_penalty` as a per-model-class loop safeguard. We must accept both
+/// without a "duplicate field" 400, and we take the stronger control (higher
+/// value, since repetition penalties above 1.0 suppress loops) so a weaker
+/// default can never silently disable the safeguard.
+pub fn merge_repetition_penalty(repetition: Option<f32>, repeat: Option<f32>) -> Option<f32> {
+    match (repetition, repeat) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// POST /v1/completions response (non-streaming).
@@ -360,12 +499,53 @@ pub struct CompletionChunkChoice {
     pub finish_reason: Option<String>,
 }
 
+/// Breakdown of the prompt token count (OpenAI `prompt_tokens_details`).
+///
+/// Only `cached_tokens` is populated: the number of prompt tokens served from
+/// reused KV state (session continuation or radix prefix cache) instead of being
+/// re-prefilled this turn. Clients read this as `usage.prompt_tokens_details.cached_tokens`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: u32,
+}
+
 /// Token usage statistics.
 #[derive(Debug, Clone, Serialize)]
 pub struct CompletionUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// OpenAI-shape prompt breakdown. Omitted from the wire when no prompt
+    /// tokens were served from cache, so `cached_tokens: 0` never masquerades as
+    /// a measured zero for paths that don't track reuse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// Higgs extension emitted as `1` only after a lease is confirmed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub higgs_session_lease_active: Option<u32>,
+}
+
+impl CompletionUsage {
+    /// Build a usage block. `cached_tokens` is the count of prompt tokens
+    /// served from reused KV; when it is 0 the `prompt_tokens_details` field is
+    /// omitted entirely (OpenAI clients treat a missing block as "no reuse").
+    #[must_use]
+    pub fn new(prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens_details: (cached_tokens > 0)
+                .then_some(PromptTokensDetails { cached_tokens }),
+            higgs_session_lease_active: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_session_lease_active(mut self, active: bool) -> Self {
+        self.higgs_session_lease_active = active.then_some(1);
+        self
+    }
 }
 
 /// GET /v1/models response.
@@ -373,6 +553,9 @@ pub struct CompletionUsage {
 pub struct ModelList {
     pub object: &'static str,
     pub data: Vec<ModelObject>,
+    /// higgs extension (additive, `OpenAI` clients ignore unknown keys): whether
+    /// runtime model load/switch is enabled (`local.allow_runtime_model_load`).
+    pub runtime_model_load: bool,
 }
 
 /// A model in the models list.
@@ -382,6 +565,25 @@ pub struct ModelObject {
     pub object: &'static str,
     pub created: i64,
     pub owned_by: String,
+    /// higgs extension (additive): whether this model accepts image input (VLM).
+    pub vision: bool,
+    /// higgs extension (additive): facts clients need to select a compatible
+    /// tool/reasoning protocol without maintaining a model-name registry.
+    pub capabilities: ModelRuntimeCapabilities,
+}
+
+/// Runtime facts for a loaded local model.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRuntimeCapabilities {
+    /// `native` means the chat template has a structured tool representation;
+    /// `textual` means nanobot should use its textual tool bridge.
+    pub tool_mode: &'static str,
+    /// `disabled`, `optional`, or `always`.
+    pub thinking: &'static str,
+    /// Fixed prompt-plus-output context ceiling configured for this model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u32>,
 }
 
 /// POST /v1/embeddings request body.
@@ -431,6 +633,20 @@ pub struct EmbeddingUsage {
 mod tests {
     use super::*;
 
+    #[test]
+    fn usage_reports_cached_tokens_only_when_nonzero() {
+        // Reuse happened: OpenAI-shape `prompt_tokens_details.cached_tokens`.
+        let reused = serde_json::to_value(CompletionUsage::new(100, 20, 80)).unwrap();
+        assert_eq!(reused["prompt_tokens"], 100);
+        assert_eq!(reused["total_tokens"], 120);
+        assert_eq!(reused["prompt_tokens_details"]["cached_tokens"], 80);
+
+        // Cold prefill: the block is omitted so a client never reads a
+        // fabricated `cached_tokens: 0`.
+        let cold = serde_json::to_value(CompletionUsage::new(100, 20, 0)).unwrap();
+        assert!(cold.get("prompt_tokens_details").is_none());
+    }
+
     /// Deserialize a chat completion request from JSON with a single user message
     /// and one extra field merged in (e.g., `"max_tokens": 0`).
     fn chat_request_with(extra_field: &str) -> ChatCompletionRequest {
@@ -474,11 +690,7 @@ mod tests {
     }
 
     fn make_usage(prompt: u32, completion: u32) -> CompletionUsage {
-        CompletionUsage {
-            prompt_tokens: prompt,
-            completion_tokens: completion,
-            total_tokens: prompt + completion,
-        }
+        CompletionUsage::new(prompt, completion, 0)
     }
 
     #[test]
@@ -490,6 +702,87 @@ mod tests {
         assert!(req.stream.is_none());
         assert!(req.max_tokens.is_none());
         assert!(req.reasoning.is_none());
+        assert!(req.cache_mode.is_none());
+        assert!(req.max_prompt_tokens.is_none());
+        assert!(req.session_lease.is_none());
+        assert!(req.session_cache_policy.is_none());
+    }
+
+    #[test]
+    fn chat_request_parses_prefill_and_session_lease_controls() {
+        let req = chat_request_with(
+            r#""max_prompt_tokens": 32768,
+                "session_lease": {"session_id": 41, "ttl_seconds": 300},
+                "session_cache_policy": "require_continuation""#,
+        );
+
+        assert_eq!(req.max_prompt_tokens, Some(32_768));
+        let lease = req.session_lease.expect("session lease");
+        assert_eq!(lease.session_id, 41);
+        assert_eq!(lease.ttl_seconds, 300);
+        assert_eq!(
+            req.session_cache_policy,
+            Some(SessionCachePolicy::RequireContinuation)
+        );
+    }
+
+    #[test]
+    fn chat_request_rejects_unknown_session_cache_policy() {
+        let json = r#"{
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "session_cache_policy": "cold_fallback"
+        }"#;
+        assert!(serde_json::from_str::<ChatCompletionRequest>(json).is_err());
+    }
+
+    #[test]
+    fn chat_request_parses_tool_choice_modes_and_named_function() {
+        let required = chat_request_with(r#""tool_choice": "required""#);
+        assert!(matches!(
+            required.tool_choice,
+            Some(ToolChoice::Mode(ToolChoiceMode::Required))
+        ));
+
+        let named = chat_request_with(
+            r#""tool_choice": {"type": "function", "function": {"name": "shell"}}"#,
+        );
+        assert!(matches!(
+            named.tool_choice,
+            Some(ToolChoice::Named(NamedToolChoice {
+                r#type,
+                function: NamedToolChoiceFunction { name }
+            })) if r#type == "function" && name == "shell"
+        ));
+
+        let invalid = r#"{
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "sometimes"
+        }"#;
+        assert!(serde_json::from_str::<ChatCompletionRequest>(invalid).is_err());
+    }
+
+    #[test]
+    fn usage_emits_confirmed_session_lease_only() {
+        let inactive = serde_json::to_value(CompletionUsage::new(8, 0, 0)).unwrap();
+        assert!(inactive.get("higgs_session_lease_active").is_none());
+
+        let active =
+            serde_json::to_value(CompletionUsage::new(8, 0, 0).with_session_lease_active(true))
+                .unwrap();
+        assert_eq!(active["higgs_session_lease_active"], 1);
+    }
+
+    #[test]
+    fn test_chat_request_cache_bypass_deserialization() {
+        let json = r#"{
+            "model": "test",
+            "messages": [{"role": "user", "content": "."}],
+            "cache_mode": "bypass"
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cache_mode.as_deref(), Some("bypass"));
     }
 
     #[test]
@@ -521,6 +814,21 @@ mod tests {
             req.reasoning.and_then(|reasoning| reasoning.effort),
             Some("none".to_owned())
         );
+    }
+
+    #[test]
+    fn test_chat_request_drop_session_id_deserialization() {
+        let json = r#"{
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "session_id": 9,
+            "drop_session_id": 8,
+            "drop_session_ids": [7, 8]
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.session_id, Some(9));
+        assert_eq!(req.drop_session_id, Some(8));
+        assert_eq!(req.drop_session_ids, Some(vec![7, 8]));
     }
 
     #[test]
@@ -572,7 +880,14 @@ mod tests {
                 object: "model",
                 created: 1_234_567_890,
                 owned_by: "local".to_owned(),
+                vision: false,
+                capabilities: ModelRuntimeCapabilities {
+                    tool_mode: "native",
+                    thinking: "disabled",
+                    context_tokens: Some(65_536),
+                },
             }],
+            runtime_model_load: false,
         };
         let json = serde_json::to_string(&list).unwrap();
         assert!(json.contains("test-model"));
@@ -841,6 +1156,64 @@ mod tests {
     }
 
     #[test]
+    fn test_completion_request_accepts_repeat_penalty_field() {
+        // llama.cpp/Ollama clients send `repeat_penalty`; higgs reads it as a
+        // dedicated field and merges it into `repetition_penalty` at sampling
+        // build time, so local repetition guards are not silently dropped.
+        let json = r#"{
+            "model": "m",
+            "prompt": "test",
+            "repeat_penalty": 1.1
+        }"#;
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.repeat_penalty, Some(1.1));
+    }
+
+    #[test]
+    fn test_chat_request_accepts_repeat_penalty_field() {
+        let json = r#"{
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "repeat_penalty": 1.15
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.repeat_penalty, Some(1.15));
+    }
+
+    #[test]
+    fn test_chat_request_accepts_both_repetition_and_repeat_penalty() {
+        // Some clients emit both names in one body. With `repeat_penalty` as a
+        // serde alias this 400s with "duplicate field repetition_penalty"; as a
+        // dedicated field it must parse cleanly, and `merge_repetition_penalty`
+        // must take the stronger (higher) control so a weaker default can't
+        // defeat a loop safeguard.
+        let json = r#"{
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "repetition_penalty": 1.0,
+            "repeat_penalty": 1.15
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.repetition_penalty, Some(1.0));
+        assert_eq!(req.repeat_penalty, Some(1.15));
+        assert_eq!(
+            merge_repetition_penalty(req.repetition_penalty, req.repeat_penalty),
+            Some(1.15)
+        );
+    }
+
+    #[test]
+    fn test_merge_repetition_penalty_takes_max() {
+        // repetition_penalty is the weaker config default; repeat_penalty is the
+        // per-model-class safeguard. The safeguard (higher) must win.
+        assert_eq!(merge_repetition_penalty(Some(1.0), Some(1.1)), Some(1.1));
+        assert_eq!(merge_repetition_penalty(Some(1.3), Some(1.1)), Some(1.3));
+        assert_eq!(merge_repetition_penalty(Some(1.1), None), Some(1.1));
+        assert_eq!(merge_repetition_penalty(None, Some(1.1)), Some(1.1));
+        assert_eq!(merge_repetition_penalty(None, None), None);
+    }
+
+    #[test]
     fn test_completion_request_accepts_max_output_tokens_alias() {
         let json = r#"{
             "model": "m",
@@ -969,6 +1342,7 @@ mod tests {
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "data:image/png;base64,abc".to_owned(),
+                    detail: None,
                 },
             },
             ContentPart::Text {
@@ -987,6 +1361,7 @@ mod tests {
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "data:image/png;base64,abc".to_owned(),
+                    detail: None,
                 },
             },
         ]);
@@ -1008,6 +1383,7 @@ mod tests {
         let with_image = MessageContent::Parts(vec![ContentPart::ImageUrl {
             image_url: ImageUrl {
                 url: "data:image/png;base64,abc".to_owned(),
+                detail: None,
             },
         }]);
         assert!(with_image.has_images());

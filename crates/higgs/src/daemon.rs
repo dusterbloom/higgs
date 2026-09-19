@@ -132,7 +132,7 @@ pub fn cmd_stop(profile: Option<&str>, force: bool) -> i32 {
     }
 }
 
-#[allow(clippy::print_stderr)]
+#[allow(clippy::print_stderr, clippy::too_many_lines)]
 pub fn cmd_init(profile: Option<&str>) {
     let dir = config::config_dir();
     let filename = profile.map_or_else(
@@ -168,6 +168,9 @@ port = 8000
 # rate_limit = 0
 # CORS origin allow-list for browser clients. Unset = no CORS headers.
 # cors_origins = ["*"]
+# max_image_bytes = 20971520   # per-image decoded byte cap (default 20 MiB); keep below max_body_size
+# image_fetch_timeout = 10.0   # remote image URL fetch timeout in seconds
+# max_image_dimension = 4096   # long-edge pixel cap before family preprocessing
 
 # --- Local serving defaults ---
 # MLX profile applies to simple-engine local models. "auto" picks balanced for
@@ -175,6 +178,9 @@ port = 8000
 
 # [local]
 # mlx_profile = "auto"
+# Allow loading/unloading models at runtime via POST/DELETE /v1/models.
+# Off by default; protect with server.api_key before enabling.
+# allow_runtime_model_load = false
 
 # --- Local models ---
 # Each [[models]] entry loads an MLX model into GPU memory.
@@ -185,10 +191,37 @@ port = 8000
 # name = "llama"
 # mlx_profile = "throughput"
 # batch = false
-# kv_disk_dir = "/var/lib/higgs/prefix-kv" # optional durable prefix cache
-# kv_disk_space_mb = 4096                # LRU budget; minimum 64 MiB
+# # Cache-resident multi-turn KV retention limits (bound resident memory):
+# kv_max_sessions = 2                    # max retained conversations, LRU-evicted (>= 1)
+# kv_max_session_tokens = 32768          # drop a conversation's KV past N tokens (0 = unlimited)
+# kv_retained_idle_secs = 300            # evict KV idle longer than N seconds (0 = never)
+# kv_max_suffix_prefill_tokens = 24576   # maximum exact suffix before degraded bootstrap
+# kv_max_retained_bytes = 2147483648     # aggregate retained session KV byte limit
+# kv_cache_bytes = 0            # prefix KV cache byte budget (0 = disabled; evicts LRU over budget)
+# # Speculative decoding (decode) + compressive prefill (PFlash) drafters:
+# # draft_model      = "/path/to/dspark-drafter"      # decode speculation (DFlash/dSpark)
+# # Validated low-bit Bonsai targets default to the block (BatchedTape) verifier.
+# # Unsupported domains fail closed to canonical S=1; set HIGGS_DFLASH_VERIFY_MODE=canonical
+# # to opt any model back to S=1.
+# # PFlash scorer/compressor: must load as a dense Transformer (for example
+# # Qwen3-0.6B). Bonsai Ternary/Q2 remains the target, not the prefill drafter.
+# # prefill_drafter  = "mlx-community/Qwen3-0.6B-4bit"
+# # prefill_compression = "off"                       # off | auto | always
+# # prefill_threshold   = 4096                        # auto: enable above this many prompt tokens
+# # prefill_keep_ratio  = 0.10                        # adaptive floor
+# # prefill_keep_ratio_max = 0.75                     # adaptive ceiling
+# # prefill_max_auto_prefill_ratio = 0.60             # auto skip ceiling for high-retention plans
+# # prefill_plan_cache = true                         # reuse frozen plans across turns
+# # prefill_plan_cache_entries = 64                   # branch/frontier cap
+# # prefill_suffix_identity_threshold = 128           # small suffixes stay exact
+# # prefill_score_mode  = "full"                      # full | l7
+# # prefill_exit_layer  = 7
+# kv_disk_dir = "/var/lib/higgs/prefix-kv" # enables model-path-specific prefix files
+# kv_disk_space_mb = 4096                # file byte ceiling, minimum 64 MiB; rotates old entries
+# # Do not combine kv_disk_dir with legacy disk_cache_path.
 # prefill_yield_tokens = 512 # optional: interleave decode during long prefills
 # mla_latent_cache = true # DeepSeek-V2 only: compressed latent KV cache; cannot combine with kv_cache = "turboquant"
+# disable_vision = true # force-disable vision for this model (escape hatch; no-op on nightly)
 
 # --- Remote providers ---
 # Forward requests to external APIs via proxy routes.
@@ -910,7 +943,19 @@ mod tests {
         with_temp_config_dir(|dir| {
             std::fs::create_dir_all(dir).unwrap();
             cmd_init(None);
-            assert!(dir.join("config.toml").exists());
+            let config = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+            for expected in [
+                "kv_max_sessions = 2",
+                "kv_max_session_tokens = 32768",
+                "kv_retained_idle_secs = 300",
+                "kv_max_suffix_prefill_tokens = 24576",
+                "kv_max_retained_bytes = 2147483648",
+            ] {
+                assert!(
+                    config.contains(expected),
+                    "missing shipped default: {expected}"
+                );
+            }
         });
     }
 

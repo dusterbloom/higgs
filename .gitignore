@@ -13,7 +13,8 @@ bench/
 .venv/
 .pytest_cache/
 **/__pycache__/
-.claude/
+.claude/*
+!.claude/settings.json
 .planning/
 graphify-out/
 GRAPH_REPORT.md
@@ -21,6 +22,7 @@ graph.json
 benchmarks/*.txt
 benchmarks/*.safetensors
 benchmarks/*.py
-validation/**/raw/
+.worktrees/
+qwen38-challenge/
 validation/**/raw/
 .mlx-metal/

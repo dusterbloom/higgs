@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use axum::{Json, extract::State, http::StatusCode};
+use higgs_engine::simple::CacheStats;
 use serde::Serialize;
 
 use crate::{metrics::MetricsStore, state::SharedState};
@@ -22,6 +23,272 @@ pub struct MetricsResponse {
     pub tokens_per_minute: Vec<u64>,
     pub models: Vec<MetricsGroup>,
     pub providers: Vec<MetricsGroup>,
+    pub cache: CacheMetricsView,
+    /// Fixed context limits, active request lifetimes, and memory telemetry.
+    /// Numbers only — no prompt content.
+    pub capacity: crate::capacity::CapacityDiagnostics,
+}
+
+/// Cache-resident KV effectiveness, aggregated across all local engines.
+#[derive(Debug, Default, Serialize)]
+pub struct CacheMetricsView {
+    /// Radix prefix-cache lookups on the normal generate path.
+    pub radix_lookups: u64,
+    /// Radix prefix-cache hits (a stored prefix was reused).
+    pub radix_hits: u64,
+    /// Memory-only paired target/dSpark radix lookups.
+    pub paired_radix_lookups: u64,
+    /// Paired radix hits that materialized and forked both cache halves.
+    pub paired_radix_hits: u64,
+    /// Prompt tokens NOT re-prefilled thanks to reuse (radix + continuation).
+    pub prefill_saved_tokens: u64,
+    /// PFlash scoring/planning attempts after config/request eligibility checks.
+    pub pflash_attempts: u64,
+    /// PFlash plans accepted for target execution.
+    pub pflash_used: u64,
+    /// PFlash attempts that fell back or errored before target execution.
+    pub pflash_fallbacks: u64,
+    /// Auto PFlash plans skipped because survivor prefill would cost more than exact cache reuse.
+    pub pflash_skipped_unprofitable: u64,
+    /// In-memory PFlash stable-body plan-cache hits.
+    pub pflash_plan_cache_hits: u64,
+    /// Source prompt tokens for the most recent accepted PFlash plan.
+    pub pflash_last_source_tokens: u64,
+    /// Survivor tokens for the most recent accepted PFlash plan.
+    pub pflash_last_kept_tokens: u64,
+    /// Stable-body prefix tokens reused from the PFlash plan cache.
+    pub pflash_last_cache_prefix_tokens: u64,
+    /// Stable-body suffix tokens scored or identity-appended this turn.
+    pub pflash_last_suffix_tokens: u64,
+    /// Request-specific generation-suffix tokens identity-appended after body planning.
+    pub pflash_last_request_tail_tokens: u64,
+    /// Scorer wall time for the most recent accepted PFlash plan.
+    pub pflash_last_score_ms: u64,
+    /// Survivor-selection wall time for the most recent accepted PFlash plan.
+    pub pflash_last_select_ms: u64,
+    /// End-to-end PFlash planning wall time for the most recent accepted plan.
+    pub pflash_last_total_ms: u64,
+    /// Effective adaptive keep ratio for the most recent accepted plan, parts per million.
+    pub pflash_last_effective_keep_ratio_ppm: u64,
+    /// Per-session continuations (best-effort retained-cache reuse).
+    pub continuations: u64,
+    /// Session prompt/cache observations recorded by the route.
+    pub session_prompt_traces: u64,
+    /// Observed retained-token prefix mismatches after route reconciliation.
+    pub session_prompt_prefix_misses: u64,
+    /// Canonical render mismatches repaired by message-boundary splicing.
+    pub session_prompt_boundary_splices: u64,
+    /// Diverged/cold sessions routed through exact retained prefill.
+    pub session_bootstrap_exact: u64,
+    /// Cold oversized sessions routed through degraded stateless PFlash prefill.
+    pub session_bootstrap_pflash: u64,
+    /// Prompt tokens for the most recent session prompt/cache trace.
+    pub session_last_prompt_tokens: u64,
+    /// Retained tokens for the most recent session prompt/cache trace.
+    pub session_last_retained_tokens: u64,
+    /// Candidate tokens passed to the exact retained-cache guard most recently.
+    pub session_last_candidate_tokens: u64,
+    /// Candidate suffix tokens beyond the retained prefix for the most recent trace.
+    pub session_last_suffix_tokens: u64,
+    /// Common retained/candidate token prefix length for the most recent trace.
+    pub session_last_common_prefix_tokens: u64,
+    /// First divergence token plus one for the most recent trace; 0 means none.
+    pub session_last_divergence_token_plus_one: u64,
+    /// Tool-result messages present in the most recent session request.
+    pub session_last_tool_result_messages: u64,
+    /// Tool-result payload bytes present in the most recent session request.
+    pub session_last_tool_result_bytes: u64,
+    /// Largest single tool-result payload in the most recent session request.
+    pub session_last_tool_result_largest_bytes: u64,
+    /// Retained sessions evicted (count cap + idle TTL).
+    pub sessions_evicted: u64,
+    /// Retained states rejected because one entry exceeded a live hard limit.
+    pub retention_oversized_drops: u64,
+    /// Maximum of each model's latest rejected size (not global chronology).
+    pub retention_last_oversized_bytes: u64,
+    /// Maximum of each model's latest rejected token count.
+    pub retention_last_oversized_tokens: u64,
+    /// Sum of live registry-published retained-state byte ceilings.
+    pub retained_bytes_limit: u64,
+    /// Currently retained per-session caches.
+    pub retained_sessions: u64,
+    /// Conservative total bytes owned by retained per-session cache state.
+    pub retained_bytes: u64,
+    /// Existing retained sessions currently protected from idle eviction.
+    pub active_leases: u64,
+    /// Leases observed expiring during retention maintenance.
+    pub expired_leases: u64,
+    /// Active leases broken to enforce hard count or byte bounds.
+    pub broken_leases: u64,
+    /// Session requests that performed prefill-only publication.
+    pub prefill_only_requests: u64,
+    /// Required-continuation requests rejected before a cold prefill.
+    pub required_continuation_misses: u64,
+    /// Currently retained sessions that own an inseparable target/dSpark pair.
+    pub retained_paired_sessions: u64,
+    /// Conservative target bytes retained by paired sessions.
+    pub retained_paired_target_bytes: u64,
+    /// Conservative dSpark bytes retained by paired sessions.
+    pub retained_paired_dflash_bytes: u64,
+    /// Currently stored radix prefixes.
+    pub radix_entries: u64,
+    /// Bytes actually held by the radix trie, counting each shared block once.
+    pub radix_resident_bytes: u64,
+    /// Bytes the same entries would hold with no block sharing.
+    /// `radix_logical_bytes - radix_resident_bytes` is the block-paging saving.
+    pub radix_logical_bytes: u64,
+    /// Currently stored paired target/dSpark radix endpoints.
+    pub paired_radix_entries: u64,
+    /// Conservative target bytes retained by paired radix endpoints.
+    pub paired_radix_target_bytes: u64,
+    /// Conservative dSpark bytes retained by paired radix endpoints.
+    pub paired_radix_dflash_bytes: u64,
+}
+
+impl CacheMetricsView {
+    fn add(&mut self, stats: CacheStats) {
+        self.radix_lookups = self.radix_lookups.saturating_add(stats.radix_lookups);
+        self.radix_hits = self.radix_hits.saturating_add(stats.radix_hits);
+        self.paired_radix_lookups = self
+            .paired_radix_lookups
+            .saturating_add(stats.paired_radix_lookups);
+        self.paired_radix_hits = self
+            .paired_radix_hits
+            .saturating_add(stats.paired_radix_hits);
+        self.prefill_saved_tokens = self
+            .prefill_saved_tokens
+            .saturating_add(stats.prefill_saved_tokens);
+        self.pflash_attempts = self.pflash_attempts.saturating_add(stats.pflash_attempts);
+        self.pflash_used = self.pflash_used.saturating_add(stats.pflash_used);
+        self.pflash_fallbacks = self.pflash_fallbacks.saturating_add(stats.pflash_fallbacks);
+        self.pflash_skipped_unprofitable = self
+            .pflash_skipped_unprofitable
+            .saturating_add(stats.pflash_skipped_unprofitable);
+        self.pflash_plan_cache_hits = self
+            .pflash_plan_cache_hits
+            .saturating_add(stats.pflash_plan_cache_hits);
+        self.pflash_last_source_tokens = self
+            .pflash_last_source_tokens
+            .max(stats.pflash_last_source_tokens);
+        self.pflash_last_kept_tokens = self
+            .pflash_last_kept_tokens
+            .max(stats.pflash_last_kept_tokens);
+        self.pflash_last_cache_prefix_tokens = self
+            .pflash_last_cache_prefix_tokens
+            .max(stats.pflash_last_cache_prefix_tokens);
+        self.pflash_last_suffix_tokens = self
+            .pflash_last_suffix_tokens
+            .max(stats.pflash_last_suffix_tokens);
+        self.pflash_last_request_tail_tokens = self
+            .pflash_last_request_tail_tokens
+            .max(stats.pflash_last_request_tail_tokens);
+        self.pflash_last_score_ms = self.pflash_last_score_ms.max(stats.pflash_last_score_ms);
+        self.pflash_last_select_ms = self.pflash_last_select_ms.max(stats.pflash_last_select_ms);
+        self.pflash_last_total_ms = self.pflash_last_total_ms.max(stats.pflash_last_total_ms);
+        self.pflash_last_effective_keep_ratio_ppm = self
+            .pflash_last_effective_keep_ratio_ppm
+            .max(stats.pflash_last_effective_keep_ratio_ppm);
+        self.continuations = self.continuations.saturating_add(stats.continuations);
+        self.session_prompt_traces = self
+            .session_prompt_traces
+            .saturating_add(stats.session_prompt_traces);
+        self.session_prompt_prefix_misses = self
+            .session_prompt_prefix_misses
+            .saturating_add(stats.session_prompt_prefix_misses);
+        self.session_prompt_boundary_splices = self
+            .session_prompt_boundary_splices
+            .saturating_add(stats.session_prompt_boundary_splices);
+        self.session_bootstrap_exact = self
+            .session_bootstrap_exact
+            .saturating_add(stats.session_bootstrap_exact);
+        self.session_bootstrap_pflash = self
+            .session_bootstrap_pflash
+            .saturating_add(stats.session_bootstrap_pflash);
+        self.session_last_prompt_tokens = self
+            .session_last_prompt_tokens
+            .max(stats.session_last_prompt_tokens);
+        self.session_last_retained_tokens = self
+            .session_last_retained_tokens
+            .max(stats.session_last_retained_tokens);
+        self.session_last_candidate_tokens = self
+            .session_last_candidate_tokens
+            .max(stats.session_last_candidate_tokens);
+        self.session_last_suffix_tokens = self
+            .session_last_suffix_tokens
+            .max(stats.session_last_suffix_tokens);
+        self.session_last_common_prefix_tokens = self
+            .session_last_common_prefix_tokens
+            .max(stats.session_last_common_prefix_tokens);
+        self.session_last_divergence_token_plus_one = self
+            .session_last_divergence_token_plus_one
+            .max(stats.session_last_divergence_token_plus_one);
+        self.session_last_tool_result_messages = self
+            .session_last_tool_result_messages
+            .max(stats.session_last_tool_result_messages);
+        self.session_last_tool_result_bytes = self
+            .session_last_tool_result_bytes
+            .max(stats.session_last_tool_result_bytes);
+        self.session_last_tool_result_largest_bytes = self
+            .session_last_tool_result_largest_bytes
+            .max(stats.session_last_tool_result_largest_bytes);
+        self.sessions_evicted = self.sessions_evicted.saturating_add(stats.sessions_evicted);
+        self.retention_oversized_drops = self
+            .retention_oversized_drops
+            .saturating_add(stats.retention_oversized_drops);
+        self.retention_last_oversized_bytes = self
+            .retention_last_oversized_bytes
+            .max(u64::try_from(stats.retention_last_oversized_bytes).unwrap_or(u64::MAX));
+        self.retention_last_oversized_tokens = self
+            .retention_last_oversized_tokens
+            .max(u64::try_from(stats.retention_last_oversized_tokens).unwrap_or(u64::MAX));
+        self.retained_bytes_limit = self
+            .retained_bytes_limit
+            .saturating_add(u64::try_from(stats.retained_bytes_limit).unwrap_or(u64::MAX));
+        self.retained_sessions = self
+            .retained_sessions
+            .saturating_add(u64::try_from(stats.retained_sessions).unwrap_or(u64::MAX));
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(u64::try_from(stats.retained_bytes).unwrap_or(u64::MAX));
+        self.active_leases = self
+            .active_leases
+            .saturating_add(u64::try_from(stats.active_leases).unwrap_or(u64::MAX));
+        self.expired_leases = self.expired_leases.saturating_add(stats.expired_leases);
+        self.broken_leases = self.broken_leases.saturating_add(stats.broken_leases);
+        self.prefill_only_requests = self
+            .prefill_only_requests
+            .saturating_add(stats.prefill_only_requests);
+        self.required_continuation_misses = self
+            .required_continuation_misses
+            .saturating_add(stats.required_continuation_misses);
+        self.retained_paired_sessions = self
+            .retained_paired_sessions
+            .saturating_add(u64::try_from(stats.retained_paired_sessions).unwrap_or(u64::MAX));
+        self.retained_paired_target_bytes = self
+            .retained_paired_target_bytes
+            .saturating_add(u64::try_from(stats.retained_paired_target_bytes).unwrap_or(u64::MAX));
+        self.retained_paired_dflash_bytes = self
+            .retained_paired_dflash_bytes
+            .saturating_add(u64::try_from(stats.retained_paired_dflash_bytes).unwrap_or(u64::MAX));
+        self.radix_entries = self
+            .radix_entries
+            .saturating_add(u64::try_from(stats.radix_entries).unwrap_or(u64::MAX));
+        self.radix_resident_bytes = self
+            .radix_resident_bytes
+            .saturating_add(u64::try_from(stats.radix_resident_bytes).unwrap_or(u64::MAX));
+        self.radix_logical_bytes = self
+            .radix_logical_bytes
+            .saturating_add(u64::try_from(stats.radix_logical_bytes).unwrap_or(u64::MAX));
+        self.paired_radix_entries = self
+            .paired_radix_entries
+            .saturating_add(u64::try_from(stats.paired_radix_entries).unwrap_or(u64::MAX));
+        self.paired_radix_target_bytes = self
+            .paired_radix_target_bytes
+            .saturating_add(u64::try_from(stats.paired_radix_target_bytes).unwrap_or(u64::MAX));
+        self.paired_radix_dflash_bytes = self
+            .paired_radix_dflash_bytes
+            .saturating_add(u64::try_from(stats.paired_radix_dflash_bytes).unwrap_or(u64::MAX));
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -64,7 +331,11 @@ pub async fn metrics(
     let Some(metrics) = state.metrics.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
-    Ok(Json(build_metrics_response(metrics)))
+    let mut response = build_metrics_response(metrics);
+    response.cache = aggregate_cache(&state.router);
+    state.capacity.refresh_measured_memory();
+    response.capacity = state.capacity.diagnostics();
+    Ok(Json(response))
 }
 
 fn build_metrics_response(metrics: &MetricsStore) -> MetricsResponse {
@@ -96,6 +367,8 @@ fn build_metrics_response(metrics: &MetricsStore) -> MetricsResponse {
         tokens_per_minute: MetricsStore::tokens_per_minute(&snapshot, num_buckets),
         models: build_groups(MetricsStore::group_by(&snapshot, |r| r.model.clone())),
         providers: build_groups(MetricsStore::group_by(&snapshot, |r| r.provider.clone())),
+        cache: CacheMetricsView::default(),
+        capacity: crate::capacity::CapacityDiagnostics::default(),
     }
 }
 
@@ -136,6 +409,17 @@ fn aggregate_tokens_per_second(records: &[&crate::metrics::RequestRecord]) -> Op
         return None;
     }
     Some(u32::try_from(tokens).map_or(f64::MAX, f64::from) / decode.as_secs_f64())
+}
+
+/// Aggregate cache-effectiveness counters across all local engines.
+fn aggregate_cache(router: &crate::router::Router) -> CacheMetricsView {
+    let mut v = CacheMetricsView::default();
+    for engine in router.local_engines() {
+        if let Some(s) = engine.cache_stats() {
+            v.add(s);
+        }
+    }
+    v
 }
 
 fn build_groups(groups: HashMap<String, Vec<&crate::metrics::RequestRecord>>) -> Vec<MetricsGroup> {
@@ -190,6 +474,84 @@ mod tests {
 
     use super::*;
     use crate::metrics::{MetricsStore, RequestRecord, RoutingMethod};
+
+    #[test]
+    fn capacity_diagnostics_render_camel_case_with_no_request_content() {
+        let diagnostics = crate::capacity::CapacityDiagnostics {
+            boot_id: "boot-1".to_owned(),
+            active_reservations: 2,
+            mlx_active_bytes: 100,
+            pressure: crate::capacity::MemoryPressure::Constrained,
+            ..crate::capacity::CapacityDiagnostics::default()
+        };
+        let json = serde_json::to_value(diagnostics).unwrap();
+        assert_eq!(json["bootId"], "boot-1");
+        assert_eq!(json["activeReservations"], 2);
+        assert_eq!(json["mlxActiveBytes"], 100);
+        assert_eq!(json["pressure"], "constrained");
+        assert!(json.get("activeReservationBytes").is_none());
+        assert!(json.get("downshifts").is_none());
+    }
+
+    fn cache_stats_fixture() -> CacheStats {
+        CacheStats {
+            radix_lookups: 1,
+            radix_hits: 2,
+            paired_radix_lookups: 3,
+            paired_radix_hits: 4,
+            prefill_saved_tokens: 5,
+            pflash_attempts: 6,
+            pflash_used: 7,
+            pflash_fallbacks: 8,
+            pflash_skipped_unprofitable: 9,
+            pflash_plan_cache_hits: 10,
+            pflash_last_source_tokens: 11,
+            pflash_last_kept_tokens: 12,
+            pflash_last_cache_prefix_tokens: 13,
+            pflash_last_suffix_tokens: 14,
+            pflash_last_request_tail_tokens: 15,
+            pflash_last_score_ms: 16,
+            pflash_last_select_ms: 17,
+            pflash_last_total_ms: 18,
+            pflash_last_effective_keep_ratio_ppm: 180_000,
+            continuations: 20,
+            session_prompt_traces: 21,
+            session_prompt_prefix_misses: 22,
+            session_prompt_boundary_splices: 23,
+            session_bootstrap_exact: 24,
+            session_bootstrap_pflash: 25,
+            session_last_prompt_tokens: 27,
+            session_last_retained_tokens: 28,
+            session_last_candidate_tokens: 29,
+            session_last_suffix_tokens: 30,
+            session_last_common_prefix_tokens: 31,
+            session_last_divergence_token_plus_one: 32,
+            session_last_tool_result_messages: 33,
+            session_last_tool_result_bytes: 34,
+            session_last_tool_result_largest_bytes: 35,
+            sessions_evicted: 36,
+            retention_oversized_drops: 1,
+            retention_last_oversized_bytes: 2,
+            retention_last_oversized_tokens: 3,
+            retained_bytes_limit: 4,
+            retained_sessions: 37,
+            retained_bytes: 38,
+            active_leases: 39,
+            expired_leases: 40,
+            broken_leases: 41,
+            prefill_only_requests: 42,
+            required_continuation_misses: 43,
+            retained_paired_sessions: 44,
+            retained_paired_target_bytes: 45,
+            retained_paired_dflash_bytes: 46,
+            radix_entries: 47,
+            radix_resident_bytes: 51,
+            radix_logical_bytes: 52,
+            paired_radix_entries: 48,
+            paired_radix_target_bytes: 49,
+            paired_radix_dflash_bytes: 50,
+        }
+    }
 
     fn sample_record(model: &str, provider: &str, status: u16) -> RequestRecord {
         RequestRecord {
@@ -284,5 +646,103 @@ mod tests {
 
         let response = build_metrics_response(&metrics);
         assert!(response.tokens_per_second.is_none());
+    }
+
+    #[test]
+    fn cache_metrics_aggregate_every_paired_stat() {
+        let mut view = CacheMetricsView::default();
+        view.add(cache_stats_fixture());
+        view.add(cache_stats_fixture());
+
+        assert_eq!(view.paired_radix_lookups, 6);
+        assert_eq!(view.paired_radix_hits, 8);
+        assert_eq!(view.pflash_attempts, 12);
+        assert_eq!(view.pflash_used, 14);
+        assert_eq!(view.pflash_fallbacks, 16);
+        assert_eq!(view.pflash_skipped_unprofitable, 18);
+        assert_eq!(view.pflash_plan_cache_hits, 20);
+        assert_eq!(view.session_prompt_traces, 42);
+        assert_eq!(view.session_prompt_prefix_misses, 44);
+        assert_eq!(view.session_prompt_boundary_splices, 46);
+        assert_eq!(view.session_bootstrap_exact, 48);
+        assert_eq!(view.session_bootstrap_pflash, 50);
+        assert_eq!(view.retention_oversized_drops, 2);
+        assert_eq!(view.retention_last_oversized_bytes, 2);
+        assert_eq!(view.retention_last_oversized_tokens, 3);
+        assert_eq!(view.retained_bytes_limit, 8);
+        assert_eq!(view.retained_bytes, 76);
+        assert_eq!(view.active_leases, 78);
+        assert_eq!(view.expired_leases, 80);
+        assert_eq!(view.broken_leases, 82);
+        assert_eq!(view.prefill_only_requests, 84);
+        assert_eq!(view.required_continuation_misses, 86);
+        assert_eq!(view.retained_paired_sessions, 88);
+        assert_eq!(view.retained_paired_target_bytes, 90);
+        assert_eq!(view.retained_paired_dflash_bytes, 92);
+        assert_eq!(view.paired_radix_entries, 96);
+        assert_eq!(view.paired_radix_target_bytes, 98);
+        assert_eq!(view.paired_radix_dflash_bytes, 100);
+    }
+
+    #[test]
+    fn cache_metrics_render_paired_fields_with_stable_names() {
+        let mut view = CacheMetricsView::default();
+        view.add(cache_stats_fixture());
+        let rendered = serde_json::to_value(view).unwrap();
+
+        for (name, expected) in [
+            ("paired_radix_lookups", 3),
+            ("paired_radix_hits", 4),
+            ("pflash_attempts", 6),
+            ("pflash_used", 7),
+            ("pflash_fallbacks", 8),
+            ("pflash_skipped_unprofitable", 9),
+            ("pflash_plan_cache_hits", 10),
+            ("pflash_last_source_tokens", 11),
+            ("pflash_last_kept_tokens", 12),
+            ("pflash_last_cache_prefix_tokens", 13),
+            ("pflash_last_suffix_tokens", 14),
+            ("pflash_last_request_tail_tokens", 15),
+            ("pflash_last_score_ms", 16),
+            ("pflash_last_select_ms", 17),
+            ("pflash_last_total_ms", 18),
+            ("pflash_last_effective_keep_ratio_ppm", 180_000),
+            ("session_prompt_traces", 21),
+            ("session_prompt_prefix_misses", 22),
+            ("session_prompt_boundary_splices", 23),
+            ("session_bootstrap_exact", 24),
+            ("session_bootstrap_pflash", 25),
+            ("session_last_prompt_tokens", 27),
+            ("session_last_retained_tokens", 28),
+            ("session_last_candidate_tokens", 29),
+            ("session_last_suffix_tokens", 30),
+            ("session_last_common_prefix_tokens", 31),
+            ("session_last_divergence_token_plus_one", 32),
+            ("session_last_tool_result_messages", 33),
+            ("session_last_tool_result_bytes", 34),
+            ("session_last_tool_result_largest_bytes", 35),
+            ("retention_oversized_drops", 1),
+            ("retention_last_oversized_bytes", 2),
+            ("retention_last_oversized_tokens", 3),
+            ("retained_bytes_limit", 4),
+            ("retained_bytes", 38),
+            ("active_leases", 39),
+            ("expired_leases", 40),
+            ("broken_leases", 41),
+            ("prefill_only_requests", 42),
+            ("required_continuation_misses", 43),
+            ("retained_paired_sessions", 44),
+            ("retained_paired_target_bytes", 45),
+            ("retained_paired_dflash_bytes", 46),
+            ("paired_radix_entries", 48),
+            ("paired_radix_target_bytes", 49),
+            ("paired_radix_dflash_bytes", 50),
+        ] {
+            assert_eq!(
+                rendered.get(name).and_then(serde_json::Value::as_u64),
+                Some(expected),
+                "missing or renamed paired cache metric {name}"
+            );
+        }
     }
 }

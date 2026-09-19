@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use regex::Regex;
 use tracing::warn;
 
-use crate::config::{ApiFormat, HiggsConfig};
+use crate::capacity::{ActiveRegistration, CapacityRegistry};
+use crate::config::{ApiFormat, GenerationDefaults, HiggsConfig};
 use crate::state::Engine;
 
 /// How a model name was resolved to its target.
@@ -26,6 +27,7 @@ pub enum ResolvedRoute {
     Higgs {
         engine: Arc<Engine>,
         model_name: String,
+        generation_defaults: GenerationDefaults,
         routing_method: RoutingMethod,
     },
     /// Forward to a remote provider.
@@ -76,6 +78,13 @@ struct AutoRouteEntry {
     target: RouteTarget,
 }
 
+#[derive(Clone)]
+struct LocalEngineEntry {
+    engine: Arc<Engine>,
+    generation_defaults: GenerationDefaults,
+    capacity_ready: bool,
+}
+
 /// Routes model names to local engines or remote providers.
 ///
 /// Resolution order:
@@ -84,14 +93,54 @@ struct AutoRouteEntry {
 /// 3. Pattern matching (first match wins)
 /// 4. Default provider fallback
 pub struct Router {
-    local_engines: HashMap<String, Arc<Engine>>,
+    /// Loaded local engines, mutable at runtime via the load/unload endpoints.
+    /// Guarded by a `RwLock`: `resolve`/`list` take a read lock and clone the
+    /// `Arc` out, so an in-flight request is never tied to map membership.
+    local_engines: RwLock<HashMap<String, LocalEngineEntry>>,
+    cache_policy: tokio::sync::Mutex<()>,
     compiled_routes: Vec<CompiledRoute>,
     auto_routes: Vec<AutoRouteEntry>,
     auto_candidates: Vec<RouteCandidate>,
     auto_router_engine: Option<Arc<Engine>>,
+    /// Map key bound to the auto-router model, if enabled. Unloading it is
+    /// refused because `auto_router_engine` keeps a separate `Arc` alive.
+    auto_router_model_name: Option<String>,
     auto_router_force: bool,
     auto_router_timeout_ms: u64,
     default_target: RouteTarget,
+}
+
+struct DisabledRouteGuard<'a> {
+    router: &'a Router,
+    name: String,
+    armed: bool,
+}
+
+#[cfg(test)]
+pub(crate) struct RouteInsertionTestGate {
+    pub(crate) arrived: tokio::sync::oneshot::Sender<()>,
+    pub(crate) release: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl DisabledRouteGuard<'_> {
+    fn remove(mut self) -> Arc<Engine> {
+        self.armed = false;
+        self.router
+            .remove_engine(&self.name)
+            .expect("disabled route entry exists")
+    }
+
+    fn publish(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DisabledRouteGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.router.remove_engine(&self.name);
+        }
+    }
 }
 
 impl Router {
@@ -104,6 +153,13 @@ impl Router {
         let mut auto_routes = Vec::new();
         let mut auto_candidates = Vec::new();
         let mut seen_names = HashSet::new();
+        let mut local_generation_defaults = HashMap::new();
+
+        for model in &config.models {
+            if let Some(name) = &model.name {
+                local_generation_defaults.insert(name.clone(), model.generation_defaults.clone());
+            }
+        }
 
         for route in &config.routes {
             if route.pattern.is_none() && route.description.is_none() {
@@ -146,7 +202,23 @@ impl Router {
             }
         }
 
-        let auto_router_engine = if config.auto_router.enabled {
+        let local_engines = engines
+            .into_iter()
+            .map(|(name, engine)| {
+                let generation_defaults =
+                    local_generation_defaults.remove(&name).unwrap_or_default();
+                (
+                    name,
+                    LocalEngineEntry {
+                        engine,
+                        generation_defaults,
+                        capacity_ready: true,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let (auto_router_engine, auto_router_model_name) = if config.auto_router.enabled {
             if config.auto_router.model.is_empty() {
                 return Err("auto_router.enabled is true but model is empty".to_owned());
             }
@@ -154,22 +226,27 @@ impl Router {
                 warn!("auto_router is enabled but no routes have descriptions");
             }
             let auto_model = &config.auto_router.model;
-            let engine = engines.get(auto_model).cloned().ok_or_else(|| {
-                format!("auto_router model '{auto_model}' not found among loaded models")
-            })?;
-            Some(engine)
+            let engine = local_engines
+                .get(auto_model)
+                .map(|entry| Arc::clone(&entry.engine))
+                .ok_or_else(|| {
+                    format!("auto_router model '{auto_model}' not found among loaded models")
+                })?;
+            (Some(engine), Some(auto_model.clone()))
         } else {
-            None
+            (None, None)
         };
 
         let default_target = build_route_target(&config.default.provider, None, config)?;
 
         Ok(Self {
-            local_engines: engines,
+            local_engines: RwLock::new(local_engines),
+            cache_policy: tokio::sync::Mutex::new(()),
             compiled_routes,
             auto_routes,
             auto_candidates,
             auto_router_engine,
+            auto_router_model_name,
             auto_router_force: config.auto_router.force,
             auto_router_timeout_ms: config.auto_router.timeout_ms,
             default_target,
@@ -195,11 +272,19 @@ impl Router {
             // force mode: auto-routing returned nothing, fall through to normal resolution
         }
 
-        // Direct engine lookup
-        if let Some(engine) = self.local_engines.get(model) {
+        // Direct engine lookup. Clone the Arc out and drop the read guard
+        // immediately -- the in-flight request owns the engine independent of
+        // map membership, so a concurrent unload can never free it mid-request.
+        let direct = self
+            .engines_read()
+            .get(model)
+            .filter(|entry| entry.capacity_ready)
+            .cloned();
+        if let Some(entry) = direct {
             return Ok(ResolvedRoute::Higgs {
-                engine: Arc::clone(engine),
+                engine: entry.engine,
                 model_name: model.to_owned(),
+                generation_defaults: entry.generation_defaults,
                 routing_method: RoutingMethod::Direct,
             });
         }
@@ -215,12 +300,258 @@ impl Router {
         self.resolve_target(&self.default_target, model, RoutingMethod::Default)
     }
 
-    /// Returns all loaded local engines.
-    pub const fn local_engines(&self) -> &HashMap<String, Arc<Engine>> {
-        &self.local_engines
+    /// Sorted names of all loaded local engines (snapshot under a read lock).
+    pub fn local_model_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .engines_read()
+            .iter()
+            .filter(|(_, entry)| entry.capacity_ready)
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Sorted `(name, is_vlm)` for all loaded local engines (snapshot under a
+    /// read lock). Used by `GET /v1/models` to advertise image-input support.
+    pub fn local_models_with_vlm(&self) -> Vec<(String, bool)> {
+        let mut models: Vec<(String, bool)> = self
+            .engines_read()
+            .iter()
+            .filter(|(_, entry)| entry.capacity_ready)
+            .map(|(name, entry)| (name.clone(), entry.engine.is_vlm()))
+            .collect();
+        models.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        models
+    }
+
+    /// Sorted runtime protocol facts for all loaded local engines.
+    pub fn local_models_with_runtime_capabilities(
+        &self,
+    ) -> Vec<(String, bool, &'static str, &'static str)> {
+        let mut models: Vec<(String, bool, &'static str, &'static str)> = self
+            .engines_read()
+            .iter()
+            .filter(|(_, entry)| entry.capacity_ready)
+            .map(|(name, entry)| {
+                (
+                    name.clone(),
+                    entry.engine.is_vlm(),
+                    entry.engine.tool_call_mode(),
+                    entry.engine.thinking_mode(),
+                )
+            })
+            .collect();
+        models.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        models
+    }
+
+    /// Whether a local engine is currently registered under `name`.
+    pub fn contains_engine(&self, name: &str) -> bool {
+        self.engines_read()
+            .get(name)
+            .is_some_and(|entry| entry.capacity_ready)
+    }
+
+    /// Register a freshly-loaded engine. Returns `Err(name)` if the name is
+    /// already taken (checked under the write lock, so it is race-free against
+    /// concurrent loads).
+    pub fn insert_engine(&self, name: String, engine: Arc<Engine>) -> Result<(), String> {
+        self.insert_engine_with_defaults(name, engine, GenerationDefaults::default())
+            .map_err(|(name, _engine)| name)
+    }
+
+    /// Register a freshly-loaded engine with per-model request defaults.
+    pub fn insert_engine_with_defaults(
+        &self,
+        name: String,
+        engine: Arc<Engine>,
+        generation_defaults: GenerationDefaults,
+    ) -> Result<(), (String, Arc<Engine>)> {
+        let mut engines = self.engines_write();
+        if engines.contains_key(&name) {
+            return Err((name, engine));
+        }
+        engines.insert(
+            name,
+            LocalEngineEntry {
+                engine,
+                generation_defaults,
+                capacity_ready: true,
+            },
+        );
+        Ok(())
+    }
+
+    /// Remove an engine from the routing table, returning it if present. The
+    /// caller is responsible for dropping it once no request still holds a clone.
+    pub fn remove_engine(&self, name: &str) -> Option<Arc<Engine>> {
+        self.engines_write().remove(name).map(|entry| entry.engine)
+    }
+
+    /// Map key bound to the auto-router model, if the auto-router is enabled.
+    pub fn auto_router_model_name(&self) -> Option<&str> {
+        self.auto_router_model_name.as_deref()
+    }
+
+    /// Snapshot of all local engines for cache aggregation and session reset.
+    pub fn local_engines(&self) -> Vec<Arc<Engine>> {
+        self.engines_read()
+            .values()
+            .map(|entry| Arc::clone(&entry.engine))
+            .collect()
+    }
+
+    /// Apply one coherent registry allocation snapshot without holding the
+    /// router lock while a batch worker acknowledges eviction.
+    pub async fn apply_capacity_cache_allocations(
+        &self,
+        capacity: &CapacityRegistry,
+    ) -> Result<(), String> {
+        let _serialized = self.cache_policy.lock().await;
+        loop {
+            let plan = capacity.cache_allocation_plan();
+            self.apply_cache_plan(&plan, None).await?;
+            if capacity.publish_cache_allocation_revision(plan.revision) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Atomically apply one current cache policy to the loaded set and a
+    /// provisional engine, then expose that engine before a newer publisher
+    /// can overtake it.
+    pub(crate) async fn insert_engine_with_capacity(
+        &self,
+        name: String,
+        engine: Arc<Engine>,
+        generation_defaults: GenerationDefaults,
+        capacity: &CapacityRegistry,
+        registration: &mut ActiveRegistration,
+        #[cfg(test)] mut insertion_gate: Option<RouteInsertionTestGate>,
+    ) -> Result<(), (String, Arc<Engine>, String)> {
+        let _serialized = self.cache_policy.lock().await;
+        let mut inserted = false;
+        let mut disabled_route: Option<DisabledRouteGuard<'_>> = None;
+        let mut pending_engine = Some(engine);
+        let mut pending_defaults = Some(generation_defaults);
+        loop {
+            let plan = capacity.cache_allocation_plan();
+            let provisional = pending_engine.as_ref().map(|engine| (&*name, engine));
+            if let Err(error) = self.apply_cache_plan(&plan, provisional).await {
+                let engine = if inserted {
+                    disabled_route
+                        .take()
+                        .expect("disabled route guard exists")
+                        .remove()
+                } else {
+                    pending_engine.take().expect("provisional engine exists")
+                };
+                return Err((name, engine, error));
+            }
+            if !capacity.publish_cache_allocation_revision(plan.revision) {
+                continue;
+            }
+            if !inserted {
+                {
+                    let mut engines = self.engines_write();
+                    if engines.contains_key(&name) {
+                        return Err((
+                            name,
+                            pending_engine.take().expect("provisional engine exists"),
+                            "model name is already loaded".to_owned(),
+                        ));
+                    }
+                    engines.insert(
+                        name.clone(),
+                        LocalEngineEntry {
+                            engine: pending_engine.take().expect("provisional engine exists"),
+                            generation_defaults: pending_defaults
+                                .take()
+                                .expect("provisional defaults exist"),
+                            capacity_ready: false,
+                        },
+                    );
+                }
+                inserted = true;
+                disabled_route = Some(DisabledRouteGuard {
+                    router: self,
+                    name: name.clone(),
+                    armed: true,
+                });
+                #[cfg(test)]
+                if let Some(gate) = insertion_gate.take() {
+                    let _ = gate.arrived.send(());
+                    let _ = gate.release.await;
+                }
+            }
+            if registration.publish_route_if_current(plan.revision, || {
+                let mut engines = self.engines_write();
+                let entry = engines
+                    .get_mut(&name)
+                    .expect("capacity publication retains its disabled engine entry");
+                entry.capacity_ready = true;
+            }) {
+                disabled_route
+                    .take()
+                    .expect("disabled route guard exists")
+                    .publish();
+                return Ok(());
+            }
+        }
+    }
+
+    async fn apply_cache_plan(
+        &self,
+        plan: &crate::capacity::CacheAllocationPlan,
+        provisional: Option<(&str, &Arc<Engine>)>,
+    ) -> Result<(), String> {
+        let engines = {
+            let loaded = self.engines_read();
+            plan.allocations
+                .iter()
+                .filter_map(|(name, retained, prefix)| {
+                    loaded
+                        .get(name)
+                        .map(|entry| (name.clone(), Arc::clone(&entry.engine), *retained, *prefix))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (name, engine, retained, prefix) in engines {
+            engine
+                .apply_capacity_cache_limits(plan.revision, retained, prefix, plan.pressure)
+                .await
+                .map_err(|error| {
+                    format!("failed to apply cache allocation for '{name}': {error}")
+                })?;
+        }
+        if let Some((name, engine)) = provisional
+            && let Some((_, retained, prefix)) =
+                plan.allocations.iter().find(|(model, _, _)| model == name)
+        {
+            engine
+                .apply_capacity_cache_limits(plan.revision, *retained, *prefix, plan.pressure)
+                .await
+                .map_err(|error| {
+                    format!("failed to apply cache allocation for '{name}': {error}")
+                })?;
+        }
+        Ok(())
     }
 
     // -- Private helpers ---------------------------------------------------
+
+    fn engines_read(&self) -> RwLockReadGuard<'_, HashMap<String, LocalEngineEntry>> {
+        self.local_engines
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn engines_write(&self) -> RwLockWriteGuard<'_, HashMap<String, LocalEngineEntry>> {
+        self.local_engines
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
 
     async fn try_auto_route(
         &self,
@@ -265,24 +596,28 @@ impl Router {
         match target {
             RouteTarget::Higgs { model_rewrite } => {
                 let lookup_name = model_rewrite.as_deref().unwrap_or(model);
-                let (engine, resolved_name) =
-                    if let Some(engine) = self.local_engines.get(lookup_name) {
-                        (Arc::clone(engine), lookup_name.to_owned())
-                    } else if model == "auto" {
-                        // "auto" is a virtual model name; pick any loaded engine
-                        let (name, engine) =
-                            self.local_engines.iter().next().ok_or_else(|| {
-                                "no local models loaded for default route".to_owned()
-                            })?;
-                        (Arc::clone(engine), name.clone())
-                    } else {
-                        return Err(format!(
-                            "model '{lookup_name}' not found among loaded local models"
-                        ));
-                    };
+                let engines = self.engines_read();
+                let (entry, resolved_name) = if let Some(entry) = engines
+                    .get(lookup_name)
+                    .filter(|entry| entry.capacity_ready)
+                {
+                    (entry.clone(), lookup_name.to_owned())
+                } else if model == "auto" {
+                    // "auto" is a virtual model name; pick any loaded engine
+                    let (name, entry) = engines
+                        .iter()
+                        .find(|(_, entry)| entry.capacity_ready)
+                        .ok_or_else(|| "no local models loaded for default route".to_owned())?;
+                    (entry.clone(), name.clone())
+                } else {
+                    return Err(format!(
+                        "model '{lookup_name}' not found among loaded local models"
+                    ));
+                };
                 Ok(ResolvedRoute::Higgs {
-                    engine,
+                    engine: entry.engine,
                     model_name: resolved_name,
+                    generation_defaults: entry.generation_defaults,
                     routing_method: method,
                 })
             }
@@ -745,6 +1080,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_model_resolution_carries_generation_defaults() {
+        let config = config_from_toml(
+            r#"
+            [[models]]
+            path = "prism-ml/Ternary-Bonsai-27B-mlx-2bit"
+            name = "bonsai-27b-q2"
+
+            [models.generation_defaults]
+            max_tokens = 4096
+            temperature = 0.0
+            top_p = 1.0
+            speculation = "auto"
+            enable_thinking = false
+            "#,
+        );
+        let mut engines = HashMap::new();
+        engines.insert(
+            "bonsai-27b-q2".to_owned(),
+            Arc::new(crate::state::Engine::test_stub("bonsai-27b-q2")),
+        );
+
+        let router = Router::from_config(&config, engines).unwrap();
+        let result = router.resolve("bonsai-27b-q2", None).await.unwrap();
+
+        match result {
+            ResolvedRoute::Higgs {
+                generation_defaults,
+                ..
+            } => {
+                assert_eq!(generation_defaults.max_tokens, Some(4096));
+                assert_eq!(generation_defaults.temperature, Some(0.0));
+                assert_eq!(generation_defaults.top_p, Some(1.0));
+                assert_eq!(generation_defaults.speculation.as_deref(), Some("auto"));
+                assert_eq!(generation_defaults.enable_thinking, Some(false));
+            }
+            ResolvedRoute::Remote { .. } => panic!("expected Higgs route"),
+        }
+    }
+
+    #[tokio::test]
     async fn higgs_default_errors_when_model_not_found() {
         let config = config_from_toml(
             r#"
@@ -801,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn local_engines_accessor_returns_engines() {
+    fn local_model_names_lists_engines() {
         let config = config_from_toml(
             r#"
             [[models]]
@@ -809,7 +1184,82 @@ mod tests {
             "#,
         );
         let router = Router::from_config(&config, HashMap::new()).unwrap();
-        assert!(router.local_engines().is_empty());
+        assert!(router.local_model_names().is_empty());
+
+        let mut engines = HashMap::new();
+        engines.insert(
+            "b".to_owned(),
+            Arc::new(crate::state::Engine::test_stub("b")),
+        );
+        engines.insert(
+            "a".to_owned(),
+            Arc::new(crate::state::Engine::test_stub("a")),
+        );
+        let router = Router::from_config(&config, engines).unwrap();
+        assert_eq!(router.local_model_names(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn insert_remove_and_contains_engine() {
+        let config = config_from_toml(
+            r#"
+            [[models]]
+            path = "some/model"
+            "#,
+        );
+        let router = Router::from_config(&config, HashMap::new()).unwrap();
+
+        assert!(!router.contains_engine("x"));
+        router
+            .insert_engine(
+                "x".to_owned(),
+                Arc::new(crate::state::Engine::test_stub("x")),
+            )
+            .unwrap();
+        assert!(router.contains_engine("x"));
+
+        // Duplicate insert is rejected with the conflicting name.
+        let dup = router.insert_engine(
+            "x".to_owned(),
+            Arc::new(crate::state::Engine::test_stub("x")),
+        );
+        assert_eq!(dup, Err("x".to_owned()));
+
+        let removed = router.remove_engine("x");
+        assert!(removed.is_some());
+        assert!(!router.contains_engine("x"));
+        assert!(router.remove_engine("x").is_none());
+    }
+
+    #[tokio::test]
+    async fn inserted_engine_and_defaults_publish_as_one_entry() {
+        let config = config_from_toml(
+            r#"
+            [[models]]
+            path = "some/model"
+            "#,
+        );
+        let router = Router::from_config(&config, HashMap::new()).unwrap();
+        let defaults = GenerationDefaults {
+            max_tokens: Some(73),
+            ..GenerationDefaults::default()
+        };
+        router
+            .insert_engine_with_defaults(
+                "atomic".to_owned(),
+                Arc::new(crate::state::Engine::test_stub("atomic")),
+                defaults,
+            )
+            .map_err(|(name, _engine)| name)
+            .unwrap();
+
+        match router.resolve("atomic", None).await.unwrap() {
+            ResolvedRoute::Higgs {
+                generation_defaults,
+                ..
+            } => assert_eq!(generation_defaults.max_tokens, Some(73)),
+            ResolvedRoute::Remote { .. } => panic!("expected local route"),
+        }
     }
 
     #[tokio::test]

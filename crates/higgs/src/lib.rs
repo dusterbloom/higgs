@@ -1,11 +1,13 @@
 pub mod anthropic_adapter;
 pub mod attach;
 pub mod auto_router;
+pub mod capacity;
 pub mod cli_config;
 pub mod config;
 pub mod daemon;
 pub mod doctor;
 pub mod error;
+pub mod media;
 pub mod metrics;
 pub mod metrics_log;
 pub mod model_download;
@@ -21,6 +23,9 @@ pub mod translate;
 pub mod tui;
 pub mod types;
 
+#[cfg(test)]
+mod streaming_compat_tests;
+
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::{Arc, LazyLock};
@@ -34,7 +39,7 @@ use axum::{
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::Response,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
 use tower_http::{
@@ -51,7 +56,13 @@ type SharedRateLimiter = Arc<RateLimiter<String, DefaultKeyedStateStore<String>,
 
 // Observability/control-plane routes must never perturb API traffic metrics.
 /// Requests that dashboards poll; they never count as traffic in metrics.
-const INFRASTRUCTURE_PATHS: &[&str] = &["/health", "/metrics", "/v1/models", "/v1/system"];
+const INFRASTRUCTURE_PATHS: &[&str] = &[
+    "/health",
+    "/metrics",
+    "/v1/models",
+    "/v1/system",
+    "/v1/capacity",
+];
 
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
@@ -75,8 +86,18 @@ pub fn build_router(
     let mut api_routes = Router::new()
         .route("/metrics", get(routes::metrics::metrics))
         .route("/v1/system", get(routes::system::system))
-        .route("/v1/models", get(routes::models::list_models))
+        .route(
+            "/v1/cache/sessions/{session_id}",
+            delete(routes::cache::drop_retained_session),
+        )
+        .route(
+            "/v1/models",
+            get(routes::models::list_models).post(routes::models::load_model),
+        )
+        .route("/v1/capacity", get(routes::capacity::capacity))
+        .route("/v1/models/{name}", delete(routes::models::unload_model))
         .route("/v1/chat/completions", post(routes::chat::chat_completions))
+        .route("/v1/sessions/drop", post(routes::chat::drop_sessions))
         .route("/v1/completions", post(routes::completions::completions))
         .route("/v1/embeddings", post(routes::embeddings::embeddings))
         .route("/v1/messages", post(routes::anthropic::create_message))
@@ -244,5 +265,15 @@ mod cors_tests {
     fn empty_list_disables_cors() {
         let origins: Vec<String> = vec![];
         assert!(build_cors_layer(Some(&origins)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod infrastructure_path_tests {
+    use super::INFRASTRUCTURE_PATHS;
+
+    #[test]
+    fn capacity_endpoint_is_not_counted_as_api_traffic() {
+        assert!(INFRASTRUCTURE_PATHS.contains(&"/v1/capacity"));
     }
 }

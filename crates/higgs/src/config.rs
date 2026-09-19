@@ -1,13 +1,27 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
 };
-use higgs_engine::{mlx_tuning::RequestedMlxProfile, model_loader};
-use higgs_models::turboquant::{KvCacheConfig, KvCacheMode};
+use higgs_engine::{
+    cache::{DEFAULT_MAX_DISK_BLOCKS, DEFAULT_MIN_TOKENS_TO_PERSIST, DiskPrefixCacheConfig},
+    mlx_tuning::RequestedMlxProfile,
+    model_loader,
+    simple::{
+        DEFAULT_PFLASH_KEEP_RATIO_MAX, DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO,
+        DEFAULT_PFLASH_PLAN_CACHE, DEFAULT_PFLASH_PLAN_CACHE_ENTRIES,
+        DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD,
+    },
+};
+use higgs_models::{
+    spec_prefill::PrefillScoreMode,
+    turboquant::{KvCacheConfig, KvCacheMode},
+};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -275,6 +289,15 @@ pub struct ServerSection {
     pub timeout: f64,
     #[serde(default = "default_max_body_size")]
     pub max_body_size: usize,
+    /// Maximum decoded byte size accepted per image (20 MiB default).
+    #[serde(default = "default_max_image_bytes")]
+    pub max_image_bytes: usize,
+    /// HTTP fetch timeout for remote image URLs, in seconds.
+    #[serde(default = "default_image_fetch_timeout")]
+    pub image_fetch_timeout: f64,
+    /// Long-edge pixel cap applied before family-specific preprocessing.
+    #[serde(default = "default_max_image_dimension")]
+    pub max_image_dimension: u32,
     /// CORS allow-list of origins. Unset = no CORS headers are sent;
     /// `["*"]` allows any origin (permissive).
     pub cors_origins: Option<Vec<String>>,
@@ -290,6 +313,9 @@ impl Default for ServerSection {
             rate_limit: 0,
             timeout: default_timeout(),
             max_body_size: default_max_body_size(),
+            max_image_bytes: default_max_image_bytes(),
+            image_fetch_timeout: default_image_fetch_timeout(),
+            max_image_dimension: default_max_image_dimension(),
             cors_origins: None,
         }
     }
@@ -307,12 +333,28 @@ const fn default_max_tokens() -> u32 {
     32768
 }
 
+pub(crate) const fn default_max_context_tokens() -> u32 {
+    65_536
+}
+
 const fn default_timeout() -> f64 {
     300.0
 }
 
 const fn default_max_body_size() -> usize {
     10 * 1024 * 1024
+}
+
+const fn default_max_image_bytes() -> usize {
+    20 << 20
+}
+
+const fn default_image_fetch_timeout() -> f64 {
+    10.0
+}
+
+const fn default_max_image_dimension() -> u32 {
+    4096
 }
 
 // -- Local defaults ---------------------------------------------------------
@@ -365,6 +407,13 @@ pub struct LocalConfig {
     /// Raise MLX's wired memory limit to the device-recommended maximum.
     #[serde(default)]
     pub raise_wired_limit: bool,
+    /// Allow loading and unloading models at runtime via `POST`/`DELETE /v1/models`.
+    ///
+    /// Off by default: the load endpoint can read arbitrary local model
+    /// directories and trigger downloads, so it is opt-in and only reachable by
+    /// authenticated operators.
+    #[serde(default)]
+    pub allow_runtime_model_load: bool,
     /// Internal requested profile after resolving precedence (`model` > `--mlx-profile` > `HIGGS_MLX_PROFILE` > local default).
     #[serde(skip, default)]
     pub requested_mlx_profile: RequestedMlxProfile,
@@ -375,6 +424,7 @@ impl Default for LocalConfig {
         Self {
             mlx_profile: MlxProfile::Auto,
             raise_wired_limit: false,
+            allow_runtime_model_load: false,
             requested_mlx_profile: RequestedMlxProfile::Auto,
         }
     }
@@ -384,17 +434,33 @@ impl Default for LocalConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
+    /// Fixed prompt-plus-output context limit, capped by model architecture.
+    #[serde(default = "default_max_context_tokens")]
+    pub max_context_tokens: u32,
     /// Filesystem path or Hugging Face reference for the model.
     pub path: String,
     /// Optional external name exposed to API clients.
     #[serde(default)]
     pub name: Option<String>,
+    /// Per-model request defaults for omitted chat-completion fields.
+    ///
+    /// Explicit request values still win. This is the config-level home for
+    /// model policy such as Bonsai+dSpark's greedy/non-thinking default.
+    #[serde(default)]
+    pub generation_defaults: GenerationDefaults,
     /// Optional per-model MLX tuning override for the simple engine.
     #[serde(default)]
     pub mlx_profile: Option<MlxProfile>,
     /// Enable the separate batch engine for this model.
     #[serde(default)]
     pub batch: bool,
+    /// Force-disable vision processing for this model, rejecting image input.
+    ///
+    /// Escape hatch for checkpoints whose vision tower fails to load. On a
+    /// checkpoint with no vision capability the flag is a no-op; `higgs doctor`
+    /// warns when that happens.
+    #[serde(default)]
+    pub disable_vision: bool,
     /// Maximum prompt tokens to prefill per batch-loop iteration. `None` and
     /// `0` retain synchronous prefill behavior.
     #[serde(default)]
@@ -420,10 +486,107 @@ pub struct ModelConfig {
     /// Seed used by `TurboQuant` setup.
     #[serde(default)]
     pub kv_seed: u64,
-    /// Directory used for durable, disk-backed prefix KV entries.
+    /// Optional path to a `DFlash` drafter (simple engine); overrides `HIGGS_DFLASH_PATH`.
+    #[serde(default)]
+    pub draft_model: Option<String>,
+    /// Optional path to a small dense MLX model (e.g. Qwen3-0.6B) used to score
+    /// the prompt for compressive (PFlash) prefill. This is not the served
+    /// target model: Bonsai Ternary/Q2 can be the target, but `prefill_drafter`
+    /// must load as a dense `Transformer`. Distinct from `draft_model`, which
+    /// is decode speculation. See `.planning/DESIGN-pflash-higgs.md`.
+    #[serde(default)]
+    pub prefill_drafter: Option<String>,
+    /// When to invoke compressive prefill. `off` (default) never; `auto`
+    /// enables above `prefill_threshold` prompt tokens; `always` for every
+    /// request. Output is NOT byte-identical to uncompressed when active.
+    #[serde(default)]
+    pub prefill_compression: PrefillCompressionMode,
+    /// Auto-enable compressive prefill above this many prompt tokens. Lower
+    /// than Lucebox PFlash's 32K because typical agent prompts are 4-16K.
+    #[serde(default = "default_prefill_threshold")]
+    pub prefill_threshold: usize,
+    /// Floor fraction of source tokens kept after compression. The engine
+    /// adaptively raises this toward `prefill_keep_ratio_max` when scorer
+    /// entropy/surprise is high.
+    #[serde(default = "default_prefill_keep_ratio")]
+    pub prefill_keep_ratio: f32,
+    /// Prompt-token block size for survivor selection (SpecPrefill default 32).
+    #[serde(default = "default_prefill_chunk")]
+    pub prefill_chunk: usize,
+    /// 1D avgpool smoothing kernel width (Cross-Family Appendix A.1: 13).
+    #[serde(default = "default_prefill_avgpool")]
+    pub prefill_avgpool: usize,
+    /// Lookahead decoded tokens used for importance aggregation (SpecPrefill: 8).
+    #[serde(default = "default_prefill_lookahead")]
+    pub prefill_lookahead: usize,
+    /// PFlash scorer variant. `full` runs the baseline full drafter scorer;
+    /// `l7` exits the dense drafter at `prefill_exit_layer`.
+    #[serde(default)]
+    pub prefill_score_mode: PrefillScoreMode,
+    /// Early-exit layer for `prefill_score_mode = "l7"`.
+    #[serde(default = "default_prefill_exit_layer")]
+    pub prefill_exit_layer: usize,
+    /// Adaptive keep-ratio ceiling used when scorer entropy/surprise is high.
+    #[serde(default = "default_prefill_keep_ratio_max")]
+    pub prefill_keep_ratio_max: f32,
+    /// Auto-mode execution ceiling: skip lossy sparse prefill when survivor
+    /// retention is above this ratio and exact prefix/session cache is likely
+    /// cheaper.
+    #[serde(default = "default_prefill_max_auto_prefill_ratio")]
+    pub prefill_max_auto_prefill_ratio: f32,
+    /// Reuse frozen PFlash survivor plans for exact source-token prefixes
+    /// across turns.
+    #[serde(default = "default_prefill_plan_cache")]
+    pub prefill_plan_cache: bool,
+    /// Maximum frozen PFlash branch frontiers retained per model.
+    #[serde(default = "default_prefill_plan_cache_entries")]
+    pub prefill_plan_cache_entries: usize,
+    /// New suffixes at or below this size are appended exact instead of running
+    /// the PFlash scorer again. Set to 0 to score every non-empty suffix.
+    #[serde(default = "default_prefill_suffix_identity_threshold")]
+    pub prefill_suffix_identity_threshold: usize,
+    /// Persist simple-engine prefix KV snapshots to disk.
+    #[serde(default)]
+    pub disk_cache_enabled: bool,
+    /// Optional path for the disk prefix cache file.
+    #[serde(default)]
+    pub disk_cache_path: Option<PathBuf>,
+    /// Maximum number of blocks allowed in one persisted prefix snapshot.
+    #[serde(default = "default_max_disk_blocks")]
+    pub max_disk_blocks: usize,
+    /// Minimum prefix length, in tokens, before persisting to disk.
+    #[serde(default = "default_min_tokens_to_persist")]
+    pub min_tokens_to_persist: usize,
+    /// Max conversations whose live KV cache is retained between turns for
+    /// cache-resident multi-turn. LRU-evicted beyond this. Must be >= 1.
+    #[serde(default = "default_kv_max_sessions")]
+    pub kv_max_sessions: usize,
+    /// Drop a conversation's retained KV once it exceeds this many tokens
+    /// (`0` = unlimited). Bounds a single conversation's resident KV.
+    #[serde(default = "default_kv_max_session_tokens")]
+    pub kv_max_session_tokens: usize,
+    /// Evict retained session KV and memory-only paired target+dSpark radix
+    /// endpoints idle longer than this many seconds (`0` = never).
+    #[serde(default = "default_kv_retained_idle_secs")]
+    pub kv_retained_idle_secs: u64,
+    /// Hard aggregate byte limit for retained per-session KV state.
+    #[serde(default = "default_kv_max_retained_bytes")]
+    pub kv_max_retained_bytes: usize,
+    /// Maximum exact suffix tokens to append to a retained session before
+    /// falling back to the stateless radix/PFlash path. Cold session bootstraps
+    /// are still executed exactly so the retained KV can seed later turns.
+    #[serde(default = "default_kv_max_suffix_prefill_tokens")]
+    pub kv_max_suffix_prefill_tokens: usize,
+    /// Resident-byte budget for the prefix KV cache. When exceeded, the
+    /// least-recently-used prefix is evicted (in addition to the count cap).
+    /// `0` (default) selects a fixed 1 GiB budget.
+    #[serde(default)]
+    pub kv_cache_bytes: usize,
+    /// Enables durable prefix KV snapshots in model-path-specific files in this directory.
     #[serde(default)]
     pub kv_disk_dir: Option<String>,
-    /// Maximum disk-prefix-store size in MiB.
+    /// Disk file byte ceiling in MiB when `kv_disk_dir` is set; minimum 64.
+    /// Older snapshots are discarded when the append log reaches this ceiling.
     #[serde(default = "default_kv_disk_space_mb")]
     pub kv_disk_space_mb: u64,
     /// Store `DeepSeek`-V2 MLA caches as compressed latent rows.
@@ -436,12 +599,171 @@ pub struct ModelConfig {
     pub mla_latent_cache: Option<bool>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GenerationDefaults {
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub speculation: Option<String>,
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+}
+
 const fn default_norm_correction() -> bool {
     true
 }
 
+fn default_prefill_threshold() -> usize {
+    4096
+}
+
+fn default_prefill_keep_ratio() -> f32 {
+    0.10
+}
+
+fn default_prefill_keep_ratio_max() -> f32 {
+    DEFAULT_PFLASH_KEEP_RATIO_MAX
+}
+
+fn default_prefill_max_auto_prefill_ratio() -> f32 {
+    DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO
+}
+
+fn default_prefill_plan_cache() -> bool {
+    DEFAULT_PFLASH_PLAN_CACHE
+}
+
+fn default_prefill_plan_cache_entries() -> usize {
+    DEFAULT_PFLASH_PLAN_CACHE_ENTRIES
+}
+
+fn default_prefill_suffix_identity_threshold() -> usize {
+    DEFAULT_PFLASH_SUFFIX_IDENTITY_THRESHOLD
+}
+
+fn default_prefill_chunk() -> usize {
+    32
+}
+
+fn default_prefill_avgpool() -> usize {
+    13
+}
+
+fn default_prefill_lookahead() -> usize {
+    8
+}
+
+const fn default_prefill_exit_layer() -> usize {
+    7
+}
+
+pub(crate) fn validate_pflash_settings(model: &ModelConfig) -> Result<(), String> {
+    if !model.prefill_keep_ratio.is_finite() || !(0.02..=0.95).contains(&model.prefill_keep_ratio) {
+        return Err(format!(
+            "prefill_keep_ratio={} must be finite and in [0.02, 0.95]",
+            model.prefill_keep_ratio
+        ));
+    }
+    if !model.prefill_keep_ratio_max.is_finite()
+        || model.prefill_keep_ratio_max < model.prefill_keep_ratio
+        || model.prefill_keep_ratio_max > 0.95
+    {
+        return Err(format!(
+            "prefill_keep_ratio_max={} must be finite and in [{}, 0.95]",
+            model.prefill_keep_ratio_max, model.prefill_keep_ratio
+        ));
+    }
+    if !model.prefill_max_auto_prefill_ratio.is_finite()
+        || !(0.0..=1.0).contains(&model.prefill_max_auto_prefill_ratio)
+    {
+        return Err(format!(
+            "prefill_max_auto_prefill_ratio={} must be finite and in [0.0, 1.0]",
+            model.prefill_max_auto_prefill_ratio
+        ));
+    }
+    if model.prefill_plan_cache && model.prefill_plan_cache_entries == 0 {
+        return Err("prefill_plan_cache_entries must be >= 1".to_owned());
+    }
+    if model.prefill_drafter.is_some() {
+        if model.prefill_chunk == 0 {
+            return Err(format!(
+                "prefill_chunk must be >= 1, got {}",
+                model.prefill_chunk
+            ));
+        }
+        if model.prefill_avgpool == 0 || model.prefill_avgpool % 2 == 0 {
+            return Err(format!(
+                "prefill_avgpool must be odd and >= 1 (symmetric smoothing window), got {}",
+                model.prefill_avgpool
+            ));
+        }
+        if model.prefill_lookahead == 0 {
+            return Err(format!(
+                "prefill_lookahead must be >= 1, got {}",
+                model.prefill_lookahead
+            ));
+        }
+        if model.prefill_score_mode == PrefillScoreMode::L7 && model.prefill_exit_layer == 0 {
+            return Err("prefill_exit_layer must be >= 1 when prefill_score_mode=l7".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// When the PFlash compressive-prefill drafter is invoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PrefillCompressionMode {
+    #[default]
+    Off,
+    Auto,
+    Always,
+}
+
 const fn default_kv_bits() -> u8 {
     3
+}
+
+const fn default_max_disk_blocks() -> usize {
+    DEFAULT_MAX_DISK_BLOCKS
+}
+
+const fn default_min_tokens_to_persist() -> usize {
+    DEFAULT_MIN_TOKENS_TO_PERSIST
+}
+
+const fn default_kv_max_sessions() -> usize {
+    2
+}
+
+const fn default_kv_retained_idle_secs() -> u64 {
+    300
+}
+
+const fn default_kv_max_session_tokens() -> usize {
+    32_768
+}
+
+const fn default_kv_max_suffix_prefill_tokens() -> usize {
+    24_576
+}
+
+const fn default_kv_max_retained_bytes() -> usize {
+    2_147_483_648
 }
 
 const fn default_kv_disk_space_mb() -> u64 {
@@ -449,20 +771,113 @@ const fn default_kv_disk_space_mb() -> u64 {
 }
 
 impl ModelConfig {
-    /// Validate disk-prefix-store settings independently of engine startup.
+    /// Apply the `HIGGS_KV_TURBO` / `HIGGS_KV_TURBO_BITS` env overrides.
+    ///
+    /// `HIGGS_KV_TURBO=1` (or any of 1/true/yes/on) switches the retained-KV
+    /// storage to `TurboQuant` — quantized-on-retain, so the *live* generation
+    /// cache stays dense and only the retained between-turns copy compresses.
+    /// `HIGGS_KV_TURBO_BITS=1..4` overrides the bit width (TurboQuant codes are
+    /// capped at 4 bits; 8-bit storage is not a TurboQuant width). Invalid
+    /// values are warned about and ignored, never fatal.
+    pub fn apply_kv_turbo_env_overrides(&mut self, env: &dyn Fn(&str) -> Option<String>) {
+        let bits_raw = env("HIGGS_KV_TURBO_BITS");
+        let enabled = env("HIGGS_KV_TURBO")
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            || bits_raw.is_some();
+        if !enabled {
+            return;
+        }
+        self.kv_cache = KvCacheMode::Turboquant;
+        // Quantize-on-retain must actually fire: the default activation
+        // boundary (100k tokens) sits above every practical session, which
+        // would keep retained KV dense and void the memory win. Lower it to
+        // zero unless the operator tuned it via env.
+        if env("HIGGS_TURBOQUANT_MIN_TOKENS").is_none() {
+            higgs_models::set_turboquant_activation_threshold(0);
+        }
+        if let Some(bits_raw) = bits_raw.as_deref() {
+            match bits_raw.trim().parse::<u8>() {
+                Ok(bits) if (1..=4).contains(&bits) => self.kv_bits = bits,
+                _ => tracing::warn!(
+                    value = %bits_raw,
+                    "HIGGS_KV_TURBO_BITS must be 1-4; keeping configured kv_bits"
+                ),
+            }
+        }
+    }
+
+    pub const fn disk_prefix_cache_enabled(&self) -> bool {
+        self.disk_cache_enabled || self.kv_disk_dir.is_some()
+    }
+
+    fn validate_disk_prefix_settings(&self) -> Result<(), String> {
+        if self.kv_disk_dir.is_some() && self.disk_cache_path.is_some() {
+            return Err("kv_disk_dir and disk_cache_path cannot both be set".to_owned());
+        }
+        if self
+            .disk_cache_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err("disk_cache_path must not be empty".to_owned());
+        }
+        if let Some(dir) = &self.kv_disk_dir {
+            if dir.trim().is_empty() {
+                return Err("kv_disk_dir must not be empty or whitespace-only".to_owned());
+            }
+            if self.kv_disk_space_mb < 64 {
+                return Err("kv_disk_space_mb must be at least 64".to_owned());
+            }
+            self.kv_disk_space_mb
+                .checked_mul(1024 * 1024)
+                .ok_or_else(|| "kv_disk_space_mb overflows the disk byte limit".to_owned())?;
+        }
+        if self.disk_prefix_cache_enabled() {
+            if self.batch {
+                return Err("disk prefix cache is only supported with batch=false".to_owned());
+            }
+            if self.max_disk_blocks == 0 {
+                return Err("max_disk_blocks must be greater than zero".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the same settings used at startup, then probe the configured directory.
     pub fn validate_disk_prefix_store(&self) -> Result<(), String> {
-        let Some(dir) = self.kv_disk_dir.as_deref() else {
+        self.validate_disk_prefix_settings()?;
+        if !self.disk_prefix_cache_enabled() {
+            return Ok(());
+        }
+        let directory = self
+            .kv_disk_dir
+            .as_deref()
+            .map(Path::new)
+            .or_else(|| self.disk_cache_path.as_deref().and_then(Path::parent));
+        let Some(dir) = directory.filter(|path| !path.as_os_str().is_empty()) else {
             return Ok(());
         };
-        if self.kv_disk_space_mb < 64 {
-            return Err("kv_disk_space_mb must be at least 64".to_owned());
-        }
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("kv_disk_dir {dir:?} is not creatable: {e}"))?;
-        let probe = std::path::Path::new(dir).join(".higgs-write-probe");
-        std::fs::write(&probe, [])
-            .map_err(|e| format!("kv_disk_dir {dir:?} is not writable: {e}"))?;
-        std::fs::remove_file(probe).map_err(|e| format!("kv_disk_dir cleanup failed: {e}"))?;
+        std::fs::create_dir_all(dir).map_err(|e| {
+            format!(
+                "disk prefix directory {} is not creatable: {e}",
+                dir.display()
+            )
+        })?;
+        let probe = dir.join(format!(".higgs-write-probe-{}", std::process::id()));
+        // Never overwrite an existing file while checking configuration.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .map_err(|e| {
+                format!(
+                    "disk prefix directory {} is not writable: {e}",
+                    dir.display()
+                )
+            })?;
+        drop(file);
+        std::fs::remove_file(probe)
+            .map_err(|e| format!("disk prefix probe cleanup failed: {e}"))?;
         Ok(())
     }
     pub const fn kv_cache_config(&self) -> KvCacheConfig {
@@ -474,6 +889,15 @@ impl ModelConfig {
             norm_correction: self.kv_norm_correction,
             adaptive_dense_layers: self.kv_adaptive_dense_layers,
             seed: self.kv_seed,
+            max_retained_sessions: self.kv_max_sessions,
+            max_session_tokens: self.kv_max_session_tokens,
+            retained_idle_secs: self.kv_retained_idle_secs,
+            max_retained_bytes: self.kv_max_retained_bytes,
+            kv_cache_bytes: if self.kv_cache_bytes == 0 {
+                1_073_741_824
+            } else {
+                self.kv_cache_bytes
+            },
             mla_latent: match self.mla_latent_cache {
                 Some(v) => v,
                 None => false,
@@ -485,6 +909,96 @@ impl ModelConfig {
         match self.mlx_profile {
             Some(profile) => profile.to_requested(),
             None => local.requested_mlx_profile,
+        }
+    }
+
+    pub fn disk_prefix_cache_config(
+        &self,
+        model_dir: &Path,
+    ) -> Result<Option<DiskPrefixCacheConfig>, String> {
+        self.validate_disk_prefix_settings()?;
+        if !self.disk_prefix_cache_enabled() {
+            return Ok(None);
+        }
+        let (disk_path, max_disk_bytes) = if let Some(dir) = &self.kv_disk_dir {
+            // A directory can serve several models. Bind each file to the resolved
+            // model path; the explicit legacy filename retains its existing semantics.
+            let identity = Sha256::digest(model_dir.as_os_str().as_encoded_bytes());
+            let mut filename = String::from(".higgs-prefix-cache-");
+            for byte in identity {
+                use std::fmt::Write as _;
+                write!(&mut filename, "{byte:02x}").map_err(|error| error.to_string())?;
+            }
+            filename.push_str(".bin");
+            let path = Path::new(dir).join(filename);
+            let bytes = self
+                .kv_disk_space_mb
+                .checked_mul(1024 * 1024)
+                .ok_or_else(|| "kv_disk_space_mb overflows the disk byte limit".to_owned())?;
+            (path, bytes)
+        } else {
+            (
+                self.disk_cache_path
+                    .clone()
+                    .unwrap_or_else(|| model_dir.join(".higgs-prefix-cache.bin")),
+                0,
+            )
+        };
+        Ok(Some(DiskPrefixCacheConfig {
+            disk_path,
+            max_disk_bytes,
+            max_disk_blocks: self.max_disk_blocks,
+            min_tokens_to_persist: self.min_tokens_to_persist,
+        }))
+    }
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            max_context_tokens: default_max_context_tokens(),
+            path: String::new(),
+            name: None,
+            generation_defaults: GenerationDefaults::default(),
+            mlx_profile: None,
+            batch: false,
+            kv_cache: KvCacheMode::Off,
+            kv_bits: default_kv_bits(),
+            kv_key_bits: None,
+            kv_value_bits: None,
+            kv_norm_correction: default_norm_correction(),
+            kv_adaptive_dense_layers: 0,
+            kv_seed: 0,
+            disable_vision: false,
+            prefill_yield_tokens: None,
+            draft_model: None,
+            prefill_drafter: None,
+            prefill_compression: PrefillCompressionMode::Off,
+            prefill_threshold: default_prefill_threshold(),
+            prefill_keep_ratio: default_prefill_keep_ratio(),
+            prefill_chunk: default_prefill_chunk(),
+            prefill_avgpool: default_prefill_avgpool(),
+            prefill_lookahead: default_prefill_lookahead(),
+            prefill_score_mode: PrefillScoreMode::Full,
+            prefill_exit_layer: default_prefill_exit_layer(),
+            prefill_keep_ratio_max: default_prefill_keep_ratio_max(),
+            prefill_max_auto_prefill_ratio: default_prefill_max_auto_prefill_ratio(),
+            prefill_plan_cache: default_prefill_plan_cache(),
+            prefill_plan_cache_entries: default_prefill_plan_cache_entries(),
+            prefill_suffix_identity_threshold: default_prefill_suffix_identity_threshold(),
+            disk_cache_enabled: false,
+            disk_cache_path: None,
+            max_disk_blocks: default_max_disk_blocks(),
+            min_tokens_to_persist: default_min_tokens_to_persist(),
+            kv_max_sessions: default_kv_max_sessions(),
+            kv_max_session_tokens: default_kv_max_session_tokens(),
+            kv_retained_idle_secs: default_kv_retained_idle_secs(),
+            kv_max_retained_bytes: default_kv_max_retained_bytes(),
+            kv_max_suffix_prefill_tokens: default_kv_max_suffix_prefill_tokens(),
+            kv_cache_bytes: 0,
+            kv_disk_dir: None,
+            kv_disk_space_mb: default_kv_disk_space_mb(),
+            mla_latent_cache: None,
         }
     }
 }
@@ -699,10 +1213,13 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
         .models
         .iter()
         .map(|p| ModelConfig {
+            max_context_tokens: default_max_context_tokens(),
             path: p.clone(),
             name: None,
+            generation_defaults: GenerationDefaults::default(),
             mlx_profile: None,
             batch: args.batch,
+            disable_vision: false,
             prefill_yield_tokens: None,
             kv_cache,
             kv_bits: args.kv_bits.unwrap_or(default_kv_bits()),
@@ -711,6 +1228,31 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             kv_norm_correction: !args.kv_no_norm_correction,
             kv_adaptive_dense_layers: args.kv_adaptive_dense_layers.unwrap_or(0),
             kv_seed: args.kv_seed.unwrap_or_default(),
+            draft_model: None,
+            prefill_drafter: None,
+            prefill_compression: PrefillCompressionMode::Off,
+            prefill_threshold: default_prefill_threshold(),
+            prefill_keep_ratio: default_prefill_keep_ratio(),
+            prefill_chunk: default_prefill_chunk(),
+            prefill_avgpool: default_prefill_avgpool(),
+            prefill_lookahead: default_prefill_lookahead(),
+            prefill_score_mode: PrefillScoreMode::Full,
+            prefill_exit_layer: default_prefill_exit_layer(),
+            prefill_keep_ratio_max: default_prefill_keep_ratio_max(),
+            prefill_max_auto_prefill_ratio: default_prefill_max_auto_prefill_ratio(),
+            prefill_plan_cache: default_prefill_plan_cache(),
+            prefill_plan_cache_entries: default_prefill_plan_cache_entries(),
+            prefill_suffix_identity_threshold: default_prefill_suffix_identity_threshold(),
+            disk_cache_enabled: false,
+            disk_cache_path: None,
+            max_disk_blocks: default_max_disk_blocks(),
+            min_tokens_to_persist: default_min_tokens_to_persist(),
+            kv_max_sessions: default_kv_max_sessions(),
+            kv_max_session_tokens: 32_768,
+            kv_retained_idle_secs: default_kv_retained_idle_secs(),
+            kv_max_retained_bytes: default_kv_max_retained_bytes(),
+            kv_max_suffix_prefill_tokens: default_kv_max_suffix_prefill_tokens(),
+            kv_cache_bytes: 0,
             kv_disk_dir: None,
             kv_disk_space_mb: default_kv_disk_space_mb(),
             mla_latent_cache: None,
@@ -813,10 +1355,13 @@ fn extract_config(
                 .models
                 .iter()
                 .map(|p| ModelConfig {
+                    max_context_tokens: default_max_context_tokens(),
                     path: p.clone(),
                     name: None,
+                    generation_defaults: GenerationDefaults::default(),
                     mlx_profile: None,
                     batch: serve_args.batch,
+                    disable_vision: false,
                     prefill_yield_tokens: None,
                     kv_cache,
                     kv_bits: serve_args.kv_bits.unwrap_or(default_kv_bits()),
@@ -825,6 +1370,31 @@ fn extract_config(
                     kv_norm_correction: !serve_args.kv_no_norm_correction,
                     kv_adaptive_dense_layers: serve_args.kv_adaptive_dense_layers.unwrap_or(0),
                     kv_seed: serve_args.kv_seed.unwrap_or_default(),
+                    draft_model: None,
+                    prefill_drafter: None,
+                    prefill_compression: PrefillCompressionMode::Off,
+                    prefill_threshold: default_prefill_threshold(),
+                    prefill_keep_ratio: default_prefill_keep_ratio(),
+                    prefill_chunk: default_prefill_chunk(),
+                    prefill_avgpool: default_prefill_avgpool(),
+                    prefill_lookahead: default_prefill_lookahead(),
+                    prefill_score_mode: PrefillScoreMode::Full,
+                    prefill_exit_layer: default_prefill_exit_layer(),
+                    prefill_keep_ratio_max: default_prefill_keep_ratio_max(),
+                    prefill_max_auto_prefill_ratio: default_prefill_max_auto_prefill_ratio(),
+                    prefill_plan_cache: default_prefill_plan_cache(),
+                    prefill_plan_cache_entries: default_prefill_plan_cache_entries(),
+                    prefill_suffix_identity_threshold: default_prefill_suffix_identity_threshold(),
+                    disk_cache_enabled: false,
+                    disk_cache_path: None,
+                    max_disk_blocks: default_max_disk_blocks(),
+                    min_tokens_to_persist: default_min_tokens_to_persist(),
+                    kv_max_sessions: default_kv_max_sessions(),
+                    kv_max_session_tokens: 32_768,
+                    kv_retained_idle_secs: default_kv_retained_idle_secs(),
+                    kv_max_retained_bytes: default_kv_max_retained_bytes(),
+                    kv_max_suffix_prefill_tokens: default_kv_max_suffix_prefill_tokens(),
+                    kv_cache_bytes: 0,
                     kv_disk_dir: None,
                     kv_disk_space_mb: default_kv_disk_space_mb(),
                     mla_latent_cache: None,
@@ -860,6 +1430,9 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
     }
 
     for model in &config.models {
+        if model.max_context_tokens == 0 {
+            return Err("max_context_tokens must be greater than zero".to_owned());
+        }
         if model.path.trim().is_empty() {
             return Err("model path must not be empty or whitespace-only".to_owned());
         }
@@ -878,12 +1451,27 @@ fn validate_config(config: &HiggsConfig, simple_mode: bool) -> Result<(), String
                 model.path
             ));
         }
+        model.validate_disk_prefix_settings().map_err(|error| {
+            format!(
+                "invalid disk prefix cache settings for model {}: {error}",
+                model.path
+            )
+        })?;
+        validate_pflash_settings(model).map_err(|error| {
+            format!("invalid PFlash settings for model {}: {error}", model.path)
+        })?;
+        if model.kv_max_suffix_prefill_tokens == 0 {
+            return Err(format!(
+                "kv_max_suffix_prefill_tokens must be greater than zero for model {}",
+                model.path
+            ));
+        }
         if model.batch
             && let Some(supported) = batch_support_for_model_path(&model.path)?
             && !supported
         {
             return Err(format!(
-                "batch=true is only supported for transformer models (llama, mistral, qwen2, qwen3); {} is not supported",
+                "batch=true is only supported for transformer models (llama, mistral, qwen2, qwen3), llava-qwen2, and qwen3_5_vl; {} is not supported",
                 model.path
             ));
         }
@@ -945,10 +1533,27 @@ fn batch_support_check_can_be_deferred(model_path: &str, err: &str) -> bool {
                 && err.contains("No such file or directory")))
 }
 
+/// Model types the merged batch engine can serve: standard dense transformers
+/// plus the vision families the merged adapter registry marks batch-capable
+/// (`llava-qwen2`; Qwen-VL `qwen3_5_vl`/`qwen3_vl`/`qwen2_5_vl`).
+fn supports_batch_model_type(model_type: &str) -> bool {
+    matches!(
+        model_type,
+        "qwen2"
+            | "qwen3"
+            | "llama"
+            | "mistral"
+            | "llava-qwen2"
+            | "qwen3_5_vl"
+            | "qwen3_vl"
+            | "qwen2_5_vl"
+    )
+}
+
 pub fn resolved_model_supports_batch(model_dir: &Path) -> Result<bool, String> {
     let inspected = model_loader::ModelConfig::from_dir(model_dir)
         .map_err(|e| format!("failed to inspect {}: {e}", model_dir.display()))?;
-    Ok(inspected.capabilities.batch_engine)
+    Ok(supports_batch_model_type(&inspected.model_type))
 }
 
 /// If `auto_router` is enabled, ensure its model is present in `config.models`
@@ -982,10 +1587,13 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
     let path = config.auto_router.model.clone();
     let name = path_basename(&path);
     config.models.push(ModelConfig {
+        max_context_tokens: default_max_context_tokens(),
         path,
         name: Some(name.clone()),
+        generation_defaults: GenerationDefaults::default(),
         mlx_profile: None,
         batch: false,
+        disable_vision: false,
         prefill_yield_tokens: None,
         kv_cache: KvCacheMode::Off,
         kv_bits: default_kv_bits(),
@@ -994,6 +1602,31 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         kv_norm_correction: true,
         kv_adaptive_dense_layers: 0,
         kv_seed: 0,
+        draft_model: None,
+        prefill_drafter: None,
+        prefill_compression: PrefillCompressionMode::Off,
+        prefill_threshold: default_prefill_threshold(),
+        prefill_keep_ratio: default_prefill_keep_ratio(),
+        prefill_chunk: default_prefill_chunk(),
+        prefill_avgpool: default_prefill_avgpool(),
+        prefill_lookahead: default_prefill_lookahead(),
+        prefill_score_mode: PrefillScoreMode::Full,
+        prefill_exit_layer: default_prefill_exit_layer(),
+        prefill_keep_ratio_max: default_prefill_keep_ratio_max(),
+        prefill_max_auto_prefill_ratio: default_prefill_max_auto_prefill_ratio(),
+        prefill_plan_cache: default_prefill_plan_cache(),
+        prefill_plan_cache_entries: default_prefill_plan_cache_entries(),
+        prefill_suffix_identity_threshold: default_prefill_suffix_identity_threshold(),
+        disk_cache_enabled: false,
+        disk_cache_path: None,
+        max_disk_blocks: default_max_disk_blocks(),
+        min_tokens_to_persist: default_min_tokens_to_persist(),
+        kv_max_sessions: default_kv_max_sessions(),
+        kv_max_session_tokens: 32_768,
+        kv_retained_idle_secs: default_kv_retained_idle_secs(),
+        kv_max_retained_bytes: default_kv_max_retained_bytes(),
+        kv_max_suffix_prefill_tokens: default_kv_max_suffix_prefill_tokens(),
+        kv_cache_bytes: 0,
         kv_disk_dir: None,
         kv_disk_space_mb: default_kv_disk_space_mb(),
         mla_latent_cache: None,
@@ -1123,6 +1756,148 @@ pub type ServerConfig = ServerSection;
 mod tests {
     use super::*;
 
+    #[test]
+    fn fixed_context_default_and_positive_validation() {
+        let model: ModelConfig =
+            serde_json::from_value(serde_json::json!({"path": "/tmp/model"})).unwrap();
+        assert_eq!(
+            serde_json::to_value(&model).unwrap()["max_context_tokens"],
+            65_536
+        );
+        let config: HiggsConfig = serde_json::from_value(
+            serde_json::json!({"models": [{"path": "/tmp/model", "max_context_tokens": 0}]}),
+        )
+        .unwrap();
+        assert!(validate_config(&config, false).is_err());
+    }
+
+    #[test]
+    fn zero_prefix_byte_setting_uses_fixed_bounded_default() {
+        assert_eq!(
+            ModelConfig::default().kv_cache_config().kv_cache_bytes,
+            1_073_741_824
+        );
+    }
+
+    #[test]
+    fn disk_directory_activates_existing_prefix_cache() {
+        let model = ModelConfig {
+            kv_disk_dir: Some("/tmp/higgs-config-prefix".to_owned()),
+            ..ModelConfig::default()
+        };
+        let cache = model
+            .disk_prefix_cache_config(Path::new("/models/escha"))
+            .unwrap()
+            .expect("documented directory must enable disk persistence");
+        assert_eq!(
+            cache.disk_path.parent(),
+            Some(Path::new("/tmp/higgs-config-prefix"))
+        );
+        let same = model
+            .disk_prefix_cache_config(Path::new("/models/escha"))
+            .unwrap()
+            .unwrap();
+        let other = model
+            .disk_prefix_cache_config(Path::new("/models/another-model"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cache.disk_path, same.disk_path);
+        assert_ne!(
+            cache.disk_path, other.disk_path,
+            "shared directories must isolate models"
+        );
+    }
+
+    #[test]
+    fn disk_directory_budget_and_legacy_path_compatibility() {
+        let dir_model = ModelConfig {
+            kv_disk_dir: Some("/tmp/higgs-config-prefix".to_owned()),
+            kv_disk_space_mb: 64,
+            ..ModelConfig::default()
+        };
+        let cache = dir_model
+            .disk_prefix_cache_config(Path::new("/models/escha"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cache.max_disk_bytes, 67_108_864);
+        assert!(
+            ModelConfig::default()
+                .disk_prefix_cache_config(Path::new("/models/escha"))
+                .unwrap()
+                .is_none()
+        );
+        let mut legacy = ModelConfig {
+            disk_cache_enabled: true,
+            ..ModelConfig::default()
+        };
+        let cache = legacy
+            .disk_prefix_cache_config(Path::new("/models/escha"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cache.disk_path,
+            Path::new("/models/escha/.higgs-prefix-cache.bin")
+        );
+        assert_eq!(cache.max_disk_bytes, 0);
+        legacy.disk_cache_path = Some(PathBuf::from("/tmp/legacy-cache.bin"));
+        let cache = legacy
+            .disk_prefix_cache_config(Path::new("/models/escha"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cache.disk_path, Path::new("/tmp/legacy-cache.bin"));
+        assert_eq!(cache.max_disk_bytes, 0);
+    }
+
+    #[test]
+    fn disk_directory_rejects_conflicting_legacy_path() {
+        let model = ModelConfig {
+            kv_disk_dir: Some("/tmp/higgs-config-prefix".to_owned()),
+            disk_cache_path: Some(PathBuf::from("/tmp/other-prefix.bin")),
+            ..ModelConfig::default()
+        };
+        let error = model
+            .validate_disk_prefix_store()
+            .expect_err("two cache destinations are ambiguous");
+        assert!(error.contains("disk_cache_path"), "{error}");
+    }
+
+    #[test]
+    fn disk_directory_rejects_overflow_and_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = ModelConfig {
+            kv_disk_dir: Some(dir.path().to_str().unwrap().to_owned()),
+            kv_disk_space_mb: u64::MAX,
+            ..ModelConfig::default()
+        };
+        assert!(
+            model.validate_disk_prefix_store().is_err(),
+            "byte conversion must not overflow"
+        );
+        let model = ModelConfig {
+            kv_disk_dir: Some("   ".to_owned()),
+            ..ModelConfig::default()
+        };
+        assert!(
+            model.validate_disk_prefix_store().is_err(),
+            "blank directory must not create a relative store"
+        );
+    }
+
+    #[test]
+    fn disk_directory_rejects_batch_before_model_load() {
+        let mut config = HiggsConfig::default();
+        config.models.push(ModelConfig {
+            max_context_tokens: default_max_context_tokens(),
+            path: "/missing/model".to_owned(),
+            kv_disk_dir: Some("/tmp/higgs-config-prefix".to_owned()),
+            batch: true,
+            ..ModelConfig::default()
+        });
+        let error =
+            validate_config(&config, false).expect_err("disk cache needs the simple engine");
+        assert!(error.contains("disk prefix cache"), "{error}");
+    }
+
     #[allow(unsafe_code)]
     fn with_env_var<R>(key: &str, desired_value: Option<&str>, f: impl FnOnce() -> R) -> R {
         let _guard = crate::test_env_lock()
@@ -1165,6 +1940,29 @@ mod tests {
             RequestedMlxProfile::Auto
         );
         assert_eq!(config.default.provider, "higgs");
+        assert_eq!(config.server.max_image_bytes, 20 << 20);
+        assert!((config.server.image_fetch_timeout - 10.0).abs() < f64::EPSILON);
+        assert_eq!(config.server.max_image_dimension, 4096);
+    }
+
+    #[test]
+    fn config_defaults_preserve_behavior() {
+        // An empty document must resolve to the pre-vision defaults: the same
+        // per-image cap, fetch timeout, and long-edge limit the media pipeline
+        // used as constants before these fields existed.
+        let config = extract_config(Figment::new().merge(Toml::string("")), "test", None).unwrap();
+        assert_eq!(config.server.max_image_bytes, 20 << 20);
+        assert!((config.server.image_fetch_timeout - 10.0).abs() < f64::EPSILON);
+        assert_eq!(config.server.max_image_dimension, 4096);
+
+        // Model entries parse with vision enabled by default.
+        let model_config = extract_config(
+            Figment::new().merge(Toml::string("[[models]]\npath = \"org/model\"\n")),
+            "test",
+            None,
+        )
+        .unwrap();
+        assert!(!model_config.models.first().unwrap().disable_vision);
     }
 
     #[test]
@@ -1359,6 +2157,12 @@ mod tests {
     }
 
     #[test]
+    fn test_batch_support_model_types_excludes_nanbeige() {
+        assert!(supports_batch_model_type("qwen3"));
+        assert!(!supports_batch_model_type("nanbeige"));
+    }
+
+    #[test]
     fn test_config_file_parses_toml() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -1521,6 +2325,173 @@ mod tests {
         let config = HiggsConfig::default();
         assert!(config.retention.enabled);
         assert_eq!(config.retention.minutes, 60);
+    }
+
+    #[test]
+    fn test_kv_retention_defaults_parse_and_map() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Defaults when unspecified.
+        let path = dir.path().join("default.toml");
+        std::fs::write(&path, "[[models]]\npath = \"some/model\"\n").unwrap();
+        let model = load_config_file(&path, None)
+            .unwrap()
+            .models
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(model.kv_max_sessions, 2);
+        assert_eq!(model.kv_max_session_tokens, 32_768);
+        assert_eq!(model.kv_retained_idle_secs, 300);
+        assert_eq!(model.kv_max_suffix_prefill_tokens, 24_576);
+        assert_eq!(model.kv_max_retained_bytes, 2_147_483_648);
+        let kv = model.kv_cache_config();
+        assert_eq!(kv.max_retained_sessions, 2);
+        assert_eq!(kv.max_session_tokens, 32_768);
+        assert_eq!(kv.retained_idle_secs, 300);
+        assert_eq!(kv.max_retained_bytes, 2_147_483_648);
+
+        // Explicit values parse and map into KvCacheConfig.
+        let path2 = dir.path().join("explicit.toml");
+        std::fs::write(
+            &path2,
+            "[[models]]\npath = \"some/model\"\nkv_max_sessions = 4\nkv_max_session_tokens = 4096\nkv_retained_idle_secs = 300\nkv_max_suffix_prefill_tokens = 2048\nkv_max_retained_bytes = 1048576\n",
+        )
+        .unwrap();
+        let model2 = load_config_file(&path2, None)
+            .unwrap()
+            .models
+            .into_iter()
+            .next()
+            .unwrap();
+        let kv2 = model2.kv_cache_config();
+        assert_eq!(kv2.max_retained_sessions, 4);
+        assert_eq!(kv2.max_session_tokens, 4096);
+        assert_eq!(kv2.retained_idle_secs, 300);
+        assert_eq!(kv2.max_retained_bytes, 1_048_576);
+        assert_eq!(model2.kv_max_suffix_prefill_tokens, 2048);
+
+        // kv_max_sessions = 0 is rejected at load (validate catches it).
+        let path3 = dir.path().join("bad.toml");
+        std::fs::write(
+            &path3,
+            "[[models]]\npath = \"some/model\"\nkv_max_sessions = 0\n",
+        )
+        .unwrap();
+        assert!(
+            load_config_file(&path3, None).is_err(),
+            "kv_max_sessions = 0 must be rejected"
+        );
+
+        let path4 = dir.path().join("bad-suffix.toml");
+        std::fs::write(
+            &path4,
+            "[[models]]\npath = \"some/model\"\nkv_max_suffix_prefill_tokens = 0\n",
+        )
+        .unwrap();
+        assert!(
+            load_config_file(&path4, None).is_err(),
+            "kv_max_suffix_prefill_tokens = 0 must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_pflash_auto_prefill_ratio_defaults_and_parses() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let default_path = dir.path().join("default-pflash.toml");
+        std::fs::write(&default_path, "[[models]]\npath = \"some/model\"\n").unwrap();
+        let model = load_config_file(&default_path, None)
+            .unwrap()
+            .models
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            model.prefill_max_auto_prefill_ratio,
+            DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO
+        );
+
+        let explicit_path = dir.path().join("explicit-pflash.toml");
+        std::fs::write(
+            &explicit_path,
+            "[[models]]\npath = \"some/model\"\nprefill_max_auto_prefill_ratio = 0.8\n",
+        )
+        .unwrap();
+        let model = load_config_file(&explicit_path, None)
+            .unwrap()
+            .models
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(model.prefill_max_auto_prefill_ratio, 0.8);
+
+        let invalid_path = dir.path().join("invalid-pflash.toml");
+        std::fs::write(
+            &invalid_path,
+            "[[models]]\npath = \"some/model\"\nprefill_max_auto_prefill_ratio = 1.2\n",
+        )
+        .unwrap();
+        assert!(load_config_file(&invalid_path, None).is_err());
+    }
+
+    #[test]
+    fn test_config_file_rejects_invalid_pflash_settings_before_model_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid_settings = [
+            ("keep-one", "prefill_keep_ratio = 1.0", "prefill_keep_ratio"),
+            ("keep-nan", "prefill_keep_ratio = nan", "prefill_keep_ratio"),
+            (
+                "max-infinite",
+                "prefill_keep_ratio_max = inf",
+                "prefill_keep_ratio_max",
+            ),
+            (
+                "reversed-range",
+                "prefill_keep_ratio = 0.5\nprefill_keep_ratio_max = 0.4",
+                "prefill_keep_ratio_max",
+            ),
+            (
+                "zero-chunk",
+                "prefill_drafter = \"some/drafter\"\nprefill_chunk = 0",
+                "prefill_chunk",
+            ),
+            (
+                "even-avgpool",
+                "prefill_drafter = \"some/drafter\"\nprefill_avgpool = 2",
+                "prefill_avgpool",
+            ),
+            (
+                "zero-lookahead",
+                "prefill_drafter = \"some/drafter\"\nprefill_lookahead = 0",
+                "prefill_lookahead",
+            ),
+            (
+                "zero-l7-exit",
+                "prefill_drafter = \"some/drafter\"\nprefill_score_mode = \"l7\"\nprefill_exit_layer = 0",
+                "prefill_exit_layer",
+            ),
+            (
+                "zero-plan-cache",
+                "prefill_plan_cache = true\nprefill_plan_cache_entries = 0",
+                "prefill_plan_cache_entries",
+            ),
+        ];
+
+        for (name, settings, expected_field) in invalid_settings {
+            let path = dir.path().join(format!("{name}.toml"));
+            std::fs::write(
+                &path,
+                format!("[[models]]\npath = \"some/model\"\n{settings}\n"),
+            )
+            .unwrap();
+            let error = load_config_file(&path, None)
+                .expect_err("invalid PFlash settings must fail config validation");
+            assert!(
+                error.contains(expected_field),
+                "{name}: expected {expected_field} in error, got {error}"
+            );
+        }
     }
 
     #[test]
@@ -2064,6 +3035,35 @@ mod tests {
     }
 
     #[test]
+    fn test_model_generation_defaults_deserialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[models]]
+            path = "org/bonsai"
+            name = "bonsai-27b-q2"
+
+            [models.generation_defaults]
+            max_tokens = 4096
+            temperature = 0.0
+            top_p = 1.0
+            speculation = "auto"
+            enable_thinking = false
+            "#,
+        )
+        .unwrap();
+        let config = load_config_file(&path, None).unwrap();
+        let defaults = &config.models.first().unwrap().generation_defaults;
+        assert_eq!(defaults.max_tokens, Some(4096));
+        assert_eq!(defaults.temperature, Some(0.0));
+        assert_eq!(defaults.top_p, Some(1.0));
+        assert_eq!(defaults.speculation.as_deref(), Some("auto"));
+        assert_eq!(defaults.enable_thinking, Some(false));
+    }
+
+    #[test]
     fn test_validate_profile_name_valid() {
         assert!(validate_profile_name("dev").is_ok());
         assert!(validate_profile_name("prod-us").is_ok());
@@ -2164,5 +3164,66 @@ mod tests {
         assert_ne!(default, profiled);
         assert!(default.to_str().unwrap().contains("higgs.log"));
         assert!(profiled.to_str().unwrap().contains("higgs.dev.log"));
+    }
+}
+
+#[cfg(test)]
+mod kv_turbo_env_tests {
+    use super::*;
+
+    fn env_map(pairs: &[(&str, String)]) -> impl Fn(&str) -> Option<String> {
+        // Owned copy: no borrow of `pairs` escapes.
+        let owned: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect();
+        move |key: &str| owned.get(key).cloned()
+    }
+
+    fn turbo_model() -> ModelConfig {
+        ModelConfig {
+            path: "m".to_owned(),
+            kv_cache: KvCacheMode::Off,
+            kv_bits: 3,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn turbo_flag_switches_mode_and_keeps_configured_bits() {
+        let mut model = turbo_model();
+        model.apply_kv_turbo_env_overrides(&env_map(&[("HIGGS_KV_TURBO", "1".to_owned())]));
+        assert!(matches!(model.kv_cache, KvCacheMode::Turboquant));
+        assert_eq!(model.kv_bits, 3, "bits stay at the configured default");
+    }
+
+    #[test]
+    fn turbo_bits_override_sets_width_and_enables_mode() {
+        let mut model = turbo_model();
+        model.apply_kv_turbo_env_overrides(&env_map(&[("HIGGS_KV_TURBO_BITS", "4".to_owned())]));
+        assert!(matches!(model.kv_cache, KvCacheMode::Turboquant));
+        assert_eq!(model.kv_bits, 4);
+    }
+
+    #[test]
+    fn invalid_bits_are_warned_and_ignored_but_still_enable_turbo() {
+        let mut model = turbo_model();
+        model.apply_kv_turbo_env_overrides(&env_map(&[
+            ("HIGGS_KV_TURBO", "1".to_owned()),
+            ("HIGGS_KV_TURBO_BITS", "8".to_owned()),
+        ]));
+        assert!(matches!(model.kv_cache, KvCacheMode::Turboquant));
+        assert_eq!(
+            model.kv_bits, 3,
+            "unsupported 8-bit width falls back to configured bits"
+        );
+    }
+
+    #[test]
+    fn no_env_leaves_config_untouched() {
+        let mut model = turbo_model();
+        model.apply_kv_turbo_env_overrides(&env_map(&[]));
+        assert!(matches!(model.kv_cache, KvCacheMode::Off));
+        assert_eq!(model.kv_bits, 3);
     }
 }

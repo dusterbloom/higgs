@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Conservative default for chunked prefill on 27B-class models.
 const DEFAULT_CHUNKED_PREFILL_THRESHOLD: i32 = 512;
@@ -10,6 +11,563 @@ const DEFAULT_PAGED_KV_TARGET_BYTES: usize = 512 * 1024 * 1024;
 const MIN_PAGED_KV_TARGET_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PAGED_KV_TARGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const MAX_MTP_DRAFT_N_MAX: usize = 8;
+
+/// Immutable process-wide allocator and device working-set facts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MlxMemorySnapshot {
+    /// Absolute process-wide MLX active allocation at measurement time.
+    pub active_bytes: u64,
+    pub peak_bytes: u64,
+    /// `None` means MLX reports no configured allocator limit.
+    pub memory_limit_bytes: Option<u64>,
+    /// `None` means the backend does not expose Metal's recommended limit.
+    pub metal_recommended_working_set_bytes: Option<u64>,
+}
+
+/// Fresh diagnostic allocator counters. This is not a policy publication:
+/// polling it must not invalidate admission/reclamation revision tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MlxAllocatorTelemetry {
+    pub memory: MlxMemorySnapshot,
+    pub cached_bytes: u64,
+    pub measured_at_unix_ms: u64,
+}
+
+impl MlxAllocatorTelemetry {
+    #[allow(unsafe_code)]
+    pub fn measure() -> Result<Self, MlxMemoryProbeError> {
+        let memory = MlxMemorySnapshot::measure()?;
+        let mut cached_bytes = 0_usize;
+        if unsafe { mlx_sys::mlx_get_cache_memory(&raw mut cached_bytes) } != 0 {
+            return Err(MlxMemoryProbeError::QueryFailed("cached memory"));
+        }
+        let measured_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| MlxMemoryProbeError::QueryFailed("measurement clock"))?
+            .as_millis();
+        Ok(Self {
+            memory,
+            cached_bytes: checked_raw_memory_bytes(
+                cached_bytes as u128,
+                "cached memory conversion",
+            )?,
+            measured_at_unix_ms: checked_raw_memory_bytes(
+                measured_at_unix_ms,
+                "measurement clock conversion",
+            )?,
+        })
+    }
+}
+
+/// A content-free allocator observation for one bounded inference phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestMemoryHighWater {
+    pub phase: MemoryPhase,
+    pub active_before_bytes: u64,
+    pub active_after_bytes: u64,
+    pub peak_bytes: u64,
+    pub active_growth_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryPhase {
+    Prefill,
+    Decode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlxMemoryProbeError {
+    QueryFailed(&'static str),
+    ResetPeakFailed,
+    InvalidatedSample,
+}
+
+impl std::fmt::Display for MlxMemoryProbeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueryFailed(operation) => {
+                write!(formatter, "MLX memory query failed: {operation}")
+            }
+            Self::ResetPeakFailed => formatter.write_str("MLX peak-memory reset failed"),
+            Self::InvalidatedSample => {
+                formatter.write_str("MLX request-memory sample was invalidated by another reset")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MlxMemoryProbeError {}
+
+trait MlxMemoryProbe {
+    fn active_memory_bytes(&self) -> Result<u128, MlxMemoryProbeError>;
+    fn peak_memory_bytes(&self) -> Result<u128, MlxMemoryProbeError>;
+    fn memory_limit_bytes(&self) -> Result<u128, MlxMemoryProbeError>;
+    fn metal_recommended_working_set_bytes(&self) -> Result<Option<u128>, MlxMemoryProbeError>;
+    fn reset_peak_memory(&self) -> Result<(), MlxMemoryProbeError>;
+}
+
+struct SystemMlxMemoryProbe;
+
+#[allow(unsafe_code)]
+impl MlxMemoryProbe for SystemMlxMemoryProbe {
+    fn active_memory_bytes(&self) -> Result<u128, MlxMemoryProbeError> {
+        let mut active_bytes = 0_usize;
+        unsafe {
+            if mlx_sys::mlx_get_active_memory(&raw mut active_bytes) != 0 {
+                return Err(MlxMemoryProbeError::QueryFailed("active memory"));
+            }
+        }
+        Ok(active_bytes as u128)
+    }
+
+    fn peak_memory_bytes(&self) -> Result<u128, MlxMemoryProbeError> {
+        let mut peak_bytes = 0_usize;
+        unsafe {
+            if mlx_sys::mlx_get_peak_memory(&raw mut peak_bytes) != 0 {
+                return Err(MlxMemoryProbeError::QueryFailed("peak memory"));
+            }
+        }
+        Ok(peak_bytes as u128)
+    }
+
+    fn memory_limit_bytes(&self) -> Result<u128, MlxMemoryProbeError> {
+        let mut memory_limit_bytes = 0_usize;
+        unsafe {
+            if mlx_sys::mlx_get_memory_limit(&raw mut memory_limit_bytes) != 0 {
+                return Err(MlxMemoryProbeError::QueryFailed("memory limit"));
+            }
+        }
+        Ok(memory_limit_bytes as u128)
+    }
+
+    fn metal_recommended_working_set_bytes(&self) -> Result<Option<u128>, MlxMemoryProbeError> {
+        Ok(metal_recommended_working_set_bytes().map(u128::from))
+    }
+
+    fn reset_peak_memory(&self) -> Result<(), MlxMemoryProbeError> {
+        let result = unsafe { mlx_sys::mlx_reset_peak_memory() };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(MlxMemoryProbeError::ResetPeakFailed)
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn metal_recommended_working_set_bytes() -> Option<u64> {
+    unsafe {
+        let mut info = mlx_sys::mlx_device_info_new();
+        let mut device = mlx_sys::mlx_device_new();
+        mlx_sys::mlx_get_default_device(&raw mut device);
+        let value = if mlx_sys::mlx_device_info_get(&raw mut info, device) == 0 {
+            let mut bytes = 0_usize;
+            let key = c"max_recommended_working_set_size";
+            (mlx_sys::mlx_device_info_get_size(&raw mut bytes, info, key.as_ptr()) == 0
+                && bytes > 0)
+                .then(|| u64::try_from(bytes).ok())
+                .flatten()
+        } else {
+            None
+        };
+        mlx_sys::mlx_device_info_free(info);
+        mlx_sys::mlx_device_free(device);
+        value
+    }
+}
+
+fn measure_mlx_memory(
+    probe: &impl MlxMemoryProbe,
+) -> Result<MlxMemorySnapshot, MlxMemoryProbeError> {
+    let active_bytes = probe.active_memory_bytes()?;
+    let peak_bytes = probe.peak_memory_bytes()?;
+    let memory_limit_bytes = probe.memory_limit_bytes()?;
+    let metal_recommended_working_set_bytes = probe.metal_recommended_working_set_bytes()?;
+
+    Ok(MlxMemorySnapshot {
+        active_bytes: checked_raw_memory_bytes(active_bytes, "active memory conversion")?,
+        peak_bytes: checked_raw_memory_bytes(peak_bytes, "peak memory conversion")?,
+        memory_limit_bytes: (memory_limit_bytes > 0)
+            .then(|| checked_raw_memory_bytes(memory_limit_bytes, "memory limit conversion"))
+            .transpose()?,
+        metal_recommended_working_set_bytes: metal_recommended_working_set_bytes
+            .map(|bytes| checked_raw_memory_bytes(bytes, "Metal working-set conversion"))
+            .transpose()?,
+    })
+}
+
+fn checked_raw_memory_bytes(
+    bytes: u128,
+    operation: &'static str,
+) -> Result<u64, MlxMemoryProbeError> {
+    u64::try_from(bytes).map_err(|_| MlxMemoryProbeError::QueryFailed(operation))
+}
+
+impl MlxMemorySnapshot {
+    /// Measure the current MLX allocator and backend working-set facts.
+    pub fn measure() -> Result<Self, MlxMemoryProbeError> {
+        measure_mlx_memory(&SystemMlxMemoryProbe)
+    }
+}
+
+/// Before/after sampler for a bounded prefill or decode phase.
+///
+/// Starting a sample resets MLX's process-global peak counter. Callers must
+/// therefore hold Higgs's process-global MLX execution gate until `finish`.
+/// Each boundary requires the live gate token. A monotonically increasing
+/// generation rejects a window if another reset superseded it, so a nested or
+/// stale sampler can never publish a polluted peak.
+///
+/// ```no_run
+/// use higgs_engine::{MemoryPhase, RequestMemorySampler};
+///
+/// let mut gate = higgs_models::mlx_exec::acquire();
+/// let prefill = RequestMemorySampler::start(MemoryPhase::Prefill, &mut gate).unwrap();
+/// let _sample = prefill.finish(&mut gate).unwrap();
+/// ```
+pub struct RequestMemorySampler {
+    phase: MemoryPhase,
+    before: MlxMemorySnapshot,
+    generation: u64,
+    gate_generation: u64,
+}
+
+static REQUEST_MEMORY_SAMPLE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+impl RequestMemorySampler {
+    pub fn start(
+        phase: MemoryPhase,
+        mlx_gate: &mut higgs_models::mlx_exec::MlxExecToken,
+    ) -> Result<Self, MlxMemoryProbeError> {
+        Self::start_with_probe(phase, mlx_gate, &SystemMlxMemoryProbe)
+    }
+
+    fn start_with_probe(
+        phase: MemoryPhase,
+        mlx_gate: &mut higgs_models::mlx_exec::MlxExecToken,
+        probe: &impl MlxMemoryProbe,
+    ) -> Result<Self, MlxMemoryProbeError> {
+        let before = measure_mlx_memory(probe)?;
+        let generation = REQUEST_MEMORY_SAMPLE_GENERATION
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        // Invalidate any prior window before attempting the process-global
+        // reset. A failed reset leaves the counter's state unknown.
+        probe.reset_peak_memory()?;
+        Ok(Self {
+            phase,
+            before,
+            generation,
+            gate_generation: mlx_gate.acquisition_generation(),
+        })
+    }
+
+    pub fn finish(
+        self,
+        mlx_gate: &mut higgs_models::mlx_exec::MlxExecToken,
+    ) -> Result<RequestMemoryHighWater, MlxMemoryProbeError> {
+        self.finish_with_probe(mlx_gate, &SystemMlxMemoryProbe)
+    }
+
+    fn finish_with_probe(
+        self,
+        mlx_gate: &mut higgs_models::mlx_exec::MlxExecToken,
+        probe: &impl MlxMemoryProbe,
+    ) -> Result<RequestMemoryHighWater, MlxMemoryProbeError> {
+        if REQUEST_MEMORY_SAMPLE_GENERATION.load(Ordering::Acquire) != self.generation
+            || mlx_gate.acquisition_generation() != self.gate_generation
+        {
+            return Err(MlxMemoryProbeError::InvalidatedSample);
+        }
+        let after = measure_mlx_memory(probe)?;
+        Ok(RequestMemoryHighWater {
+            phase: self.phase,
+            active_before_bytes: self.before.active_bytes,
+            active_after_bytes: after.active_bytes,
+            peak_bytes: after
+                .peak_bytes
+                .max(self.before.active_bytes)
+                .max(after.active_bytes),
+            active_growth_bytes: after.active_bytes.saturating_sub(self.before.active_bytes),
+        })
+    }
+}
+
+/// Artifact and measured allocator residency attributable to one model load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelFootprint {
+    pub artifact_weight_bytes: u64,
+    /// Checked `after - before` delta from a serialized model-load window.
+    ///
+    /// This is load-attributable growth, not current absolute process state;
+    /// use [`MlxMemorySnapshot::active_bytes`] for an absolute measurement.
+    pub loaded_mlx_bytes: u64,
+}
+
+/// Allocation strategy selected by the real model adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoaderWorkspaceKind {
+    StandardStream,
+    QwenSpecial,
+    NativeEscha,
+    AffineEscha,
+    FullArtifact,
+    Unknown,
+}
+
+/// Strict pre-allocation upper bound for one model load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelLoadEstimate {
+    pub artifact_bytes: u64,
+    pub largest_selected_shard_bytes: u64,
+    pub workspace_kind: LoaderWorkspaceKind,
+    pub workspace_upper_bound_bytes: u64,
+    pub required_process_bytes: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ModelLoadEstimateError {
+    #[error("model artifact is unreadable, corrupt, empty, or contains unsafe links")]
+    InvalidArtifact,
+    #[error("model load estimate overflowed")]
+    ArithmeticOverflow,
+    #[error("failed to classify model loader: {0}")]
+    Loader(String),
+}
+
+/// Inspect only file metadata and safetensors headers; no MLX object exists yet.
+pub fn model_load_estimate(
+    model_dir: &Path,
+    model_type: &str,
+) -> Result<ModelLoadEstimate, ModelLoadEstimateError> {
+    let is_bonsai = if model_type == "qwen3" {
+        let bonsai_group_size = u64::try_from(higgs_models::bonsai_q1::GROUP_SIZE)
+            .map_err(|error| ModelLoadEstimateError::Loader(error.to_string()))?;
+        let config: serde_json::Value = serde_json::from_reader(
+            std::fs::File::open(model_dir.join("config.json"))
+                .map_err(|error| ModelLoadEstimateError::Loader(error.to_string()))?,
+        )
+        .map_err(|error| ModelLoadEstimateError::Loader(error.to_string()))?;
+        config.get("model_type").and_then(serde_json::Value::as_str) == Some("qwen3")
+            && config
+                .get("quantization")
+                .and_then(|value| value.get("bits"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(1)
+            && config
+                .get("quantization")
+                .and_then(|value| value.get("group_size"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(bonsai_group_size)
+    } else {
+        false
+    };
+    let files = strict_selected_model_artifact_files(model_dir, is_bonsai)
+        .ok_or(ModelLoadEstimateError::InvalidArtifact)?;
+    let artifact_bytes = files.iter().try_fold(0_u64, |sum, (_, bytes)| {
+        sum.checked_add(*bytes)
+            .ok_or(ModelLoadEstimateError::ArithmeticOverflow)
+    })?;
+    let largest_selected_shard_bytes = files
+        .iter()
+        .map(|(_, bytes)| *bytes)
+        .max()
+        .ok_or(ModelLoadEstimateError::InvalidArtifact)?;
+    // The released 35B escha checkpoint is a VLM wrapper (vision_config +
+    // text_config): the loader classifies it qwen3_5_vl while the eschamoe
+    // trellis path serves its text backbone. The VL type must reach the same
+    // escha workspace classification or the load bound double-charges.
+    let is_escha = matches!(model_type, "qwen3_5" | "qwen3_5_moe" | "qwen3_5_vl")
+        && higgs_models::eschamoe::is_eschamoe_checkpoint(model_dir)
+            .map_err(|error| ModelLoadEstimateError::Loader(error.to_string()))?;
+    let workspace_kind = if is_bonsai {
+        LoaderWorkspaceKind::FullArtifact
+    } else if is_escha && higgs_models::eschamoe::native_mode() {
+        LoaderWorkspaceKind::NativeEscha
+    } else if is_escha {
+        LoaderWorkspaceKind::AffineEscha
+    } else {
+        match model_type {
+            "qwen3_next" | "qwen3_5" | "qwen3_5_moe" => LoaderWorkspaceKind::QwenSpecial,
+            "qwen3_5_vl" | "qwen3_vl" | "qwen2_5_vl" | "llava-qwen2" | "gemma3" | "gemma3_text"
+            | "gemma4" | "gemma4_text" | "gemma4_unified" => LoaderWorkspaceKind::FullArtifact,
+            "qwen2" | "qwen3" | "llama" | "mistral" | "nanbeige" | "qwen3_moe" | "gemma2"
+            | "phi3" | "starcoder2" | "deepseek_v2" => LoaderWorkspaceKind::StandardStream,
+            _ => LoaderWorkspaceKind::Unknown,
+        }
+    };
+    let mut estimate =
+        finish_load_estimate(artifact_bytes, largest_selected_shard_bytes, workspace_kind)?;
+    // Native trellis resident memory is the architecture-derived estimate
+    // (experts stay packed: ~9-10 GiB for the released 35B, shared with
+    // doctor so the two can never disagree); the safetensors side is an
+    // mmap of file-backed (evictable) pages, so only the largest streaming
+    // shard counts as hot. Charging artifact + full artifact as unevictable
+    // double-counted evictable page cache and rejected a model the shipped
+    // doctor math says fits on this hardware class. The hardware replay gate
+    // (Task 8 step 5) measures the real load peak to validate this bound; a
+    // checkpoint without the architecture fields keeps the fallback bound.
+    if workspace_kind == LoaderWorkspaceKind::NativeEscha
+        && let Some(resident) = higgs_models::eschamoe::resident_estimate_bytes(model_dir, true)
+        && let Some(required) = resident.checked_add(largest_selected_shard_bytes)
+    {
+        estimate.required_process_bytes = required;
+        // The load ledger composes resident floor + workspace upper bound;
+        // both must reflect the packed-trellis reality (resident ~9-10 GiB,
+        // streaming workspace one shard) or admission still double-charges
+        // the evictable mmap side.
+        estimate.workspace_upper_bound_bytes = estimate
+            .workspace_upper_bound_bytes
+            .min(largest_selected_shard_bytes);
+    }
+    Ok(estimate)
+}
+
+fn finish_load_estimate(
+    artifact_bytes: u64,
+    largest_selected_shard_bytes: u64,
+    workspace_kind: LoaderWorkspaceKind,
+) -> Result<ModelLoadEstimate, ModelLoadEstimateError> {
+    let workspace_upper_bound_bytes = match workspace_kind {
+        LoaderWorkspaceKind::StandardStream => largest_selected_shard_bytes,
+        LoaderWorkspaceKind::QwenSpecial
+        | LoaderWorkspaceKind::NativeEscha
+        | LoaderWorkspaceKind::FullArtifact => artifact_bytes,
+        LoaderWorkspaceKind::AffineEscha | LoaderWorkspaceKind::Unknown => artifact_bytes
+            .checked_mul(2)
+            .ok_or(ModelLoadEstimateError::ArithmeticOverflow)?,
+    };
+    let required_process_bytes = artifact_bytes
+        .checked_add(workspace_upper_bound_bytes)
+        .ok_or(ModelLoadEstimateError::ArithmeticOverflow)?;
+    Ok(ModelLoadEstimate {
+        artifact_bytes,
+        largest_selected_shard_bytes,
+        workspace_kind,
+        workspace_upper_bound_bytes,
+        required_process_bytes,
+    })
+}
+
+impl ModelFootprint {
+    /// Describe one model load measured without concurrent MLX allocations.
+    pub fn from_load_measurements(
+        model_dir: &Path,
+        before: MlxMemorySnapshot,
+        after: MlxMemorySnapshot,
+    ) -> Option<Self> {
+        Some(Self {
+            artifact_weight_bytes: strict_model_artifact_bytes(model_dir)?,
+            loaded_mlx_bytes: after.active_bytes.checked_sub(before.active_bytes)?,
+        })
+    }
+}
+
+/// Conservative transient-prefill function over a declared input domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransientPrefillEstimate {
+    pub base_bytes: u64,
+    pub bytes_per_prompt_token: u64,
+    pub bytes_per_chunk_token: u64,
+    pub max_prompt_tokens: u64,
+    pub max_chunk_tokens: u64,
+}
+
+impl TransientPrefillEstimate {
+    pub fn estimate_bytes(&self, prompt_tokens: u64, chunk_tokens: u64) -> Option<u64> {
+        if prompt_tokens > self.max_prompt_tokens || chunk_tokens > self.max_chunk_tokens {
+            return None;
+        }
+        self.base_bytes
+            .checked_add(self.bytes_per_prompt_token.checked_mul(prompt_tokens)?)?
+            .checked_add(self.bytes_per_chunk_token.checked_mul(chunk_tokens)?)
+    }
+}
+
+/// Immutable byte-domain costs required by the adaptive capacity controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineCostDescription {
+    pub fixed_live_session_bytes: u64,
+    pub persistent_bytes_per_token: u64,
+    pub decode_workspace_bytes: u64,
+    pub transient_prefill: TransientPrefillEstimate,
+}
+
+impl EngineCostDescription {
+    /// Charge the cache dtype produced by the selected model execution path.
+    /// Native Escha projections return FP32 and promote subsequent K/V arrays;
+    /// the checkpoint's BF16 label therefore cannot describe runtime KV storage.
+    /// Preserve that numerical behavior and charge its bytes instead of casting.
+    pub fn runtime_from_model_dir(
+        model_dir: &Path,
+        fixed_live_session_bytes: u64,
+        decode_workspace_bytes: u64,
+        transient_prefill: TransientPrefillEstimate,
+    ) -> Option<Self> {
+        let mut cost = Self::fp16_from_model_dir(
+            model_dir,
+            fixed_live_session_bytes,
+            decode_workspace_bytes,
+            transient_prefill,
+        )?;
+        if higgs_models::eschamoe::is_eschamoe_checkpoint(model_dir).ok()?
+            && higgs_models::eschamoe::native_mode()
+        {
+            cost.persistent_bytes_per_token = cost.persistent_bytes_per_token.checked_mul(2)?;
+        }
+        // Dense caches grow in 256-slot blocks. Reserve the largest rounding
+        // slack once per live session; the token slope then remains linear.
+        cost.fixed_live_session_bytes = cost
+            .fixed_live_session_bytes
+            .checked_add(cost.persistent_bytes_per_token.checked_mul(255)?)?;
+        Some(cost)
+    }
+
+    /// Derive the fp16 dense-KV term from model metadata without exposing the
+    /// loader's private model representation.
+    pub fn fp16_from_model_dir(
+        model_dir: &Path,
+        fixed_live_session_bytes: u64,
+        decode_workspace_bytes: u64,
+        transient_prefill: TransientPrefillEstimate,
+    ) -> Option<Self> {
+        let metadata = ModelMetadata::from_model_dir(model_dir);
+        let layers = u64::try_from(metadata.num_hidden_layers?).ok()?;
+        let kv_heads = u64::try_from(metadata.num_key_value_heads?).ok()?;
+        let head_dim = u64::try_from(metadata.head_dim?).ok()?;
+        if layers == 0 || kv_heads == 0 || head_dim == 0 {
+            return None;
+        }
+        let dense_layers = if metadata.is_hybrid_attention() {
+            let interval = u64::try_from(metadata.full_attention_interval?).ok()?;
+            if interval == 0 {
+                return None;
+            }
+            layers / interval
+        } else {
+            layers
+        };
+        if dense_layers == 0 {
+            return None;
+        }
+        let persistent_bytes_per_token = dense_layers
+            .checked_mul(2)?
+            .checked_mul(kv_heads)?
+            .checked_mul(head_dim)?
+            .checked_mul(2)?;
+
+        Some(Self {
+            fixed_live_session_bytes,
+            persistent_bytes_per_token,
+            decode_workspace_bytes,
+            transient_prefill,
+        })
+    }
+
+    pub fn persistent_bytes(&self, tokens: u64) -> Option<u64> {
+        self.persistent_bytes_per_token.checked_mul(tokens)
+    }
+}
 
 fn parse_positive_chunked_prefill_value(raw: Option<&str>, default: i32) -> i32 {
     raw.and_then(|s| s.parse::<i32>().ok())
@@ -127,8 +685,12 @@ enum ModelSizeClass {
 #[derive(Debug, Clone, Default)]
 struct ModelMetadata {
     model_type: Option<String>,
+    quantization_bits: Option<u8>,
     num_hidden_layers: Option<usize>,
     hidden_size: Option<usize>,
+    num_key_value_heads: Option<usize>,
+    head_dim: Option<usize>,
+    full_attention_interval: Option<usize>,
     max_position_embeddings: Option<usize>,
     weight_bytes: Option<u64>,
 }
@@ -143,9 +705,19 @@ impl ModelMetadata {
 
         Self {
             model_type: config_lookup_str(&config, "model_type").map(str::to_owned),
+            quantization_bits: config
+                .get("quantization")
+                .and_then(|quantization| quantization.get("bits"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|bits| u8::try_from(bits).ok()),
             num_hidden_layers: config_lookup_u64(&config, "num_hidden_layers")
                 .and_then(|v| usize::try_from(v).ok()),
             hidden_size: config_lookup_u64(&config, "hidden_size")
+                .and_then(|v| usize::try_from(v).ok()),
+            num_key_value_heads: config_lookup_u64(&config, "num_key_value_heads")
+                .and_then(|v| usize::try_from(v).ok()),
+            head_dim: config_lookup_u64(&config, "head_dim").and_then(|v| usize::try_from(v).ok()),
+            full_attention_interval: config_lookup_u64(&config, "full_attention_interval")
                 .and_then(|v| usize::try_from(v).ok()),
             max_position_embeddings: config_lookup_u64(&config, "max_position_embeddings")
                 .and_then(|v| usize::try_from(v).ok()),
@@ -191,6 +763,23 @@ impl ModelMetadata {
 
     fn is_long_context(&self) -> bool {
         self.max_position_embeddings.unwrap_or_default() >= 65_536
+    }
+
+    fn is_hybrid_attention(&self) -> bool {
+        matches!(
+            self.model_type.as_deref(),
+            Some("qwen3_next" | "qwen3_5" | "qwen3_5_moe")
+        )
+    }
+
+    fn should_clear_cache_after_prefill(&self) -> bool {
+        match self.model_type.as_deref() {
+            Some("qwen3_5") => {
+                matches!(self.quantization_bits, Some(bits) if (1..=4).contains(&bits))
+            }
+            Some("qwen3_5_moe") => true,
+            _ => false,
+        }
     }
 }
 
@@ -263,6 +852,7 @@ impl MlxRuntimeTuning {
             balanced_chunked_prefill(size_class, is_long_context, is_moe);
         let balanced_paged_kv = heuristic_paged_kv_target_bytes(metadata, size_class, is_moe);
         let default_mtp_draft_n_max = default_mtp_draft_n_max(size_class);
+        let clear_cache_after_prefill = metadata.should_clear_cache_after_prefill();
 
         match resolved_profile {
             ResolvedMlxProfile::Baseline => Self {
@@ -270,7 +860,7 @@ impl MlxRuntimeTuning {
                 resolved_profile,
                 chunked_prefill_threshold: DEFAULT_CHUNKED_PREFILL_THRESHOLD,
                 chunked_prefill_chunk_size: DEFAULT_CHUNKED_PREFILL_CHUNK_SIZE,
-                clear_cache_after_prefill: false,
+                clear_cache_after_prefill,
                 enable_mtp: false,
                 mtp_draft_n_max: 1,
                 paged_kv_target_bytes: DEFAULT_PAGED_KV_TARGET_BYTES,
@@ -280,7 +870,7 @@ impl MlxRuntimeTuning {
                 resolved_profile,
                 chunked_prefill_threshold: (balanced_threshold.saturating_mul(2)).min(4096),
                 chunked_prefill_chunk_size: balanced_chunk.max(768),
-                clear_cache_after_prefill: false,
+                clear_cache_after_prefill,
                 enable_mtp: true,
                 mtp_draft_n_max: default_mtp_draft_n_max,
                 paged_kv_target_bytes: clamp_paged_kv_target_bytes(
@@ -292,7 +882,7 @@ impl MlxRuntimeTuning {
                 resolved_profile,
                 chunked_prefill_threshold: balanced_threshold,
                 chunked_prefill_chunk_size: balanced_chunk,
-                clear_cache_after_prefill: false,
+                clear_cache_after_prefill,
                 enable_mtp: true,
                 mtp_draft_n_max: default_mtp_draft_n_max,
                 paged_kv_target_bytes: balanced_paged_kv,
@@ -302,7 +892,7 @@ impl MlxRuntimeTuning {
                 resolved_profile,
                 chunked_prefill_threshold: balanced_threshold.max(1024),
                 chunked_prefill_chunk_size: balanced_chunk.max(1024),
-                clear_cache_after_prefill: false,
+                clear_cache_after_prefill,
                 enable_mtp: true,
                 mtp_draft_n_max: default_mtp_draft_n_max,
                 paged_kv_target_bytes: clamp_paged_kv_target_bytes(
@@ -483,6 +1073,274 @@ fn config_lookup_u64(config: &serde_json::Value, key: &str) -> Option<u64> {
     config_lookup(config, key).and_then(serde_json::Value::as_u64)
 }
 
+fn checked_artifact_total(total: u64, bytes: u64) -> Option<u64> {
+    total.checked_add(bytes)
+}
+
+const MAX_SAFETENSORS_HEADER_BYTES: u64 = 100_000_000;
+
+fn strict_selected_model_artifact_files(
+    model_dir: &Path,
+    force_consolidated_model: bool,
+) -> Option<Vec<(std::path::PathBuf, u64)>> {
+    use std::collections::BTreeSet;
+    use std::path::Component;
+
+    if !directory_tree_has_no_symlinked_directory(model_dir) {
+        return None;
+    }
+    let root_metadata = std::fs::symlink_metadata(model_dir).ok()?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return None;
+    }
+
+    let index_path = model_dir.join("model.safetensors.index.json");
+    let single_path = model_dir.join("model.safetensors");
+    let mut relative_paths = if force_consolidated_model {
+        if !single_path.exists() {
+            return None;
+        }
+        BTreeSet::from([std::path::PathBuf::from("model.safetensors")])
+    } else if index_path.exists() {
+        let index_metadata = std::fs::symlink_metadata(&index_path).ok()?;
+        if index_metadata.file_type().is_symlink() {
+            if !std::fs::metadata(&index_path).ok()?.is_file() {
+                return None;
+            }
+        } else if !index_metadata.is_file() {
+            return None;
+        }
+        let index: higgs_models::WeightMapIndex =
+            serde_json::from_reader(std::fs::File::open(&index_path).ok()?).ok()?;
+        let weight_map = index.weight_map;
+        if weight_map.is_empty() {
+            return None;
+        }
+        let mut selected = BTreeSet::new();
+        for value in weight_map.values() {
+            let relative = Path::new(value);
+            if relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                return None;
+            }
+            selected.insert(relative.to_path_buf());
+        }
+        let indexed_exist = selected
+            .iter()
+            .all(|relative| model_dir.join(relative).exists());
+        if !indexed_exist && single_path.exists() {
+            BTreeSet::from([std::path::PathBuf::from("model.safetensors")])
+        } else {
+            selected
+        }
+    } else if single_path.exists() {
+        BTreeSet::from([std::path::PathBuf::from("model.safetensors")])
+    } else {
+        return None;
+    };
+
+    if !force_consolidated_model {
+        let auxiliary = ["mtp.safetensors", "model-mtp.safetensors"]
+            .into_iter()
+            .filter(|name| model_dir.join(name).exists())
+            .collect::<Vec<_>>();
+        if auxiliary.len() > 1 {
+            return None;
+        }
+        if let Some(name) = auxiliary.first() {
+            relative_paths.insert(std::path::PathBuf::from(name));
+        }
+    }
+
+    let mut files = Vec::with_capacity(relative_paths.len());
+    for relative in relative_paths {
+        let mut current = model_dir.to_path_buf();
+        let components = relative.components().collect::<Vec<_>>();
+        for (index, component) in components.iter().enumerate() {
+            let Component::Normal(part) = component else {
+                return None;
+            };
+            current.push(part);
+            let link_metadata = std::fs::symlink_metadata(&current).ok()?;
+            if index + 1 == components.len() {
+                let metadata = if link_metadata.file_type().is_symlink() {
+                    std::fs::metadata(&current).ok()?
+                } else {
+                    link_metadata
+                };
+                if !metadata.is_file() || metadata.len() == 0 {
+                    return None;
+                }
+                validate_safetensors_header(&current, metadata.len())?;
+                files.push((current.clone(), metadata.len()));
+            } else if link_metadata.file_type().is_symlink() || !link_metadata.is_dir() {
+                return None;
+            }
+        }
+    }
+    (!files.is_empty()).then_some(files)
+}
+
+fn directory_tree_has_no_symlinked_directory(model_dir: &Path) -> bool {
+    let mut stack = vec![model_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return false;
+            };
+            let Ok(file_type) = entry.file_type() else {
+                return false;
+            };
+            if file_type.is_symlink() {
+                let Ok(target) = std::fs::metadata(entry.path()) else {
+                    return false;
+                };
+                if !target.is_file() {
+                    return false;
+                }
+            } else if file_type.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    true
+}
+
+fn strict_model_artifact_files_with_validation(
+    model_dir: &Path,
+) -> Option<Vec<(std::path::PathBuf, u64)>> {
+    let mut files = Vec::new();
+    let mut stack = vec![model_dir.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        for entry_result in std::fs::read_dir(&dir).ok()? {
+            let entry = entry_result.ok()?;
+            let path = entry.path();
+            let file_type = entry.file_type().ok()?;
+            let is_safetensors = path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"));
+            if file_type.is_symlink() {
+                let metadata = std::fs::metadata(&path).ok()?;
+                if metadata.is_dir() {
+                    return None;
+                }
+                if is_safetensors {
+                    if !metadata.is_file() {
+                        return None;
+                    }
+                    files.push((path, metadata.len()));
+                }
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if file_type.is_file() && is_safetensors {
+                let metadata = entry.metadata().ok()?;
+                if !metadata.is_file() {
+                    return None;
+                }
+                files.push((path, metadata.len()));
+            }
+        }
+    }
+
+    (!files.is_empty()).then_some(files)
+}
+
+fn validate_safetensors_header(path: &Path, file_bytes: u64) -> Option<()> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut length = [0_u8; 8];
+    file.read_exact(&mut length).ok()?;
+    let header_bytes = u64::from_le_bytes(length);
+    if !safetensors_header_length_is_safe(header_bytes, file_bytes) {
+        return None;
+    }
+    let header_len = usize::try_from(header_bytes).ok()?;
+    let mut header = vec![0_u8; header_len];
+    file.read_exact(&mut header).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&header).ok()?;
+    let entries = json.as_object()?;
+    let payload_bytes = file_bytes.checked_sub(8 + header_bytes)?;
+    let mut ranges = Vec::new();
+    for (name, value) in entries {
+        if name == "__metadata__" {
+            let metadata = value.as_object()?;
+            if !metadata.values().all(serde_json::Value::is_string) {
+                return None;
+            }
+            continue;
+        }
+        let dtype_bits = safetensors_dtype_bits(value.get("dtype")?.as_str()?)?;
+        let shape = value.get("shape")?.as_array()?;
+        let elements = shape.iter().try_fold(1_u64, |total, dimension| {
+            total.checked_mul(dimension.as_u64()?)
+        })?;
+        let offsets = value.get("data_offsets")?.as_array()?;
+        if offsets.len() != 2 {
+            return None;
+        }
+        let start = offsets.first()?.as_u64()?;
+        let end = offsets.get(1)?.as_u64()?;
+        let bits = elements.checked_mul(dtype_bits)?;
+        if bits % 8 != 0 || bits / 8 != end.checked_sub(start)? {
+            return None;
+        }
+        if end > payload_bytes {
+            return None;
+        }
+        ranges.push((start, end));
+    }
+    if ranges.is_empty() {
+        return None;
+    }
+    ranges.sort_unstable();
+    let mut expected_start = 0_u64;
+    for (start, end) in ranges {
+        if start != expected_start {
+            return None;
+        }
+        expected_start = end;
+    }
+    (expected_start == payload_bytes).then_some(())
+}
+
+fn safetensors_dtype_bits(dtype: &str) -> Option<u64> {
+    match dtype {
+        "F4" => Some(4),
+        "F6_E2M3" | "F6_E3M2" => Some(6),
+        "BOOL" | "U8" | "I8" | "F8_E5M2" | "F8_E4M3" | "F8_E8M0" | "F8_E4M3FNUZ"
+        | "F8_E5M2FNUZ" => Some(8),
+        "I16" | "U16" | "F16" | "BF16" => Some(16),
+        "I32" | "U32" | "F32" => Some(32),
+        "C64" | "F64" | "I64" | "U64" => Some(64),
+        _ => None,
+    }
+}
+
+fn safetensors_header_length_is_safe(header_bytes: u64, file_bytes: u64) -> bool {
+    header_bytes > 0
+        && header_bytes <= MAX_SAFETENSORS_HEADER_BYTES
+        && header_bytes <= file_bytes.saturating_sub(8)
+}
+
+fn strict_model_artifact_bytes(model_dir: &Path) -> Option<u64> {
+    strict_model_artifact_files_with_validation(model_dir)?
+        .into_iter()
+        .try_fold(0_u64, |total, (_, bytes)| {
+            checked_artifact_total(total, bytes)
+        })
+}
+
 fn model_weight_bytes(model_dir: &Path) -> Option<u64> {
     let mut total: u64 = 0;
     let mut stack = vec![model_dir.to_path_buf()];
@@ -556,13 +1414,834 @@ fn model_weight_bytes(model_dir: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MlxRuntimeTuning, ModelMetadata, ModelSizeClass, RequestedMlxProfile, ResolvedMlxProfile,
-        default_mtp_draft_n_max, heuristic_paged_kv_target_bytes_with_max, model_weight_bytes,
-        parse_enabled_flag, parse_mtp_draft_n_max, parse_positive_chunked_prefill_value,
-        resolve_effective_mlx_profile, resolve_profile_from_metadata, resolve_runtime_tuning,
+        EngineCostDescription, LoaderWorkspaceKind, MemoryPhase, MlxMemoryProbe,
+        MlxMemoryProbeError, MlxMemorySnapshot, MlxRuntimeTuning, ModelFootprint, ModelMetadata,
+        ModelSizeClass, RequestMemorySampler, RequestedMlxProfile, ResolvedMlxProfile,
+        TransientPrefillEstimate, checked_artifact_total, default_mtp_draft_n_max,
+        finish_load_estimate, heuristic_paged_kv_target_bytes_with_max, measure_mlx_memory,
+        model_load_estimate, model_weight_bytes, parse_enabled_flag, parse_mtp_draft_n_max,
+        parse_positive_chunked_prefill_value, resolve_effective_mlx_profile,
+        resolve_profile_from_metadata, resolve_runtime_tuning, safetensors_header_length_is_safe,
     };
+    use std::collections::VecDeque;
     use std::fs;
+    use std::path::Path;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    fn write_tiny_safetensor(path: &Path, payload_bytes: usize) {
+        let header = format!(
+            r#"{{"x":{{"dtype":"U8","shape":[{payload_bytes}],"data_offsets":[0,{payload_bytes}]}}}}"#
+        );
+        let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend(std::iter::repeat_n(0_u8, payload_bytes));
+        fs::write(path, bytes).unwrap();
+    }
+
+    /// A standard stream must reserve its resident artifact plus only the
+    /// largest selected shard; using the smallest shard underbounds the peak.
+    #[test]
+    fn model_load_estimate_standard_uses_largest_shard() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"qwen3","quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+        write_tiny_safetensor(&dir.path().join("a.safetensors"), 3);
+        write_tiny_safetensor(&dir.path().join("b.safetensors"), 19);
+        fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{"a":"a.safetensors","b":"b.safetensors"}}"#,
+        )
+        .unwrap();
+        let a = fs::metadata(dir.path().join("a.safetensors"))
+            .unwrap()
+            .len();
+        let b = fs::metadata(dir.path().join("b.safetensors"))
+            .unwrap()
+            .len();
+        let estimate = model_load_estimate(dir.path(), "qwen3").unwrap();
+        assert_eq!(estimate.artifact_bytes, a + b);
+        assert_eq!(estimate.largest_selected_shard_bytes, b);
+        assert_eq!(estimate.workspace_kind, LoaderWorkspaceKind::StandardStream);
+        assert_eq!(estimate.workspace_upper_bound_bytes, b);
+        assert_eq!(estimate.required_process_bytes, a + b + b);
+    }
+
+    /// Treating all-weight vision rereads as streaming would allow the full
+    /// artifact map to coexist without being charged.
+    #[test]
+    fn model_load_estimate_vlm_charges_full_artifact_workspace() {
+        let dir = TempDir::new().unwrap();
+        write_tiny_safetensor(&dir.path().join("model.safetensors"), 17);
+        let artifact = fs::metadata(dir.path().join("model.safetensors"))
+            .unwrap()
+            .len();
+        let estimate = model_load_estimate(dir.path(), "qwen3_5_vl").unwrap();
+        assert_eq!(estimate.workspace_kind, LoaderWorkspaceKind::FullArtifact);
+        assert_eq!(estimate.workspace_upper_bound_bytes, artifact);
+        assert_eq!(estimate.required_process_bytes, artifact * 2);
+    }
+
+    #[test]
+    fn model_load_estimate_vlm_escha_uses_native_resident_and_one_shard() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"text_config":{"num_hidden_layers":2,"num_experts":4,
+                "moe_intermediate_size":8,"hidden_size":16,"vocab_size":32},
+                "quantization_config":{"quant_method":"eschamoe","layer_meta":{
+                  "gate_up":{"K":2,"num_experts":4,"in_features":8,"out_features":16},
+                  "down":{"K":3,"num_experts":4,"in_features":16,"out_features":8}}}}"#,
+        )
+        .unwrap();
+        write_tiny_safetensor(&dir.path().join("model.safetensors"), 17);
+        let artifact = fs::metadata(dir.path().join("model.safetensors"))
+            .unwrap()
+            .len();
+
+        let estimate = model_load_estimate(dir.path(), "qwen3_5_vl").unwrap();
+
+        assert_eq!(estimate.workspace_kind, LoaderWorkspaceKind::NativeEscha);
+        assert_eq!(estimate.workspace_upper_bound_bytes, artifact);
+        assert_eq!(estimate.required_process_bytes, 896 + artifact);
+    }
+
+    #[test]
+    fn model_load_estimate_gemma_text_charges_full_artifact_workspace() {
+        let dir = TempDir::new().unwrap();
+        write_tiny_safetensor(&dir.path().join("model.safetensors"), 17);
+        for model_type in ["gemma3_text", "gemma4_text"] {
+            let estimate = model_load_estimate(dir.path(), model_type).unwrap();
+            assert_eq!(estimate.workspace_kind, LoaderWorkspaceKind::FullArtifact);
+            assert_eq!(
+                estimate.workspace_upper_bound_bytes,
+                estimate.artifact_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn model_load_estimate_bonsai_uses_actual_consolidated_file() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"qwen3","quantization":{"bits":1,"group_size":128}}"#,
+        )
+        .unwrap();
+        write_tiny_safetensor(&dir.path().join("model.safetensors"), 31);
+        write_tiny_safetensor(&dir.path().join("shard.safetensors"), 1);
+        fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{"x":"shard.safetensors"}}"#,
+        )
+        .unwrap();
+        let actual = fs::metadata(dir.path().join("model.safetensors"))
+            .unwrap()
+            .len();
+        let estimate = model_load_estimate(dir.path(), "qwen3").unwrap();
+        assert_eq!(estimate.workspace_kind, LoaderWorkspaceKind::FullArtifact);
+        assert_eq!(estimate.artifact_bytes, actual);
+        assert_eq!(estimate.required_process_bytes, actual * 2);
+    }
+
+    #[test]
+    fn model_load_estimate_q1_wrong_group_uses_generic_index_files() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"qwen3","quantization":{"bits":1,"group_size":64}}"#,
+        )
+        .unwrap();
+        write_tiny_safetensor(&dir.path().join("model.safetensors"), 1);
+        write_tiny_safetensor(&dir.path().join("shard.safetensors"), 31);
+        fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{"x":"shard.safetensors"}}"#,
+        )
+        .unwrap();
+        let shard = fs::metadata(dir.path().join("shard.safetensors"))
+            .unwrap()
+            .len();
+        let estimate = model_load_estimate(dir.path(), "qwen3").unwrap();
+        assert_eq!(estimate.workspace_kind, LoaderWorkspaceKind::StandardStream);
+        assert_eq!(estimate.artifact_bytes, shard);
+    }
+
+    #[test]
+    fn model_load_estimate_rejects_oversized_declared_header_before_allocation() {
+        assert!(!safetensors_header_length_is_safe(100_000_001, 100_000_009));
+        assert!(safetensors_header_length_is_safe(64, 72));
+    }
+
+    #[test]
+    fn model_load_estimate_rejects_unsafe_index_path_even_with_unrelated_weights() {
+        let root = TempDir::new().unwrap();
+        let model = root.path().join("model");
+        fs::create_dir(&model).unwrap();
+        write_tiny_safetensor(&root.path().join("outside.safetensors"), 3);
+        write_tiny_safetensor(&model.join("unrelated.safetensors"), 3);
+        fs::write(
+            model.join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{"x":"../outside.safetensors"}}"#,
+        )
+        .unwrap();
+        assert!(model_load_estimate(&model, "llama").is_err());
+    }
+
+    #[test]
+    fn model_load_estimate_uses_nonstandard_indexed_weight_filename() {
+        let dir = TempDir::new().unwrap();
+        write_tiny_safetensor(&dir.path().join("weights.data"), 7);
+        fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{"x":"weights.data"}}"#,
+        )
+        .unwrap();
+        let estimate = model_load_estimate(dir.path(), "llama").unwrap();
+        assert_eq!(
+            estimate.artifact_bytes,
+            fs::metadata(dir.path().join("weights.data")).unwrap().len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_load_estimate_accepts_hf_style_file_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let model = root.path().join("snapshot");
+        fs::create_dir(&model).unwrap();
+        let blob = root.path().join("blob");
+        write_tiny_safetensor(&blob, 9);
+        symlink(&blob, model.join("model.safetensors")).unwrap();
+        assert!(model_load_estimate(&model, "llama").is_ok());
+    }
+
+    /// Malformed safetensors may have a plausible file size but cannot be
+    /// admitted as an artifact estimate because loader metadata is mandatory.
+    #[test]
+    fn model_load_estimate_rejects_corrupt_artifact() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("model.safetensors"), b"not-a-safetensor").unwrap();
+        assert!(model_load_estimate(dir.path(), "qwen3").is_err());
+    }
+
+    #[test]
+    fn model_load_estimate_rejects_structurally_invalid_safetensors() {
+        let dir = TempDir::new().unwrap();
+        let header = r#"{"x":{"dtype":"U8","shape":[2],"data_offsets":[0,1]}}"#;
+        let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.push(0);
+        fs::write(dir.path().join("model.safetensors"), bytes).unwrap();
+        assert!(model_load_estimate(dir.path(), "qwen3").is_err());
+    }
+
+    #[test]
+    fn model_load_estimate_rejects_index_missing_mandatory_metadata() {
+        let dir = TempDir::new().unwrap();
+        write_tiny_safetensor(&dir.path().join("weights.safetensors"), 1);
+        fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"x":"weights.safetensors"}}"#,
+        )
+        .unwrap();
+        assert!(model_load_estimate(dir.path(), "qwen3").is_err());
+    }
+
+    #[test]
+    fn model_load_estimate_rejects_non_string_safetensors_metadata() {
+        let dir = TempDir::new().unwrap();
+        let header =
+            r#"{"__metadata__":{"format":7},"x":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}"#;
+        let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.push(0);
+        fs::write(dir.path().join("model.safetensors"), bytes).unwrap();
+        assert!(model_load_estimate(dir.path(), "qwen3").is_err());
+    }
+
+    /// Saturating an overflow would turn an unbounded unknown loader into a
+    /// smaller apparently safe estimate.
+    #[test]
+    fn model_load_estimate_overflow_fails_closed() {
+        assert!(finish_load_estimate(u64::MAX, 1, LoaderWorkspaceKind::Unknown).is_err());
+    }
+
+    #[test]
+    fn unknown_loader_uses_fail_closed_double_artifact_workspace() {
+        let estimate = finish_load_estimate(100, 40, LoaderWorkspaceKind::Unknown).unwrap();
+        assert_eq!(estimate.workspace_upper_bound_bytes, 200);
+        assert_eq!(estimate.required_process_bytes, 300);
+    }
+
+    /// Fallback bound for a native-escha checkpoint without architecture
+    /// fields: artifact + full-artifact workspace stays fail-closed.
+    /// Checkpoints WITH config fields get the architecture-derived resident
+    /// override in `model_load_estimate` (resident + one streaming shard).
+    #[test]
+    fn native_escha_estimate_fallback_charges_artifact_plus_workspace() {
+        let estimate = finish_load_estimate(100, 40, LoaderWorkspaceKind::NativeEscha).unwrap();
+        assert_eq!(estimate.workspace_upper_bound_bytes, 100);
+        assert_eq!(estimate.required_process_bytes, 200);
+    }
+
+    #[derive(Clone, Copy)]
+    struct RawMemoryMeasurement {
+        active_bytes: Result<u128, MlxMemoryProbeError>,
+        peak_bytes: Result<u128, MlxMemoryProbeError>,
+        memory_limit_bytes: Result<u128, MlxMemoryProbeError>,
+        metal_recommended_working_set_bytes: Result<Option<u128>, MlxMemoryProbeError>,
+    }
+
+    impl RawMemoryMeasurement {
+        fn successful(
+            active_bytes: u128,
+            peak_bytes: u128,
+            memory_limit_bytes: u128,
+            metal_recommended_working_set_bytes: Option<u128>,
+        ) -> Self {
+            Self {
+                active_bytes: Ok(active_bytes),
+                peak_bytes: Ok(peak_bytes),
+                memory_limit_bytes: Ok(memory_limit_bytes),
+                metal_recommended_working_set_bytes: Ok(metal_recommended_working_set_bytes),
+            }
+        }
+    }
+
+    struct FakeMemoryProbe {
+        measurements: Mutex<VecDeque<RawMemoryMeasurement>>,
+        reset_result: Result<(), MlxMemoryProbeError>,
+        resets: Mutex<usize>,
+    }
+
+    impl FakeMemoryProbe {
+        fn new(snapshots: impl IntoIterator<Item = MlxMemorySnapshot>) -> Self {
+            Self::from_raw(snapshots.into_iter().map(|snapshot| {
+                RawMemoryMeasurement::successful(
+                    u128::from(snapshot.active_bytes),
+                    u128::from(snapshot.peak_bytes),
+                    u128::from(snapshot.memory_limit_bytes.unwrap_or(0)),
+                    snapshot.metal_recommended_working_set_bytes.map(u128::from),
+                )
+            }))
+        }
+
+        fn from_raw(measurements: impl IntoIterator<Item = RawMemoryMeasurement>) -> Self {
+            Self {
+                measurements: Mutex::new(measurements.into_iter().collect()),
+                reset_result: Ok(()),
+                resets: Mutex::new(0),
+            }
+        }
+
+        fn with_reset_result(mut self, result: Result<(), MlxMemoryProbeError>) -> Self {
+            self.reset_result = result;
+            self
+        }
+
+        fn current(
+            &self,
+            exhausted: &'static str,
+        ) -> Result<RawMemoryMeasurement, MlxMemoryProbeError> {
+            self.measurements
+                .lock()
+                .map_err(|_| MlxMemoryProbeError::QueryFailed("test probe lock"))?
+                .front()
+                .copied()
+                .ok_or(MlxMemoryProbeError::QueryFailed(exhausted))
+        }
+
+        fn take(&self) -> Result<RawMemoryMeasurement, MlxMemoryProbeError> {
+            self.measurements
+                .lock()
+                .map_err(|_| MlxMemoryProbeError::QueryFailed("test probe lock"))?
+                .pop_front()
+                .ok_or(MlxMemoryProbeError::QueryFailed(
+                    "test measurement exhausted",
+                ))
+        }
+    }
+
+    impl MlxMemoryProbe for FakeMemoryProbe {
+        fn active_memory_bytes(&self) -> Result<u128, MlxMemoryProbeError> {
+            self.current("test active memory exhausted")?.active_bytes
+        }
+
+        fn peak_memory_bytes(&self) -> Result<u128, MlxMemoryProbeError> {
+            self.current("test peak memory exhausted")?.peak_bytes
+        }
+
+        fn memory_limit_bytes(&self) -> Result<u128, MlxMemoryProbeError> {
+            self.current("test memory limit exhausted")?
+                .memory_limit_bytes
+        }
+
+        fn metal_recommended_working_set_bytes(&self) -> Result<Option<u128>, MlxMemoryProbeError> {
+            self.take()?.metal_recommended_working_set_bytes
+        }
+
+        fn reset_peak_memory(&self) -> Result<(), MlxMemoryProbeError> {
+            self.reset_result?;
+            let mut resets = self
+                .resets
+                .lock()
+                .map_err(|_| MlxMemoryProbeError::QueryFailed("test reset lock"))?;
+            *resets += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn memory_snapshot_preserves_allocator_and_working_set_measurements() {
+        let probe =
+            FakeMemoryProbe::from_raw([RawMemoryMeasurement::successful(11, 17, 23, Some(29))]);
+
+        assert_eq!(
+            measure_mlx_memory(&probe),
+            Ok(MlxMemorySnapshot {
+                active_bytes: 11,
+                peak_bytes: 17,
+                memory_limit_bytes: Some(23),
+                metal_recommended_working_set_bytes: Some(29),
+            })
+        );
+    }
+
+    #[test]
+    fn memory_snapshot_normalizes_zero_mlx_limit() {
+        let probe = FakeMemoryProbe::from_raw([RawMemoryMeasurement::successful(11, 17, 0, None)]);
+
+        assert_eq!(
+            measure_mlx_memory(&probe),
+            Ok(MlxMemorySnapshot {
+                active_bytes: 11,
+                peak_bytes: 17,
+                memory_limit_bytes: None,
+                metal_recommended_working_set_bytes: None,
+            })
+        );
+    }
+
+    #[test]
+    fn memory_snapshot_propagates_each_raw_query_failure() {
+        let error = MlxMemoryProbeError::QueryFailed("injected query failure");
+        let mut cases = [
+            RawMemoryMeasurement::successful(1, 2, 3, Some(4)),
+            RawMemoryMeasurement::successful(1, 2, 3, Some(4)),
+            RawMemoryMeasurement::successful(1, 2, 3, Some(4)),
+            RawMemoryMeasurement::successful(1, 2, 3, Some(4)),
+        ];
+        cases[0].active_bytes = Err(error);
+        cases[1].peak_bytes = Err(error);
+        cases[2].memory_limit_bytes = Err(error);
+        cases[3].metal_recommended_working_set_bytes = Err(error);
+
+        for measurement in cases {
+            assert_eq!(
+                measure_mlx_memory(&FakeMemoryProbe::from_raw([measurement])),
+                Err(error)
+            );
+        }
+    }
+
+    #[test]
+    fn memory_snapshot_rejects_each_u64_conversion_overflow() {
+        let too_large = u128::from(u64::MAX) + 1;
+        let cases = [
+            (
+                RawMemoryMeasurement::successful(too_large, 2, 3, Some(4)),
+                MlxMemoryProbeError::QueryFailed("active memory conversion"),
+            ),
+            (
+                RawMemoryMeasurement::successful(1, too_large, 3, Some(4)),
+                MlxMemoryProbeError::QueryFailed("peak memory conversion"),
+            ),
+            (
+                RawMemoryMeasurement::successful(1, 2, too_large, Some(4)),
+                MlxMemoryProbeError::QueryFailed("memory limit conversion"),
+            ),
+            (
+                RawMemoryMeasurement::successful(1, 2, 3, Some(too_large)),
+                MlxMemoryProbeError::QueryFailed("Metal working-set conversion"),
+            ),
+        ];
+
+        for (measurement, expected) in cases {
+            assert_eq!(
+                measure_mlx_memory(&FakeMemoryProbe::from_raw([measurement])),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn request_memory_sampler_propagates_reset_failure() {
+        let probe = FakeMemoryProbe::new([MlxMemorySnapshot::default()])
+            .with_reset_result(Err(MlxMemoryProbeError::ResetPeakFailed));
+        let mut mlx_gate = higgs_models::mlx_exec::acquire();
+
+        assert!(matches!(
+            RequestMemorySampler::start_with_probe(MemoryPhase::Prefill, &mut mlx_gate, &probe),
+            Err(MlxMemoryProbeError::ResetPeakFailed)
+        ));
+    }
+
+    #[test]
+    fn request_memory_sampler_records_content_free_prefill_high_water() {
+        let before = MlxMemorySnapshot {
+            active_bytes: 100,
+            peak_bytes: 900,
+            memory_limit_bytes: Some(1_000),
+            metal_recommended_working_set_bytes: Some(800),
+        };
+        let after = MlxMemorySnapshot {
+            active_bytes: 140,
+            peak_bytes: 220,
+            memory_limit_bytes: Some(1_000),
+            metal_recommended_working_set_bytes: Some(800),
+        };
+        let probe = FakeMemoryProbe::new([before, after]);
+        let mut mlx_gate = higgs_models::mlx_exec::acquire();
+
+        let sampler =
+            RequestMemorySampler::start_with_probe(MemoryPhase::Prefill, &mut mlx_gate, &probe)
+                .unwrap();
+        let sample = sampler.finish_with_probe(&mut mlx_gate, &probe).unwrap();
+
+        assert_eq!(sample.phase, MemoryPhase::Prefill);
+        assert_eq!(sample.active_before_bytes, 100);
+        assert_eq!(sample.active_after_bytes, 140);
+        assert_eq!(sample.peak_bytes, 220);
+        assert_eq!(sample.active_growth_bytes, 40);
+        assert_eq!(*probe.resets.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn request_memory_sampler_records_decode_and_never_understates_baseline() {
+        let before = MlxMemorySnapshot {
+            active_bytes: 300,
+            peak_bytes: 700,
+            memory_limit_bytes: None,
+            metal_recommended_working_set_bytes: None,
+        };
+        let after = MlxMemorySnapshot {
+            active_bytes: 280,
+            peak_bytes: 250,
+            memory_limit_bytes: None,
+            metal_recommended_working_set_bytes: None,
+        };
+        let probe = FakeMemoryProbe::new([before, after]);
+        let mut mlx_gate = higgs_models::mlx_exec::acquire();
+
+        let sampler =
+            RequestMemorySampler::start_with_probe(MemoryPhase::Decode, &mut mlx_gate, &probe)
+                .unwrap();
+        let sample = sampler.finish_with_probe(&mut mlx_gate, &probe).unwrap();
+
+        assert_eq!(sample.phase, MemoryPhase::Decode);
+        assert_eq!(sample.peak_bytes, 300);
+        assert_eq!(sample.active_growth_bytes, 0);
+    }
+
+    #[test]
+    fn request_memory_sampler_allows_sequential_phases_on_one_gate() {
+        let snapshot = MlxMemorySnapshot::default();
+        let probe = FakeMemoryProbe::new([snapshot; 4]);
+        let mut mlx_gate = higgs_models::mlx_exec::acquire();
+
+        let prefill =
+            RequestMemorySampler::start_with_probe(MemoryPhase::Prefill, &mut mlx_gate, &probe)
+                .unwrap()
+                .finish_with_probe(&mut mlx_gate, &probe)
+                .unwrap();
+        let decode =
+            RequestMemorySampler::start_with_probe(MemoryPhase::Decode, &mut mlx_gate, &probe)
+                .unwrap()
+                .finish_with_probe(&mut mlx_gate, &probe)
+                .unwrap();
+
+        assert_eq!(prefill.phase, MemoryPhase::Prefill);
+        assert_eq!(decode.phase, MemoryPhase::Decode);
+        assert_eq!(*probe.resets.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn nested_request_memory_sample_invalidates_outer_window() {
+        let snapshot = MlxMemorySnapshot::default();
+        let probe = FakeMemoryProbe::new([snapshot; 4]);
+        let mut mlx_gate = higgs_models::mlx_exec::acquire();
+
+        let outer =
+            RequestMemorySampler::start_with_probe(MemoryPhase::Prefill, &mut mlx_gate, &probe)
+                .unwrap();
+        let inner =
+            RequestMemorySampler::start_with_probe(MemoryPhase::Decode, &mut mlx_gate, &probe)
+                .unwrap();
+        assert!(inner.finish_with_probe(&mut mlx_gate, &probe).is_ok());
+        assert_eq!(
+            outer.finish_with_probe(&mut mlx_gate, &probe),
+            Err(MlxMemoryProbeError::InvalidatedSample)
+        );
+    }
+
+    #[test]
+    fn reacquiring_mlx_gate_invalidates_old_sample_window() {
+        let snapshot = MlxMemorySnapshot::default();
+        let probe = FakeMemoryProbe::new([snapshot; 2]);
+        let mut first_gate = higgs_models::mlx_exec::acquire();
+        let sample =
+            RequestMemorySampler::start_with_probe(MemoryPhase::Prefill, &mut first_gate, &probe)
+                .unwrap();
+
+        drop(first_gate);
+        let mut next_gate = higgs_models::mlx_exec::acquire();
+        assert_eq!(
+            sample.finish_with_probe(&mut next_gate, &probe),
+            Err(MlxMemoryProbeError::InvalidatedSample)
+        );
+    }
+
+    #[test]
+    fn model_memory_footprint_uses_artifact_bytes_and_checked_active_delta() -> std::io::Result<()>
+    {
+        let temp = TempDir::new().map_err(std::io::Error::other)?;
+        fs::write(temp.path().join("model.safetensors"), [0_u8; 13])?;
+        let before = MlxMemorySnapshot {
+            active_bytes: 80,
+            ..MlxMemorySnapshot::default()
+        };
+        let after = MlxMemorySnapshot {
+            active_bytes: 180,
+            ..MlxMemorySnapshot::default()
+        };
+
+        assert_eq!(
+            ModelFootprint::from_load_measurements(temp.path(), before, after),
+            Some(ModelFootprint {
+                artifact_weight_bytes: 13,
+                loaded_mlx_bytes: 100,
+            })
+        );
+        assert!(ModelFootprint::from_load_measurements(temp.path(), after, before).is_none());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_memory_footprint_fails_closed_on_artifact_io_errors() -> std::io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().map_err(std::io::Error::other)?;
+        fs::write(temp.path().join("model.safetensors"), [0_u8; 13])?;
+        symlink(
+            temp.path().join("missing-target"),
+            temp.path().join("broken.safetensors"),
+        )?;
+        let before = MlxMemorySnapshot::default();
+        let after = MlxMemorySnapshot {
+            active_bytes: 100,
+            ..MlxMemorySnapshot::default()
+        };
+
+        assert_eq!(
+            ModelFootprint::from_load_measurements(temp.path(), before, after),
+            None,
+            "a partial artifact count is unsafe when a safetensors stat fails"
+        );
+
+        let missing = temp.path().join("missing-directory");
+        assert_eq!(
+            ModelFootprint::from_load_measurements(&missing, before, after),
+            None
+        );
+
+        let not_directory = temp.path().join("plain-file");
+        fs::write(&not_directory, b"not a model directory")?;
+        assert_eq!(
+            ModelFootprint::from_load_measurements(&not_directory, before, after),
+            None
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_memory_footprint_fails_closed_on_directory_symlink() -> std::io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let model = TempDir::new().map_err(std::io::Error::other)?;
+        fs::write(model.path().join("direct.safetensors"), [0_u8; 13])?;
+        let linked_weights = TempDir::new().map_err(std::io::Error::other)?;
+        fs::write(linked_weights.path().join("linked.safetensors"), [0_u8; 17])?;
+        symlink(linked_weights.path(), model.path().join("linked-weights"))?;
+        let before = MlxMemorySnapshot::default();
+        let after = MlxMemorySnapshot {
+            active_bytes: 100,
+            ..MlxMemorySnapshot::default()
+        };
+
+        assert_eq!(
+            ModelFootprint::from_load_measurements(model.path(), before, after),
+            None,
+            "skipping a directory symlink would publish a partial direct-weight total"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_memory_footprint_counts_symlinked_safetensors_file() -> std::io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let model = TempDir::new().map_err(std::io::Error::other)?;
+        let target = TempDir::new().map_err(std::io::Error::other)?;
+        let target_file = target.path().join("weight-target");
+        fs::write(&target_file, [0_u8; 17])?;
+        symlink(&target_file, model.path().join("model.safetensors"))?;
+        let before = MlxMemorySnapshot::default();
+        let after = MlxMemorySnapshot {
+            active_bytes: 100,
+            ..MlxMemorySnapshot::default()
+        };
+
+        assert_eq!(
+            ModelFootprint::from_load_measurements(model.path(), before, after),
+            Some(ModelFootprint {
+                artifact_weight_bytes: 17,
+                loaded_mlx_bytes: 100,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn model_memory_footprint_rejects_artifact_sum_overflow() {
+        assert_eq!(checked_artifact_total(u64::MAX, 1), None);
+    }
+
+    #[test]
+    fn escha_memory_geometry_is_20480_dense_kv_bytes_per_token() -> std::io::Result<()> {
+        let temp = TempDir::new().map_err(std::io::Error::other)?;
+        write_json(
+            &temp.path().join("config.json"),
+            &serde_json::json!({
+                "model_type": "qwen3_5_moe",
+                "num_hidden_layers": 40,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "full_attention_interval": 4
+            }),
+        )?;
+        let transient = TransientPrefillEstimate {
+            base_bytes: 0,
+            bytes_per_prompt_token: 0,
+            bytes_per_chunk_token: 0,
+            max_prompt_tokens: 131_072,
+            max_chunk_tokens: 4_096,
+        };
+
+        let cost = EngineCostDescription::fp16_from_model_dir(temp.path(), 0, 0, transient)
+            .expect("complete Escha cache geometry");
+
+        assert_eq!(cost.persistent_bytes_per_token, 20_480);
+        assert_eq!(cost.persistent_bytes(49_152), Some(960 * 1024 * 1024));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_native_escha_charges_fp32_cache_and_allocation_slack() -> std::io::Result<()> {
+        let temp = TempDir::new().map_err(std::io::Error::other)?;
+        write_json(
+            &temp.path().join("config.json"),
+            &serde_json::json!({
+                "model_type": "qwen3_5_moe", "num_hidden_layers": 40,
+                "num_key_value_heads": 2, "head_dim": 256, "full_attention_interval": 4,
+                "quantization_config": {"quant_method": "eschamoe"}
+            }),
+        )?;
+        let transient = TransientPrefillEstimate {
+            base_bytes: 0,
+            bytes_per_prompt_token: 0,
+            bytes_per_chunk_token: 0,
+            max_prompt_tokens: 131_072,
+            max_chunk_tokens: 1024,
+        };
+        let cost =
+            EngineCostDescription::runtime_from_model_dir(temp.path(), 65_863_680, 0, transient)
+                .expect("native runtime geometry");
+        assert_eq!(cost.persistent_bytes_per_token, 40_960);
+        // Capacity rounds dense KV storage to 256 slots. The bound covers any
+        // position in the bucket without changing the actual cache precision.
+        for tokens in [5085_u64, 7007, 9129, 11202, 11265, 16384] {
+            let actual = 65_863_680 + tokens.div_ceil(256) * 256 * 40_960;
+            assert!(
+                cost.fixed_live_session_bytes + cost.persistent_bytes(tokens).unwrap() >= actual
+            );
+        }
+        assert!(65_863_680 + 11_264_u64 * 40_960 <= 512 * 1024 * 1024);
+        assert!(65_863_680 + 11_520_u64 * 40_960 > 512 * 1024 * 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn engine_memory_cost_rejects_zero_cache_geometry() -> std::io::Result<()> {
+        let transient = TransientPrefillEstimate {
+            base_bytes: 0,
+            bytes_per_prompt_token: 0,
+            bytes_per_chunk_token: 0,
+            max_prompt_tokens: 1,
+            max_chunk_tokens: 1,
+        };
+
+        for (layers, kv_heads, head_dim) in [(0, 2, 256), (40, 0, 256), (40, 2, 0)] {
+            let temp = TempDir::new().map_err(std::io::Error::other)?;
+            write_json(
+                &temp.path().join("config.json"),
+                &serde_json::json!({
+                    "model_type": "qwen3_5_moe",
+                    "num_hidden_layers": layers,
+                    "num_key_value_heads": kv_heads,
+                    "head_dim": head_dim,
+                    "full_attention_interval": 4
+                }),
+            )?;
+
+            assert_eq!(
+                EngineCostDescription::fp16_from_model_dir(temp.path(), 0, 0, transient),
+                None,
+                "zero geometry must fail closed: layers={layers}, kv_heads={kv_heads}, head_dim={head_dim}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn engine_memory_cost_rejects_overflow_and_out_of_domain_prefill() {
+        let transient = TransientPrefillEstimate {
+            base_bytes: u64::MAX,
+            bytes_per_prompt_token: 1,
+            bytes_per_chunk_token: 1,
+            max_prompt_tokens: 8,
+            max_chunk_tokens: 4,
+        };
+        let cost = EngineCostDescription {
+            fixed_live_session_bytes: 1,
+            persistent_bytes_per_token: u64::MAX,
+            decode_workspace_bytes: 1,
+            transient_prefill: transient,
+        };
+
+        assert_eq!(cost.persistent_bytes(2), None);
+        assert_eq!(transient.estimate_bytes(1, 1), None);
+        assert_eq!(transient.estimate_bytes(9, 1), None);
+        assert_eq!(transient.estimate_bytes(1, 5), None);
+    }
 
     #[test]
     fn test_requested_profile_env_aliases_parse() {
@@ -609,6 +2288,65 @@ mod tests {
             resolve_profile_from_metadata(RequestedMlxProfile::Auto, &metadata),
             ResolvedMlxProfile::Throughput
         );
+    }
+
+    #[test]
+    fn test_qwen35_low_bit_affine_clears_prefill_allocator_cache_by_default() {
+        let metadata = ModelMetadata {
+            model_type: Some("qwen3_5".to_owned()),
+            quantization_bits: Some(1),
+            ..ModelMetadata::default()
+        };
+        let tuning = MlxRuntimeTuning::from_profile(
+            RequestedMlxProfile::Latency,
+            ResolvedMlxProfile::Latency,
+            &metadata,
+        );
+        assert!(tuning.clear_cache_after_prefill());
+
+        // Q1 through Q4 all dequantize large projections during prefill and need
+        // the allocator cache cleared to avoid multi-GB post-prefill residency.
+        for bits in [1, 2, 3, 4] {
+            let low_bit = ModelMetadata {
+                quantization_bits: Some(bits),
+                ..metadata.clone()
+            };
+            assert!(
+                low_bit.should_clear_cache_after_prefill(),
+                "bits={bits} should clear cache after prefill"
+            );
+        }
+
+        // Dense (bits=0) and 8-bit re-quant paths do not materialize oversized
+        // fp16 dequant projections and therefore should not trigger.
+        for bits in [0, 8] {
+            let dense_or_8bit = ModelMetadata {
+                quantization_bits: Some(bits),
+                ..metadata.clone()
+            };
+            assert!(
+                !dense_or_8bit.should_clear_cache_after_prefill(),
+                "bits={bits} should not clear cache after prefill"
+            );
+        }
+
+        // Non-Qwen3.5 architectures are out of domain regardless of bits.
+        let non_qwen35 = ModelMetadata {
+            model_type: Some("qwen3".to_owned()),
+            quantization_bits: Some(1),
+            ..metadata.clone()
+        };
+        assert!(!non_qwen35.should_clear_cache_after_prefill());
+
+        // Qwen3.5-MoE (eschamoe native trellis path) always clears,
+        // even without traditional quantization bits, because the
+        // trellis decode creates transient weight intermediates.
+        let moe = ModelMetadata {
+            model_type: Some("qwen3_5_moe".to_owned()),
+            quantization_bits: None,
+            ..metadata.clone()
+        };
+        assert!(moe.should_clear_cache_after_prefill());
     }
 
     fn write_json(path: &std::path::Path, value: &serde_json::Value) -> std::io::Result<()> {

@@ -22,6 +22,15 @@ pub enum ModelError {
 
     #[error("Shape mismatch: {0}")]
     ShapeMismatch(String),
+
+    #[error("Model load rejected by capacity policy: {0}")]
+    LoadCapacity(String),
+
+    #[error("Optional model load suppressed after pressure increased")]
+    OptionalLoadSuppressed,
+
+    #[error("Prefill cancelled by observer")]
+    PrefillCancelled,
 }
 
 #[allow(clippy::panic, clippy::unwrap_used)]

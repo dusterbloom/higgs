@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::error::ModelError;
 
 /// Maximum config.json size (10 MiB) — prevents `DoS` from symlinked large files.
-const MAX_CONFIG_SIZE: u64 = crate::adapter::MAX_CONFIG_SIZE;
+const MAX_CONFIG_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Detect the model architecture from config.json's `model_type` field.
 pub fn detect_model_type<P: AsRef<Path>>(model_dir: P) -> Result<String, ModelError> {
@@ -26,7 +26,32 @@ pub fn detect_model_type<P: AsRef<Path>>(model_dir: P) -> Result<String, ModelEr
 
 /// Supported model architectures.
 pub fn is_supported(model_type: &str) -> bool {
-    crate::adapter::is_exact_supported(model_type)
+    matches!(
+        model_type,
+        "qwen2"
+            | "qwen3"
+            | "llama"
+            | "mistral"
+            | "qwen3_next"
+            | "qwen3_moe"
+            | "qwen3_5"
+            | "qwen3_5_moe"
+            | "prism_hadamard_qwen35"
+            | "qwen3_5_vl"
+            | "qwen3_vl"
+            | "qwen2_5_vl"
+            | "nanbeige"
+            | "gemma2"
+            | "gemma3"
+            | "gemma3_text"
+            | "gemma4"
+            | "gemma4_text"
+            | "gemma4_unified"
+            | "phi3"
+            | "starcoder2"
+            | "llava-qwen2"
+            | "deepseek_v2"
+    )
 }
 
 #[allow(clippy::panic, clippy::unwrap_used)]
@@ -142,6 +167,11 @@ mod tests {
     }
 
     #[test]
+    fn test_is_supported_nanbeige() {
+        assert!(is_supported("nanbeige"));
+    }
+
+    #[test]
     fn test_detect_model_type_qwen3_moe() {
         let dir = write_model_type_config("qwen3_moe");
         assert_eq!(detect_model_type(dir.path()).unwrap(), "qwen3_moe");
@@ -155,6 +185,20 @@ mod tests {
     #[test]
     fn test_is_supported_qwen3_5_moe() {
         assert!(is_supported("qwen3_5_moe"));
+    }
+
+    #[test]
+    fn test_is_supported_prism_hadamard_qwen35() {
+        assert!(is_supported("prism_hadamard_qwen35"));
+    }
+
+    #[test]
+    fn test_detect_model_type_prism_hadamard_qwen35() {
+        let dir = write_model_type_config("prism_hadamard_qwen35");
+        assert_eq!(
+            detect_model_type(dir.path()).unwrap(),
+            "prism_hadamard_qwen35"
+        );
     }
 
     #[test]

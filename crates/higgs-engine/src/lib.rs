@@ -4,6 +4,7 @@ pub mod batch_engine;
 pub mod cache;
 pub mod chat_template;
 pub mod constrained;
+pub(crate) mod decode;
 pub mod disk_prefix_store;
 pub mod engine;
 pub mod error;
@@ -12,10 +13,21 @@ pub mod model_loader;
 pub mod mtp;
 pub mod paged_prefix_cache;
 pub mod prompt_cache;
+pub mod prune;
+pub mod prune_eval;
 pub mod reasoning_parser;
+pub mod runtime_identity;
 pub mod scheduler;
 pub mod simple;
-pub mod spec_prefill;
+pub mod stop;
 pub mod tool_parser;
 
+pub use engine::{RequestAllocationCapture, RequestAllocationReceipt, RequestExecutionPath};
+pub use mlx_tuning::{
+    EngineCostDescription, LoaderWorkspaceKind, MemoryPhase, MlxAllocatorTelemetry,
+    MlxMemoryProbeError, MlxMemorySnapshot, ModelFootprint, ModelLoadEstimate,
+    ModelLoadEstimateError, RequestMemoryHighWater, RequestMemorySampler, TransientPrefillEstimate,
+    model_load_estimate,
+};
+pub use simple::CacheResidency;
 pub use tokenizers;

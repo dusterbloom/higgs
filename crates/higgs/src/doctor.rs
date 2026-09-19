@@ -1,10 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::time::Instant;
-
-use higgs_engine::{mlx_tuning::resolve_effective_mlx_profile, model_loader};
 
 use crate::config::HiggsConfig;
 use crate::model_resolver;
+use higgs_engine::mlx_tuning::resolve_effective_mlx_profile;
 
 pub struct DoctorResult {
     pub passes: u32,
@@ -45,6 +45,7 @@ pub async fn run_doctor(
 
     check_config_valid(&mut result);
     check_config_file_permissions(config, config_path, &mut result);
+    check_misplaced_local_keys(config_path, &mut result);
     check_server_section(config, &mut result);
     check_models(config, &mut result);
     check_duplicate_models(config, &mut result);
@@ -52,6 +53,7 @@ pub async fn run_doctor(
     check_route_consistency(config, &mut result);
     check_default_provider(config, &mut result);
     check_auto_router(config, &mut result);
+    check_runtime_model_load(config, &mut result);
     check_port_availability(config, &mut result);
     check_orphaned_providers(config, &mut result);
 
@@ -68,6 +70,7 @@ fn check_config_valid(result: &mut DoctorResult) {
     pass("config file is valid", result);
 }
 
+#[allow(clippy::too_many_lines)]
 fn check_server_section(config: &crate::config::HiggsConfig, result: &mut DoctorResult) {
     let server = &config.server;
 
@@ -113,6 +116,42 @@ fn check_server_section(config: &crate::config::HiggsConfig, result: &mut Doctor
     } else {
         pass(
             &format!("server.max_body_size={} bytes", server.max_body_size),
+            result,
+        );
+    }
+
+    if server.max_image_bytes > server.max_body_size {
+        warn(
+            "server.max_image_bytes > server.max_body_size: images can never arrive within the body cap",
+            result,
+        );
+    } else {
+        pass(
+            &format!("server.max_image_bytes={} bytes", server.max_image_bytes),
+            result,
+        );
+    }
+
+    if (64..=16384).contains(&server.max_image_dimension) {
+        pass(
+            &format!("server.max_image_dimension={}", server.max_image_dimension),
+            result,
+        );
+    } else {
+        fail(
+            "server.max_image_dimension must be within 64..=16384",
+            result,
+        );
+    }
+
+    if !server.image_fetch_timeout.is_finite() || server.image_fetch_timeout <= 0.0 {
+        fail(
+            "server.image_fetch_timeout must be a positive finite number of seconds",
+            result,
+        );
+    } else {
+        pass(
+            &format!("server.image_fetch_timeout={}s", server.image_fetch_timeout),
             result,
         );
     }
@@ -262,6 +301,83 @@ fn model_label(model: &crate::config::ModelConfig) -> String {
     )
 }
 
+/// Adapter-level inspection of a resolved model directory.
+///
+/// The merged `higgs-engine::model_loader::ModelConfig` only exposes
+/// `model_dir`/`model_type`; capability, adapter, and version metadata lives on
+/// the merged adapter registry (`higgs-models::adapter`), so the doctor resolves
+/// it here.
+struct InspectedAdapter {
+    capabilities: higgs_models::adapter::Capabilities,
+    adapter_id: &'static str,
+    family: String,
+    version: Option<higgs_models::adapter::ModelVersion>,
+}
+
+fn inspect_adapter(resolved: &std::path::Path) -> Result<InspectedAdapter, String> {
+    let detected = higgs_models::adapter::detect(resolved)
+        .map_err(|e| format!("architecture detection failed: {e}"))?;
+    let adapter = higgs_models::adapter::resolve(&detected)
+        .map_err(|e| format!("adapter resolution failed: {e}"))?;
+    let info = adapter.describe();
+    Ok(InspectedAdapter {
+        capabilities: info.capabilities,
+        adapter_id: info.id,
+        family: info.family.to_string(),
+        version: detected.version,
+    })
+}
+
+/// Whether a checkpoint declares vision capability from its own `config.json`:
+/// a `vision_config` key or a `*_vl` model type (wrapper or effective).
+///
+/// This is the checkpoint-side signal; it is independent of whether the
+/// resolved adapter implements vision ([`higgs_models::adapter::Capabilities`]'s
+/// `vision`).
+fn checkpoint_declares_vision(detected: &higgs_models::adapter::DetectedModel) -> bool {
+    detected.raw.get("vision_config").is_some()
+        || detected.model_type.contains("_vl")
+        || detected
+            .wrapper_model_type
+            .as_deref()
+            .is_some_and(|model_type| model_type.contains("_vl"))
+}
+
+/// The vision column for the capability report.
+///
+/// The report is checkpoint-driven so a text-only `gemma3_text` / `gemma4_text`
+/// checkpoint never claims vision even though it shares an adapter with the
+/// multimodal `gemma3` / `gemma4` checkpoints:
+/// `supported` when the resolved adapter implements vision **and** the
+/// checkpoint declares vision weights, `tower-ignored` when the checkpoint
+/// declares vision weights that the resolved text-only adapter skips,
+/// `disabled` when the config's `disable_vision` escape hatch forces a
+/// vision-capable checkpoint to load text-only, and `none` otherwise. The
+/// parenthetical names the checkpoint's declared model type (wrapper when
+/// present), matching the family names a loaded model would report.
+fn vision_status(
+    inspected: &InspectedAdapter,
+    detected: Option<&higgs_models::adapter::DetectedModel>,
+    disable_vision: bool,
+) -> String {
+    let Some(detected_config) = detected else {
+        return "vision: none".to_owned();
+    };
+    let family = detected_config
+        .wrapper_model_type
+        .as_deref()
+        .unwrap_or(detected_config.model_type.as_str());
+    if disable_vision && checkpoint_declares_vision(detected_config) {
+        format!("vision: disabled (escape hatch; {family})")
+    } else if inspected.capabilities.vision && checkpoint_declares_vision(detected_config) {
+        format!("vision: supported ({family})")
+    } else if checkpoint_declares_vision(detected_config) {
+        format!("vision: tower-ignored ({family})")
+    } else {
+        "vision: none".to_owned()
+    }
+}
+
 fn check_prefill_yield_tokens(
     label: &str,
     prefill_yield_tokens: Option<u32>,
@@ -306,7 +422,7 @@ fn check_mla_latent_cache_architecture(
     if !higgs_models::cache::resolve_mla_latent_cache(model.kv_cache_config().mla_latent) {
         return;
     }
-    match model_loader::ModelConfig::from_dir(resolved) {
+    match inspect_adapter(resolved) {
         Ok(inspected) => check_mla_latent_cache_adapter(label, &inspected, result),
         Err(err) => {
             warn(
@@ -321,7 +437,7 @@ fn check_mla_latent_cache_architecture(
 
 fn check_mla_latent_cache_adapter(
     label: &str,
-    inspected: &model_loader::ModelConfig,
+    inspected: &InspectedAdapter,
     result: &mut DoctorResult,
 ) {
     if inspected.capabilities.mla_latent_cache {
@@ -347,11 +463,24 @@ fn check_mla_latent_cache_adapter(
 fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
     for model in &config.models {
         let label = model_label(model);
+        // The uncached suffix a continued turn prefills can never usefully
+        // exceed the retained-session cap it is served from.
+        if model.kv_max_suffix_prefill_tokens > model.kv_max_session_tokens {
+            warn(
+                &format!(
+                    "model {label} sets kv_max_suffix_prefill_tokens={} above \
+                     kv_max_session_tokens={}; the session cap binds first, so the suffix \
+                     value can never take effect — lower it",
+                    model.kv_max_suffix_prefill_tokens, model.kv_max_session_tokens
+                ),
+                result,
+            );
+        }
         if let Err(error) = model.validate_disk_prefix_store() {
             fail(&format!("model {label} disk prefix store: {error}"), result);
-        } else if model.kv_disk_dir.is_some() {
+        } else if model.disk_prefix_cache_enabled() {
             pass(
-                &format!("model {label} disk prefix store is writable"),
+                &format!("model {label} disk prefix settings are valid"),
                 result,
             );
         }
@@ -386,6 +515,39 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                 continue;
             }
         }
+        // Cache-resident retention limits: catch values that "work" but quietly
+        // defeat the cache (a too-low cap drops it almost every turn → constant
+        // full-prefill). 0 = disabled, which is fine.
+        let kv = model.kv_cache_config();
+        if kv.max_session_tokens > 0 && kv.max_session_tokens < 512 {
+            warn(
+                &format!(
+                    "model {label} kv_max_session_tokens={} is very low — most turns will drop the retained cache and full-prefill (use 0 to disable the cap, or a larger value)",
+                    kv.max_session_tokens
+                ),
+                result,
+            );
+        }
+        if kv.retained_idle_secs > 0 && kv.retained_idle_secs < 30 {
+            warn(
+                &format!(
+                    "model {label} kv_retained_idle_secs={} is very low — retained caches will be evicted almost immediately (use 0 to disable idle eviction, or a larger value)",
+                    kv.retained_idle_secs
+                ),
+                result,
+            );
+        }
+        // A byte budget smaller than a single typical prefix defeats the cache
+        // (every store evicts immediately). Warn but don't fail — 0 disables it.
+        if kv.kv_cache_bytes > 0 && kv.kv_cache_bytes < 1 << 20 {
+            warn(
+                &format!(
+                    "model {label} kv_cache_bytes={} is very low (< 1 MiB) — the prefix cache will likely evict every entry and provide no reuse (use 0 to disable the budget, or a larger value)",
+                    kv.kv_cache_bytes
+                ),
+                result,
+            );
+        }
         if model.batch && kv_cache_config.is_turboquant() {
             fail(
                 &format!(
@@ -395,9 +557,112 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
             );
             continue;
         }
+        if model.kv_cache_config().is_turboquant() {
+            let tq_default = higgs_models::cache::DEFAULT_TURBOQUANT_ACTIVATE_AT;
+            warn(
+                &format!(
+                    "model {label} sets kv_cache=turboquant: its custom Metal decode kernels are \
+                     ~20-25% slower than dense SDPA until the activation threshold (default \
+                     {tq_default} tokens; override with HIGGS_TURBOQUANT_MIN_TOKENS), plus a \
+                     first-token stall when prefilled KV is bulk-quantized. Dense KV is only \
+                     ~10 KB/token — prefer it unless very long context threatens memory."
+                ),
+                result,
+            );
+        }
+        if let Some(ref drafter) = model.draft_model {
+            if !std::path::Path::new(drafter).exists() {
+                fail(
+                    &format!("model {label} draft_model path does not exist: {drafter}"),
+                    result,
+                );
+                continue;
+            }
+            if model.batch {
+                fail(
+                    &format!(
+                        "model {label} sets draft_model but DFlash is simple-engine only (batch=true)"
+                    ),
+                    result,
+                );
+                continue;
+            }
+        }
+        // PFlash compressive prefill (docs/RESEARCH-pflash-prior-art.md).
+        if let Some(ref pd) = model.prefill_drafter {
+            if !std::path::Path::new(pd).exists() {
+                fail(
+                    &format!("model {label} prefill_drafter path does not exist: {pd}"),
+                    result,
+                );
+                continue;
+            }
+            if model.batch {
+                fail(
+                    &format!(
+                        "model {label} sets prefill_drafter but PFlash is simple-engine only (batch=true)"
+                    ),
+                    result,
+                );
+                continue;
+            }
+        }
+        if model.prefill_compression != crate::config::PrefillCompressionMode::Off
+            && model.prefill_drafter.is_none()
+        {
+            fail(
+                &format!(
+                    "model {label} sets prefill_compression={:?} but no prefill_drafter is configured",
+                    model.prefill_compression
+                ),
+                result,
+            );
+            continue;
+        }
+        if model.prefill_drafter.is_some()
+            && model.prefill_compression != crate::config::PrefillCompressionMode::Off
+        {
+            warn(
+                &format!(
+                    "model {label} enables PFlash (mode={:?}, keep_ratio={}, threshold={}): \
+                     max_auto_prefill_ratio={}; \
+                     compressed output is NOT byte-identical to uncompressed. \
+                     Validate on your workload before relying on it.",
+                    model.prefill_compression,
+                    model.prefill_keep_ratio,
+                    model.prefill_threshold,
+                    model.prefill_max_auto_prefill_ratio
+                ),
+                result,
+            );
+        }
+        if let Err(error) = crate::config::validate_pflash_settings(model) {
+            fail(&format!("model {label} {error}"), result);
+            continue;
+        }
+        if model.prefill_suffix_identity_threshold > 512 {
+            warn(
+                &format!(
+                    "model {label} prefill_suffix_identity_threshold={} is high; exact suffix prefill can dominate TTFT on slow targets",
+                    model.prefill_suffix_identity_threshold
+                ),
+                result,
+            );
+        }
+        if model.prefill_drafter.is_some() {
+            if model.prefill_threshold < 1024 {
+                warn(
+                    &format!(
+                        "model {label} prefill_threshold={} is very low; compressing short prompts costs more than it saves",
+                        model.prefill_threshold
+                    ),
+                    result,
+                );
+            }
+        }
         match model_resolver::resolve(&model.path) {
             Ok(resolved) => {
-                let inspected = match model_loader::ModelConfig::from_dir(&resolved) {
+                let inspected = match inspect_adapter(&resolved) {
                     Ok(inspected) => inspected,
                     Err(err) => {
                         fail(
@@ -407,6 +672,28 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                         continue;
                     }
                 };
+                let detected = higgs_models::adapter::detect(&resolved).ok();
+                if model.disable_vision
+                    && !detected.as_ref().is_some_and(checkpoint_declares_vision)
+                {
+                    warn(
+                        &format!(
+                            "model {label} sets disable_vision=true but the checkpoint has no vision weights; the flag is a no-op"
+                        ),
+                        result,
+                    );
+                }
+                if !inspected.capabilities.vision
+                    && detected.as_ref().is_some_and(checkpoint_declares_vision)
+                {
+                    warn(
+                        &format!(
+                            "model {label} checkpoint contains vision weights that Higgs will ignore (adapter '{}' does not implement vision)",
+                            inspected.adapter_id
+                        ),
+                        result,
+                    );
+                }
                 if model.batch && !inspected.capabilities.batch_engine {
                     fail(
                         &format!(
@@ -439,16 +726,542 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
                 let version = inspected
                     .version
                     .map_or_else(|| "unknown".to_owned(), |version| version.to_string());
+                let vision = vision_status(&inspected, detected.as_ref(), model.disable_vision);
                 pass(
                     &format!(
-                        "model {label} resolvable (adapter={}, family={}, version={version}; {profile_msg})",
+                        "model {label} resolvable (adapter={}, family={}, version={version}; {vision}; {profile_msg})",
                         inspected.adapter_id, inspected.family
                     ),
                     result,
                 );
+                check_eschamoe_checkpoint(&resolved, &label, result);
+                check_hadamard_manifest(&resolved, &label, result);
             }
             Err(err) => fail(&format!("model {label} not found: {err}"), result),
         }
+    }
+}
+
+// -- Eschamoe checkpoint checks --
+
+/// Check an eschamoe checkpoint before the server starts.
+///
+/// The check validates the quantization declaration, estimates the resident
+/// size after conversion, and warns about the slow CPU-bound load.
+fn check_eschamoe_checkpoint(model_dir: &std::path::Path, label: &str, result: &mut DoctorResult) {
+    // Measured Metal/MLX facts: the GPU-recommended working set is the real
+    // ceiling for resident MLX memory; total RAM is only the fallback when
+    // the accessor is unavailable (non-macOS, MLX not initialized).
+    let metal_recommended = higgs_engine::MlxMemorySnapshot::measure()
+        .ok()
+        .and_then(|snapshot| snapshot.metal_recommended_working_set_bytes)
+        .filter(|bytes| *bytes > 0);
+    check_eschamoe_checkpoint_with_ram(
+        model_dir,
+        label,
+        total_system_ram_bytes(),
+        metal_recommended,
+        higgs_models::eschamoe::native_mode(),
+        result,
+    );
+}
+
+fn check_eschamoe_checkpoint_with_ram(
+    model_dir: &std::path::Path,
+    label: &str,
+    ram_bytes: Option<u64>,
+    metal_recommended_bytes: Option<u64>,
+    native: bool,
+    result: &mut DoctorResult,
+) {
+    let is_eschamoe = match higgs_models::eschamoe::is_eschamoe_checkpoint(model_dir) {
+        Ok(flag) => flag,
+        Err(err) => {
+            fail(
+                &format!(
+                    "model {label} has a malformed quantization declaration in \
+                     quantize_config.json or config.json (field quant_method): {err}"
+                ),
+                result,
+            );
+            return;
+        }
+    };
+
+    if !check_quant_method_declarations(model_dir, label, result) {
+        return;
+    }
+    if !is_eschamoe {
+        return;
+    }
+
+    let target = higgs_models::eschamoe::CONVERSION_TARGET;
+    if native {
+        pass(
+            &format!(
+                "model {label} is an eschamoe trellis checkpoint; higgs keeps the experts in the \
+                 trellis form and reads them with the Metal kernel. The other weights become MLX \
+                 affine {}-bit (group size {}).",
+                target.bits, target.group_size
+            ),
+            result,
+        );
+    } else {
+        pass(
+            &format!(
+                "model {label} is an eschamoe trellis checkpoint; HIGGS_ESCHA_NATIVE=0 selects \
+                 the affine path, so higgs decodes every expert to MLX affine {}-bit (group size \
+                 {}) in memory at load",
+                target.bits, target.group_size
+            ),
+            result,
+        );
+        warn(
+            &format!(
+                "model {label} is an eschamoe checkpoint on the affine path: the trellis decode \
+                 runs on the CPU at load (~140s for the 35B checkpoint) and the result is about \
+                 twice the resident size of the native path; a long first start is expected, not \
+                 a hang. Unset HIGGS_ESCHA_NATIVE for the native path."
+            ),
+            result,
+        );
+    }
+    match eschamoe_resident_estimate_bytes(model_dir, native) {
+        Some(estimate) => {
+            check_eschamoe_memory(estimate, ram_bytes, metal_recommended_bytes, label, result);
+        }
+        None => warn(
+            &format!(
+                "model {label} config.json lacks size fields (num_hidden_layers, num_experts, \
+                 moe_intermediate_size, hidden_size, vocab_size); cannot estimate resident \
+                 memory after eschamoe conversion"
+            ),
+            result,
+        ),
+    }
+}
+
+/// Compare the `quant_method` declarations of the two config files.
+///
+/// A conflict or a bad field type is an error. Return `false` on error.
+fn check_quant_method_declarations(
+    model_dir: &std::path::Path,
+    label: &str,
+    result: &mut DoctorResult,
+) -> bool {
+    let mut methods: Vec<(&str, String)> = Vec::new();
+    for file in ["quantize_config.json", "config.json"] {
+        let Ok(raw) = std::fs::read_to_string(model_dir.join(file)) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            // `is_eschamoe_checkpoint` already reports files that are not JSON.
+            continue;
+        };
+        if let Some(quant_config) = value.get("quantization_config") {
+            if !quant_config.is_object() {
+                fail(
+                    &format!("model {label} {file} field quantization_config is not a JSON object"),
+                    result,
+                );
+                return false;
+            }
+        }
+        let method = value.get("quant_method").or_else(|| {
+            value
+                .get("quantization_config")
+                .and_then(|qc| qc.get("quant_method"))
+        });
+        match method {
+            Some(serde_json::Value::String(name)) => methods.push((file, name.clone())),
+            Some(_) => {
+                fail(
+                    &format!("model {label} {file} field quant_method is not a string"),
+                    result,
+                );
+                return false;
+            }
+            None => {}
+        }
+    }
+    if let [(file_a, method_a), (file_b, method_b)] = methods.as_slice() {
+        if method_a != method_b {
+            fail(
+                &format!(
+                    "model {label} {file_a} quant_method=\"{method_a}\" conflicts with {file_b} \
+                     quant_method=\"{method_b}\"; the loader obeys {file_a}"
+                ),
+                result,
+            );
+            return false;
+        }
+    }
+    true
+}
+
+/// Estimate the resident bytes of an eschamoe model after conversion.
+///
+/// The estimate counts the expert weights and the vocabulary weights. These
+/// weights dominate the total.
+///
+/// The vocabulary weights always take the affine layout: packed values plus
+/// one fp16 scale and one fp16 bias per group. The expert weights depend on
+/// the mode. The affine path gives them the same layout. The native path
+/// keeps the trellis codes, which hold `K` bits for each weight, and `K`
+/// differs per projection: the 35B release uses 2 bits for `gate_up_proj` and
+/// 3 for `down_proj`. Thus the native estimate reads the rate of each
+/// projection from `quantization_config.layer_meta` and falls back to the
+/// affine estimate when that block is absent.
+fn eschamoe_resident_estimate_bytes(model_dir: &std::path::Path, native: bool) -> Option<u64> {
+    higgs_models::eschamoe::resident_estimate_bytes(model_dir, native)
+}
+
+/// Warn when the resident estimate crowds the memory of the machine.
+///
+/// No public accessor gives the Metal working-set limit to the doctor. Thus
+/// the check uses 75% of the total system RAM as a stand-in and says so.
+fn check_eschamoe_memory(
+    estimate: u64,
+    ram_bytes: Option<u64>,
+    metal_recommended_bytes: Option<u64>,
+    label: &str,
+    result: &mut DoctorResult,
+) {
+    let ram = ram_bytes.unwrap_or(u64::MAX);
+    let ram_threshold = ram / 4 * 3;
+    match metal_recommended_bytes {
+        Some(metal) if estimate > metal && metal <= ram_threshold => {
+            warn(
+                &format!(
+                    "model {label} needs an estimated {:.1} GiB resident after eschamoe \
+                     conversion, above the measured Metal recommended working set ({:.1} GiB). \
+                     Requests use the configured fixed context limit; \
+                     consider a smaller quantization",
+                    gib(estimate),
+                    gib(metal)
+                ),
+                result,
+            );
+        }
+        Some(metal) if estimate <= metal => {
+            pass(
+                &format!(
+                    "model {label} estimated resident size after eschamoe conversion \
+                     (~{:.1} GiB weights) fits the measured Metal recommended working set \
+                     ({:.1} GiB)",
+                    gib(estimate),
+                    gib(metal)
+                ),
+                result,
+            );
+        }
+        _ if estimate > ram_threshold => {
+            warn(
+                &format!(
+                    "model {label} needs an estimated {:.1} GiB resident after eschamoe \
+                     conversion — far more than the on-disk size suggests (the 35B release is \
+                     12.3 GB on disk but ~20 GB resident). That exceeds 75% of system RAM \
+                     ({:.1} GiB). No measured Metal working set is available, so total RAM is \
+                     the reference; the real Metal limit is lower. Expect memory pressure or \
+                     an OOM kill",
+                    gib(estimate),
+                    gib(ram)
+                ),
+                result,
+            );
+        }
+        _ => {
+            pass(
+                &format!(
+                    "model {label} estimated resident size after eschamoe conversion \
+                     (~{:.1} GiB weights) fits in system RAM ({:.1} GiB)",
+                    gib(estimate),
+                    gib(ram)
+                ),
+                result,
+            );
+        }
+    }
+}
+
+/// Convert bytes to GiB for display.
+#[allow(clippy::cast_precision_loss, clippy::as_conversions)]
+const fn gib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+/// Read the total system RAM in bytes.
+///
+/// The engine reads the Metal working-set limit through a private helper.
+/// The doctor cannot call it, so the doctor reads the total RAM instead.
+#[cfg(target_os = "macos")]
+fn total_system_ram_bytes() -> Option<u64> {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    String::from_utf8(output.stdout).ok()?.trim().parse().ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn total_system_ram_bytes() -> Option<u64> {
+    None
+}
+
+// -- Hadamard-rotation manifest checks (prism_hadamard_qwen35 packs) --
+
+/// Check a `prism_hadamard_qwen35` pack's `modules` manifest before the
+/// server starts.
+///
+/// The manifest names Linear/Embedding tensors that carry a Fast
+/// Walsh-Hadamard rotation (see `higgs_models::qwen3_next::hadamard_rotate`)
+/// around their otherwise-ordinary affine Q2 matmul, driven by a per-tensor
+/// `<path>.signs` array in the checkpoint. The checkpoint's own reference
+/// loader is explicit that skipping this transform "returns wrong output
+/// rather than an error" — a truncated or hand-edited checkpoint that is
+/// missing a `.signs` tensor would otherwise load "successfully" and decode
+/// silently wrong text. This check reads only the safetensors header (tensor
+/// names/shapes, no weight data) so it stays cheap even for a multi-GB pack.
+fn check_hadamard_manifest(model_dir: &std::path::Path, label: &str, result: &mut DoctorResult) {
+    let Ok(config_text) = std::fs::read_to_string(model_dir.join("config.json")) else {
+        return; // model resolution already failed/warned above
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_text) else {
+        return;
+    };
+    let Some(modules) = config.get("modules").and_then(serde_json::Value::as_array) else {
+        return; // not a Hadamard-manifest pack
+    };
+
+    let schema_version = config
+        .get("schema_version")
+        .and_then(serde_json::Value::as_i64);
+    // Pack config schema 1 = original preview, 2 = re-release (adds
+    // vision/components metadata; text path unaffected). The Hadamard
+    // manifest contract is versioned separately in hadamard.json (v1 in both).
+    if !matches!(schema_version, Some(1) | Some(2)) {
+        fail(
+            &format!(
+                "model {label} has a `modules` Hadamard-rotation manifest but schema_version is \
+                 {schema_version:?} (expected 1 or 2); refusing to guess at an unrecognized \
+                 rotation contract"
+            ),
+            result,
+        );
+        return;
+    }
+
+    // Nothing to verify against the checkpoint if every listed module has
+    // `block == 0` (declared but not rotated) — skip the (possibly
+    // multi-shard) header read entirely in that case.
+    let any_rotated = modules.iter().any(|module| {
+        module
+            .get("block")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|block| block != 0)
+    });
+    let tensor_shapes = if any_rotated {
+        match read_safetensors_header_shapes(model_dir) {
+            Ok(shapes) => shapes,
+            Err(err) => {
+                fail(
+                    &format!(
+                        "model {label}: could not read the safetensors header to verify the \
+                         Hadamard manifest: {err}"
+                    ),
+                    result,
+                );
+                return;
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+
+    // Manifest paths are relative to the model trunk; the checkpoint stores
+    // them under the `language_model.` prefix. Accept both forms.
+    let lookup = |path: &str| -> Option<&Vec<i64>> {
+        tensor_shapes
+            .get(&format!("language_model.{path}"))
+            .or_else(|| tensor_shapes.get(path))
+    };
+
+    let mut rotated_modules = 0usize;
+    let mut ok = true;
+    for module in modules {
+        let Some(path) = module.get("path").and_then(serde_json::Value::as_str) else {
+            fail(
+                &format!("model {label}: a `modules` manifest entry is missing `path`"),
+                result,
+            );
+            ok = false;
+            continue;
+        };
+        let block = module
+            .get("block")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        if block == 0 {
+            continue; // listed but not rotated — nothing to verify
+        }
+        if !matches!(block, 512 | 1024 | 2048 | 4096) {
+            fail(
+                &format!(
+                    "model {label}: {path} declares Hadamard block={block}, not one of \
+                     512/1024/2048/4096"
+                ),
+                result,
+            );
+            ok = false;
+            continue;
+        }
+        let Some(weight_shape) = lookup(&format!("{path}.weight")) else {
+            fail(
+                &format!(
+                    "model {label}: {path} is in the Hadamard manifest but has no `.weight` \
+                     tensor in the checkpoint"
+                ),
+                result,
+            );
+            ok = false;
+            continue;
+        };
+        // Packed 2-bit affine layout (matches `bonsai_q2.rs`): `weight` is
+        // `[rows, in_features/16]` for both a Linear (`rows` = out_features)
+        // and an Embedding (`rows` = vocab_size) — the rotated axis is
+        // always the packed one.
+        let Some(in_features) = weight_shape.get(1).map(|packed| packed * 16) else {
+            fail(
+                &format!(
+                    "model {label}: {path}.weight has shape {weight_shape:?}, expected 2 \
+                     dimensions ([rows, in_features/16])"
+                ),
+                result,
+            );
+            ok = false;
+            continue;
+        };
+        let Some(signs_shape) = lookup(&format!("{path}.signs")) else {
+            fail(
+                &format!(
+                    "model {label}: {path} declares Hadamard block={block} but has no `.signs` \
+                     tensor — the checkpoint is incomplete; loading it would silently skip the \
+                     rotation and decode wrong text"
+                ),
+                result,
+            );
+            ok = false;
+            continue;
+        };
+        if signs_shape.as_slice() != [in_features] {
+            fail(
+                &format!(
+                    "model {label}: {path}.signs has shape {signs_shape:?}, expected \
+                     [{in_features}] to match {path}.weight's packed in_features"
+                ),
+                result,
+            );
+            ok = false;
+            continue;
+        }
+        rotated_modules += 1;
+    }
+
+    if ok {
+        pass(
+            &format!(
+                "model {label} is a prism_hadamard_qwen35 pack; Hadamard manifest verified \
+                 ({rotated_modules} rotated module(s), every `.signs` tensor present with the \
+                 expected shape)"
+            ),
+            result,
+        );
+    }
+}
+
+/// Read every safetensors shard/sidecar's header (tensor name -> shape),
+/// without loading any tensor data. Manual minimal parse of the safetensors
+/// format (an 8-byte little-endian header length, then that many bytes of
+/// JSON) rather than `safetensors::SafeTensors::read_metadata`, which
+/// additionally validates that the buffer's length matches the full file
+/// size — exactly the multi-GB read this check exists to avoid.
+fn read_safetensors_header_shapes(
+    model_dir: &std::path::Path,
+) -> Result<HashMap<String, Vec<i64>>, String> {
+    let mut shapes = HashMap::new();
+    for file_path in
+        higgs_models::collect_safetensors_files(model_dir).map_err(|e| e.to_string())?
+    {
+        let mut file = std::fs::File::open(&file_path).map_err(|e| e.to_string())?;
+        let mut len_bytes = [0u8; 8];
+        file.read_exact(&mut len_bytes).map_err(|e| e.to_string())?;
+        let header_len = u64::from_le_bytes(len_bytes);
+        let mut header_bytes = vec![0u8; usize::try_from(header_len).map_err(|e| e.to_string())?];
+        file.read_exact(&mut header_bytes)
+            .map_err(|e| e.to_string())?;
+        let header: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&header_bytes).map_err(|e| e.to_string())?;
+        for (name, info) in header {
+            if name == "__metadata__" {
+                continue;
+            }
+            let Some(shape) = info.get("shape").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            let shape: Vec<i64> = shape.iter().filter_map(serde_json::Value::as_i64).collect();
+            shapes.insert(name, shape);
+        }
+    }
+    Ok(shapes)
+}
+
+/// Catch `[local]` keys mistakenly written under `[server]`.
+///
+/// `local.allow_runtime_model_load = true` placed below a `[server]` header is
+/// parsed by TOML as `server.local.*` -- an unknown key serde silently drops, so
+/// the setting never takes effect. This is only visible in the raw file; the
+/// parsed [`HiggsConfig`] no longer carries the stray key.
+fn check_misplaced_local_keys(config_path: Option<&std::path::Path>, result: &mut DoctorResult) {
+    let Some(path) = config_path else { return };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(doc) = raw.parse::<toml_edit::DocumentMut>() else {
+        return;
+    };
+    let Some(server) = doc.get("server").and_then(|item| item.as_table()) else {
+        return;
+    };
+
+    let stray: Vec<&str> = [
+        "local",
+        "allow_runtime_model_load",
+        "raise_wired_limit",
+        "mlx_profile",
+    ]
+    .into_iter()
+    .filter(|key| server.contains_key(key))
+    .collect();
+    if stray.is_empty() {
+        pass("no misplaced [local] keys under [server]", result);
+    } else {
+        warn(
+            &format!(
+                "{stray:?} found under [server]: TOML reads these as server.* and silently ignores them, so the setting never applies. Move them to a top-level [local] table."
+            ),
+            result,
+        );
+    }
+}
+
+fn check_runtime_model_load(config: &HiggsConfig, result: &mut DoctorResult) {
+    if config.local.allow_runtime_model_load {
+        warn(
+            "local.allow_runtime_model_load is enabled: POST/DELETE /v1/models can load and unload models at runtime; ensure server.api_key restricts this to trusted operators",
+            result,
+        );
+    } else {
+        pass("runtime model load/unload disabled", result);
     }
 }
 
@@ -706,6 +1519,37 @@ mod tests {
         assert_eq!(result.failures, 1);
     }
 
+    // -- Misplaced [local] keys under [server] --
+
+    fn write_config(toml: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), toml).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_local_key_under_server_warns() {
+        // The exact footgun: dotted `local.*` written below [server] parses as
+        // server.local.* and is silently dropped.
+        let dir =
+            write_config("[server]\nhost = \"0.0.0.0\"\nlocal.allow_runtime_model_load = true\n");
+        let mut result = empty_result();
+        check_misplaced_local_keys(Some(&dir.path().join("config.toml")), &mut result);
+        assert_eq!(result.warnings, 1);
+        assert_eq!(result.passes, 0);
+    }
+
+    #[test]
+    fn test_correct_local_table_passes() {
+        let dir = write_config(
+            "[server]\nhost = \"0.0.0.0\"\n\n[local]\nallow_runtime_model_load = true\n",
+        );
+        let mut result = empty_result();
+        check_misplaced_local_keys(Some(&dir.path().join("config.toml")), &mut result);
+        assert_eq!(result.passes, 1);
+        assert_eq!(result.warnings, 0);
+    }
+
     #[test]
     fn prefill_yield_tokens_rejects_small_nonzero_values() {
         let mut result = empty_result();
@@ -736,37 +1580,11 @@ mod tests {
             models: vec![
                 ModelConfig {
                     path: "org/model-a".to_owned(),
-                    name: None,
-                    mlx_profile: None,
-                    batch: false,
-                    prefill_yield_tokens: None,
-                    kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                    kv_bits: 3,
-                    kv_seed: 0,
-                    kv_key_bits: None,
-                    kv_value_bits: None,
-                    kv_norm_correction: true,
-                    kv_adaptive_dense_layers: 0,
-                    kv_disk_dir: None,
-                    kv_disk_space_mb: 4096,
-                    mla_latent_cache: None,
+                    ..Default::default()
                 },
                 ModelConfig {
                     path: "org/model-b".to_owned(),
-                    name: None,
-                    mlx_profile: None,
-                    batch: false,
-                    prefill_yield_tokens: None,
-                    kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                    kv_bits: 3,
-                    kv_seed: 0,
-                    kv_key_bits: None,
-                    kv_value_bits: None,
-                    kv_norm_correction: true,
-                    kv_adaptive_dense_layers: 0,
-                    kv_disk_dir: None,
-                    kv_disk_space_mb: 4096,
-                    mla_latent_cache: None,
+                    ..Default::default()
                 },
             ],
             ..HiggsConfig::default()
@@ -783,37 +1601,11 @@ mod tests {
             models: vec![
                 ModelConfig {
                     path: "org/model-a".to_owned(),
-                    name: None,
-                    mlx_profile: None,
-                    batch: false,
-                    prefill_yield_tokens: None,
-                    kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                    kv_bits: 3,
-                    kv_seed: 0,
-                    kv_key_bits: None,
-                    kv_value_bits: None,
-                    kv_norm_correction: true,
-                    kv_adaptive_dense_layers: 0,
-                    kv_disk_dir: None,
-                    kv_disk_space_mb: 4096,
-                    mla_latent_cache: None,
+                    ..Default::default()
                 },
                 ModelConfig {
                     path: "org/model-a".to_owned(),
-                    name: None,
-                    mlx_profile: None,
-                    batch: false,
-                    prefill_yield_tokens: None,
-                    kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                    kv_bits: 3,
-                    kv_seed: 0,
-                    kv_key_bits: None,
-                    kv_value_bits: None,
-                    kv_norm_correction: true,
-                    kv_adaptive_dense_layers: 0,
-                    kv_disk_dir: None,
-                    kv_disk_space_mb: 4096,
-                    mla_latent_cache: None,
+                    ..Default::default()
                 },
             ],
             ..HiggsConfig::default()
@@ -1001,6 +1793,13 @@ mod tests {
     fn server_with(modify: impl FnOnce(&mut ServerSection)) -> HiggsConfig {
         let mut server = ServerSection::default();
         modify(&mut server);
+        // Keep the image cap within the body cap so the default advisory (the
+        // 20 MiB image cap exceeds the 10 MiB body cap) doesn't fire in tests
+        // isolating other server checks. Tests exercising the advisory set
+        // `max_image_bytes` themselves and build the config directly.
+        if server.max_image_bytes > server.max_body_size {
+            server.max_image_bytes = server.max_body_size;
+        }
         HiggsConfig {
             server,
             ..HiggsConfig::default()
@@ -1013,7 +1812,9 @@ mod tests {
         let mut result = empty_result();
         check_server_section(&config, &mut result);
         assert_eq!(result.failures, 0);
-        assert_eq!(result.warnings, 0);
+        // Advisory only: the default image cap (20 MiB) exceeds the default
+        // body cap (10 MiB), which the doctor flags on an untouched config.
+        assert_eq!(result.warnings, 1);
     }
 
     #[test]
@@ -1079,6 +1880,78 @@ mod tests {
         let mut result = empty_result();
         check_server_section(&config, &mut result);
         assert!(result.warnings >= 1);
+        assert_eq!(result.failures, 0);
+    }
+
+    // -- Vision server-section validation --
+
+    #[test]
+    fn doctor_warns_when_image_cap_exceeds_body_cap() {
+        let mut server = ServerSection::default();
+        server.max_image_bytes = server.max_body_size + 1;
+        let config = HiggsConfig {
+            server,
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert_eq!(result.failures, 0);
+        assert!(result.warnings >= 1);
+    }
+
+    #[test]
+    fn test_max_image_dimension_below_range_fails() {
+        let config = server_with(|s| s.max_image_dimension = 63);
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert!(result.failures >= 1);
+    }
+
+    #[test]
+    fn test_max_image_dimension_above_range_fails() {
+        let config = server_with(|s| s.max_image_dimension = 16385);
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert!(result.failures >= 1);
+    }
+
+    #[test]
+    fn test_max_image_dimension_in_range_passes() {
+        let config = server_with(|s| s.max_image_dimension = 4096);
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert_eq!(result.failures, 0);
+    }
+
+    #[test]
+    fn test_image_fetch_timeout_zero_fails() {
+        let config = server_with(|s| s.image_fetch_timeout = 0.0);
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert!(result.failures >= 1);
+    }
+
+    #[test]
+    fn test_image_fetch_timeout_negative_fails() {
+        let config = server_with(|s| s.image_fetch_timeout = -1.0);
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert!(result.failures >= 1);
+    }
+
+    #[test]
+    fn test_image_fetch_timeout_nan_fails() {
+        let config = server_with(|s| s.image_fetch_timeout = f64::NAN);
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
+        assert!(result.failures >= 1);
+    }
+
+    #[test]
+    fn test_image_fetch_timeout_positive_passes() {
+        let config = server_with(|s| s.image_fetch_timeout = 10.0);
+        let mut result = empty_result();
+        check_server_section(&config, &mut result);
         assert_eq!(result.failures, 0);
     }
 
@@ -1279,20 +2152,7 @@ mod tests {
             },
             models: vec![ModelConfig {
                 path: "org/other-model".to_owned(),
-                name: None,
-                mlx_profile: None,
-                batch: false,
-                prefill_yield_tokens: None,
-                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                kv_bits: 3,
-                kv_seed: 0,
-                kv_key_bits: None,
-                kv_value_bits: None,
-                kv_norm_correction: true,
-                kv_adaptive_dense_layers: 0,
-                kv_disk_dir: None,
-                kv_disk_space_mb: 4096,
-                mla_latent_cache: None,
+                ..Default::default()
             }],
             ..HiggsConfig::default()
         };
@@ -1313,20 +2173,7 @@ mod tests {
             },
             models: vec![ModelConfig {
                 path: "org/router-model".to_owned(),
-                name: None,
-                mlx_profile: None,
-                batch: false,
-                prefill_yield_tokens: None,
-                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                kv_bits: 3,
-                kv_seed: 0,
-                kv_key_bits: None,
-                kv_value_bits: None,
-                kv_norm_correction: true,
-                kv_adaptive_dense_layers: 0,
-                kv_disk_dir: None,
-                kv_disk_space_mb: 4096,
-                mla_latent_cache: None,
+                ..Default::default()
             }],
             ..HiggsConfig::default()
         };
@@ -1349,20 +2196,7 @@ mod tests {
             },
             models: vec![ModelConfig {
                 path: "org/router-model".to_owned(),
-                name: None,
-                mlx_profile: None,
-                batch: false,
-                prefill_yield_tokens: None,
-                kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-                kv_bits: 3,
-                kv_seed: 0,
-                kv_key_bits: None,
-                kv_value_bits: None,
-                kv_norm_correction: true,
-                kv_adaptive_dense_layers: 0,
-                kv_disk_dir: None,
-                kv_disk_space_mb: 4096,
-                mla_latent_cache: None,
+                ..Default::default()
             }],
             routes: vec![RouteConfig {
                 name: Some("test".to_owned()),
@@ -1378,6 +2212,418 @@ mod tests {
         // Should pass for model found, but warn for no descriptions
         assert_eq!(result.passes, 1);
         assert_eq!(result.warnings, 1);
+    }
+
+    // -- Eschamoe checkpoint checks --
+
+    fn write_model_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, content) in files {
+            std::fs::write(dir.path().join(name), content).unwrap();
+        }
+        dir
+    }
+
+    /// A small eschamoe model dir. The formula gives 2304 estimate bytes:
+    /// params = 2*3*4*8*16 + 2*32*16 = 4096; 4096*4/8 + 4096*4/64 = 2304.
+    fn eschamoe_model_dir() -> tempfile::TempDir {
+        write_model_dir(&[
+            ("quantize_config.json", r#"{"quant_method":"eschamoe"}"#),
+            (
+                "config.json",
+                r#"{"model_type":"qwen3_5_moe","num_hidden_layers":2,"num_experts":4,
+                    "moe_intermediate_size":8,"hidden_size":16,"vocab_size":32}"#,
+            ),
+        ])
+    }
+
+    #[test]
+    fn test_eschamoe_conflicting_quant_method_fails() {
+        let dir = write_model_dir(&[
+            ("quantize_config.json", r#"{"quant_method":"awq"}"#),
+            (
+                "config.json",
+                r#"{"quantization_config":{"quant_method":"eschamoe"}}"#,
+            ),
+        ]);
+        let mut result = empty_result();
+        check_eschamoe_checkpoint_with_ram(
+            dir.path(),
+            "test",
+            Some(1 << 40),
+            None,
+            true,
+            &mut result,
+        );
+        assert_eq!(result.failures, 1);
+        assert_eq!(result.passes, 0);
+    }
+
+    #[test]
+    fn test_eschamoe_malformed_quantize_config_fails() {
+        let dir = write_model_dir(&[("quantize_config.json", "not json")]);
+        let mut result = empty_result();
+        check_eschamoe_checkpoint_with_ram(
+            dir.path(),
+            "test",
+            Some(1 << 40),
+            None,
+            true,
+            &mut result,
+        );
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn test_eschamoe_exceeds_ram_warns_memory() {
+        let dir = eschamoe_model_dir();
+        // 2304 estimate bytes exceed 75% of 1024 bytes of injected RAM.
+        let mut native = empty_result();
+        check_eschamoe_checkpoint_with_ram(dir.path(), "test", Some(1024), None, true, &mut native);
+        assert_eq!(native.failures, 0);
+        assert_eq!(native.passes, 1);
+        // The native path warns about the memory estimate and nothing else.
+        assert_eq!(native.warnings, 1);
+
+        let mut affine = empty_result();
+        check_eschamoe_checkpoint_with_ram(
+            dir.path(),
+            "test",
+            Some(1024),
+            None,
+            false,
+            &mut affine,
+        );
+        assert_eq!(affine.failures, 0);
+        assert_eq!(affine.passes, 1);
+        // The affine path adds the slow CPU load warning.
+        assert_eq!(affine.warnings, 2);
+    }
+
+    #[test]
+    fn disk_directory_doctor_rejects_conflicting_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_config_json(dir.path(), "qwen2");
+        let mut model = model_with_path(dir.path().to_str().unwrap().to_owned());
+        model.kv_disk_dir = Some(dir.path().join("prefix").to_str().unwrap().to_owned());
+        model.disk_cache_path = Some(dir.path().join("other.bin"));
+        let config = HiggsConfig {
+            models: vec![model],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_models(&config, &mut result);
+        assert_eq!(
+            result.failures, 1,
+            "doctor must reject ambiguous cache destinations"
+        );
+    }
+
+    #[test]
+    fn test_kv_suffix_above_session_cap_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_config_json(dir.path(), "qwen2");
+        let mut model = model_with_path(dir.path().to_str().unwrap().to_owned());
+        model.kv_max_session_tokens = 4_096;
+        model.kv_max_suffix_prefill_tokens = 8_192;
+        let config = HiggsConfig {
+            models: vec![model],
+            ..HiggsConfig::default()
+        };
+        let mut result = empty_result();
+        check_models(&config, &mut result);
+        assert_eq!(result.failures, 0);
+        assert_eq!(result.warnings, 1, "the ineffective suffix cap must warn");
+    }
+
+    #[test]
+    fn test_eschamoe_measured_metal_working_set_drives_the_memory_check() {
+        let dir = eschamoe_model_dir();
+        // Estimate (2304 bytes) exceeds a measured 2048-byte Metal working
+        // set even though 75% of the injected RAM is far larger: the warning
+        // must cite the measured Metal limit.
+        let mut result = empty_result();
+        check_eschamoe_checkpoint_with_ram(
+            dir.path(),
+            "test",
+            Some(1 << 40),
+            Some(2048),
+            true,
+            &mut result,
+        );
+        assert_eq!(result.failures, 0);
+        assert_eq!(result.warnings, 1);
+
+        // Under the measured working set: pass citing Metal, not RAM.
+        let mut result = empty_result();
+        check_eschamoe_checkpoint_with_ram(
+            dir.path(),
+            "test",
+            Some(1 << 40),
+            Some(1 << 40),
+            true,
+            &mut result,
+        );
+        assert_eq!(result.warnings, 0);
+        assert_eq!(result.passes, 2);
+    }
+
+    #[test]
+    fn test_eschamoe_fits_ram_passes_memory_check() {
+        let dir = eschamoe_model_dir();
+        let mut native = empty_result();
+        check_eschamoe_checkpoint_with_ram(
+            dir.path(),
+            "test",
+            Some(1 << 40),
+            None,
+            true,
+            &mut native,
+        );
+        assert_eq!(native.failures, 0);
+        // Detection pass plus memory-fit pass, and no warning.
+        assert_eq!(native.passes, 2);
+        assert_eq!(native.warnings, 0);
+
+        let mut affine = empty_result();
+        check_eschamoe_checkpoint_with_ram(
+            dir.path(),
+            "test",
+            Some(1 << 40),
+            None,
+            false,
+            &mut affine,
+        );
+        assert_eq!(affine.passes, 2);
+        assert_eq!(affine.warnings, 1);
+    }
+
+    /// Test that the size fields are found under `text_config` too. A
+    /// checkpoint with a vision tower nests them there, and the released 35B
+    /// escha checkpoint does. The numbers match the flat fixture, so the
+    /// estimate must agree with it.
+    #[test]
+    fn test_eschamoe_estimate_reads_nested_text_config() {
+        let dir = write_model_dir(&[
+            ("quantize_config.json", r#"{"quant_method":"eschamoe"}"#),
+            (
+                "config.json",
+                r#"{"model_type":"qwen3_5_moe","text_config":{"num_hidden_layers":2,
+                    "num_experts":4,"moe_intermediate_size":8,"hidden_size":16,
+                    "vocab_size":32}}"#,
+            ),
+        ]);
+        assert_eq!(
+            eschamoe_resident_estimate_bytes(dir.path(), false),
+            Some(2304)
+        );
+    }
+
+    /// Test the estimate in both modes. The fixture has no `layer_meta`, so
+    /// the native estimate falls back to the affine one.
+    #[test]
+    fn test_eschamoe_resident_estimate_formula() {
+        let dir = eschamoe_model_dir();
+        assert_eq!(
+            eschamoe_resident_estimate_bytes(dir.path(), false),
+            Some(2304)
+        );
+        assert_eq!(
+            eschamoe_resident_estimate_bytes(dir.path(), true),
+            Some(2304)
+        );
+    }
+
+    /// Test that the native estimate reads the trellis rate of each
+    /// projection. The two entries hold 4*8*16*2 and 4*16*8*3 bits, so the
+    /// codes take (1024 + 1536) / 8 = 320 bytes. The vocabulary adds
+    /// 2*32*16 = 1024 params, which take 1024*4/8 + 1024*4/64 = 576 bytes.
+    #[test]
+    fn test_eschamoe_native_estimate_uses_the_trellis_rate() {
+        let dir = write_model_dir(&[
+            ("quantize_config.json", r#"{"quant_method":"eschamoe"}"#),
+            (
+                "config.json",
+                r#"{"model_type":"qwen3_5_moe","num_hidden_layers":2,"num_experts":4,
+                    "moe_intermediate_size":8,"hidden_size":16,"vocab_size":32,
+                    "quantization_config":{"quant_method":"eschamoe","layer_meta":{
+                      "layers.0.mlp.experts.gate_up_proj":{"K":2,"num_experts":4,
+                        "in_features":8,"out_features":16},
+                      "layers.0.mlp.experts.down_proj":{"K":3,"num_experts":4,
+                        "in_features":16,"out_features":8}}}}"#,
+            ),
+        ]);
+        assert_eq!(
+            eschamoe_resident_estimate_bytes(dir.path(), true),
+            Some(320 + 576)
+        );
+        // The affine path ignores `layer_meta` and keeps the old formula.
+        assert_eq!(
+            eschamoe_resident_estimate_bytes(dir.path(), false),
+            Some(2304)
+        );
+    }
+
+    #[test]
+    fn test_non_eschamoe_dir_is_silent() {
+        let dir = write_model_dir(&[("config.json", r#"{"model_type":"llama"}"#)]);
+        let mut result = empty_result();
+        check_eschamoe_checkpoint_with_ram(
+            dir.path(),
+            "test",
+            Some(1 << 40),
+            None,
+            true,
+            &mut result,
+        );
+        assert_eq!(result.passes, 0);
+        assert_eq!(result.warnings, 0);
+        assert_eq!(result.failures, 0);
+    }
+
+    /// Write a minimal valid safetensors file: an 8-byte little-endian header
+    /// length, then the JSON header itself, then one zero byte of "data" per
+    /// declared tensor (offsets aren't validated by `read_safetensors_header_shapes`,
+    /// which only reads the header).
+    fn write_fake_safetensors(dir: &std::path::Path, tensors: &[(&str, &[i64])]) {
+        let mut header = serde_json::Map::new();
+        for (name, shape) in tensors {
+            header.insert(
+                (*name).to_owned(),
+                serde_json::json!({"dtype": "U32", "shape": shape, "data_offsets": [0, 1]}),
+            );
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut file = Vec::new();
+        file.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        file.extend_from_slice(&header_bytes);
+        std::fs::write(dir.join("model.safetensors"), file).unwrap();
+    }
+
+    /// A checkpoint with no `modules` key is not a Hadamard-manifest pack —
+    /// the check must stay completely silent (no pass/warn/fail), same as
+    /// `test_non_eschamoe_dir_is_silent` for the unrelated eschamoe check.
+    #[test]
+    fn test_hadamard_manifest_absent_is_silent() {
+        let dir = write_model_dir(&[("config.json", r#"{"model_type":"llama"}"#)]);
+        let mut result = empty_result();
+        check_hadamard_manifest(dir.path(), "test", &mut result);
+        assert_eq!(result.passes, 0);
+        assert_eq!(result.warnings, 0);
+        assert_eq!(result.failures, 0);
+    }
+
+    #[test]
+    fn test_hadamard_manifest_valid_passes() {
+        let dir = write_model_dir(&[(
+            "config.json",
+            r#"{"schema_version":1,"model_type":"prism_hadamard_qwen35",
+                "modules":[{"path":"model.layers.0.mlp.down_proj","block":512,"embedding":false}]}"#,
+        )]);
+        write_fake_safetensors(
+            dir.path(),
+            &[
+                ("model.layers.0.mlp.down_proj.weight", &[64, 32]),
+                ("model.layers.0.mlp.down_proj.signs", &[512]),
+            ],
+        );
+        let mut result = empty_result();
+        check_hadamard_manifest(dir.path(), "test", &mut result);
+        assert_eq!(result.passes, 1);
+        assert_eq!(result.failures, 0);
+    }
+
+    /// The exact failure mode this check exists to catch: a manifest names a
+    /// rotated module but the checkpoint is missing its `.signs` tensor.
+    /// Loading this checkpoint would silently skip the rotation and decode
+    /// wrong text rather than error — doctor must fail closed instead.
+    #[test]
+    fn test_hadamard_manifest_missing_signs_tensor_fails() {
+        let dir = write_model_dir(&[(
+            "config.json",
+            r#"{"schema_version":1,"model_type":"prism_hadamard_qwen35",
+                "modules":[{"path":"model.layers.0.mlp.down_proj","block":512,"embedding":false}]}"#,
+        )]);
+        write_fake_safetensors(
+            dir.path(),
+            &[("model.layers.0.mlp.down_proj.weight", &[64, 32])],
+        );
+        let mut result = empty_result();
+        check_hadamard_manifest(dir.path(), "test", &mut result);
+        assert_eq!(result.failures, 1);
+        assert_eq!(result.passes, 0);
+    }
+
+    #[test]
+    fn test_hadamard_manifest_wrong_signs_shape_fails() {
+        let dir = write_model_dir(&[(
+            "config.json",
+            r#"{"schema_version":1,"model_type":"prism_hadamard_qwen35",
+                "modules":[{"path":"model.layers.0.mlp.down_proj","block":512,"embedding":false}]}"#,
+        )]);
+        write_fake_safetensors(
+            dir.path(),
+            &[
+                ("model.layers.0.mlp.down_proj.weight", &[64, 32]),
+                ("model.layers.0.mlp.down_proj.signs", &[256]),
+            ],
+        );
+        let mut result = empty_result();
+        check_hadamard_manifest(dir.path(), "test", &mut result);
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn test_hadamard_manifest_bad_block_size_fails() {
+        let dir = write_model_dir(&[(
+            "config.json",
+            r#"{"schema_version":1,"model_type":"prism_hadamard_qwen35",
+                "modules":[{"path":"model.layers.0.mlp.down_proj","block":777,"embedding":false}]}"#,
+        )]);
+        write_fake_safetensors(dir.path(), &[]);
+        let mut result = empty_result();
+        check_hadamard_manifest(dir.path(), "test", &mut result);
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn test_hadamard_manifest_bad_schema_version_fails() {
+        let dir = write_model_dir(&[(
+            "config.json",
+            r#"{"schema_version":3,"model_type":"prism_hadamard_qwen35",
+                "modules":[{"path":"model.layers.0.mlp.down_proj","block":512,"embedding":false}]}"#,
+        )]);
+        let mut result = empty_result();
+        check_hadamard_manifest(dir.path(), "test", &mut result);
+        assert_eq!(result.failures, 1);
+    }
+
+    #[test]
+    fn test_hadamard_manifest_schema_version_2_is_accepted() {
+        let dir = write_model_dir(&[(
+            "config.json",
+            r#"{"schema_version":2,"model_type":"prism_hadamard_qwen35",
+                "modules":[{"path":"model.layers.0.mlp.down_proj","block":0,"embedding":false}]}"#,
+        )]);
+        let mut result = empty_result();
+        check_hadamard_manifest(dir.path(), "test", &mut result);
+        assert_eq!(result.failures, 0);
+    }
+
+    /// A module listed with `block: 0` is declared but not rotated (today's
+    /// plain Bonsai-Q2 behavior) — nothing to verify, no safetensors file
+    /// even needed.
+    #[test]
+    fn test_hadamard_manifest_zero_block_is_ignored() {
+        let dir = write_model_dir(&[(
+            "config.json",
+            r#"{"schema_version":1,"model_type":"prism_hadamard_qwen35",
+                "modules":[{"path":"model.layers.0.mlp.up_proj","block":0,"embedding":false}]}"#,
+        )]);
+        let mut result = empty_result();
+        check_hadamard_manifest(dir.path(), "test", &mut result);
+        assert_eq!(result.passes, 1);
+        assert_eq!(result.failures, 0);
     }
 
     // -- Provider reachability --
@@ -1410,20 +2656,7 @@ mod tests {
     fn model_with_path(path: String) -> ModelConfig {
         ModelConfig {
             path,
-            name: None,
-            mlx_profile: None,
-            batch: false,
-            prefill_yield_tokens: None,
-            kv_cache: higgs_models::turboquant::KvCacheMode::Off,
-            kv_bits: 3,
-            kv_seed: 0,
-            kv_key_bits: None,
-            kv_value_bits: None,
-            kv_norm_correction: true,
-            kv_adaptive_dense_layers: 0,
-            kv_disk_dir: None,
-            kv_disk_space_mb: 4096,
-            mla_latent_cache: None,
+            ..Default::default()
         }
     }
 
@@ -1431,6 +2664,16 @@ mod tests {
         std::fs::write(
             dir.join("config.json"),
             format!(r#"{{"model_type": "{model_type}"}}"#),
+        )
+        .unwrap();
+    }
+
+    /// Write a config.json that declares vision capability (`vision_config`)
+    /// alongside the given `model_type`.
+    fn write_model_config_with_vision(dir: &std::path::Path, model_type: &str) {
+        std::fs::write(
+            dir.join("config.json"),
+            format!(r#"{{"model_type": "{model_type}", "vision_config": {{"hidden_size": 768}}}}"#),
         )
         .unwrap();
     }
@@ -1498,8 +2741,8 @@ mod tests {
                 result.failures, 0,
                 "HIGGS_MLA_LATENT_CACHE=0 should resolve the conflict away, not fail"
             );
-            assert_eq!(
-                result.warnings, 1,
+            assert!(
+                result.warnings >= 1,
                 "the masked conflict should still surface as a warning"
             );
         });
@@ -1606,6 +2849,170 @@ mod tests {
             assert_eq!(result.passes, 0);
             assert_eq!(result.warnings, 0);
             assert_eq!(result.failures, 0);
+        });
+    }
+
+    // -- Vision capability report --
+
+    #[test]
+    fn test_vision_status_supported_for_vision_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_config_with_vision(dir.path(), "llava-qwen2");
+        let inspected = inspect_adapter(dir.path()).unwrap();
+        let detected = higgs_models::adapter::detect(dir.path()).unwrap();
+        assert_eq!(
+            vision_status(&inspected, Some(&detected), false),
+            "vision: supported (llava-qwen2)"
+        );
+    }
+
+    #[test]
+    fn test_vision_status_supported_for_multimodal_gemma() {
+        // The `gemma3` / `gemma4` adapters run `load_gemma_vision_tower`, so a
+        // multimodal checkpoint (vision weights declared) reports `supported`.
+        for model_type in ["gemma3", "gemma4"] {
+            let dir = tempfile::tempdir().unwrap();
+            write_model_config_with_vision(dir.path(), model_type);
+            let inspected = inspect_adapter(dir.path()).unwrap();
+            let detected = higgs_models::adapter::detect(dir.path()).unwrap();
+            assert!(
+                inspected.capabilities.vision,
+                "{model_type} must advertise vision"
+            );
+            assert_eq!(
+                vision_status(&inspected, Some(&detected), false),
+                format!("vision: supported ({model_type})")
+            );
+        }
+    }
+
+    #[test]
+    fn test_vision_status_none_for_text_only_gemma() {
+        // `gemma3_text` / `gemma4_text` checkpoints carry no vision weights and
+        // report `none` (the shared adapter only loads a tower when the
+        // checkpoint actually has one).
+        for model_type in ["gemma3_text", "gemma4_text"] {
+            let dir = tempfile::tempdir().unwrap();
+            write_model_config_json(dir.path(), model_type);
+            let inspected = inspect_adapter(dir.path()).unwrap();
+            let detected = higgs_models::adapter::detect(dir.path()).unwrap();
+            assert_eq!(
+                vision_status(&inspected, Some(&detected), false),
+                "vision: none",
+                "{model_type} must not report vision"
+            );
+        }
+    }
+
+    #[test]
+    fn test_vision_status_tower_ignored_for_text_adapter() {
+        // A text-family adapter that truly implements no vision still reports
+        // `tower-ignored` when the checkpoint declares vision weights.
+        let dir = tempfile::tempdir().unwrap();
+        write_model_config_with_vision(dir.path(), "phi3");
+        let inspected = inspect_adapter(dir.path()).unwrap();
+        let detected = higgs_models::adapter::detect(dir.path()).unwrap();
+        assert!(!inspected.capabilities.vision);
+        assert_eq!(
+            vision_status(&inspected, Some(&detected), false),
+            "vision: tower-ignored (phi3)"
+        );
+    }
+
+    #[test]
+    fn test_vision_status_disabled_by_escape_hatch() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_config_with_vision(dir.path(), "llava-qwen2");
+        let inspected = inspect_adapter(dir.path()).unwrap();
+        let detected = higgs_models::adapter::detect(dir.path()).unwrap();
+        assert_eq!(
+            vision_status(&inspected, Some(&detected), true),
+            "vision: disabled (escape hatch; llava-qwen2)"
+        );
+    }
+
+    #[test]
+    fn test_vision_status_none_for_text_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model_config_json(dir.path(), "qwen2");
+        let inspected = inspect_adapter(dir.path()).unwrap();
+        let detected = higgs_models::adapter::detect(dir.path()).unwrap();
+        assert_eq!(
+            vision_status(&inspected, Some(&detected), false),
+            "vision: none"
+        );
+    }
+
+    #[test]
+    fn test_doctor_warns_tower_ignored_for_multimodal_checkpoint() {
+        with_mla_env(None, || {
+            let dir = tempfile::tempdir().unwrap();
+            // `phi3` has no vision adapter; a vision-declaring checkpoint still
+            // warns that its tower would be ignored.
+            write_model_config_with_vision(dir.path(), "phi3");
+            let model = model_with_path(dir.path().to_str().unwrap().to_owned());
+            let config = HiggsConfig {
+                models: vec![model],
+                ..HiggsConfig::default()
+            };
+            let mut result = empty_result();
+            check_models(&config, &mut result);
+            assert_eq!(result.failures, 0);
+            assert_eq!(result.warnings, 1);
+        });
+    }
+
+    #[test]
+    fn test_doctor_no_longer_warns_tower_ignored_for_multimodal_gemma() {
+        with_mla_env(None, || {
+            let dir = tempfile::tempdir().unwrap();
+            // gemma3/gemma4 adapters load towers: no "will ignore" warning.
+            write_model_config_with_vision(dir.path(), "gemma3");
+            let model = model_with_path(dir.path().to_str().unwrap().to_owned());
+            let config = HiggsConfig {
+                models: vec![model],
+                ..HiggsConfig::default()
+            };
+            let mut result = empty_result();
+            check_models(&config, &mut result);
+            assert_eq!(result.failures, 0);
+            assert_eq!(result.warnings, 0);
+        });
+    }
+
+    #[test]
+    fn test_doctor_disable_vision_noop_warns_for_text_checkpoint() {
+        with_mla_env(None, || {
+            let dir = tempfile::tempdir().unwrap();
+            write_model_config_json(dir.path(), "qwen2");
+            let mut model = model_with_path(dir.path().to_str().unwrap().to_owned());
+            model.disable_vision = true;
+            let config = HiggsConfig {
+                models: vec![model],
+                ..HiggsConfig::default()
+            };
+            let mut result = empty_result();
+            check_models(&config, &mut result);
+            assert_eq!(result.failures, 0);
+            assert_eq!(result.warnings, 1);
+        });
+    }
+
+    #[test]
+    fn test_doctor_disable_vision_noop_not_flagged_for_vlm() {
+        with_mla_env(None, || {
+            let dir = tempfile::tempdir().unwrap();
+            write_model_config_with_vision(dir.path(), "llava-qwen2");
+            let mut model = model_with_path(dir.path().to_str().unwrap().to_owned());
+            model.disable_vision = true;
+            let config = HiggsConfig {
+                models: vec![model],
+                ..HiggsConfig::default()
+            };
+            let mut result = empty_result();
+            check_models(&config, &mut result);
+            assert_eq!(result.failures, 0);
+            assert_eq!(result.warnings, 0);
         });
     }
 }

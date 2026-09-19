@@ -39,6 +39,8 @@ pub enum ModelFamily {
     DeepSeek,
     /// The `LLaVA` vision-language family with a supported text backbone.
     Llava,
+    /// Alibaba's Qwen vision-language wrapper family on a Qwen text backbone.
+    QwenVl,
     /// A detected family for which Higgs has no built-in family variant.
     Other(String),
 }
@@ -54,6 +56,7 @@ impl fmt::Display for ModelFamily {
             Self::Starcoder => f.write_str("Starcoder"),
             Self::DeepSeek => f.write_str("DeepSeek"),
             Self::Llava => f.write_str("Llava"),
+            Self::QwenVl => f.write_str("Qwen-VL"),
             Self::Other(name) => f.write_str(name),
         }
     }
@@ -165,8 +168,10 @@ pub trait ModelAdapter: Send + Sync {
     ///
     /// Implementations must consume `DetectedModel::raw` or `resolved_config()`
     /// rather than reopening `config.json`, and return a descriptive error when
-    /// the config or weights are incompatible.
-    fn load(&self, model: &DetectedModel) -> Result<AnyModel, ModelError>;
+    /// the config or weights are incompatible. `disable_vision` (the config's
+    /// escape hatch) asks vision-capable adapters to load their text backbone
+    /// only, skipping vision weights; the loaded model then reports no vision.
+    fn load(&self, model: &DetectedModel, disable_vision: bool) -> Result<AnyModel, ModelError>;
 }
 
 #[derive(Clone, Copy)]
@@ -184,6 +189,16 @@ enum LoadKind {
     Starcoder2,
     LlavaQwen2,
     DeepSeekV2,
+    QwenVl,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoaderBoundaryClass {
+    StandardStream,
+    QwenSpecial,
+    FullArtifact,
+    Unclassified,
 }
 
 struct BuiltinAdapter {
@@ -193,6 +208,28 @@ struct BuiltinAdapter {
     capabilities: Capabilities,
     notes: &'static str,
     kind: LoadKind,
+}
+
+#[cfg(test)]
+impl BuiltinAdapter {
+    const fn loader_boundary_class(&self) -> LoaderBoundaryClass {
+        match self.kind {
+            LoadKind::Qwen3Next | LoadKind::Qwen35Dense | LoadKind::Qwen35Moe => {
+                LoaderBoundaryClass::QwenSpecial
+            }
+            LoadKind::Bonsai
+            | LoadKind::Gemma3
+            | LoadKind::Gemma4
+            | LoadKind::LlavaQwen2
+            | LoadKind::QwenVl => LoaderBoundaryClass::FullArtifact,
+            LoadKind::Transformer
+            | LoadKind::Qwen3Moe
+            | LoadKind::Gemma2
+            | LoadKind::Phi3
+            | LoadKind::Starcoder2
+            | LoadKind::DeepSeekV2 => LoaderBoundaryClass::StandardStream,
+        }
+    }
 }
 
 #[allow(clippy::fn_params_excessive_bools)]
@@ -229,6 +266,9 @@ const fn deepseek() -> ModelFamily {
 }
 const fn llava() -> ModelFamily {
     ModelFamily::Llava
+}
+const fn qwen_vl() -> ModelFamily {
+    ModelFamily::QwenVl
 }
 
 static TRANSFORMER_DENSE: BuiltinAdapter = BuiltinAdapter {
@@ -291,7 +331,10 @@ static GEMMA3: BuiltinAdapter = BuiltinAdapter {
     id: "gemma3-text",
     family: gemma,
     version_range: "Gemma 3+ text",
-    capabilities: caps(false, false, false, false, false),
+    // The loader runs `load_gemma_vision_tower`, so multimodal `gemma3`
+    // checkpoints load with a working vision tower; text-only `gemma3_text`
+    // checkpoints keep `vision == None` and report no vision at runtime.
+    capabilities: caps(true, false, false, false, false),
     notes: "Gemma 3 text backbone",
     kind: LoadKind::Gemma3,
 };
@@ -299,7 +342,7 @@ static GEMMA4: BuiltinAdapter = BuiltinAdapter {
     id: "gemma4-text",
     family: gemma,
     version_range: "Gemma 4+ text/unified",
-    capabilities: caps(false, false, true, false, false),
+    capabilities: caps(true, false, true, false, false),
     notes: "Gemma 4 text backbone with optional MoE",
     kind: LoadKind::Gemma4,
 };
@@ -323,7 +366,7 @@ static LLAVA_QWEN2: BuiltinAdapter = BuiltinAdapter {
     id: "llava-qwen2",
     family: llava,
     version_range: "LLaVA-Qwen2",
-    capabilities: caps(true, false, false, false, false),
+    capabilities: caps(true, false, false, false, true),
     notes: "LLaVA vision-language model with Qwen2 text",
     kind: LoadKind::LlavaQwen2,
 };
@@ -335,9 +378,21 @@ static DEEPSEEK_V2: BuiltinAdapter = BuiltinAdapter {
     notes: "DeepSeek-V2 MLA/MoE",
     kind: LoadKind::DeepSeekV2,
 };
+static QWEN_VL: BuiltinAdapter = BuiltinAdapter {
+    id: "qwen_vl",
+    family: qwen_vl,
+    version_range: "Qwen-VL",
+    capabilities: caps(true, false, false, false, true),
+    notes: "Qwen-VL vision-language family on a Qwen3Next text backbone",
+    kind: LoadKind::QwenVl,
+};
 
-static BUILTINS: [&BuiltinAdapter; 13] = [
+static BUILTINS: [&BuiltinAdapter; 14] = [
     &BONSAI_Q1,
+    // Qwen-VL must precede the qwen3_5 adapters: a `qwen3_5_vl` wrapper is an
+    // exact match for QWEN_VL and for the nested `qwen3_5` backbone, so equal
+    // scores are resolved by registry order.
+    &QWEN_VL,
     &QWEN35_MOE,
     &QWEN35_DENSE,
     &QWEN3_NEXT,
@@ -374,6 +429,12 @@ impl BuiltinAdapter {
             LoadKind::Starcoder2 => model_type == "starcoder2",
             LoadKind::LlavaQwen2 => model_type == "llava-qwen2",
             LoadKind::DeepSeekV2 => model_type == "deepseek_v2",
+            LoadKind::QwenVl => {
+                matches!(
+                    text_alias.as_ref(),
+                    "qwen3_5_vl" | "qwen3_vl" | "qwen2_5_vl"
+                )
+            }
         }
     }
 
@@ -387,6 +448,10 @@ impl BuiltinAdapter {
             }
             LoadKind::Gemma3 => gemma_revision(model_type).is_some_and(|major| major >= 3),
             LoadKind::Gemma4 => gemma_revision(model_type).is_some_and(|major| major >= 4),
+            LoadKind::QwenVl => matches!(
+                strip_text_alias(model_type).as_ref(),
+                "qwen3_5_vl" | "qwen3_vl" | "qwen2_5_vl"
+            ),
             LoadKind::Transformer
             | LoadKind::Bonsai
             | LoadKind::Qwen3Next
@@ -522,7 +587,7 @@ impl ModelAdapter for BuiltinAdapter {
             None
         }
     }
-    fn load(&self, model: &DetectedModel) -> Result<AnyModel, ModelError> {
+    fn load(&self, model: &DetectedModel, disable_vision: bool) -> Result<AnyModel, ModelError> {
         self.validate_tolerant(model)?;
         if !self.has_exact_candidate(model) {
             tracing::warn!(model_type = %model.model_type, adapter = self.id, "loading an untested model version through a structurally compatible adapter");
@@ -536,11 +601,9 @@ impl ModelAdapter for BuiltinAdapter {
             }
             LoadKind::Bonsai => crate::bonsai_q1::load_bonsai_q1_with_config(dir, &model.raw)
                 .map(AnyModel::BonsaiQ1),
-            LoadKind::Qwen3Next => {
-                crate::qwen3_next::load_qwen3_next_args_from_value(model.resolved_config().clone())
-                    .and_then(|args| crate::qwen3_next::load_qwen3_next_model_with_args(dir, args))
-                    .map(AnyModel::Qwen3Next)
-            }
+            LoadKind::Qwen3Next => crate::qwen3_next::resolve_runtime_model_args(dir, &model.raw)
+                .and_then(|args| crate::qwen3_next::load_qwen3_next_model_with_args(dir, args))
+                .map(AnyModel::Qwen3Next),
             LoadKind::Qwen35Dense => qwen35_args(model)
                 .and_then(|args| crate::qwen3_next::load_qwen3_5_model_with_args(dir, args))
                 .map(AnyModel::Qwen3Next),
@@ -556,10 +619,14 @@ impl ModelAdapter for BuiltinAdapter {
                 .and_then(|args| crate::gemma2::load_gemma2_model_with_args(dir, args))
                 .map(AnyModel::Gemma2),
             LoadKind::Gemma3 => crate::gemma3::gemma3_model_args_from_value(model.raw.clone())
-                .and_then(|args| crate::gemma3::load_gemma3_model_with_args(dir, args))
+                .and_then(|args| {
+                    crate::gemma3::load_gemma3_model_with_args(dir, args, disable_vision)
+                })
                 .map(AnyModel::Gemma3),
             LoadKind::Gemma4 => crate::gemma4::gemma4_model_args_from_value(model.raw.clone())
-                .and_then(|args| crate::gemma4::load_gemma4_model_with_args(dir, args))
+                .and_then(|args| {
+                    crate::gemma4::load_gemma4_model_with_args(dir, args, disable_vision)
+                })
                 .map(AnyModel::Gemma4),
             LoadKind::Phi3 => serde_json::from_value(model.resolved_config().clone())
                 .map_err(ModelError::Json)
@@ -569,25 +636,25 @@ impl ModelAdapter for BuiltinAdapter {
                 .map_err(ModelError::Json)
                 .and_then(|args| crate::starcoder2::load_starcoder2_model_with_args(dir, args))
                 .map(AnyModel::Starcoder2),
-            LoadKind::LlavaQwen2 => {
-                crate::llava_qwen2::load_llava_qwen2_model_from_value(dir, &model.raw)
-                    .map(AnyModel::LlavaQwen2)
-            }
+            LoadKind::LlavaQwen2 => crate::llava_qwen2::load_llava_qwen2_model_from_value(
+                dir,
+                &model.raw,
+                disable_vision,
+            )
+            .map(AnyModel::LlavaQwen2),
             LoadKind::DeepSeekV2 => serde_json::from_value(model.resolved_config().clone())
                 .map_err(ModelError::Json)
                 .and_then(|args| crate::deepseek_v2::load_deepseek_v2_model_with_args(dir, args))
                 .map(AnyModel::DeepSeekV2),
+            LoadKind::QwenVl => {
+                crate::qwen_vl::load_qwen_vl_model_from_value(dir, &model.raw, disable_vision)
+            }
         }
     }
 }
 
 fn qwen35_args(model: &DetectedModel) -> Result<crate::qwen3_next::Qwen3NextModelArgs, ModelError> {
-    if model.raw.get("text_config").is_some() {
-        crate::qwen3_next::load_qwen3_5_text_config_args_from_value(&model.raw)
-    } else {
-        let wrapped = serde_json::json!({ "text_config": model.raw.clone() });
-        crate::qwen3_next::load_qwen3_5_text_config_args_from_value(&wrapped)
-    }
+    crate::qwen3_next::resolve_runtime_model_args(&model.dir, &model.raw)
 }
 
 fn as_model_adapter(adapter: &'static BuiltinAdapter) -> &'static dyn ModelAdapter {
@@ -715,12 +782,17 @@ fn unsupported_error(model_type: &str) -> ModelError {
 fn qwen_revision(model_type: &str) -> Option<(u32, bool)> {
     let normalized = strip_text_alias(model_type);
     let rest = normalized.strip_prefix("qwen3_")?;
+    if rest == "vl" {
+        // "qwen3_vl": the VL suffix directly follows the major version with no
+        // minor digit; report the major (3) as the version.
+        return Some((3, false));
+    }
     let (minor_text, suffix) = rest
         .split_once('_')
         .map_or((rest, None), |(minor, suffix)| (minor, Some(suffix)));
     let minor = minor_text.parse().ok()?;
     match suffix {
-        None => Some((minor, false)),
+        None | Some("vl") => Some((minor, false)), // VL wrapper: text backbone inside text_config
         Some("moe") => Some((minor, true)),
         Some(_) => None,
     }
@@ -798,4 +870,108 @@ fn number_after(model_type: &str, prefix: &str) -> Option<ModelVersion> {
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
     Some(ModelVersion { major, minor })
+}
+
+#[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Write a `config.json` with the given value and return the tempdir.
+    fn write_config(value: &serde_json::Value) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(value).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// A structurally complete Qwen3.5 text-backbone config.
+    fn complete_text_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "qwen3_5",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "vocab_size": 152_064,
+            "intermediate_size": 11_008,
+            "head_dim": 128,
+            "max_position_embeddings": 131_072,
+            "linear_num_value_heads": 32,
+            "linear_num_key_heads": 16,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "rms_norm_eps": 0.000_001
+        })
+    }
+
+    /// Adding an adapter without classifying its direct allocation loop would
+    /// silently create an unprotected loader path.
+    #[test]
+    fn every_builtin_adapter_has_loader_boundary_inventory() {
+        let inventory = BUILTINS
+            .iter()
+            .map(|adapter| (adapter.id, adapter.loader_boundary_class()))
+            .collect::<Vec<_>>();
+        assert_eq!(inventory.len(), 14);
+        assert!(inventory.contains(&("qwen3-next", LoaderBoundaryClass::QwenSpecial)));
+        assert!(inventory.contains(&("qwen3.5-moe", LoaderBoundaryClass::QwenSpecial)));
+        assert!(inventory.contains(&("qwen_vl", LoaderBoundaryClass::FullArtifact)));
+        assert!(inventory.contains(&("llava-qwen2", LoaderBoundaryClass::FullArtifact)));
+        assert!(inventory.contains(&("gemma4-text", LoaderBoundaryClass::FullArtifact)));
+        assert!(
+            inventory
+                .iter()
+                .all(|(_, class)| *class != LoaderBoundaryClass::Unclassified)
+        );
+    }
+
+    #[test]
+    fn qwen_revision_accepts_vl_suffix() {
+        assert_eq!(qwen_revision("qwen3_5_vl"), Some((5, false)));
+        assert_eq!(qwen_revision("qwen3_vl"), Some((3, false)));
+        // qwen2_5 is a different prefix: not recognized by qwen_revision.
+        assert_eq!(qwen_revision("qwen2_5_vl"), None);
+    }
+
+    #[test]
+    fn qwen_vl_adapter_detected() {
+        let dir = write_config(&serde_json::json!({
+            "model_type": "qwen3_5_vl",
+            "architectures": ["Qwen3_5VlForConditionalGeneration"],
+            "text_config": complete_text_config()
+        }));
+        let detected = detect(dir.path()).unwrap();
+        let resolved = resolve(&detected).unwrap();
+
+        assert_eq!(detected.model_type, "qwen3_5");
+        assert_eq!(detected.wrapper_model_type.as_deref(), Some("qwen3_5_vl"));
+        assert_eq!(resolved.id(), "qwen_vl");
+        assert!(!is_untested_version(resolved, &detected));
+    }
+
+    #[test]
+    fn qwen2_5_vl_wrapper_resolves_via_exact_match() {
+        let dir = write_config(&serde_json::json!({
+            "model_type": "qwen2_5_vl",
+            "architectures": ["Qwen2_5VlForConditionalGeneration"],
+            "text_config": {
+                "model_type": "qwen2_5",
+                "hidden_size": 4096,
+                "num_hidden_layers": 32,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "vocab_size": 152_064
+            }
+        }));
+        let detected = detect(dir.path()).unwrap();
+        let resolved = resolve(&detected).unwrap();
+
+        assert_eq!(resolved.id(), "qwen_vl");
+        assert!(!is_untested_version(resolved, &detected));
+    }
 }

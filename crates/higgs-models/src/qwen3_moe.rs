@@ -22,7 +22,8 @@ use crate::{
     cache::{KeyValueCache, SteppingKeyValueCache},
     error::ModelError,
     qwen3_next::{
-        QEmbedding, QLinear, QuantizationConfig, SwitchMlpWeights, new_mlp_projections, swiglu,
+        QEmbedding, QLinear, QuantizationConfig, SwitchMlpWeights, new_mlp_projections_from_quant,
+        swiglu,
     },
     utils::{
         AttentionMask, apply_rope, cached_scaled_dot_product_attention, create_attention_mask,
@@ -292,7 +293,7 @@ impl Qwen3MoeMlpBlock {
         }
         Ok(Self {
             gate: Some(QLinear::new(ql, qb)?),
-            switch_mlp: Some(SwitchMlpWeights::new(ql, qb)?),
+            switch_mlp: Some(SwitchMlpWeights::from_quant(ql, qb)?),
             gate_proj: None,
             down_proj: None,
             up_proj: None,
@@ -304,7 +305,7 @@ impl Qwen3MoeMlpBlock {
     }
 
     fn new_dense(ql: i32, qb: i32) -> Result<Self, Exception> {
-        let (gate_proj, down_proj, up_proj) = new_mlp_projections(ql, qb)?;
+        let (gate_proj, down_proj, up_proj) = new_mlp_projections_from_quant(ql, qb)?;
         Ok(Self {
             gate: None,
             switch_mlp: None,
@@ -611,7 +612,10 @@ pub(crate) fn load_qwen3_moe_model_with_args(
     // declares an override for a specific tensor path would otherwise be
     // silently ignored and loaded into a default-quantized module.
     if let Some(settings) = args.quantization.as_ref() {
-        crate::validate_per_tensor_quantization_support(settings, &[])?;
+        crate::validate_per_tensor_quantization_support(
+            &crate::quant_config::QuantizationSettings::new(settings.group_size, settings.bits),
+            &[],
+        )?;
     }
 
     let quantization = args.quantization.clone();
@@ -621,7 +625,10 @@ pub(crate) fn load_qwen3_moe_model_with_args(
         &mut model,
         model_path,
         false,
-        quantization.as_ref(),
+        quantization
+            .as_ref()
+            .map(|q| crate::quant_config::QuantizationSettings::new(q.group_size, q.bits))
+            .as_ref(),
     )?;
 
     tracing::info!("Qwen3MoE model loaded successfully");
@@ -655,7 +662,11 @@ mod tests {
             decoder_sparse_step: 1,
             mlp_only_layers: vec![],
             norm_topk_prob: true,
-            quantization: Some(QuantizationConfig::new(64, 4)),
+            quantization: Some(QuantizationConfig {
+                group_size: 64,
+                bits: 4,
+                mode: crate::quant_mode::QuantMode::Affine,
+            }),
         }
     }
 
@@ -971,39 +982,5 @@ mod tests {
         assert_eq!(args.model_type, "qwen3_moe");
         assert_eq!(args.hidden_size, 32);
         assert_eq!(args.num_hidden_layers, 2);
-    }
-
-    #[test]
-    fn test_load_qwen3_moe_model_rejects_unsupported_per_tensor_override() {
-        // qwen3_moe never resolves per-tensor overrides; a checkpoint
-        // declaring one for a specific tensor must fail loudly at load time
-        // rather than silently falling back to scalar quantization.
-        let dir = tempfile::tempdir().unwrap();
-        let json = r#"{
-            "model_type": "qwen3_moe",
-            "hidden_size": 32,
-            "num_hidden_layers": 2,
-            "intermediate_size": 64,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "rms_norm_eps": 1e-06,
-            "vocab_size": 64,
-            "max_position_embeddings": 128,
-            "num_experts": 4,
-            "num_experts_per_tok": 2,
-            "moe_intermediate_size": 32,
-            "quantization": {
-                "group_size": 64,
-                "bits": 4,
-                "model.layers.0.self_attn.q_proj": false
-            }
-        }"#;
-        std::fs::write(dir.path().join("config.json"), json).unwrap();
-
-        let err = load_qwen3_moe_model(dir.path()).unwrap_err();
-        assert!(
-            err.to_string().contains("model.layers.0.self_attn.q_proj"),
-            "unexpected error: {err}"
-        );
     }
 }

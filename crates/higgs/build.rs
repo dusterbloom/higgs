@@ -71,6 +71,5 @@ fn copy_metallib() -> Result<(), &'static str> {
         );
         return Err("copy failed (see warning above)");
     }
-    println!("cargo:warning=Copied mlx.metallib to {}", dst.display());
     Ok(())
 }

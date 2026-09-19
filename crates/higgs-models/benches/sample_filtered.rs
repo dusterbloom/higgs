@@ -11,7 +11,8 @@
     clippy::expect_used,
     clippy::as_conversions,
     clippy::cast_possible_truncation,
-    clippy::unusual_byte_groupings
+    clippy::unusual_byte_groupings,
+    clippy::disallowed_methods
 )]
 
 use std::hint::black_box;
@@ -62,6 +63,8 @@ fn bench_sample_filtered(c: &mut Criterion) {
                 repetition_penalty: None,
                 frequency_penalty: None,
                 presence_penalty: None,
+                speculation: higgs_models::Speculation::Auto,
+                thinking_budget: None,
             };
             let label = format!(
                 "{vocab_label}/top_k={}",

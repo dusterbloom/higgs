@@ -54,6 +54,10 @@ struct Args {
     #[arg(long, default_value = "./target/release/higgs")]
     higgs_bin: PathBuf,
 
+    /// API key used only between this benchmark and its fresh Higgs server.
+    #[arg(long)]
+    api_key: Option<String>,
+
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
@@ -108,7 +112,46 @@ struct TrialRun {
     completion_tokens: u32,
     tok_s: f64,
     content_prefix: String,
+    output_digest_fnv1a64: String,
+    parity_with_baseline: bool,
     telemetry: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OutputSignature {
+    completion_tokens: u32,
+    content: String,
+    digest: u64,
+}
+
+impl OutputSignature {
+    fn new(completion_tokens: u32, content: &str) -> Self {
+        Self {
+            completion_tokens,
+            content: content.to_owned(),
+            digest: fnv1a64(content.as_bytes()),
+        }
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+fn compare_to_baseline(baseline: &OutputSignature, candidate: &OutputSignature) -> Result<()> {
+    if baseline.completion_tokens != candidate.completion_tokens {
+        anyhow::bail!(
+            "greedy completion token count differs from baseline: expected {}, got {}",
+            baseline.completion_tokens,
+            candidate.completion_tokens
+        );
+    }
+    if baseline.content != candidate.content {
+        anyhow::bail!("greedy visible output differs from baseline");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -180,6 +223,7 @@ async fn run(args: Args) -> Result<()> {
 
     let mut summaries = Vec::with_capacity(trial_specs.len());
     let mut baseline_tok_s: Option<f64> = None;
+    let mut baseline_signatures = Vec::with_capacity(args.repeats as usize);
 
     for spec in &trial_specs {
         let mut runs = Vec::with_capacity(args.repeats as usize);
@@ -190,9 +234,30 @@ async fn run(args: Args) -> Result<()> {
                 repeat_idx + 1,
                 args.repeats
             );
-            let run =
+            let mut run =
                 run_trial(&args, spec, repeat_idx, &client, &base_url, &model, &prompt).await?;
-            runs.push(run);
+            if spec.label == "baseline_mtp_off" {
+                baseline_signatures.push(run.signature);
+            } else {
+                let baseline = baseline_signatures
+                    .get(repeat_idx as usize)
+                    .with_context(|| {
+                        format!(
+                            "trial {} requires baseline_mtp_off to run first for repeat {}",
+                            spec.label,
+                            repeat_idx + 1
+                        )
+                    })?;
+                compare_to_baseline(baseline, &run.signature).with_context(|| {
+                    format!(
+                        "trial {} repeat {} failed greedy parity",
+                        spec.label,
+                        repeat_idx + 1
+                    )
+                })?;
+            }
+            run.summary.parity_with_baseline = true;
+            runs.push(run.summary);
         }
 
         let tok_s: Vec<f64> = runs.iter().map(|run| run.tok_s).collect();
@@ -261,7 +326,7 @@ async fn run_trial(
     base_url: &str,
     model: &ResolvedModel,
     prompt: &str,
-) -> Result<TrialRun> {
+) -> Result<CompletedTrial> {
     let log_path = log_path(&spec.label, repeat_idx)?;
     let mut child = start_higgs_server(args, spec, &model.serve_path, &log_path)
         .with_context(|| format!("start higgs server for trial {}", spec.label))?;
@@ -276,6 +341,7 @@ async fn run_trial(
             &model.request_model,
             prompt,
             args.max_tokens,
+            args.api_key.as_deref(),
         )
         .await
     }
@@ -283,6 +349,8 @@ async fn run_trial(
 
     stop_child(&mut child);
     let telemetry = read_filtered_telemetry(&log_path);
+    ensure_requested_mtp_ran(spec, &telemetry)
+        .with_context(|| format!("trial {} did not execute requested MTP", spec.label))?;
     let payload = result?;
     let elapsed_s = payload.elapsed.as_secs_f64();
     let tok_s = if elapsed_s > 0.0 {
@@ -291,13 +359,24 @@ async fn run_trial(
         0.0
     };
 
-    Ok(TrialRun {
-        elapsed_s,
-        completion_tokens: payload.completion_tokens,
-        tok_s,
-        content_prefix: payload.content.chars().take(120).collect(),
-        telemetry,
+    let signature = OutputSignature::new(payload.completion_tokens, &payload.content);
+    Ok(CompletedTrial {
+        summary: TrialRun {
+            elapsed_s,
+            completion_tokens: payload.completion_tokens,
+            tok_s,
+            content_prefix: payload.content.chars().take(120).collect(),
+            output_digest_fnv1a64: format!("{:016x}", signature.digest),
+            parity_with_baseline: false,
+            telemetry,
+        },
+        signature,
     })
+}
+
+struct CompletedTrial {
+    summary: TrialRun,
+    signature: OutputSignature,
 }
 
 struct CompletionPayload {
@@ -312,6 +391,7 @@ async fn request_completion(
     model_name: &str,
     prompt: &str,
     max_tokens: u32,
+    api_key: Option<&str>,
 ) -> Result<CompletionPayload> {
     let body = serde_json::json!({
         "model": model_name,
@@ -324,9 +404,7 @@ async fn request_completion(
 
     let url = format!("{base_url}/v1/chat/completions");
     let started = Instant::now();
-    let resp = client
-        .post(&url)
-        .json(&body)
+    let resp = authorize_request(client.post(&url).json(&body), api_key)
         .send()
         .await
         .with_context(|| format!("POST {url}"))?;
@@ -362,6 +440,16 @@ async fn request_completion(
         completion_tokens,
         content,
     })
+}
+
+fn authorize_request(
+    request: reqwest::RequestBuilder,
+    api_key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match api_key {
+        Some(key) => request.bearer_auth(key),
+        None => request,
+    }
 }
 
 fn resolve_model(args: &Args, manifest_path: &Path) -> Result<ResolvedModel> {
@@ -440,12 +528,19 @@ fn start_higgs_server(
         .stderr(Stdio::from(log_stderr));
 
     clear_speculative_env(&mut cmd);
+    configure_server_api_key(&mut cmd, args.api_key.as_deref());
     for (key, value) in &spec.env {
         cmd.env(key, value);
     }
 
     cmd.spawn()
         .with_context(|| format!("spawn {}", args.higgs_bin.display()))
+}
+
+fn configure_server_api_key(cmd: &mut Command, api_key: Option<&str>) {
+    if let Some(key) = api_key {
+        cmd.arg("--api-key").arg(key);
+    }
 }
 
 fn stop_child(child: &mut Child) {
@@ -509,15 +604,33 @@ fn read_filtered_telemetry(path: &Path) -> String {
     };
     body.lines()
         .filter(|line| {
-            line.contains("MTP decode complete") || line.contains("Prompt-lookup decode complete")
+            line.contains("MTP decode complete")
+                || line.contains("Prompt-lookup decode complete")
+                || line.contains("AR generation complete")
+                || line.contains("checkpoint has no MTP weights")
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
+fn ensure_requested_mtp_ran(spec: &speculative::TrialSpec, telemetry: &str) -> Result<()> {
+    let mtp_requested = spec.env.get("HIGGS_MTP").is_some_and(|value| value == "1");
+    if mtp_requested && !telemetry.contains("MTP decode complete") {
+        anyhow::bail!(
+            "MTP was requested but no MTP decode completion was recorded; telemetry: {telemetry}"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SPECULATIVE_ENV_KEYS, clear_speculative_env};
+    use super::{
+        Args, OutputSignature, SPECULATIVE_ENV_KEYS, authorize_request, clear_speculative_env,
+        compare_to_baseline, configure_server_api_key, ensure_requested_mtp_ran,
+    };
+    use clap::Parser;
+    use higgs_bench::speculative::parse_trial_specs;
     use std::process::Command;
 
     #[test]
@@ -533,5 +646,84 @@ mod tests {
                 "expected {key} to be explicitly removed"
             );
         }
+    }
+
+    #[test]
+    fn accepts_a_completion_that_matches_its_baseline() {
+        let baseline = OutputSignature::new(4, "same");
+        let candidate = OutputSignature::new(4, "same");
+
+        assert!(compare_to_baseline(&baseline, &candidate).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_visible_completion_that_differs_from_its_baseline() {
+        let baseline = OutputSignature::new(4, "same");
+        let candidate = OutputSignature::new(4, "different");
+
+        assert!(compare_to_baseline(&baseline, &candidate).is_err());
+    }
+
+    #[test]
+    fn rejects_a_completion_token_count_that_differs_from_its_baseline() {
+        let baseline = OutputSignature::new(4, "same");
+        let candidate = OutputSignature::new(5, "same");
+
+        assert!(compare_to_baseline(&baseline, &candidate).is_err());
+    }
+
+    #[test]
+    fn accepts_a_benchmark_api_key() {
+        let args = Args::try_parse_from([
+            "bench_speculative",
+            "--model-path",
+            "model",
+            "--api-key",
+            "bench-key",
+        ])
+        .unwrap();
+
+        assert_eq!(args.api_key.as_deref(), Some("bench-key"));
+    }
+
+    #[test]
+    fn sends_the_benchmark_key_as_bearer_auth() {
+        let request = authorize_request(
+            reqwest::Client::new().get("http://127.0.0.1:8098/v1/models"),
+            Some("bench-key"),
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request.headers()[reqwest::header::AUTHORIZATION],
+            "Bearer bench-key"
+        );
+    }
+
+    #[test]
+    fn passes_the_benchmark_key_to_the_fresh_server() {
+        let mut command = Command::new("higgs");
+        configure_server_api_key(&mut command, Some("bench-key"));
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(args, ["--api-key", "bench-key"]);
+    }
+
+    #[test]
+    fn rejects_an_mtp_trial_without_mtp_completion_telemetry() {
+        let spec = parse_trial_specs("mtp_default").unwrap().remove(0);
+
+        assert!(ensure_requested_mtp_ran(&spec, "AR generation complete").is_err());
+    }
+
+    #[test]
+    fn permits_an_mtp_trial_with_mtp_completion_telemetry() {
+        let spec = parse_trial_specs("mtp_default").unwrap().remove(0);
+
+        assert!(ensure_requested_mtp_ran(&spec, "MTP decode complete").is_ok());
     }
 }

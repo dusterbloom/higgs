@@ -10,10 +10,12 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 | Mistral | `mistral` | Mistral 7B |
 | Qwen2 | `qwen2` | Qwen2 and Qwen2.5 |
 | Qwen3 | `qwen3` | Qwen3 |
-| Qwen3.5+ (dense) | `qwen3_5`, `qwen3_5_text` | Qwen3.5 dense checkpoints; Qwen3.8-27B |
-| Qwen3.5+ (MoE) | `qwen3_5_moe`, `qwen3_5_text_moe` | Qwen3.5-35B-A3B, Qwen3.6-35B-A3B |
+| Qwen3.5 (dense) | `qwen3_5` | Qwen3.5 dense MLX checkpoints |
+| Qwen3.5 / Qwen3.6 MoE | `qwen3_5_moe` | Qwen3.5-35B-A3B, Qwen3.6-35B-A3B |
+| Bonsai-2 Hadamard Q2 | `prism_hadamard_qwen35` | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` |
 | Qwen3-Next | `qwen3_next` | Qwen3-Coder hybrid checkpoints |
 | Qwen3-MoE | `qwen3_moe` | Qwen3-30B-A3B |
+| Nanbeige | `nanbeige` | Nanbeige4.2 |
 | Gemma 2 | `gemma2` | Gemma 2 2B, 9B, and 27B |
 | Gemma 3 | `gemma3`, `gemma3_text` | Gemma 3 1B, 4B, 12B, and 27B |
 | Gemma 4 | `gemma4`, `gemma4_text`, `gemma4_unified` | Gemma 4 E2B, E4B (edge); 12B, 31B; 26B-A4B (MoE) |
@@ -21,18 +23,98 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 | Starcoder2 | `starcoder2` | Starcoder2 3B, 7B, and 15B |
 | DeepSeek-V2 | `deepseek_v2` | DeepSeek-V2-Lite |
 | LLaVA-Qwen2 | `llava-qwen2` | nanoLLaVA-1.5 |
+| Architecture | `model_type` | Examples | Vision |
+|---|---|---|---|
+| LLaMA | `llama` | Llama 3 and CodeLlama | none |
+| Mistral | `mistral` | Mistral 7B | none |
+| Qwen2 | `qwen2` | Qwen2 and Qwen2.5 | none |
+| Qwen3 | `qwen3` | Qwen3 | none |
+| Qwen3.5+ (dense) | `qwen3_5`, `qwen3_5_text` | Qwen3.5 dense checkpoints; Qwen3.8-27B | none |
+| Qwen3.5+ (MoE) | `qwen3_5_moe`, `qwen3_5_text_moe` | Qwen3.5-35B-A3B, Qwen3.6-35B-A3B | none |
+| Bonsai-2 Hadamard Q2 | `prism_hadamard_qwen35` | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` | none‡ |
+| Qwen3-Next | `qwen3_next` | Qwen3-Coder hybrid checkpoints | none |
+| Qwen3-MoE | `qwen3_moe` | Qwen3-30B-A3B | none |
+| Qwen-VL | `qwen3_5_vl`, `qwen3_vl`, `qwen2_5_vl` | Qwen2.5-VL / Qwen3-VL / Qwen3.5-VL | supported |
+| Gemma 2 | `gemma2` | Gemma 2 2B, 9B, and 27B | none |
+| Gemma 3 | `gemma3`, `gemma3_text` | Gemma 3 1B, 4B, 12B, and 27B | tower-ignored† |
+| Gemma 4 | `gemma4`, `gemma4_text`, `gemma4_unified` | Gemma 4 E2B, E4B (edge); 12B, 31B; 26B-A4B (MoE) | tower-ignored† |
+| Phi-3 | `phi3` | Phi-3 Mini, Small, and Medium | none |
+| Starcoder2 | `starcoder2` | Starcoder2 3B, 7B, and 15B | none |
+| DeepSeek-V2 | `deepseek_v2` | DeepSeek-V2-Lite | none |
+| LLaVA-Qwen2 | `llava-qwen2` | nanoLLaVA-1.5 | supported |
+
+† `higgs doctor` reports vision at the adapter level. A multimodal `gemma3` /
+`gemma4` checkpoint (with `vision_config` and `vision_tower.` weights) shows
+`vision: tower-ignored` even though the runtime loads the tower and runs
+pan-and-scan image input; `gemma3_text` / `gemma4_text` checkpoints show
+`vision: none`.
+
+‡ The upstream `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` pack's `text_config`
+describes a text-only backbone; the vision tower bundled with the base
+Qwen3.8-27B model is not part of this Q2 pack, so there is nothing for Higgs
+to skip. See [Bonsai-2 Hadamard Q2 notes](#bonsai-2-hadamard-q2-notes) below.
 
 ### Gemma 3 / Gemma 4 notes
 
-- These are text-language-model implementations. Multimodal checkpoints
-  (`gemma3`, `gemma4`) load fine — their vision/audio tower weights are skipped
-  and only the text model runs. The text weights may be nested under
-  `language_model.` in such checkpoints; Higgs strips that prefix automatically.
+- Multimodal `gemma3` / `gemma4` checkpoints carry a SigLIP-style vision tower
+  under `vision_tower.`; Higgs loads it and processes images with the
+  pan-and-scan scheme (see [Vision-capable models](#vision-capable-models)).
+  Text-only `gemma3_text` / `gemma4_text` checkpoints have no tower and remain
+  text-only. The audio tower weights on multimodal checkpoints are skipped. The
+  text weights of multimodal checkpoints may be nested under `language_model.`;
+  Higgs strips that prefix automatically.
+- Current constraint: the multimodal forward requires the vision tower's hidden
+  size to equal the language model's hidden size — the learned multi-modal
+  projector is not yet implemented, so checkpoints where the two differ error at
+  prefill rather than producing wrong output.
 - Gemma 4 E2B/E4B (per-layer-input embeddings + cross-layer KV sharing) and dense
   text variants are supported. The MoE variant (`gemma4` with
   `enable_moe_block`, e.g. 26B-A4B) is supported only with **unquantized** expert
   weights; a checkpoint with quantized experts is rejected at load with a clear
   error rather than producing incorrect output.
+
+## Vision-Capable Models
+
+Image input is supported on the OpenAI chat endpoint (`/v1/chat/completions`,
+streaming and non-streaming) for three families. Each family implements a
+different preprocessing scheme; the per-family defaults come from the
+checkpoint's `config.json` (`vision_config`, `mm_tokens_per_image`,
+`min_pixels` / `max_pixels`).
+
+| Family | `model_type` | Preprocessing | Per-family defaults |
+|---|---|---|---|
+| LLaVA-Qwen2 | `llava-qwen2` | Square resize | Every image is resized to `vision_config.image_size` (384 for nanoLLaVA); `detail: "low"` on every image halves the target (floored at 128 px), `auto`/`high` use the full size |
+| Qwen-VL | `qwen2_5_vl`, `qwen3_vl`, `qwen3_5_vl` | Dynamic resolution | `smart_resize` into the `[min_pixels, max_pixels]` budget (`256·28²` / `1280·28²` defaults), rounding to multiples of `patch × merge` (28); 2×2 spatial merge of the patch grid |
+| Gemma 3 / Gemma 4 | `gemma3`, `gemma4` (multimodal) | Pan-and-scan | Shorter side scaled to the tower's `image_size`; aspect-aware 6-crop grid (2 rows × 3 cols, transposed to 3 × 2 for portrait); `mm_tokens_per_image` embeddings per crop (256 for Gemma 3 27B, 1024 for 4B; fallback `num_patches / 4`) |
+
+Notes:
+
+- **Markers**: LLaVA uses `<image>`; Qwen-VL uses
+  `<|vision_start|><|image_pad|><|vision_end|>`; Gemma uses
+  `<start_of_image><end_of_image>`. Markers are spliced at each image's true
+  position, so multiple images per request are supported in all three families.
+- **Backbones**: Qwen-VL runs on the Qwen3Next text backbone, loaded through the
+  Qwen3.5 dense/MoE loaders. escha-w2 (eschamoe) backbones are expected to work
+  under the same wrapper per the design spec — escha quantization is confined to
+  expert projections and is orthogonal to the vision wrapper — but there is no
+  in-tree escha checkpoint to verify against.
+- **Doctor status**: `higgs doctor` reports a `vision:` status in each model's
+  capability line: `vision: supported (<model_type>)`, `vision: tower-ignored
+  (<model_type>)`, or `vision: none`. `supported` means the resolved adapter
+  implements vision; `tower-ignored` means the checkpoint declares vision
+  weights (`vision_config` or a `*_vl` model type) that the resolved text
+  adapter skips; `none` means neither.
+- **Current constraints**:
+  - Qwen-VL's SigLIP-shaped tower supports its nominal grid only (fixed learned
+    position table); an image that `smart_resize`s to a different patch grid
+    fails prefill with a clear error (the Qwen-VL RoPE tower is not yet
+    implemented).
+  - Gemma 3/4 multimodal forward requires the tower's hidden size to equal the
+    language model's hidden size (see the Gemma notes above).
+- **Caching and MTP**: image requests never reuse or populate the in-memory or
+  disk prefix cache (their KV state reflects merged image features and would not
+  match a text-only prefix), and MTP speculative decode is disabled for image
+  requests.
 
 ## Continuous Batching Support
 
@@ -42,8 +124,12 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 - `mistral`
 - `qwen2`
 - `qwen3`
+- `llava-qwen2`
+- `qwen3_5_vl` (and the other Qwen-VL types `qwen3_vl` / `qwen2_5_vl`)
 
-Other supported architectures still serve normally in simple mode, but Higgs now rejects `batch=true` during config load, `doctor`, and server startup.
+Other supported architectures still serve normally in simple mode, but Higgs now rejects `batch=true` during config load, `doctor`, and server startup. In batch mode, vision-capable families preprocess images inside the worker thread and route multimodal requests through the batched engine.
+
+Nanbeige uses repeated shared-weight decoder loops with loop-aware KV cache slots, so it is not included in true batched decode support.
 
 ## Representative Working MLX Model IDs
 
@@ -56,6 +142,8 @@ Other supported architectures still serve normally in simple mode, but Higgs now
 | Qwen3.5 dense | `mlx-community/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit` |
 | Qwen3.5 MoE | `NexVeridian/Qwen3.5-35B-A3B-3bit` |
 | Qwen3.6 MoE | `mlx-community/Qwen3.6-35B-A3B-4bit` |
+| Qwen3.6 MoE (eschamoe) | `EschaLabs/Qwen3.6-35B-A3B-Escha-W2` (converted at load; see below) |
+| Nanbeige | `MercuriusDream/Nanbeige4.2-3B-mlx-6bit` |
 | Qwen3.8 dense | `mlx-community/Qwen3.8-27B-4bit` |
 | DeepSeek-V2 | `mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx` |
 
@@ -68,10 +156,127 @@ Other supported architectures still serve normally in simple mode, but Higgs now
 - The cached-model smoke matrix covered `mlx-community/Qwen3.6-35B-A3B-4bit` plus `mlx-community/Llama-3.2-1B-Instruct-4bit`, `mlx-community/Qwen2.5-3B-Instruct-4bit`, `mlx-community/Qwen3-1.7B-4bit`, and `mlx-community/Qwen3-Coder-Next-4bit`.
 - OpenAI-style chat requests use non-thinking mode by default for `Qwen3.6` unless the request explicitly opts into reasoning.
 
+## Bonsai-2 Hadamard Q2 notes
+
+`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` (`model_type: "prism_hadamard_qwen35"`)
+is a Qwen3.8-27B-based checkpoint from the same family as the
+[Bonsai-27B / dSpark](BONSAI_Q1.md) releases, quantized to the same packed
+affine 2-bit layout `bonsai_q2.rs` already handles — plus a per-tensor Fast
+Walsh-Hadamard rotation on a subset of Linear/Embedding modules, applied to
+activations immediately before (Linear) or after (Embedding, inverse
+direction) the quantized matmul. The rotated modules, their block size
+(512/1024/2048/4096), and a `±1` sign vector per tensor (`<path>.signs`) are
+declared in the pack's top-level `modules` manifest, alongside a normal
+`qwen3_5`-shaped `text_config` — Higgs resolves it through the same
+`text_config`-wrapper path described above, folding `modules` into the
+per-tensor `QuantSpec.hadamard_block` resolution that already carries
+`quant_overrides`. The rotation itself reuses MLX's native
+`hadamard_transform` op, matching the checkpoint's own reference Python
+loader bit-for-bit in normalization convention.
+
+The checkpoint's own model card is explicit that an ordinary affine loader
+"skips the activation transform... returns wrong output rather than an
+error" — a truncated or hand-edited pack that is missing a `.signs` tensor
+would otherwise load "successfully" and decode silently wrong text. `higgs
+doctor` verifies the manifest (schema version, valid block sizes, and that
+every rotated module's `.signs` tensor is present with the shape its
+`.weight` tensor implies) from the safetensors header alone, before the
+server starts.
+
+This adapter is covered by unit and property tests (config resolution,
+manifest validation, and a numerical round-trip proving the rotation is
+self-inverse) but has not yet been run end-to-end against the real
+downloaded checkpoint — that verification, including a parity check against
+the pack's bundled Python loader, is still open.
+
+## EschaLabs `eschamoe` Checkpoints
+
+Higgs loads EschaLabs trellis-quantized (`eschamoe`) checkpoints, for example
+`EschaLabs/Qwen3.6-35B-A3B-Escha-W2` (a 2-bit trellis release of
+Qwen3.6-35B-A3B). No config field is needed — detection is automatic:
+
+- A checkpoint is treated as `eschamoe` when `quantize_config.json` declares
+  `quant_method: "eschamoe"`, or, as a fallback, when `config.json` declares it
+  under `quantization_config.quant_method`. `quantize_config.json` wins when
+  both files are present.
+- `model_type` stays `qwen3_5_moe`, so the model serves through the existing
+  Qwen3.5/3.6-MoE path.
+
+### Native and affine paths
+
+Higgs has two ways to load these checkpoints. The native path is the default.
+
+**Native (default).** The expert projections stay in their trellis form and a
+Metal kernel decodes them during the forward pass. Only the non-expert weights
+convert, to MLX affine 4-bit (group size 64). The 35B release holds about
+11 GB and loads in a few seconds.
+
+**Affine (`HIGGS_ESCHA_NATIVE=0`).** Every expert decodes on the CPU and
+requantizes in memory to MLX affine 4-bit — the same layout as
+`mlx-community/Qwen3.6-35B-A3B-4bit`. The same 35B release then holds about
+22 GB and takes roughly 140 s to start, so it needs a machine with memory to
+spare. The path stays available for comparing the kernel against a plain
+affine baseline.
+
+### Dense Qwen3.8-27B
+
+`EschaLabs/Qwen3.8-27B-Escha-W2` is a dense checkpoint, not an MoE expert
+layout. Higgs recognizes its exact structural configuration and automatically
+converts its trellis projections to affine Q2, selects separate gate/up
+projections, and enables the matching SIMD decode path. No Escha environment
+variable is required for this release. `HIGGS_ESCHA_AFFINE_BITS=4..8` remains
+available only to compare another conversion target; structurally different
+dense Escha checkpoints stay on affine Q4 by default.
+
+`higgs doctor` estimates the resident size for whichever mode is active and
+warns when it crowds system RAM. On the native path it reads the trellis rate
+of each projection from `quantization_config.layer_meta`; note that the rate
+varies per projection, so a checkpoint named `W2` is not uniformly 2-bit — the
+35B release uses 2 bits for `gate_up_proj` and 3 for `down_proj`.
+
+**Memory: the on-disk size is misleading on the affine path.** The 2-bit
+trellis download is 12.3 GB for the 35B release; converted, it is roughly
+22 GB. Size the machine for the resident number, not the download.
+
+Native Escha prefill uses packed trellis GEMM by default on base Apple M4.
+Matched AC tests with Escha W2 and 1024-token chunks reduced 16K requests from
+90–94 s to 82–83 s and a retained 45K request from 307.8 s to 286.7 s, with no
+new swapouts. Both 45K runs recalled the tested facts and reused 45,037 tokens
+on the follow-up. Seven behavior probes produced identical answers (six passed;
+both missed one inventory calculation). These checks do not establish universal
+numerical equivalence: GEMM and scratch round differently. Other hardware keeps
+scratch pending matched measurements. `HIGGS_ESCHA_TRELLIS_GEMM=0` selects scratch;
+`=1` selects GEMM on any host. Decode kernel selection is unchanged.
+
+On base M4, FP32 attention with 256-wide heads (16 query heads, two KV heads)
+uses 128-query blocks once the KV sequence reaches 16,384 tokens and the query
+sequence exceeds 128 tokens. This bounds the unfused attention score scratch
+while preserving the model's prefill chunk size, precision, and complete KV
+history. A matched 45K run on a 32 GiB M4 reduced sampled peak process footprint
+from 18.55 to 16.17 GiB with effectively unchanged latency; retrieval and cached
+continuation passed in both arms. This is a memory-headroom improvement.
+
+**Limitations.**
+
+- Support is currently text-only.
+- The MTP draft head in the published checkpoint is not usable: it ships the
+  MoE router and shared expert but no routed expert weights, so Higgs disables
+  MTP for this checkpoint and decodes without speculation.
+
+Worked config entry:
+
+```toml
+[[models]]
+name = "qwen36-escha"
+path = "EschaLabs/Qwen3.6-35B-A3B-Escha-W2"
+```
+
 ## Model Input Requirements
 
 - Local models can be referenced by Hugging Face model ID or local path.
-- The model must be in MLX `safetensors` format.
+- The model must be in MLX `safetensors` format. EschaLabs `eschamoe` trellis
+  checkpoints are the exception; Higgs converts them in memory at load (see
+  above).
 - The checkpoint must use a supported `config.json` `model_type`.
 - macOS local serving requires `mlx.metallib` next to the executable. Release artifacts bundle it, and source builds restore it from Cargo build output when possible.
 

@@ -28,6 +28,12 @@
 //! using the request's declared tool schema ([`ToolSchema`]) when available,
 //! falling back to best-effort parsing otherwise.
 
+mod streaming;
+
+pub use streaming::{
+    IncrementalToolCallOutput, IncrementalToolCallTracker, ToolParseError, ToolStreamEvent,
+};
+
 /// A parsed tool call extracted from model output.
 #[derive(Debug, Clone)]
 pub struct ParsedToolCall {
@@ -569,6 +575,13 @@ impl StreamingToolCallTracker {
 
     pub const fn completed_count(&self) -> usize {
         self.completed_count
+    }
+
+    /// Whether the tracker is currently holding bytes inside an unclosed
+    /// tool-call block. Streams in this state produce no visible deltas, so
+    /// the route emits SSE transport comments to keep client watchdogs fed.
+    pub fn is_holding(&self) -> bool {
+        self.inside != Inside::None
     }
 
     pub const fn has_tool_calls(&self) -> bool {

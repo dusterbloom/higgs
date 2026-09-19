@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
@@ -129,6 +129,7 @@ impl RequestRecord {
 pub struct MetricsStore {
     records: RwLock<Vec<RequestRecord>>,
     id_index: RwLock<HashMap<u64, usize>>,
+    pending_ids: Mutex<HashSet<u64>>,
     window: Duration,
     logger: Option<Mutex<MetricsLogger>>,
     next_id: AtomicU64,
@@ -139,6 +140,7 @@ impl MetricsStore {
         Self {
             records: RwLock::new(Vec::new()),
             id_index: RwLock::new(HashMap::new()),
+            pending_ids: Mutex::new(HashSet::new()),
             window,
             logger: None,
             next_id: AtomicU64::new(1),
@@ -149,6 +151,7 @@ impl MetricsStore {
         Self {
             records: RwLock::new(Vec::new()),
             id_index: RwLock::new(HashMap::new()),
+            pending_ids: Mutex::new(HashSet::new()),
             window,
             logger: Some(Mutex::new(logger)),
             next_id: AtomicU64::new(1),
@@ -193,6 +196,10 @@ impl MetricsStore {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(id, idx);
+        self.pending_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id);
         id
     }
 
@@ -204,15 +211,71 @@ impl MetricsStore {
         duration: Duration,
         timing: RequestTiming,
     ) {
+        self.finish_stream(id, output_tokens, duration, timing, None, None);
+    }
+
+    /// Finalize a streaming request that failed after the HTTP response began.
+    pub fn fail_stream(
+        &self,
+        id: u64,
+        output_tokens: u64,
+        duration: Duration,
+        timing: RequestTiming,
+        error: String,
+    ) {
+        self.finish_stream(id, output_tokens, duration, timing, Some(500), Some(error));
+    }
+
+    /// Finalize a streaming request whose client disconnected.
+    pub fn disconnect_stream(
+        &self,
+        id: u64,
+        output_tokens: u64,
+        duration: Duration,
+        timing: RequestTiming,
+    ) {
+        self.finish_stream(
+            id,
+            output_tokens,
+            duration,
+            timing,
+            Some(499),
+            Some("client disconnected".to_owned()),
+        );
+    }
+
+    fn finish_stream(
+        &self,
+        id: u64,
+        output_tokens: u64,
+        duration: Duration,
+        timing: RequestTiming,
+        status: Option<u16>,
+        error: Option<String>,
+    ) {
         let completed = {
             let mut records = self.records.write().unwrap_or_else(PoisonError::into_inner);
             let index = self.id_index.read().unwrap_or_else(PoisonError::into_inner);
-            if let Some(&idx) = index.get(&id) {
-                if let Some(record) = records.get_mut(idx) {
-                    record.output_tokens = output_tokens;
-                    record.duration = duration;
-                    record.timing = timing;
-                    Some(record.clone())
+            let mut pending = self
+                .pending_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if pending.remove(&id) {
+                if let Some(&idx) = index.get(&id) {
+                    if let Some(record) = records.get_mut(idx) {
+                        if let Some(terminal_status) = status {
+                            record.status = terminal_status;
+                        }
+                        record.output_tokens = output_tokens;
+                        record.duration = duration;
+                        record.timing = timing;
+                        if let Some(terminal_error) = error {
+                            record.error_body = Some(terminal_error);
+                        }
+                        Some(record.clone())
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -249,16 +312,20 @@ impl MetricsStore {
         #[allow(clippy::unchecked_time_subtraction)]
         let cutoff = Instant::now() - self.window;
         let mut records = self.records.write().unwrap_or_else(PoisonError::into_inner);
-        records.retain(|r| r.timestamp >= cutoff);
-
         let mut index = self
             .id_index
             .write()
             .unwrap_or_else(PoisonError::into_inner);
+        let mut pending = self
+            .pending_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        records.retain(|r| r.timestamp >= cutoff || pending.contains(&r.id));
         index.clear();
         for (i, record) in records.iter().enumerate() {
             index.insert(record.id, i);
         }
+        pending.retain(|id| index.contains_key(id));
     }
 
     fn log_record(&self, record: &RequestRecord) {
@@ -360,6 +427,153 @@ impl MetricsStore {
     }
 }
 
+/// Owns the lifecycle of one streaming metrics record.
+///
+/// A guard that reaches `Drop` without a terminal method records a client
+/// disconnect, including the latest partial output count.
+pub struct StreamMetricsGuard {
+    metrics: Option<Arc<MetricsStore>>,
+    pending_id: Option<u64>,
+    start: Instant,
+    output_tokens: u64,
+    first_generated_at: Option<Instant>,
+    last_generated_at: Option<Instant>,
+    first_semantic_event_at: Option<Instant>,
+    last_semantic_event_at: Option<Instant>,
+    max_semantic_gap: Duration,
+    semantic_event_count: u64,
+    done: bool,
+}
+
+impl StreamMetricsGuard {
+    pub const fn new(
+        metrics: Option<Arc<MetricsStore>>,
+        pending_id: Option<u64>,
+        start: Instant,
+    ) -> Self {
+        Self {
+            metrics,
+            pending_id,
+            start,
+            output_tokens: 0,
+            first_generated_at: None,
+            last_generated_at: None,
+            first_semantic_event_at: None,
+            last_semantic_event_at: None,
+            max_semantic_gap: Duration::ZERO,
+            semantic_event_count: 0,
+            done: false,
+        }
+    }
+
+    /// Record the latest total generated token count.
+    pub fn update(&mut self, output_tokens: u64) {
+        if self.done || output_tokens <= self.output_tokens {
+            return;
+        }
+        let now = Instant::now();
+        self.output_tokens = output_tokens;
+        self.first_generated_at.get_or_insert(now);
+        self.last_generated_at = Some(now);
+    }
+
+    /// Record an emitted semantic stream event and its inter-event gap.
+    pub fn semantic_event(&mut self) {
+        if self.done {
+            return;
+        }
+        let now = Instant::now();
+        let previous = self.last_semantic_event_at.unwrap_or(self.start);
+        self.max_semantic_gap = self
+            .max_semantic_gap
+            .max(now.saturating_duration_since(previous));
+        self.first_semantic_event_at.get_or_insert(now);
+        self.last_semantic_event_at = Some(now);
+        self.semantic_event_count = self.semantic_event_count.saturating_add(1);
+    }
+
+    pub fn finish(&mut self) {
+        self.finish_with(None);
+    }
+
+    pub fn fail(&mut self, error: String) {
+        self.finish_with(Some(error));
+    }
+
+    #[allow(clippy::needless_pass_by_value)] // Keep the owned error available for both storage and tracing.
+    fn finish_with(&mut self, error: Option<String>) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+
+        self.max_semantic_gap = self.max_semantic_gap.max(
+            Instant::now()
+                .saturating_duration_since(self.last_semantic_event_at.unwrap_or(self.start)),
+        );
+        let duration = self.start.elapsed();
+        if let (Some(metrics), Some(id)) = (&self.metrics, self.pending_id) {
+            if let Some(terminal_error) = error.as_ref() {
+                metrics.fail_stream(id, self.output_tokens, duration, terminal_error.clone());
+            } else {
+                metrics.finalize_stream(id, self.output_tokens, duration);
+            }
+        }
+
+        let first_generated_ms = self
+            .first_generated_at
+            .map(|at| at.saturating_duration_since(self.start).as_millis());
+        let last_generated_ms = self
+            .last_generated_at
+            .map(|at| at.saturating_duration_since(self.start).as_millis());
+        let first_semantic_event_ms = self
+            .first_semantic_event_at
+            .map(|at| at.saturating_duration_since(self.start).as_millis());
+        tracing::debug!(
+            pending_id = ?self.pending_id,
+            status = if error.is_some() { 500 } else { 200 },
+            output_tokens = self.output_tokens,
+            duration_ms = duration.as_millis(),
+            first_generated_ms = ?first_generated_ms,
+            last_generated_ms = ?last_generated_ms,
+            first_semantic_event_ms = ?first_semantic_event_ms,
+            max_semantic_gap_ms = self.max_semantic_gap.as_millis(),
+            semantic_event_count = self.semantic_event_count,
+            error = ?error,
+            "stream metrics finalized"
+        );
+    }
+}
+
+impl Drop for StreamMetricsGuard {
+    fn drop(&mut self) {
+        if !self.done {
+            let error = "client disconnected".to_owned();
+            self.max_semantic_gap = self.max_semantic_gap.max(
+                Instant::now()
+                    .saturating_duration_since(self.last_semantic_event_at.unwrap_or(self.start)),
+            );
+            let duration = self.start.elapsed();
+            if let (Some(metrics), Some(id)) = (&self.metrics, self.pending_id) {
+                metrics.disconnect_stream(id, self.output_tokens, duration);
+            }
+            tracing::debug!(
+                pending_id = ?self.pending_id,
+                status = 499,
+                output_tokens = self.output_tokens,
+                duration_ms = duration.as_millis(),
+                first_generated_ms = ?self.first_generated_at.map(|at| at.saturating_duration_since(self.start).as_millis()),
+                last_generated_ms = ?self.last_generated_at.map(|at| at.saturating_duration_since(self.start).as_millis()),
+                first_semantic_event_ms = ?self.first_semantic_event_at.map(|at| at.saturating_duration_since(self.start).as_millis()),
+                max_semantic_gap_ms = self.max_semantic_gap.as_millis(),
+                semantic_event_count = self.semantic_event_count,
+                error = %error,
+                "stream metrics finalized"
+            );
+        }
+    }
+}
+
 #[allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -369,6 +583,37 @@ impl MetricsStore {
 )]
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[allow(clippy::duration_suboptimal_units)] // Duration::from_mins exceeds the workspace MSRV.
+    fn terminal_silence_counts_toward_maximum_semantic_gap() {
+        for failed in [false, true] {
+            let start = std::time::Instant::now() - std::time::Duration::from_secs(301);
+            let mut guard = super::StreamMetricsGuard::new(None, None, start);
+            guard.last_semantic_event_at = Some(start + std::time::Duration::from_secs(1));
+            if failed {
+                guard.fail("interrupted".to_owned());
+            } else {
+                guard.finish();
+            }
+            assert!(guard.max_semantic_gap >= std::time::Duration::from_secs(300));
+        }
+        let start = std::time::Instant::now() - std::time::Duration::from_secs(300);
+        let mut silent = super::StreamMetricsGuard::new(None, None, start);
+        silent.finish();
+        assert!(silent.max_semantic_gap >= std::time::Duration::from_secs(300));
+    }
+
+    #[test]
+    #[allow(clippy::duration_suboptimal_units)] // Duration::from_mins exceeds the workspace MSRV.
+    fn initial_silence_counts_toward_maximum_semantic_gap() {
+        let start = std::time::Instant::now() - std::time::Duration::from_secs(300);
+        let mut guard = super::StreamMetricsGuard::new(None, None, start);
+        guard.semantic_event();
+        guard.semantic_event();
+        guard.finish();
+        assert!(guard.max_semantic_gap >= std::time::Duration::from_secs(300));
+    }
+
     use super::*;
 
     #[test]
@@ -553,6 +798,20 @@ mod tests {
     }
 
     #[test]
+    fn fail_stream_marks_pending_record_as_server_error() {
+        let store = MetricsStore::new(Duration::from_secs(ONE_MINUTE_SECS));
+        let id = store.record_pending(sample_record());
+
+        store.fail_stream(id, 7, Duration::from_secs(2), "decode failed".to_owned());
+
+        let record = store.snapshot().pop().unwrap();
+        assert_eq!(record.status, 500);
+        assert_eq!(record.output_tokens, 7);
+        assert_eq!(record.duration, Duration::from_secs(2));
+        assert_eq!(record.error_body.as_deref(), Some("decode failed"));
+    }
+
+    #[test]
     fn finalize_stream_ignores_unknown_id() {
         let store = MetricsStore::new(Duration::from_secs(ONE_MINUTE_SECS));
         store.record(sample_record());
@@ -725,5 +984,111 @@ mod tests {
                 record.id
             );
         }
+    }
+
+    #[test]
+    fn dropping_stream_guard_records_latest_partial_output_as_disconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(store_with_logger(dir.path()));
+        let id = store.record_pending(sample_record());
+
+        let mut guard = StreamMetricsGuard::new(
+            Some(Arc::clone(&store)),
+            Some(id),
+            Instant::now() - Duration::from_secs(1),
+        );
+        guard.update(17);
+        drop(guard);
+
+        let record = store.snapshot().pop().unwrap();
+        assert_eq!(record.status, 499);
+        assert_eq!(record.output_tokens, 17);
+        assert_eq!(record.error_body.as_deref(), Some("client disconnected"));
+        let content = std::fs::read_to_string(dir.path().join("metrics.jsonl")).unwrap();
+        assert_eq!(content.lines().count(), 1);
+    }
+
+    #[test]
+    fn finished_stream_guard_and_terminal_retry_log_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(store_with_logger(dir.path()));
+        let id = store.record_pending(sample_record());
+        let mut guard = StreamMetricsGuard::new(Some(Arc::clone(&store)), Some(id), Instant::now());
+        guard.update(25);
+        guard.finish();
+        store.finalize_stream(id, 99, Duration::from_secs(1));
+
+        let content = std::fs::read_to_string(dir.path().join("metrics.jsonl")).unwrap();
+        assert_eq!(content.lines().count(), 1);
+        assert_eq!(store.snapshot()[0].output_tokens, 25);
+    }
+
+    #[test]
+    fn failed_stream_cannot_become_successful() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(store_with_logger(dir.path()));
+        let id = store.record_pending(sample_record());
+        let mut guard = StreamMetricsGuard::new(Some(Arc::clone(&store)), Some(id), Instant::now());
+        guard.update(8);
+        guard.fail("capacity interrupted".to_owned());
+        guard.finish();
+        store.finalize_stream(id, 100, Duration::from_secs(1));
+
+        let record = store.snapshot().pop().unwrap();
+        assert_eq!(record.status, 500);
+        assert_eq!(record.output_tokens, 8);
+        assert_eq!(record.error_body.as_deref(), Some("capacity interrupted"));
+        let content = std::fs::read_to_string(dir.path().join("metrics.jsonl")).unwrap();
+        assert_eq!(content.lines().count(), 1);
+    }
+
+    #[test]
+    fn unknown_stream_ids_are_ignored_by_both_terminal_paths() {
+        let store = MetricsStore::new(Duration::from_secs(ONE_MINUTE_SECS));
+        store.finalize_stream(999_999, 100, Duration::from_secs(1));
+        store.fail_stream(999_999, 100, Duration::from_secs(1), "missing".to_owned());
+        assert!(store.snapshot().is_empty());
+    }
+
+    #[test]
+    fn evicting_pending_stream_defers_eviction_until_terminalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MetricsStore::with_logger(Duration::from_millis(50), {
+            let config = crate::config::MetricsLogConfig {
+                enabled: true,
+                path: dir
+                    .path()
+                    .join("metrics.jsonl")
+                    .to_string_lossy()
+                    .to_string(),
+                max_size_mb: 50,
+                max_files: 5,
+            };
+            crate::metrics_log::MetricsLogger::new(&config).unwrap()
+        }));
+        let mut old = sample_record();
+        old.timestamp = Instant::now() - Duration::from_millis(100);
+        let id = store.record_pending(old);
+        store.evict_expired();
+        store.finalize_stream(id, 42, Duration::from_secs(1));
+        store.finalize_stream(id, 99, Duration::from_secs(1));
+
+        let content = std::fs::read_to_string(dir.path().join("metrics.jsonl")).unwrap();
+        assert_eq!(content.lines().count(), 1);
+        assert_eq!(store.records.read().unwrap().len(), 1);
+
+        store.evict_expired();
+        assert!(store.records.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn guard_progress_is_positive_and_monotonic() {
+        let mut guard = StreamMetricsGuard::new(None, None, Instant::now());
+        guard.update(0);
+        assert!(guard.first_generated_at.is_none());
+        guard.update(17);
+        guard.update(3);
+        assert_eq!(guard.output_tokens, 17);
+        assert!(guard.first_generated_at.is_some());
     }
 }

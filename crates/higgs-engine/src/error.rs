@@ -1,4 +1,5 @@
 use higgs_models::error::ModelError;
+use higgs_models::vision::VisionError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -16,6 +17,41 @@ pub enum EngineError {
 
     #[error("Generation error: {0}")]
     Generation(String),
+
+    #[error("Generation cancelled")]
+    Cancelled,
+
+    #[error("Capacity interrupted (boot {boot_id}, generation {generation})")]
+    CapacityInterrupted { boot_id: String, generation: u64 },
+
+    #[error("Retained session {0} is unavailable for required continuation")]
+    RetainedSessionUnavailable(u64),
+    #[error("Vision error: {0}")]
+    Vision(#[from] VisionError),
+}
+
+impl EngineError {
+    /// Map a boundary-check stop reason to its engine error. Disconnect and
+    /// drain are ordinary cancellation; critical pressure keeps its typed
+    /// payload so streaming routes can emit the exact terminal SSE.
+    #[must_use]
+    pub fn from_stop_reason(reason: &crate::stop::StopReason) -> Self {
+        match reason {
+            crate::stop::StopReason::ClientDisconnect | crate::stop::StopReason::ModelDrain => {
+                Self::Cancelled
+            }
+            crate::stop::StopReason::NoProgressWatchdog => Self::Generation(
+                "no-progress watchdog fired within the configured request timeout".to_owned(),
+            ),
+            crate::stop::StopReason::CriticalPressure {
+                boot_id,
+                generation,
+            } => Self::CapacityInterrupted {
+                boot_id: boot_id.clone(),
+                generation: *generation,
+            },
+        }
+    }
 }
 
 #[allow(clippy::panic, clippy::unwrap_used)]
@@ -39,6 +75,12 @@ mod tests {
     fn test_engine_error_display_generation() {
         let err = EngineError::Generation("out of memory".to_owned());
         assert!(err.to_string().contains("out of memory"));
+    }
+
+    #[test]
+    fn test_engine_error_display_cancelled() {
+        let err = EngineError::Cancelled;
+        assert_eq!(err.to_string(), "Generation cancelled");
     }
 
     #[test]

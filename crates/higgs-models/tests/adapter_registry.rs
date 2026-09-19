@@ -286,7 +286,7 @@ fn adapter_load_uses_the_already_parsed_config() {
     let resolved = adapter::resolve(&detected).unwrap();
     std::fs::remove_file(dir.path().join("config.json")).unwrap();
 
-    let Err(error) = resolved.load(&detected) else {
+    let Err(error) = resolved.load(&detected, false) else {
         panic!("config-only checkpoint unexpectedly loaded");
     };
     assert!(

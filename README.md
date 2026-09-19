@@ -32,16 +32,40 @@ brew install --cask panbanda/brews/higgs-desktop # desktop app; bundles the CLI
 
 Or grab the binary and the desktop app from the [latest release](https://github.com/panbanda/higgs/releases/latest), or build from source with Rust 1.88+ and the Xcode Command Line Tools:
 
-```bash
-cargo build --release
+- Local MLX inference and remote-provider routing behind compatible HTTP APIs.
+- Native Escha trellis execution and low-bit Metal kernels for supported models.
+- Streaming responses and grammar-constrained required or named tool calls.
+- Retained sessions, prefix caching, and model-bound disk cache support.
+- Capacity admission informed by execution measurements, cache geometry, and memory-pressure evidence.
+- Diagnostics for allocator usage, capacity transitions, cache retention, and runtime identity.
+- Speculative decoding and vision support on supported model paths.
+
+Native Escha production cache accounting reflects FP32 storage. FP16 attention remains an isolated candidate: long-context exact parity has not passed. Performance claims require matched measurements.
+
+## Disk prefix cache
+
+For the simple engine (`batch = false`), add these settings to a `[[models]]` entry:
+
+```toml
+kv_disk_dir = "/var/lib/higgs/prefix-kv"
+kv_disk_space_mb = 4096
 ```
 
 ## Quick start
 
 Serve a model from Hugging Face (downloaded on first use):
 
-```bash
-higgs serve --model mlx-community/Qwen3.6-35B-A3B-4bit
+Legacy `disk_cache_enabled = true` and optional `disk_cache_path` still work with
+no file-byte ceiling. `kv_disk_dir` cannot be combined with `disk_cache_path`.
+Run `higgs doctor` to check settings and directory access.
+
+## Architecture
+
+```text
+HTTP client → API / routing → fixed context check → inference engine
+                   ↓                                  ⇅
+             remote provider                   model + Metal / MLX
+                   └────────────── response ───────────┘
 ```
 
 Talk to it with any OpenAI client:

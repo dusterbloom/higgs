@@ -1,19 +1,45 @@
 pub mod adapter;
 pub mod bonsai_q1;
+pub mod bonsai_q2;
 pub mod cache;
+/// Internal: runtime JIT Metal kernels (Bonsai-Q1 bits=1 matvec/dequant).
+mod crossrow_qmv;
 pub mod deepseek_v2;
+pub mod dflash;
 pub mod error;
+pub mod eschamoe;
 pub mod gemma2;
 pub mod gemma3;
 pub mod gemma4;
+pub mod gemma_vision;
 pub mod llava_qwen2;
-/// Internal: runtime JIT Metal kernels (Bonsai-Q1 bits=1 matvec/dequant).
 mod metal_kernel;
+#[doc(hidden)]
+pub mod q2_row2_bench {
+    use mlx_rs::{Array, error::Exception};
+
+    /// Opaque handle for release-build microbenchmarks that need the internal
+    /// Bonsai Q2 row2 layout without exposing `metal_kernel` as public API.
+    pub struct BonsaiQ2Row2Bench(crate::metal_kernel::BonsaiQ2Row2);
+
+    impl BonsaiQ2Row2Bench {
+        pub fn from_row_major(weight: &Array, scales: &Array) -> Result<Self, Exception> {
+            crate::metal_kernel::BonsaiQ2Row2::from_row_major(weight, scales).map(Self)
+        }
+
+        pub fn m5_contract(&self, x: &Array, bias: &Array) -> Result<Array, Exception> {
+            crate::metal_kernel::bonsai_q2_row2_m5_contract(x, self.0.as_ref(), bias)
+        }
+    }
+}
+pub mod mlx_exec;
 pub mod phi3;
 pub mod progress;
 pub mod quant_config;
+pub mod quant_mode;
 pub mod qwen3_moe;
 pub mod qwen3_next;
+pub mod qwen_vl;
 pub mod registry;
 pub mod siglip;
 pub mod spec_prefill;
@@ -21,27 +47,79 @@ pub mod starcoder2;
 pub mod transformer;
 pub mod turboquant;
 pub mod utils;
+pub mod vision;
 pub mod yarn;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::mlx_exec::eval;
 use mlx_rs::module::ModuleParametersExt;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::transforms::eval;
-use mlx_rs::{Array, array, error::Exception, ops, random};
+use mlx_rs::{Array, argmax_axis, array, categorical, error::Exception, ops, random};
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::error::ModelError;
+pub use crate::cache::set_turboquant_activation_threshold;
 use crate::turboquant::KvCacheConfig;
+use crate::vision::{ImageBatch, VisionCapabilities, VisionModel};
 
 static BONSAI_IGNORED_MASK_WARNED: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // SamplingParams -- configurable sampling parameters
 // ---------------------------------------------------------------------------
+
+/// Per-request speculative-decoding method selector.
+///
+/// The chosen method is otherwise fixed at model load (`DFlash` if a drafter is
+/// loaded, MTP otherwise); this lets a single loaded engine alternate per request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Speculation {
+    /// Use `DFlash` when a drafter is loaded, else the built-in MTP head (default).
+    #[default]
+    Auto,
+    /// Force the `DFlash` drafter; falls through to the non-DFlash path if none is loaded.
+    DFlash,
+    /// Force the built-in MTP head (reachable even when a `DFlash` drafter is loaded).
+    Mtp,
+    /// Disable speculation entirely; plain autoregressive decode.
+    None,
+}
+
+impl Speculation {
+    /// Parse a request value; absent (`None`) → [`Speculation::Auto`].
+    ///
+    /// # Errors
+    /// Returns the offending value when it is not one of `auto|dflash|mtp|none`.
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        let Some(raw) = value else {
+            return Ok(Self::Auto);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Ok(Self::Auto),
+            "dflash" => Ok(Self::DFlash),
+            "mtp" => Ok(Self::Mtp),
+            "none" | "off" => Ok(Self::None),
+            other => Err(other.to_owned()),
+        }
+    }
+
+    /// Whether the `DFlash` drafter may be used (when one is loaded).
+    #[must_use]
+    pub const fn allows_dflash(self) -> bool {
+        matches!(self, Self::Auto | Self::DFlash)
+    }
+
+    /// Whether the MTP / prompt-lookup speculative paths may be used.
+    #[must_use]
+    pub const fn allows_mtp(self) -> bool {
+        matches!(self, Self::Auto | Self::Mtp)
+    }
+}
 
 /// Parameters controlling token sampling behavior.
 #[derive(Debug, Clone)]
@@ -53,6 +131,11 @@ pub struct SamplingParams {
     pub repetition_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     pub presence_penalty: Option<f32>,
+    /// Per-request speculative-decoding method (defaults to [`Speculation::Auto`]).
+    pub speculation: Speculation,
+    /// Max tokens of `<think>` reasoning before `</think>` is force-closed.
+    /// `None` falls back to the engine's default budget.
+    pub thinking_budget: Option<u32>,
 }
 
 impl Default for SamplingParams {
@@ -65,6 +148,8 @@ impl Default for SamplingParams {
             repetition_penalty: None,
             frequency_penalty: None,
             presence_penalty: None,
+            speculation: Speculation::Auto,
+            thinking_budget: None,
         }
     }
 }
@@ -84,7 +169,12 @@ impl SamplingParams {
     }
 }
 
-pub use qwen3_next::{LayerCache, MtpHead, Qwen3NextCausalLM};
+pub use qwen3_next::{
+    DiagGdnCapture, DiagLayer, LayerCache, MtpHead, Qwen3NextCausalLM, diag_report_attn_diff,
+    diag_report_gdn_diff, diag_report_hidden_diff, diag_request_attn_capture,
+    diag_request_gdn_capture, diag_request_hidden_capture, diag_take_attn_capture,
+    diag_take_gdn_capture, diag_take_hidden_capture,
+};
 pub use transformer::{Model, ModelArgs};
 
 /// MTP (Multi-Token Prediction) KV cache — one `SteppingKeyValueCache` per MTP layer.
@@ -182,32 +272,329 @@ impl AnyCache {
         targets
     }
 
-    /// An **independent** deep copy for use as a speculative-decode checkpoint.
-    /// KV layers are deep-cloned (their in-place `slice_update` buffers must not
-    /// be shared — see [`cache::SteppingKeyValueCache::deep_clone`]); GDN/SSM
-    /// (`Arrays`) layers update by full reassignment, never in place, so a cheap
-    /// shallow `clone()` of those is safe.
+    /// Approximate resident byte size of the KV state (keys + values + any
+    /// TurboQuant storage). Conservative: counts every layer's full K/V
+    /// buffers, so shared/overlapping prefixes are over-counted across
+    /// entries — a safe upper bound for a size budget that must never
+    /// under-evict.
     #[must_use]
-    pub fn deep_clone(&self) -> Self {
+    pub fn approx_bytes(&self) -> usize {
+        let mut total = 0usize;
         match self {
-            Self::KV(layers) => Self::KV(
-                layers
-                    .iter()
-                    .map(|l| l.as_ref().map(cache::SteppingKeyValueCache::deep_clone))
-                    .collect(),
-            ),
-            Self::Hybrid(layers) => Self::Hybrid(
-                layers
-                    .iter()
-                    .map(|l| {
-                        l.as_ref().map(|lc| match lc {
-                            LayerCache::KV(kv) => LayerCache::KV(kv.deep_clone()),
-                            recurrent @ LayerCache::Arrays(_) => recurrent.clone(),
-                        })
-                    })
-                    .collect(),
-            ),
+            Self::KV(layers) => {
+                for layer in layers.iter().flatten() {
+                    total = total.saturating_add(layer.keys().map(|a| a.nbytes()).unwrap_or(0));
+                    total = total.saturating_add(layer.values().map(|a| a.nbytes()).unwrap_or(0));
+                    if let Some((_, kc, kn, kg, vc, vn)) = layer.turbo_arrays() {
+                        total = total.saturating_add(kc.nbytes());
+                        total = total.saturating_add(kn.nbytes());
+                        total = total.saturating_add(kg.nbytes());
+                        total = total.saturating_add(vc.nbytes());
+                        total = total.saturating_add(vn.nbytes());
+                    }
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter().flatten() {
+                    if let LayerCache::KV(kv) = layer {
+                        total = total.saturating_add(kv.keys().map(|a| a.nbytes()).unwrap_or(0));
+                        total = total.saturating_add(kv.values().map(|a| a.nbytes()).unwrap_or(0));
+                    }
+                }
+            }
         }
+        total
+    }
+
+    /// Resident token count (the dense KV offset) of the first KV layer, or 0.
+    /// All KV layers advance in lockstep, so layer 0 is representative.
+    #[must_use]
+    pub fn resident_len(&self) -> i32 {
+        match self {
+            Self::KV(layers) => layers
+                .iter()
+                .flatten()
+                .next()
+                .map_or(0, cache::KeyValueCache::offset),
+            Self::Hybrid(layers) => layers
+                .iter()
+                .flatten()
+                .find_map(|l| match l {
+                    LayerCache::KV(kv) => Some(cache::KeyValueCache::offset(kv)),
+                    LayerCache::Arrays(_) => None,
+                })
+                .unwrap_or(0),
+        }
+    }
+
+    /// Validate that every target-cache layer represents one exact absolute
+    /// token boundary.
+    ///
+    /// Unlike [`Self::resident_len`], this checks every KV layer and every
+    /// recurrent `ArraysCache` offset. Missing layers are rejected because a
+    /// paired target/drafter snapshot must never publish partially-advanced
+    /// target state.
+    pub fn validate_absolute_boundary(&self, expected: i32) -> Result<(), Exception> {
+        if expected < 0 {
+            return Err(Exception::custom(format!(
+                "cache absolute boundary must be non-negative, got {expected}"
+            )));
+        }
+        match self {
+            Self::KV(layers) => {
+                if layers.is_empty() {
+                    return Err(Exception::custom(
+                        "cache has no KV layers to validate at an absolute boundary",
+                    ));
+                }
+                for (index, layer) in layers.iter().enumerate() {
+                    let Some(layer) = layer else {
+                        return Err(Exception::custom(format!(
+                            "cache missing layer {index} at absolute boundary {expected}"
+                        )));
+                    };
+                    let actual = cache::KeyValueCache::offset(layer);
+                    if actual != expected {
+                        return Err(Exception::custom(format!(
+                            "cache layer {index} KV offset {actual} does not match absolute boundary {expected}"
+                        )));
+                    }
+                }
+            }
+            Self::Hybrid(layers) => {
+                if layers.is_empty() {
+                    return Err(Exception::custom(
+                        "cache has no hybrid layers to validate at an absolute boundary",
+                    ));
+                }
+                for (index, layer) in layers.iter().enumerate() {
+                    let Some(layer) = layer else {
+                        return Err(Exception::custom(format!(
+                            "cache missing layer {index} at absolute boundary {expected}"
+                        )));
+                    };
+                    let (kind, actual) = match layer {
+                        LayerCache::KV(kv) => ("KV", cache::KeyValueCache::offset(kv)),
+                        LayerCache::Arrays(arrays) => ("GDN", arrays.offset),
+                    };
+                    if actual != expected {
+                        return Err(Exception::custom(format!(
+                            "cache layer {index} {kind} offset {actual} does not match absolute boundary {expected}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Force-evaluate every array this cache holds. Required before the cache is
+    /// shared across threads — e.g. stashed for a later turn that resumes on a
+    /// different blocking-pool thread, or after a lazy `quantize_for_retention`.
+    /// Sharing a pending lazy MLX graph across threads is a data race; evaluating
+    /// first makes the handoff a read-only transfer of concrete buffers. No-op
+    /// for an empty cache.
+    pub fn eval(&self) -> Result<(), Exception> {
+        let mut targets: Vec<&Array> = Vec::new();
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter().flatten() {
+                    targets.extend(layer.eval_targets());
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter().flatten() {
+                    match layer {
+                        LayerCache::KV(kv) => targets.extend(kv.eval_targets()),
+                        LayerCache::Arrays(a) => {
+                            if let Some(ref cs) = a.conv_state {
+                                targets.push(cs);
+                            }
+                            if let Some(ref ss) = a.ssm_state {
+                                targets.push(ss);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        crate::mlx_exec::eval(targets)
+    }
+
+    /// Prune the token span `[a, b)` from every dense KV layer, compacting
+    /// survivors and renumbering positions (see
+    /// [`cache::SteppingKeyValueCache::prune_span`]). Recurrent (SSM) layers are
+    /// left untouched — like [`Self::trim_by`], their state can't be sliced by
+    /// offset. Returns the first layer error, if any.
+    pub fn prune_span(&mut self, a: i32, b: i32, rope: cache::RopeShift) -> Result<(), Exception> {
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    layer.prune_span(a, b, rope)?;
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    if let LayerCache::KV(kv) = layer {
+                        kv.prune_span(a, b, rope)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Compress every dense KV layer into `TurboQuant` storage for cheap
+    /// between-turn retention (see
+    /// [`cache::SteppingKeyValueCache::quantize_for_retention`]). Recurrent
+    /// (SSM/`Arrays`) layers are left untouched — they have no dense KV to pack.
+    ///
+    /// `config` supplies the TurboQuant bit-widths/seed for layers that were
+    /// created dense; layers already on a TurboQuant config reuse their own.
+    /// Returns the number of layers actually compressed (0 when every layer was
+    /// already TQ-active, empty, or otherwise left dense). Best-effort: a layer
+    /// that cannot be packed (e.g. non-power-of-2 `head_dim`) stays dense and is
+    /// simply not counted, so a continuation still works — just uncompressed.
+    #[allow(clippy::doc_markdown)]
+    pub fn quantize_for_retention(&mut self, config: KvCacheConfig) -> Result<usize, Exception> {
+        let mut compressed = 0usize;
+        match self {
+            Self::KV(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    if layer.quantize_for_retention(config)? {
+                        compressed += 1;
+                    }
+                }
+            }
+            Self::Hybrid(layers) => {
+                for layer in layers.iter_mut().flatten() {
+                    if let LayerCache::KV(kv) = layer {
+                        if kv.quantize_for_retention(config)? {
+                            compressed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(compressed)
+    }
+
+    /// An **independent** deep copy for use as a speculative-decode checkpoint
+    /// or cross-turn prefix snapshot. KV layers are deep-cloned because their
+    /// in-place `slice_update` buffers must not be shared (see
+    /// [`cache::SteppingKeyValueCache::deep_clone`]). Hybrid GDN/SSM (`Arrays`)
+    /// state is deep-cloned too: MLX `Array::clone()` is a shared handle, and a
+    /// boundary snapshot must remain independent of the suffix/decode forwards
+    /// that continue mutating the live cache.
+    #[must_use]
+    #[allow(clippy::expect_used)]
+    pub fn deep_clone(&self) -> Self {
+        self.try_deep_clone()
+            .expect("device copy failed for cache checkpoint")
+    }
+
+    /// Fallible independent device-side copy for retained/prefix snapshots.
+    pub fn try_deep_clone(&self) -> Result<Self, Exception> {
+        match self {
+            Self::KV(layers) => Ok(Self::KV(
+                layers
+                    .iter()
+                    .map(|layer| {
+                        layer
+                            .as_ref()
+                            .map(cache::SteppingKeyValueCache::try_deep_clone)
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>, Exception>>()?,
+            )),
+            Self::Hybrid(layers) => Ok(Self::Hybrid(
+                layers
+                    .iter()
+                    .map(|layer| {
+                        layer
+                            .as_ref()
+                            .map(|cache| match cache {
+                                LayerCache::KV(kv) => kv.try_deep_clone().map(LayerCache::KV),
+                                LayerCache::Arrays(arrays) => {
+                                    arrays.try_deep_clone().map(LayerCache::Arrays)
+                                }
+                            })
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>, Exception>>()?,
+            )),
+        }
+    }
+
+    /// Estimated device bytes retained by all cache arrays.
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::KV(layers) => layers.iter().flatten().fold(0usize, |total, cache| {
+                total.saturating_add(cache.estimated_bytes())
+            }),
+            Self::Hybrid(layers) => layers.iter().flatten().fold(0usize, |total, cache| {
+                total.saturating_add(match cache {
+                    LayerCache::KV(kv) => kv.estimated_bytes(),
+                    LayerCache::Arrays(arrays) => arrays.estimated_bytes(),
+                })
+            }),
+        }
+    }
+
+    /// Borrow the inner hybrid (KV+SSM) cache slice; errors on a KV-only cache.
+    pub fn as_hybrid(&self) -> Result<&[Option<LayerCache>], Exception> {
+        match self {
+            Self::Hybrid(c) => Ok(c),
+            Self::KV(_) => Err(Exception::custom("expected Hybrid cache, got KV")),
+        }
+    }
+
+    /// Mutably borrow the inner hybrid cache vec; errors on a KV-only cache.
+    pub fn as_hybrid_mut(&mut self) -> Result<&mut Vec<Option<LayerCache>>, Exception> {
+        match self {
+            Self::Hybrid(c) => Ok(c),
+            Self::KV(_) => Err(Exception::custom("expected Hybrid cache, got KV")),
+        }
+    }
+}
+
+impl qwen3_next::ArraysCache {
+    /// Independent copy of recurrent Hybrid state for cross-turn cache storage.
+    /// Device-side copy — see [`cache::try_eval_deep_clone`].
+    #[must_use]
+    #[allow(clippy::expect_used)]
+    pub fn deep_clone(&self) -> Self {
+        self.try_deep_clone()
+            .expect("device copy failed for recurrent cache checkpoint")
+    }
+
+    pub fn try_deep_clone(&self) -> Result<Self, Exception> {
+        Ok(Self {
+            conv_state: self
+                .conv_state
+                .as_ref()
+                .map(cache::try_eval_deep_clone)
+                .transpose()?,
+            ssm_state: self
+                .ssm_state
+                .as_ref()
+                .map(cache::try_eval_deep_clone)
+                .transpose()?,
+            conv_pos: self.conv_pos,
+            offset: self.offset,
+        })
+    }
+
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        self.conv_state
+            .as_ref()
+            .map_or(0, mlx_rs::Array::nbytes)
+            .saturating_add(self.ssm_state.as_ref().map_or(0, mlx_rs::Array::nbytes))
     }
 }
 
@@ -248,6 +635,9 @@ pub enum AnyModel {
     Starcoder2(starcoder2::Starcoder2CausalLM),
     /// LLaVA-Qwen2 vision-language model (nanoLLaVA architecture).
     LlavaQwen2(llava_qwen2::LlavaQwen2Model),
+    /// Qwen-VL vision-language model (Qwen2.5-VL / Qwen3-VL / Qwen3.5-VL) on a
+    /// `Qwen3Next` text backbone with dynamic-resolution vision.
+    QwenVl(qwen_vl::QwenVlModel),
     /// DeepSeek-V2 with Multi-head Latent Attention and sparse `MoE`.
     DeepSeekV2(deepseek_v2::DeepSeekV2CausalLM),
     /// Bonsai-Q1: packed 1.25-bpw Qwen3-shaped target (1.7B / 8B).
@@ -317,6 +707,9 @@ fn make_turboquant_kv_cache(
     Ok(AnyCache::KV(caches))
 }
 
+/// Output of [`AnyModel::forward_with_taps_tape`]: logits, tap hiddens, per-layer GDN tape.
+pub type TapsTapeOutput = (Array, Vec<Array>, Vec<Option<qwen3_next::GdnLayerTape>>);
+
 impl AnyModel {
     pub fn forward(
         &mut self,
@@ -333,6 +726,7 @@ impl AnyModel {
             (Self::Phi3(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::Starcoder2(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text(inputs, mask, c),
+            (Self::QwenVl(m), AnyCache::Hybrid(c)) => m.forward_text(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward(inputs, mask, c),
             // BonsaiQ1 builds its causal mask internally; any externally-provided
@@ -365,6 +759,7 @@ impl AnyModel {
             (Self::Phi3(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Starcoder2(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text_hidden(inputs, mask, c),
+            (Self::QwenVl(m), AnyCache::Hybrid(c)) => m.forward_text_hidden(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_hidden(inputs, mask, c),
             (Self::BonsaiQ1(m), AnyCache::KV(c)) => bonsai_q1::forward_trunk_free(m, c, inputs),
@@ -417,6 +812,7 @@ impl AnyModel {
             (Self::Phi3(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
             (Self::Starcoder2(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
             (Self::LlavaQwen2(m), AnyCache::KV(c)) => m.forward_text_all_logits(inputs, mask, c),
+            (Self::QwenVl(m), AnyCache::Hybrid(c)) => m.forward_text_all_logits(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
                 let (_, logits) = m.forward_with_hidden(inputs, mask, c)?;
@@ -477,7 +873,8 @@ impl AnyModel {
             }
             eval(targets)?;
             offset += chunk_size;
-            progress::report_prefill_progress(offset, T);
+            progress::report_prefill_progress(offset, T)
+                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
         }
 
         // Last chunk: forward + LM head projection on last position only.
@@ -486,51 +883,91 @@ impl AnyModel {
         // The loop only reports up to the final chunk boundary; emit the
         // terminal 100% mark once the last chunk is processed so clients don't
         // stall just short of `total`.
-        progress::report_prefill_progress(T, T);
+        progress::report_prefill_progress(T, T)
+            .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
         Ok(logits)
     }
 
     /// Batched decode forward pass for N requests each with 1 token.
     ///
-    /// Only supported for the `Transformer` variant (Llama/Qwen/Mistral).
+    /// Supported for the `Transformer` variant (Llama/Qwen/Mistral), `LLaVA`
+    /// (delegates to its inner Qwen2 transformer), and `Qwen3Next`/`QwenVl`
+    /// (hybrid SSM/attention batched decode over `AnyCache::Hybrid`).
     pub fn forward_batched(
         &mut self,
         inputs: &Array,
         caches: &mut [&mut AnyCache],
     ) -> Result<Array, Exception> {
-        let mut kv_refs: Vec<&mut Vec<Option<cache::SteppingKeyValueCache>>> =
-            Vec::with_capacity(caches.len());
-        for cache in caches.iter_mut() {
-            match cache {
-                AnyCache::KV(kv) => kv_refs.push(kv),
-                AnyCache::Hybrid(_) => {
-                    return Err(Exception::custom(
-                        "Batched forward not supported for Hybrid cache",
-                    ));
-                }
-            }
-        }
-
         match self {
-            Self::Transformer(m) => m.forward_batched(inputs, &mut kv_refs),
+            Self::Transformer(m) => {
+                let mut kv_refs: Vec<&mut Vec<Option<cache::SteppingKeyValueCache>>> =
+                    Vec::with_capacity(caches.len());
+                for cache in caches.iter_mut() {
+                    let AnyCache::KV(kv) = cache else {
+                        return Err(Exception::custom(
+                            "Batched forward requires KV cache for Transformer models",
+                        ));
+                    };
+                    kv_refs.push(kv);
+                }
+                m.forward_batched(inputs, &mut kv_refs)
+            }
+            Self::LlavaQwen2(m) => {
+                let mut kv_refs: Vec<&mut Vec<Option<cache::SteppingKeyValueCache>>> =
+                    Vec::with_capacity(caches.len());
+                for cache in caches.iter_mut() {
+                    let AnyCache::KV(kv) = cache else {
+                        return Err(Exception::custom(
+                            "Batched forward requires KV cache for LlavaQwen2 models",
+                        ));
+                    };
+                    kv_refs.push(kv);
+                }
+                m.forward_text_batched(inputs, &mut kv_refs)
+            }
+            Self::Qwen3Next(m) => {
+                let mut hybrid_refs: Vec<&mut Vec<Option<LayerCache>>> =
+                    Vec::with_capacity(caches.len());
+                for cache in caches.iter_mut() {
+                    let AnyCache::Hybrid(hybrid) = cache else {
+                        return Err(Exception::custom(
+                            "Batched forward requires Hybrid cache for Qwen3Next models",
+                        ));
+                    };
+                    hybrid_refs.push(hybrid);
+                }
+                m.forward_batched(inputs, &mut hybrid_refs)
+            }
+            Self::QwenVl(m) => {
+                let mut hybrid_refs: Vec<&mut Vec<Option<LayerCache>>> =
+                    Vec::with_capacity(caches.len());
+                for cache in caches.iter_mut() {
+                    let AnyCache::Hybrid(hybrid) = cache else {
+                        return Err(Exception::custom(
+                            "Batched forward requires Hybrid cache for QwenVl models",
+                        ));
+                    };
+                    hybrid_refs.push(hybrid);
+                }
+                m.forward_text_batched(inputs, &mut hybrid_refs)
+            }
             Self::Qwen3Moe(_)
-            | Self::Qwen3Next(_)
             | Self::Gemma2(_)
             | Self::Gemma3(_)
             | Self::Gemma4(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
-            | Self::LlavaQwen2(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom(
-                "Batched forward only supported for Transformer models",
+                "Batched forward only supported for Transformer, LlavaQwen2, and Qwen3Next models",
             )),
         }
     }
 
     /// Whether this model supports batched decode.
-    pub const fn supports_batched_decode(&self) -> bool {
-        matches!(self, Self::Transformer(_))
+    pub fn supports_batched_decode(&self) -> bool {
+        matches!(self, Self::Transformer(m) if m.supports_batched_decode())
+            || matches!(self, Self::LlavaQwen2(_) | Self::QwenVl(_))
     }
 
     /// Whether this model has a loaded MTP head for speculative decode.
@@ -550,8 +987,29 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => None,
+        }
+    }
+
+    /// Whether the target is the 1-bit Bonsai variant (affine quantization at
+    /// 1 bit). This enables the validated Bonsai row4/dSpark defaults while
+    /// leaving unrelated models on their generic policy.
+    pub fn is_target_1bit(&self) -> bool {
+        match self {
+            Self::Qwen3Next(m) => m.args.default_quant_spec().bits == 1,
+            _ => false,
+        }
+    }
+
+    /// Whether the target is the 2-bit Bonsai variant (affine quantization at
+    /// 2 bits). The 2-bit target defaults to the validated exact dSpark block
+    /// verifier plus row2/head verifier kernels; AR decode still uses MLX stock.
+    pub fn is_target_2bit(&self) -> bool {
+        match self {
+            Self::Qwen3Next(m) => m.args.default_quant_spec().bits == 2,
+            _ => false,
         }
     }
 
@@ -574,6 +1032,7 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
         }
@@ -596,6 +1055,7 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
         }
@@ -618,6 +1078,7 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
         }
@@ -640,6 +1101,7 @@ impl AnyModel {
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_) => Err(Exception::custom("MTP not supported for this model")),
         }
@@ -662,6 +1124,25 @@ impl AnyModel {
         }
     }
 
+    /// Prefill-only hidden capture with last-token vocabulary projection.
+    /// MTP verification still uses [`Self::forward_with_hidden`] because it
+    /// requires logits for every candidate position.
+    pub fn forward_with_hidden_last_token_logits(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+    ) -> Result<(Array, Array), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_hidden_last_token_logits(inputs, mask, c)
+            }
+            _ => Err(Exception::custom(
+                "forward_with_hidden_last_token_logits only supported for Qwen3Next",
+            )),
+        }
+    }
+
     /// The model's hidden dimension.
     pub fn hidden_size(&self) -> i32 {
         match self {
@@ -674,6 +1155,7 @@ impl AnyModel {
             Self::Phi3(m) => m.args.hidden_size,
             Self::Starcoder2(m) => m.args.hidden_size,
             Self::LlavaQwen2(m) => m.hidden_size(),
+            Self::QwenVl(m) => m.hidden_size(),
             Self::DeepSeekV2(m) => m.args.hidden_size,
             Self::BonsaiQ1(m) => i32::try_from(m.config.hidden).unwrap_or(i32::MAX),
         }
@@ -712,6 +1194,7 @@ impl AnyModel {
                 m.head_dim()
                     .map_err(|err| Exception::custom(err.to_string()))?,
             )),
+            Self::QwenVl(m) => Ok((m.num_key_value_heads(), m.head_dim())),
             Self::DeepSeekV2(m) => Ok((
                 m.args.num_key_value_heads,
                 m.args.qk_nope_head_dim + m.args.qk_rope_head_dim,
@@ -735,9 +1218,12 @@ impl AnyModel {
     ) -> Result<AnyCache, Exception> {
         match self {
             Self::Transformer(m) => {
+                let num_cache_layers = m
+                    .num_cache_layers()
+                    .map_err(|err| Exception::custom(err.to_string()))?;
                 if kv_cache_config.is_turboquant() {
                     make_turboquant_kv_cache(
-                        m.args.num_hidden_layers,
+                        num_cache_layers,
                         m.args.num_key_value_heads,
                         m.args
                             .checked_head_dim()
@@ -745,7 +1231,7 @@ impl AnyModel {
                         kv_cache_config,
                     )
                 } else {
-                    Ok(make_kv_cache(m.args.num_hidden_layers))
+                    Ok(make_kv_cache(num_cache_layers))
                 }
             }
             Self::Qwen3Moe(m) => {
@@ -828,6 +1314,13 @@ impl AnyModel {
                 }
                 Ok(make_kv_cache(m.num_hidden_layers()))
             }
+            Self::QwenVl(m) => {
+                if kv_cache_config.is_turboquant() {
+                    Ok(AnyCache::Hybrid(m.make_lm_cache_turbo(kv_cache_config)?))
+                } else {
+                    Ok(AnyCache::Hybrid(m.make_lm_cache()))
+                }
+            }
             Self::DeepSeekV2(m) => {
                 if kv_cache_config.is_turboquant() {
                     return Err(Exception::custom(
@@ -857,20 +1350,49 @@ impl AnyModel {
     }
 
     /// Whether this model is a vision-language model that supports image input.
-    pub const fn is_vlm(&self) -> bool {
-        matches!(self, Self::LlavaQwen2(_))
+    pub fn is_vlm(&self) -> bool {
+        self.as_vision().is_some()
     }
 
-    /// The expected image size for the VLM's vision encoder, or `None` for text-only models.
-    pub const fn image_size(&self) -> Option<i32> {
+    /// Capability metadata if this model supports vision.
+    pub fn vision_capabilities(&self) -> Option<VisionCapabilities> {
+        self.as_vision().map(VisionModel::vision_capabilities)
+    }
+
+    /// The vision implementation for this model, if it has one.
+    pub fn as_vision(&self) -> Option<&dyn VisionModel> {
         match self {
-            Self::LlavaQwen2(m) => Some(m.image_size()),
+            // LLaVA/Qwen-VL report vision only when their tower was actually
+            // loaded (`disable_vision` leaves a text-only model).
+            Self::LlavaQwen2(m) => m.has_vision().then_some(m),
+            Self::QwenVl(m) => m.has_vision().then_some(m),
+            // Gemma 3/4 are vision-capable only when a vision tower was loaded
+            // (multimodal checkpoints); text-only variants report `None`.
+            Self::Gemma3(m) => m.has_vision_tower().then_some(m),
+            Self::Gemma4(m) => m.has_vision_tower().then_some(m),
             Self::Transformer(_)
             | Self::Qwen3Next(_)
             | Self::Qwen3Moe(_)
             | Self::Gemma2(_)
-            | Self::Gemma3(_)
-            | Self::Gemma4(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => None,
+        }
+    }
+
+    /// The mutable vision implementation for this model, if it has one.
+    pub fn as_vision_mut(&mut self) -> Option<&mut dyn VisionModel> {
+        match self {
+            Self::LlavaQwen2(m) => m.has_vision().then_some(m),
+            Self::QwenVl(m) => m.has_vision().then_some(m),
+            // Gemma 3/4 are vision-capable only when a vision tower was loaded.
+            Self::Gemma3(m) => m.has_vision_tower().then_some(m),
+            Self::Gemma4(m) => m.has_vision_tower().then_some(m),
+            Self::Transformer(_)
+            | Self::Qwen3Next(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
             | Self::Phi3(_)
             | Self::Starcoder2(_)
             | Self::DeepSeekV2(_)
@@ -885,15 +1407,275 @@ impl AnyModel {
     pub fn forward_multimodal(
         &mut self,
         input_ids: &Array,
-        pixel_values: &Array,
+        batch: &ImageBatch,
         cache: &mut AnyCache,
     ) -> Result<Array, Exception> {
+        self.as_vision_mut().map_or_else(
+            || {
+                Err(Exception::custom(
+                    "Model does not support multimodal forward",
+                ))
+            },
+            |v| v.forward_multimodal(input_ids, batch, cache),
+        )
+    }
+
+    /// `DFlash`: forward returning logits + hidden states at `tap_layers` (drafter input).
+    pub fn forward_with_taps(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Vec<Array>), Exception> {
         match (self, cache) {
-            (Self::LlavaQwen2(m), AnyCache::KV(c)) => {
-                m.forward_multimodal(input_ids, pixel_values, c)
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_taps(inputs, mask, c, tap_layers)
             }
             _ => Err(Exception::custom(
-                "Model does not support multimodal forward",
+                "forward_with_taps requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Run a Qwen3Next backbone with tap capture but without the vocabulary
+    /// projection, for chunked drafter-context prefill.
+    pub fn forward_raw_with_taps(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Vec<Array>), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(model), AnyCache::Hybrid(cache)) => {
+                model.forward_raw_with_taps(inputs, mask, cache, tap_layers)
+            }
+            _ => Err(Exception::custom(
+                "forward_raw_with_taps requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Apply the target's final norm and vocabulary head to one raw hidden row.
+    pub fn project_raw_hidden_last(&mut self, hidden: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Qwen3Next(model) => model.project_raw_hidden_last(hidden),
+            _ => Err(Exception::custom(
+                "project_raw_hidden_last requires Qwen3Next",
+            )),
+        }
+    }
+
+    /// Forward returning raw hidden + logits + tap hiddens: one backbone pass
+    /// feeding both hidden-consuming (MTP head) and tap-consuming (`DFlash`
+    /// drafter context) speculation.
+    pub fn forward_with_hidden_taps(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+    ) -> Result<(Array, Array, Vec<Array>), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_hidden_taps(inputs, mask, c, tap_layers)
+            }
+            _ => Err(Exception::custom(
+                "forward_with_hidden_taps requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// PFlash compressive-prefill scorer (SpecPrefill). Computes per-token
+    /// prompt importance via lookahead attention. Only the dense `Transformer`
+    /// variant is supported — the drafter must be a vanilla Qwen3-class model.
+    /// See `transformer::Model::pflash_importance` and `.planning/DESIGN-pflash-higgs.md`.
+    pub fn pflash_importance(
+        &mut self,
+        inputs: &Array,
+        score_layers: &[usize],
+        lookahead: usize,
+        kv_cache: &mut Vec<Option<cache::SteppingKeyValueCache>>,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Transformer(m) => m.pflash_importance(inputs, score_layers, lookahead, kv_cache),
+            _ => Err(Exception::custom(
+                "pflash_importance requires a dense Transformer drafter (got non-Transformer model)",
+            )),
+        }
+    }
+
+    /// Whether this target can execute a PFlash survivor plan with restored
+    /// source positions and a separate logical decode cursor.
+    #[must_use]
+    pub fn supports_pflash_sparse_prefill(&self) -> bool {
+        matches!(self, Self::Qwen3Next(_))
+    }
+
+    /// Checked target sparse-prefill boundary for PFlash survivor plans.
+    ///
+    /// Currently only Qwen3Next/Bonsai hybrid checkpoints have a target-side
+    /// sparse boundary. Packed `BonsaiQ1` is intentionally unsupported here.
+    pub fn pflash_prefill_sparse(
+        &mut self,
+        plan: spec_prefill::TargetSparsePrefillPlan<'_>,
+    ) -> Result<qwen3_next::Qwen3NextSparsePrefillOutput, Exception> {
+        match self {
+            Self::Qwen3Next(model) => model.prefill_sparse(plan),
+            Self::BonsaiQ1(_) => Err(Exception::custom(
+                "PFlash sparse prefill is unsupported for packed BonsaiQ1 models",
+            )),
+            _ => Err(Exception::custom(
+                "PFlash sparse prefill requires a Qwen3Next/Bonsai hybrid target",
+            )),
+        }
+    }
+
+    /// Sparse-prefill boundary that also captures dSpark drafter taps at the
+    /// requested layers. Tap rows are indexed by resident survivor position;
+    /// RoPE and `logical_next_pos` still track the source prompt domain.
+    ///
+    /// Same dispatch surface as [`Self::pflash_prefill_sparse`]: only
+    /// Qwen3Next/Bonsai hybrid targets implement it.
+    pub fn pflash_prefill_sparse_with_taps(
+        &mut self,
+        plan: spec_prefill::TargetSparsePrefillPlan<'_>,
+        tap_layers: &[usize],
+    ) -> Result<qwen3_next::Qwen3NextSparsePrefillOutput, Exception> {
+        match self {
+            Self::Qwen3Next(model) => model.prefill_sparse_with_taps(plan, tap_layers),
+            Self::BonsaiQ1(_) => Err(Exception::custom(
+                "PFlash sparse prefill with taps is unsupported for packed BonsaiQ1 models",
+            )),
+            _ => Err(Exception::custom(
+                "PFlash sparse prefill with taps requires a Qwen3Next/Bonsai hybrid target",
+            )),
+        }
+    }
+
+    /// Number of transformer layers (PFlash scorer uses the last few).
+    pub fn num_layers(&self) -> usize {
+        match self {
+            Self::Transformer(m) => m.num_layers() as usize,
+            _ => 0,
+        }
+    }
+
+    /// `DFlash` verify: forward returning logits + tap hiddens + per-layer GDN tape (for cheap rollback).
+    pub fn forward_with_taps_tape(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+    ) -> Result<TapsTapeOutput, Exception> {
+        self.forward_with_taps_tape_n(inputs, mask, cache, tap_layers, None)
+    }
+
+    /// Tape-recording verify with optional early exit after `max_layers`.
+    pub fn forward_with_taps_tape_n(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+        max_layers: Option<usize>,
+    ) -> Result<TapsTapeOutput, Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.forward_with_taps_tape_n(inputs, mask, c, tap_layers, max_layers)
+            }
+            _ => Err(Exception::custom(
+                "forward_with_taps_tape requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Tape-recording verify with an explicit short-row numerical schedule.
+    pub fn forward_with_taps_tape_scheduled(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut AnyCache,
+        tap_layers: &[usize],
+        max_layers: Option<usize>,
+        row_schedule: qwen3_next::DFlashRowSchedule,
+    ) -> Result<TapsTapeOutput, Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_with_taps_tape_scheduled(
+                inputs,
+                mask,
+                c,
+                tap_layers,
+                max_layers,
+                row_schedule,
+            ),
+            _ => Err(Exception::custom(
+                "forward_with_taps_tape_scheduled requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Replay GDN innovation tape for accepted prefix on partial accept.
+    ///
+    /// Used by `DFlash` verify path: after partial acceptance, restore each
+    /// GDN layer's state from the tape's initial snapshot, replay only the
+    /// SSM recurrence kernel for `n_accepted` accepted positions, and roll
+    /// KV layers back by `kv_rollback`. Avoids the cost of a full rerun.
+    pub fn replay_tape_rollback(
+        &self,
+        layer_tapes: &[Option<qwen3_next::GdnLayerTape>],
+        cache: &mut AnyCache,
+        n_accepted: i32,
+        kv_rollback: i32,
+    ) -> Result<(), Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
+                m.replay_tape_rollback(layer_tapes, c, n_accepted, kv_rollback)
+            }
+            _ => Err(Exception::custom(
+                "replay_tape_rollback requires Qwen3Next + Hybrid cache",
+            )),
+        }
+    }
+
+    /// Embed raw token IDs through the target model's embedding layer.
+    pub fn embed_token_ids(&self, token_ids: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.embed_token_ids(token_ids),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom(
+                "embed_token_ids only implemented for Qwen3Next",
+            )),
+        }
+    }
+
+    /// Apply only the `lm_head` to pre-computed hidden states.
+    pub fn forward_all_logits_from_hidden(&self, hidden: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.forward_all_logits_from_hidden(hidden),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_) => Err(Exception::custom(
+                "forward_all_logits_from_hidden only implemented for Qwen3Next",
             )),
         }
     }
@@ -1088,9 +1870,9 @@ fn sample_filtered_topk(
     let ones = Array::ones::<f32>(&[1])?;
     let zeros = Array::zeros::<f32>(&[k_i32 - 1])?;
     let first_token_mask = if probs.ndim() > 1 {
-        concatenate(&[&ones, &zeros], 0)?.reshape(&[1, -1])?
+        concatenate_axis(&[&ones, &zeros], 0)?.reshape(&[1, -1])?
     } else {
-        concatenate(&[&ones, &zeros], 0)?
+        concatenate_axis(&[&ones, &zeros], 0)?
     };
     let top_p_mask = maximum(&cumsum_mask, &first_token_mask)?;
 
@@ -1151,9 +1933,9 @@ fn sample_filtered_full(
     let ones = Array::ones::<f32>(&[1])?;
     let zeros = Array::zeros::<f32>(&[n_vocab_i32 - 1])?;
     let first_token_mask = if probs.ndim() > 1 {
-        concatenate(&[&ones, &zeros], 0)?.reshape(&[1, -1])?
+        concatenate_axis(&[&ones, &zeros], 0)?.reshape(&[1, -1])?
     } else {
-        concatenate(&[&ones, &zeros], 0)?
+        concatenate_axis(&[&ones, &zeros], 0)?
     };
     let top_p_mask = maximum(&cumsum_mask, &first_token_mask)?;
 
@@ -1264,7 +2046,7 @@ impl LogprobArrays {
 
     /// Extract concrete values after eval.
     pub fn materialize(&self, token_id: u32) -> TokenLogprobInfo {
-        let logprob: f32 = self.token_logprob.item_cast();
+        let logprob: f32 = self.token_logprob.item();
 
         let top_logprobs = match (&self.top_indices, &self.top_values) {
             (Some(indices), Some(values)) => {
@@ -1346,7 +2128,8 @@ pub(crate) fn load_quantized_safetensors_weights_with_settings<M: ModuleParamete
 
     let mut params = model.parameters_mut().flatten();
 
-    for file_path in &safetensors_files {
+    for (index, file_path) in safetensors_files.iter().enumerate() {
+        progress::report_before_shard(index, file_path)?;
         tracing::debug!(file = %file_path.display(), "Loading weights");
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
@@ -1369,11 +2152,21 @@ pub(crate) fn load_quantized_safetensors_weights_with_settings<M: ModuleParamete
                 tracing::warn!(key = %key, "Weight key not found in model parameters");
             }
         }
+        progress::report_after_shard(index)?;
     }
 
+    progress::report_load_boundary(progress::LoadBoundary::BeforeConversion {
+        index: 0,
+        bytes: 0,
+        kind: progress::ConversionKind::FinalModelEval,
+    })?;
     model
         .eval()
         .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+    progress::report_load_boundary(progress::LoadBoundary::AfterConversion {
+        index: 0,
+        kind: progress::ConversionKind::FinalModelEval,
+    })?;
 
     Ok(())
 }
@@ -1416,7 +2209,8 @@ pub(crate) fn load_quantized_safetensors_weights_with_prefix_and_settings<
     // Loader-wide warning budget so throttling doesn't reset per shard.
     let mut total_unmatched_warns = 0usize;
 
-    for file_path in &safetensors_files {
+    for (index, file_path) in safetensors_files.iter().enumerate() {
+        progress::report_before_shard(index, file_path)?;
         tracing::debug!(file = %file_path.display(), prefix, "Loading weights with prefix");
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
@@ -1463,11 +2257,21 @@ pub(crate) fn load_quantized_safetensors_weights_with_prefix_and_settings<
             }
         }
         tracing::info!(matched, unmatched, "Weight loading stats for shard");
+        progress::report_after_shard(index)?;
     }
 
+    progress::report_load_boundary(progress::LoadBoundary::BeforeConversion {
+        index: 0,
+        bytes: 0,
+        kind: progress::ConversionKind::FinalModelEval,
+    })?;
     model
         .eval()
         .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+    progress::report_load_boundary(progress::LoadBoundary::AfterConversion {
+        index: 0,
+        kind: progress::ConversionKind::FinalModelEval,
+    })?;
 
     Ok(())
 }
@@ -1514,7 +2318,8 @@ pub(crate) fn load_quantized_safetensors_weights_optional_prefix_with_settings<
     let mut total_unmatched = 0usize;
     let mut total_unmatched_warns = 0usize;
 
-    for file_path in &safetensors_files {
+    for (index, file_path) in safetensors_files.iter().enumerate() {
+        progress::report_before_shard(index, file_path)?;
         let loaded = Array::load_safetensors(file_path)
             .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
         validate_quantized_tensor_widths(&loaded, quantization)?;
@@ -1538,6 +2343,7 @@ pub(crate) fn load_quantized_safetensors_weights_optional_prefix_with_settings<
                 }
             }
         }
+        progress::report_after_shard(index)?;
     }
 
     tracing::info!(
@@ -1546,9 +2352,18 @@ pub(crate) fn load_quantized_safetensors_weights_optional_prefix_with_settings<
         "Weight loading stats (optional prefix)"
     );
 
+    progress::report_load_boundary(progress::LoadBoundary::BeforeConversion {
+        index: 0,
+        bytes: 0,
+        kind: progress::ConversionKind::FinalModelEval,
+    })?;
     model
         .eval()
         .map_err(|e| ModelError::Io(std::io::Error::other(e.to_string())))?;
+    progress::report_load_boundary(progress::LoadBoundary::AfterConversion {
+        index: 0,
+        kind: progress::ConversionKind::FinalModelEval,
+    })?;
 
     Ok(())
 }
@@ -1664,58 +2479,153 @@ pub(crate) fn validate_quantized_tensor_widths(
 /// Checks `model.safetensors.index.json`'s weight map when present (cheap),
 /// otherwise scans the safetensors file headers. Used to detect optional weights
 /// such as a separate `lm_head` that determines tied vs untied embeddings.
-pub(crate) fn checkpoint_has_key_suffix(model_path: &Path, suffix: &str) -> bool {
-    let index_path = model_path.join("model.safetensors.index.json");
-    if let Ok(json) = std::fs::read_to_string(&index_path)
-        && let Ok(index) = serde_json::from_str::<WeightMapIndex>(&json)
-    {
-        return index.weight_map.keys().any(|k| k.ends_with(suffix));
-    }
-    collect_safetensors_files(model_path).is_ok_and(|files| {
-        files.iter().any(|f| {
-            Array::load_safetensors(f)
-                .is_ok_and(|loaded| loaded.keys().any(|k| k.ends_with(suffix)))
-        })
-    })
+pub(crate) fn checkpoint_has_key_suffix(
+    model_path: &Path,
+    suffix: &str,
+) -> Result<bool, ModelError> {
+    Ok(checkpoint_weight_names(model_path)?
+        .iter()
+        .any(|key| key.ends_with(suffix)))
 }
 
-/// Collect safetensors file paths from a model directory.
-pub(crate) fn collect_safetensors_files(
+fn checkpoint_weight_names(model_path: &Path) -> Result<Vec<String>, ModelError> {
+    let index_path = model_path.join("model.safetensors.index.json");
+    if index_path.exists() {
+        let index: WeightMapIndex = serde_json::from_str(&std::fs::read_to_string(index_path)?)?;
+        return Ok(index.weight_map.into_keys().collect());
+    }
+
+    let mut names = Vec::new();
+    for (index, file) in collect_safetensors_files(model_path)?.iter().enumerate() {
+        progress::report_before_shard(index, file)?;
+        names.extend(safetensor_weight_names(file)?);
+        progress::report_after_shard(index)?;
+    }
+    Ok(names)
+}
+
+pub(crate) fn safetensor_weight_names(path: &Path) -> Result<Vec<String>, ModelError> {
+    use std::io::Read;
+
+    const MAX_SAFETENSORS_HEADER_BYTES: u64 = 100_000_000;
+
+    let file_bytes = std::fs::metadata(path)?.len();
+    let mut file = std::fs::File::open(path)?;
+    let mut length = [0_u8; 8];
+    file.read_exact(&mut length)?;
+    let header_bytes = u64::from_le_bytes(length);
+    if header_bytes == 0
+        || header_bytes > MAX_SAFETENSORS_HEADER_BYTES
+        || header_bytes > file_bytes.saturating_sub(8)
+    {
+        return Err(ModelError::Io(std::io::Error::other(
+            "invalid safetensors header length",
+        )));
+    }
+    let mut header = vec![
+        0_u8;
+        usize::try_from(header_bytes).map_err(|_| {
+            ModelError::Io(std::io::Error::other("safetensors header length overflow"))
+        })?
+    ];
+    file.read_exact(&mut header)?;
+    let entries: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)?;
+    let payload_bytes = file_bytes - 8 - header_bytes;
+    let mut names = Vec::with_capacity(entries.len());
+    let mut ranges = Vec::with_capacity(entries.len());
+    for (name, value) in entries {
+        if name == "__metadata__" {
+            let metadata = value.as_object().ok_or_else(|| {
+                ModelError::Io(std::io::Error::other(
+                    "safetensors __metadata__ must be an object",
+                ))
+            })?;
+            if !metadata.values().all(serde_json::Value::is_string) {
+                return Err(ModelError::Io(std::io::Error::other(
+                    "safetensors __metadata__ values must be strings",
+                )));
+            }
+            continue;
+        }
+        let info: safetensors::tensor::TensorInfo = serde_json::from_value(value)?;
+        let elements = info
+            .shape
+            .iter()
+            .try_fold(1_usize, |total, dimension| total.checked_mul(*dimension))
+            .ok_or_else(|| ModelError::Io(std::io::Error::other("tensor shape overflow")))?;
+        let bits = elements
+            .checked_mul(info.dtype.bitsize())
+            .ok_or_else(|| ModelError::Io(std::io::Error::other("tensor size overflow")))?;
+        let tensor_bytes = info.data_offsets.1.checked_sub(info.data_offsets.0);
+        if bits % 8 != 0 || tensor_bytes != Some(bits / 8) {
+            return Err(ModelError::Io(std::io::Error::other(
+                "safetensors tensor shape does not match data_offsets",
+            )));
+        }
+        let start = u64::try_from(info.data_offsets.0)
+            .map_err(|_| ModelError::Io(std::io::Error::other("tensor offset overflow")))?;
+        let end = u64::try_from(info.data_offsets.1)
+            .map_err(|_| ModelError::Io(std::io::Error::other("tensor offset overflow")))?;
+        if end > payload_bytes {
+            return Err(ModelError::Io(std::io::Error::other(
+                "safetensors data_offsets exceed file",
+            )));
+        }
+        ranges.push((start, end));
+        names.push(name);
+    }
+    if names.is_empty() {
+        return Err(ModelError::Io(std::io::Error::other(
+            "safetensors tensor map is empty",
+        )));
+    }
+    ranges.sort_unstable();
+    let mut expected_start = 0_u64;
+    for (start, end) in ranges {
+        if start != expected_start {
+            return Err(ModelError::Io(std::io::Error::other(
+                "safetensors data offsets are not contiguous",
+            )));
+        }
+        expected_start = end;
+    }
+    if expected_start != payload_bytes {
+        return Err(ModelError::Io(std::io::Error::other(
+            "safetensors payload contains unindexed bytes",
+        )));
+    }
+    Ok(names)
+}
+
+/// Whether any weight key in the checkpoint contains `needle` (e.g. a
+/// `vision_tower.` prefix on multimodal Gemma checkpoints). Like
+/// [`checkpoint_has_key_suffix`], prefers the shard index when present.
+pub(crate) fn checkpoint_has_key_containing(
+    model_path: &Path,
+    needle: &str,
+) -> Result<bool, ModelError> {
+    Ok(checkpoint_weight_names(model_path)?
+        .iter()
+        .any(|key| key.contains(needle)))
+}
+
+/// Collect only the base checkpoint safetensors selected by the loader.
+/// Auxiliary MTP sidecars are deliberately excluded so artifact bindings can
+/// attest the target model independently of optional speculation heads.
+pub(crate) fn collect_base_safetensors_files(
     model_path: &Path,
 ) -> Result<Vec<std::path::PathBuf>, ModelError> {
-    fn existing_auxiliary_files(model_path: &Path) -> Vec<std::path::PathBuf> {
-        AUXILIARY_SAFETENSORS_FILES
-            .iter()
-            .map(|file_name| model_path.join(file_name))
-            .filter(|file_path| file_path.exists())
-            .collect()
-    }
-
-    fn append_existing_auxiliary_files(
-        model_path: &Path,
-        files: &mut Vec<std::path::PathBuf>,
-    ) -> Result<(), ModelError> {
-        let auxiliary_files = existing_auxiliary_files(model_path);
-        if auxiliary_files.len() > 1 {
-            return Err(ModelError::UnsupportedModel(
-                "ambiguous MTP sidecars: both mtp.safetensors and model-mtp.safetensors are present; remove one".to_owned(),
-            ));
-        }
-
-        if let Some(file_path) = auxiliary_files.into_iter().next() {
-            if !files.iter().any(|path| path == &file_path) {
-                files.push(file_path);
-            }
-        }
-        Ok(())
-    }
-
     let index_path = model_path.join("model.safetensors.index.json");
     let single_path = model_path.join("model.safetensors");
     if index_path.exists() {
         let json = std::fs::read_to_string(&index_path)?;
         let index: WeightMapIndex = serde_json::from_str(&json)?;
         let weight_files: HashSet<&String> = index.weight_map.values().collect();
+        if weight_files.is_empty() {
+            return Err(ModelError::MissingWeight(
+                "Safetensors index contains no weight files".to_owned(),
+            ));
+        }
         let mut files: Vec<_> = weight_files
             .into_iter()
             .map(|f| model_path.join(f))
@@ -1727,19 +2637,38 @@ pub(crate) fn collect_safetensors_files(
             files = vec![single_path];
         }
         files.sort();
-        append_existing_auxiliary_files(model_path, &mut files)?;
-        files.sort();
         Ok(files)
     } else if single_path.exists() {
-        let mut files = vec![single_path];
-        append_existing_auxiliary_files(model_path, &mut files)?;
-        files.sort();
-        Ok(files)
+        Ok(vec![single_path])
     } else {
         Err(ModelError::MissingWeight(
             "No safetensors files found".to_owned(),
         ))
     }
+}
+
+/// Collect base checkpoint files plus at most one optional MTP sidecar.
+/// List a model directory's safetensors shard/sidecar files (base shards
+/// plus any recognized auxiliary sidecar, e.g. an MTP head), sorted.
+pub fn collect_safetensors_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>, ModelError> {
+    let mut files = collect_base_safetensors_files(model_path)?;
+    let auxiliary_files = AUXILIARY_SAFETENSORS_FILES
+        .iter()
+        .map(|file_name| model_path.join(file_name))
+        .filter(|file_path| file_path.exists())
+        .collect::<Vec<_>>();
+    if auxiliary_files.len() > 1 {
+        return Err(ModelError::UnsupportedModel(
+            "ambiguous MTP sidecars: both mtp.safetensors and model-mtp.safetensors are present; remove one".to_owned(),
+        ));
+    }
+    if let Some(file_path) = auxiliary_files.into_iter().next()
+        && !files.iter().any(|path| path == &file_path)
+    {
+        files.push(file_path);
+    }
+    files.sort();
+    Ok(files)
 }
 
 /// Remap a safetensors key for quantized model parameter names.
@@ -1763,8 +2692,13 @@ fn remap_quantized_key(key: &str) -> Option<String> {
     }
 }
 
-#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 #[cfg(test)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::disallowed_methods
+)]
 mod tests {
     use super::*;
     use crate::cache::KeyValueCache;
@@ -1783,6 +2717,115 @@ mod tests {
         dense: QLinear,
         #[param]
         quantized: QLinear,
+    }
+
+    #[derive(ModuleParameters)]
+    struct TestTwoShardModel {
+        #[param]
+        first: QLinear,
+        #[param]
+        second: QLinear,
+    }
+
+    /// Removing a pre-shard checkpoint, reporting it after allocation, or
+    /// swallowing its error would let shard two allocate under critical pressure.
+    #[test]
+    fn standard_loader_stops_before_rejected_second_shard() {
+        use crate::progress::{LoadBoundary, install_load_boundary_sink};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let values = [1.0_f32; 4];
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect::<Vec<_>>();
+        for (file, key) in [
+            ("a.safetensors", "first.weight"),
+            ("b.safetensors", "second.weight"),
+        ] {
+            let tensor = safetensors::tensor::TensorView::new(
+                safetensors::tensor::Dtype::F32,
+                vec![2, 2],
+                &bytes,
+            )
+            .unwrap();
+            safetensors::serialize_to_file([(key, tensor)], None, &dir.path().join(file)).unwrap();
+        }
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{"first.weight":"a.safetensors","second.weight":"b.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let sink_events = Rc::clone(&events);
+        let _guard = install_load_boundary_sink(Box::new(move |event| {
+            sink_events.borrow_mut().push(event);
+            if matches!(event, LoadBoundary::BeforeShard { index: 1, .. }) {
+                Err(ModelError::LoadCapacity("critical".to_owned()))
+            } else {
+                Ok(())
+            }
+        }));
+        let mut model = TestTwoShardModel {
+            first: QLinear::new(2, 2).unwrap(),
+            second: QLinear::new(2, 2).unwrap(),
+        };
+        let error = load_quantized_safetensors_weights(&mut model, dir.path(), false).unwrap_err();
+        assert!(matches!(error, ModelError::LoadCapacity(message) if message == "critical"));
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [
+                LoadBoundary::BeforeShard { index: 0, .. },
+                LoadBoundary::AfterShard { index: 0 },
+                LoadBoundary::BeforeShard { index: 1, .. },
+            ]
+        ));
+    }
+
+    #[test]
+    fn indexless_key_scan_stops_before_rejected_second_shard() {
+        use crate::progress::{LoadBoundary, install_load_boundary_sink};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let payload = [0_u8; 1];
+        for (file, key) in [
+            ("model.safetensors", "first"),
+            ("mtp.safetensors", "lm_head.weight"),
+        ] {
+            let tensor = safetensors::tensor::TensorView::new(
+                safetensors::tensor::Dtype::U8,
+                vec![1],
+                &payload,
+            )
+            .unwrap();
+            safetensors::serialize_to_file([(key, tensor)], None, &dir.path().join(file)).unwrap();
+        }
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let sink_events = Rc::clone(&events);
+        let _guard = install_load_boundary_sink(Box::new(move |event| {
+            sink_events.borrow_mut().push(event);
+            if matches!(event, LoadBoundary::BeforeShard { index: 1, .. }) {
+                Err(ModelError::LoadCapacity("critical".to_owned()))
+            } else {
+                Ok(())
+            }
+        }));
+        let error = checkpoint_has_key_suffix(dir.path(), "lm_head.weight").unwrap_err();
+        assert!(matches!(error, ModelError::LoadCapacity(message) if message == "critical"));
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [
+                LoadBoundary::BeforeShard { index: 0, .. },
+                LoadBoundary::AfterShard { index: 0 },
+                LoadBoundary::BeforeShard { index: 1, .. },
+            ]
+        ));
     }
 
     #[test]
@@ -1924,6 +2967,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn speculation_parse_known_absent_and_invalid() {
+        assert_eq!(Speculation::parse(None), Ok(Speculation::Auto));
+        assert_eq!(Speculation::parse(Some("")), Ok(Speculation::Auto));
+        assert_eq!(Speculation::parse(Some("AUTO")), Ok(Speculation::Auto));
+        assert_eq!(
+            Speculation::parse(Some(" DFlash ")),
+            Ok(Speculation::DFlash)
+        );
+        assert_eq!(Speculation::parse(Some("mtp")), Ok(Speculation::Mtp));
+        assert_eq!(Speculation::parse(Some("none")), Ok(Speculation::None));
+        assert_eq!(Speculation::parse(Some("off")), Ok(Speculation::None));
+        assert_eq!(Speculation::parse(Some("bogus")), Err("bogus".to_owned()));
+        // Default carrier value rides on SamplingParams.
+        assert_eq!(SamplingParams::default().speculation, Speculation::Auto);
+        assert!(Speculation::Auto.allows_dflash() && Speculation::Auto.allows_mtp());
+        assert!(Speculation::DFlash.allows_dflash() && !Speculation::DFlash.allows_mtp());
+        assert!(!Speculation::Mtp.allows_dflash() && Speculation::Mtp.allows_mtp());
+        assert!(!Speculation::None.allows_dflash() && !Speculation::None.allows_mtp());
+    }
+
     fn assert_sample_shape(
         logit_data: &[f32],
         logit_shape: &[i32],
@@ -1940,7 +3004,7 @@ mod tests {
     #[test]
     fn test_sample_greedy() {
         let token = assert_sample_shape(&[0.1_f32, 0.9, 0.0], &[1, 3], 0.0, 1.0, &[1]);
-        let val: u32 = token.item_cast();
+        let val: u32 = token.item();
         assert_eq!(val, 1);
     }
 
@@ -2031,14 +3095,14 @@ mod tests {
     #[test]
     fn sample_single_element_logits() {
         let token = assert_sample_shape(&[5.0_f32], &[1, 1], 0.0, 1.0, &[1]);
-        let val: u32 = token.item_cast();
+        let val: u32 = token.item();
         assert_eq!(val, 0, "Single-element logits must return index 0");
     }
 
     #[test]
     fn sample_uniform_logits_greedy() {
         let token = assert_sample_shape(&[1.0_f32, 1.0, 1.0, 1.0], &[1, 4], 0.0, 1.0, &[1]);
-        let val: u32 = token.item_cast();
+        let val: u32 = token.item();
         assert_eq!(val, 0, "Tied logits should return first index via argmax");
     }
 
@@ -2117,6 +3181,20 @@ mod tests {
         let result = collect_safetensors_files(dir.path()).unwrap();
         // Two unique shard files
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn collect_safetensors_rejects_empty_index() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{}}"#,
+        )
+        .unwrap();
+
+        let error = collect_base_safetensors_files(dir.path()).unwrap_err();
+        assert!(matches!(error, ModelError::MissingWeight(_)));
+        assert!(error.to_string().contains("contains no weight files"));
     }
 
     #[test]
@@ -2203,6 +3281,103 @@ mod tests {
     }
 
     #[test]
+    fn arrays_cache_deep_clone_materializes_both_recurrent_states() {
+        let _exec = crate::mlx_exec::acquire();
+        let conv_source = Array::from_slice(
+            &[
+                0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0,
+            ],
+            &[1, 3, 4],
+        )
+        .as_dtype(mlx_rs::Dtype::Float16)
+        .unwrap();
+        let live = qwen3_next::ArraysCache {
+            // Production retains a trailing slice of the convolution input.
+            // Keep this view non-contiguous so the copy regression exercises
+            // the real recurrent-cache shape rather than a packed fixture.
+            conv_state: Some(conv_source.index((.., 1..3, ..))),
+            ssm_state: Some(Array::from_slice(&[5.0_f32, 6.0, 7.0, 8.0], &[1, 2, 2])),
+            conv_pos: 3,
+            offset: 11,
+        };
+        let checkpoint = live.try_deep_clone().unwrap();
+
+        assert_eq!(checkpoint.conv_pos, live.conv_pos);
+        assert_eq!(checkpoint.offset, live.offset);
+        let live_conv = live.conv_state.as_ref().unwrap();
+        let copied_conv = checkpoint.conv_state.as_ref().unwrap();
+        assert_eq!(copied_conv.dtype(), live_conv.dtype());
+        assert_eq!(copied_conv.shape(), live_conv.shape());
+        assert_eq!(
+            copied_conv.as_slice::<half::f16>(),
+            live_conv.as_slice::<half::f16>(),
+            "deep-cloned convolution history must preserve every source value"
+        );
+        assert_ne!(
+            copied_conv.as_slice::<half::f16>().as_ptr(),
+            live_conv.as_slice::<half::f16>().as_ptr()
+        );
+
+        let live_ssm = live.ssm_state.as_ref().unwrap();
+        let copied_ssm = checkpoint.ssm_state.as_ref().unwrap();
+        assert_eq!(copied_ssm.as_slice::<f32>(), live_ssm.as_slice::<f32>());
+        assert_ne!(
+            copied_ssm.as_slice::<f32>().as_ptr(),
+            live_ssm.as_slice::<f32>().as_ptr()
+        );
+    }
+
+    fn kv_cache_at(offset: i32) -> cache::SteppingKeyValueCache {
+        let mut kv = cache::SteppingKeyValueCache::new();
+        if offset > 0 {
+            let keys = Array::zeros::<f32>(&[1, 1, offset, 4]).unwrap();
+            let values = Array::zeros::<f32>(&[1, 1, offset, 4]).unwrap();
+            kv.update_and_fetch(keys, values).unwrap();
+        }
+        kv
+    }
+
+    #[test]
+    fn any_cache_absolute_boundary_checks_every_hybrid_layer() {
+        let mut aligned_arrays = qwen3_next::ArraysCache::new();
+        aligned_arrays.offset = 3;
+        let aligned = AnyCache::Hybrid(vec![
+            Some(LayerCache::KV(kv_cache_at(3))),
+            Some(LayerCache::Arrays(aligned_arrays)),
+        ]);
+        aligned.validate_absolute_boundary(3).unwrap();
+
+        let mut stale_arrays = qwen3_next::ArraysCache::new();
+        stale_arrays.offset = 2;
+        let stale_gdn = AnyCache::Hybrid(vec![
+            Some(LayerCache::KV(kv_cache_at(3))),
+            Some(LayerCache::Arrays(stale_arrays)),
+        ]);
+        let error = stale_gdn.validate_absolute_boundary(3).unwrap_err();
+        assert!(error.to_string().contains("layer 1"));
+
+        let mut aligned_arrays = qwen3_next::ArraysCache::new();
+        aligned_arrays.offset = 3;
+        let stale_kv = AnyCache::Hybrid(vec![
+            Some(LayerCache::KV(kv_cache_at(2))),
+            Some(LayerCache::Arrays(aligned_arrays)),
+        ]);
+        let error = stale_kv.validate_absolute_boundary(3).unwrap_err();
+        assert!(error.to_string().contains("layer 0"));
+    }
+
+    #[test]
+    fn any_cache_absolute_boundary_rejects_missing_or_negative_state() {
+        let missing = AnyCache::Hybrid(vec![Some(LayerCache::KV(kv_cache_at(0))), None]);
+        let error = missing.validate_absolute_boundary(0).unwrap_err();
+        assert!(error.to_string().contains("missing layer 1"));
+
+        let populated = AnyCache::KV(vec![Some(kv_cache_at(0))]);
+        let error = populated.validate_absolute_boundary(-1).unwrap_err();
+        assert!(error.to_string().contains("non-negative"));
+    }
+
+    #[test]
     fn make_kv_cache_positive_layers() {
         let cache = super::make_kv_cache(4);
         match &cache {
@@ -2232,6 +3407,44 @@ mod tests {
             AnyCache::KV(layers) => assert!(layers.is_empty()),
             AnyCache::Hybrid(_) => panic!("Expected KV variant"),
         }
+    }
+
+    fn small_transformer_args(model_type: &str) -> transformer::ModelArgs {
+        transformer::ModelArgs {
+            model_type: model_type.to_owned(),
+            hidden_size: 32,
+            num_hidden_layers: 2,
+            num_loops: 1,
+            skip_loop_final_norm: false,
+            intermediate_size: 64,
+            num_attention_heads: 4,
+            rms_norm_eps: 1e-6,
+            vocab_size: 64,
+            num_key_value_heads: 2,
+            max_position_embeddings: 128,
+            rope_theta: 10000.0,
+            tie_word_embeddings: true,
+            attention_bias: None,
+            use_sliding_window: false,
+            sliding_window: None,
+            rope_scaling: None,
+            head_dim_override: None,
+            quantization: None,
+        }
+    }
+
+    #[test]
+    fn any_model_nanbeige_make_cache_uses_logical_loop_layers() {
+        let mut args = small_transformer_args("nanbeige");
+        args.num_loops = 2;
+        let model = transformer::Model::new(args).unwrap();
+        let any = AnyModel::Transformer(model);
+        let cache = any.make_cache().unwrap();
+        match &cache {
+            AnyCache::KV(layers) => assert_eq!(layers.len(), 4),
+            AnyCache::Hybrid(_) => panic!("Expected KV cache for Nanbeige"),
+        }
+        assert!(!any.supports_batched_decode());
     }
 
     fn small_qwen3_moe_args() -> qwen3_moe::Qwen3MoeModelArgs {
@@ -2269,6 +3482,15 @@ mod tests {
             AnyCache::KV(layers) => assert_eq!(layers.len(), 2),
             AnyCache::Hybrid(_) => panic!("Expected KV cache for Qwen3Moe"),
         }
+    }
+
+    #[test]
+    fn text_models_report_no_vision() {
+        let model = qwen3_moe::Qwen3MoeCausalLM::new(small_qwen3_moe_args()).unwrap();
+        let any = AnyModel::Qwen3Moe(model);
+        assert!(any.as_vision().is_none());
+        assert!(any.vision_capabilities().is_none());
+        assert!(!any.is_vlm());
     }
 
     #[test]
@@ -2363,7 +3585,7 @@ mod tests {
             ..SamplingParams::default()
         };
         let token = sample(&logits, &p).unwrap();
-        let val: u32 = token.item_cast();
+        let val: u32 = token.item();
         assert_eq!(val, 3);
     }
 
@@ -2392,7 +3614,7 @@ mod tests {
             ..SamplingParams::default()
         };
         let token = sample(&logits, &p).unwrap();
-        let val: u32 = token.item_cast();
+        let val: u32 = token.item();
         assert_eq!(val, 0);
     }
 

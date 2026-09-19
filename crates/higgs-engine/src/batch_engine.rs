@@ -8,21 +8,24 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
+use higgs_models::mlx_exec::{async_eval, eval};
 use higgs_models::{
     AnyCache, AnyModel, LogprobArrays, SamplingParams, apply_penalties, sample,
     turboquant::KvCacheConfig,
+    vision::{ImageBatch, ImageInput, VisionCapabilities, VisionError, VisionModel},
 };
 use mlx_rs::{
     Array, Stream,
     ops::indexing::{IndexOp, NewAxis},
     transforms::{async_eval, eval},
-    with_stream,
+    with_new_default_stream,
 };
 use tokenizers::Tokenizer;
 
 use crate::{
-    chat_template::{ChatMessage, ChatTemplateRenderer},
+    chat_template::{ChatMessage, ChatPromptMode, ChatTemplateRenderer},
     engine::{GenerationOutput, StreamingOutput},
     error::EngineError,
     model_loader,
@@ -50,7 +53,89 @@ struct BatchRequest {
     logprobs: bool,
     top_logprobs: Option<u32>,
     constraint: Option<crate::constrained::ConstrainedGenerator>,
+    /// Raw decoded images for multimodal requests. The worker preprocesses
+    /// them (inside [`start_prefill`], where the `AnyModel` lives) into an
+    /// `ImageBatch` and expands the family marker tokens in the prompt. When
+    /// present, the prompt is prefilled in a single merged-embedding forward
+    /// (image features cannot span chunk boundaries) and the prefix cache is
+    /// bypassed.
+    image_inputs: Vec<ImageInput>,
     response_tx: tokio::sync::mpsc::Sender<StreamingOutput>,
+    /// Per-request stop signal: the route worker's generation stop captured
+    /// at submit (disconnect/pressure/drain/watchdog), signalled by the
+    /// streaming forwarder on client disconnect. Checked by the worker at
+    /// every safe allocation boundary.
+    stop: crate::stop::GenerationStop,
+}
+
+enum BatchCommand {
+    Generate(BatchRequest),
+    SetPrefixCacheBytes { requested_revision: u64 },
+}
+
+/// Bounded coalescing state: commands are only wakeups; the latest tuple and
+/// acknowledgement waiters remain authoritative across enqueue timeouts.
+#[derive(Default)]
+struct CacheControlState {
+    desired_revision: u64,
+    desired_bytes: usize,
+    applied_revision: u64,
+    acknowledgements: Vec<(u64, tokio::sync::oneshot::Sender<u64>)>,
+}
+
+async fn send_cache_control(
+    request_tx: &tokio::sync::mpsc::Sender<BatchCommand>,
+    desired: &Arc<Mutex<CacheControlState>>,
+    revision: u64,
+    prefix_bytes: usize,
+    timeout: std::time::Duration,
+) -> Result<(), EngineError> {
+    let (acknowledged, wait) = tokio::sync::oneshot::channel();
+    let should_wake = {
+        let mut state = desired.lock().unwrap_or_else(PoisonError::into_inner);
+        if revision <= state.applied_revision {
+            return Ok(());
+        }
+        let changed = revision > state.desired_revision;
+        if changed {
+            state.desired_revision = revision;
+            state.desired_bytes = prefix_bytes;
+        }
+        state.acknowledgements.push((revision, acknowledged));
+        changed
+    };
+    if should_wake {
+        match tokio::time::timeout(
+            timeout,
+            request_tx.send(BatchCommand::SetPrefixCacheBytes {
+                requested_revision: revision,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) | Err(_) => {}
+            Ok(Err(_)) => return Err(EngineError::Generation("Engine shut down".to_owned())),
+        }
+    }
+    tokio::time::timeout(timeout, wait)
+        .await
+        .map_err(|_| {
+            EngineError::Generation("batch cache update acknowledgement timed out".to_owned())
+        })?
+        .map_err(|_| {
+            EngineError::Generation(
+                "batch engine stopped before applying its cache allocation".to_owned(),
+            )
+        })
+        .and_then(|applied| {
+            if applied >= revision {
+                Ok(())
+            } else {
+                Err(EngineError::Generation(
+                    "batch engine acknowledged a stale cache allocation".to_owned(),
+                ))
+            }
+        })
 }
 
 /// An in-flight request being actively decoded.
@@ -66,6 +151,7 @@ struct ActiveRequest {
     response_tx: tokio::sync::mpsc::Sender<StreamingOutput>,
     prompt_len: u32,
     detok: IncrementalDetok,
+    stop: crate::stop::GenerationStop,
 }
 
 /// A request whose prompt is being fed through the model over multiple turns
@@ -77,6 +163,9 @@ struct PendingPrefill {
     tokens: Vec<u32>,
     offset: usize,
     cache: AnyCache,
+    /// Worker-produced `ImageBatch` for multimodal requests (see
+    /// [`start_prefill`]); `None` for text-only requests.
+    image_batch: Option<ImageBatch>,
 }
 
 enum PrefillAdvance {
@@ -106,12 +195,23 @@ fn prefill_chunk_ranges(token_count: usize, quantum: usize) -> Vec<std::ops::Ran
 /// dedicated background thread. Concurrent requests are interleaved at the
 /// token level instead of being fully serialized.
 pub struct BatchEngine {
-    request_tx: tokio::sync::mpsc::Sender<BatchRequest>,
+    request_tx: tokio::sync::mpsc::Sender<BatchCommand>,
+    cache_control: Arc<Mutex<CacheControlState>>,
+    worker: Option<std::thread::JoinHandle<()>>,
     tokenizer: Tokenizer,
     template: ChatTemplateRenderer,
     model_name: String,
     eos_token_ids: Vec<u32>,
     hidden_size: AtomicI32,
+    /// Whether the loaded model is a vision-language model. Captured at load
+    /// time because the `AnyModel` is moved into the worker thread and the
+    /// handle cannot lock it afterwards.
+    is_vlm: bool,
+    /// The family marker text injected at each image position before
+    /// tokenization, if the loaded model supports vision.
+    image_marker_text: Option<&'static str>,
+    /// Capability metadata for the loaded model, if it supports vision.
+    vision_capabilities: Option<VisionCapabilities>,
 }
 
 impl BatchEngine {
@@ -121,6 +221,7 @@ impl BatchEngine {
         kv_cache_config: KvCacheConfig,
         raise_wired_limit: bool,
         prefill_yield_tokens: Option<u32>,
+        disable_vision: bool,
     ) -> Result<Self, EngineError> {
         if kv_cache_config.is_turboquant() {
             return Err(EngineError::Generation(
@@ -132,19 +233,33 @@ impl BatchEngine {
 
         tracing::info!(model_dir = %model_dir.display(), "Loading model (batch engine)");
 
+        // `disable_vision` is a no-op on nightly (deferred): nightly's
+        // `model_loader::load_model` keeps its single-argument signature and
+        // loads vision-capable checkpoints with their vision tower (see
+        // model_loader.rs). The parameter is retained so the state/main call
+        // chain stays shape-compatible.
+        let _ = disable_vision;
         let model = model_loader::load_model(model_dir)?;
         let tokenizer = model_loader::load_tokenizer(model_dir)?;
         let template = ChatTemplateRenderer::from_model_dir(model_dir)?;
         let eos_token_ids = crate::simple::extract_eos_tokens(model_dir);
         let hidden_size = model.hidden_size();
 
+        // Capture vision metadata before the model is moved into the worker
+        // thread; the handle needs it for route-level capability gating and
+        // marker rendering but can never lock the model afterwards.
+        let (is_vlm, image_marker_text, vision_capabilities) =
+            capture_vision_capabilities(model.as_vision());
+
         crate::simple::set_wired_limit_to_max(raise_wired_limit);
 
         let (request_tx, request_rx) = tokio::sync::mpsc::channel(REQUEST_QUEUE_CAPACITY);
+        let cache_control = Arc::new(Mutex::new(CacheControlState::default()));
+        let worker_cache_control = Arc::clone(&cache_control);
         let eos_ids = eos_token_ids.clone();
         let tok = tokenizer.clone();
 
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("batch-engine".into())
             .spawn(move || {
                 worker_loop(
@@ -152,6 +267,8 @@ impl BatchEngine {
                     &tok,
                     &eos_ids,
                     request_rx,
+                    worker_cache_control,
+                    kv_cache_config.kv_cache_bytes,
                     prefill_yield_tokens.unwrap_or(0),
                 );
             })
@@ -165,16 +282,56 @@ impl BatchEngine {
 
         Ok(Self {
             request_tx,
+            cache_control,
+            worker: Some(worker),
             tokenizer,
             template,
             model_name,
             eos_token_ids,
             hidden_size: AtomicI32::new(hidden_size),
+            is_vlm,
+            image_marker_text,
+            vision_capabilities,
         })
     }
 
     pub fn model_name(&self) -> &str {
         &self.model_name
+    }
+
+    /// Close the request queue and wait until the worker-owned model is dropped.
+    pub fn shutdown(mut self) -> Result<(), EngineError> {
+        self.shutdown_worker()
+    }
+
+    fn shutdown_worker(&mut self) -> Result<(), EngineError> {
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
+        drop(closed_rx);
+        drop(std::mem::replace(&mut self.request_tx, closed_tx));
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker.join().map_err(|_| {
+            EngineError::Generation("batch engine worker panicked during shutdown".to_owned())
+        })
+    }
+
+    /// Apply the process registry's effective prefix-cache allocation and wait
+    /// until the worker has evicted entries above the new limit.
+    pub async fn apply_capacity_cache_limit(
+        &self,
+        revision: u64,
+        prefix_bytes: usize,
+    ) -> Result<(), EngineError> {
+        const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        send_cache_control(
+            &self.request_tx,
+            &self.cache_control,
+            revision,
+            prefix_bytes,
+            CONTROL_TIMEOUT,
+        )
+        .await
     }
 
     pub const fn tokenizer(&self) -> &Tokenizer {
@@ -187,6 +344,37 @@ impl BatchEngine {
 
     pub fn hidden_size(&self) -> i32 {
         self.hidden_size.load(Ordering::Relaxed)
+    }
+
+    /// Whether the loaded model is a vision-language model.
+    pub const fn is_vlm(&self) -> bool {
+        self.is_vlm
+    }
+
+    /// Runtime tool protocol derived from the loaded chat template.
+    pub fn tool_call_mode(&self) -> &'static str {
+        if self.template.supports_tools() {
+            "native"
+        } else {
+            "textual"
+        }
+    }
+
+    /// Batch generation currently does not expose a per-request thinking
+    /// toggle, so report it as disabled even when the template mentions one.
+    pub const fn thinking_mode(&self) -> &'static str {
+        "disabled"
+    }
+
+    /// The marker text injected at each image position before tokenization,
+    /// if the loaded model supports vision.
+    pub const fn image_marker_text(&self) -> Option<&'static str> {
+        self.image_marker_text
+    }
+
+    /// Capability metadata for the loaded model, if it supports vision.
+    pub fn vision_capabilities(&self) -> Option<VisionCapabilities> {
+        self.vision_capabilities.clone()
     }
 
     /// Apply chat template and tokenize messages.
@@ -205,7 +393,18 @@ impl BatchEngine {
         messages: &[ChatMessage],
         tools: Option<&[serde_json::Value]>,
     ) -> Result<Vec<u32>, EngineError> {
-        let prompt = self.template.apply(messages, tools, true)?;
+        self.prepare_chat_prompt_for_mode(messages, tools, ChatPromptMode::Generation)
+    }
+
+    pub fn prepare_chat_prompt_for_mode(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        mode: ChatPromptMode,
+    ) -> Result<Vec<u32>, EngineError> {
+        let prompt = self
+            .template
+            .apply(messages, tools, mode.add_generation_prompt())?;
         let encoding = self
             .tokenizer
             .encode(prompt.as_str(), false)
@@ -224,7 +423,7 @@ impl BatchEngine {
         logprobs: bool,
         top_logprobs: Option<u32>,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<mlx_rs::Array>,
+        image_inputs: Option<Vec<ImageInput>>,
     ) -> Result<GenerationOutput, EngineError> {
         self.generate_with_thinking(
             prompt_tokens,
@@ -235,7 +434,7 @@ impl BatchEngine {
             top_logprobs,
             false,
             constraint,
-            pixel_values,
+            image_inputs,
         )
     }
 
@@ -250,13 +449,8 @@ impl BatchEngine {
         top_logprobs: Option<u32>,
         _enable_thinking: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<mlx_rs::Array>,
+        image_inputs: Option<Vec<ImageInput>>,
     ) -> Result<GenerationOutput, EngineError> {
-        if pixel_values.is_some() {
-            return Err(EngineError::Generation(
-                "Batch engine does not support multimodal (image) inputs".to_owned(),
-            ));
-        }
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
         }
@@ -273,14 +467,20 @@ impl BatchEngine {
                 prompt_tokens: prompt_len,
                 completion_tokens: 0,
                 token_logprobs: None,
+                reasoning_content: None,
+                cached_prompt_tokens: 0,
             });
         }
 
-        // Submit request and collect all streaming outputs.
+        // Submit request and collect all streaming outputs. The stop signal
+        // is the route worker's thread-local generation stop (disconnect,
+        // pressure, drain, watchdog); without one, a default (never-signalled
+        // externally) stop still carries worker-side cancellation coverage.
+        let stop = crate::stop::generation_stop().unwrap_or_default();
         let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel(32);
 
         self.request_tx
-            .blocking_send(BatchRequest {
+            .blocking_send(BatchCommand::Generate(BatchRequest {
                 prompt_tokens: prompt_tokens.to_vec(),
                 max_tokens,
                 params: params.clone(),
@@ -288,16 +488,34 @@ impl BatchEngine {
                 logprobs,
                 top_logprobs,
                 constraint,
+                image_inputs: image_inputs.unwrap_or_default(),
                 response_tx: internal_tx,
-            })
+                stop: stop.clone(),
+            }))
             .map_err(|_| EngineError::Generation("Engine shut down".to_owned()))?;
 
         let mut full_text = String::new();
         let mut finish_reason = "length".to_owned();
         let mut completion_tokens: u32 = 0;
+        let mut saw_terminal = false;
         let mut all_logprobs: Option<Vec<higgs_models::TokenLogprobInfo>> = logprobs.then(Vec::new);
+        // The worker reports the post-preprocess prompt length on every chunk;
+        // capture it from the first one so multimodal usage matches the
+        // sentinel-expanded token count actually prefilled.
+        let mut reported_prompt_len: Option<u32> = None;
 
         while let Some(output) = internal_rx.blocking_recv() {
+            // Worker-sent error chunks (prefill/decode failures) fail the
+            // request instead of surfacing as an empty success.
+            if matches!(
+                output.finish_reason.as_deref(),
+                Some(WORKER_ERROR_FINISH | WORKER_ERROR_FINISH_VISION)
+            ) {
+                return Err(worker_error_from_output(&output));
+            }
+            if reported_prompt_len.is_none() {
+                reported_prompt_len = Some(output.prompt_tokens);
+            }
             full_text.push_str(&output.new_text);
             completion_tokens = output.completion_tokens;
             if let Some(ref reason) = output.finish_reason {
@@ -307,16 +525,28 @@ impl BatchEngine {
                 all_lp.push(lp);
             }
             if output.finished {
+                saw_terminal = true;
                 break;
             }
+        }
+
+        // The worker removed the request without a terminal chunk (its
+        // response channel closed) only when a stop boundary fired; that is
+        // a typed failure, never a partial success.
+        if !saw_terminal && stop.is_stopped() {
+            return Err(stop.reason().map_or(EngineError::Cancelled, |reason| {
+                EngineError::from_stop_reason(&reason)
+            }));
         }
 
         Ok(GenerationOutput {
             text: full_text,
             finish_reason,
-            prompt_tokens: prompt_len,
+            prompt_tokens: reported_prompt_len.unwrap_or(prompt_len),
             completion_tokens,
             token_logprobs: all_logprobs,
+            reasoning_content: None,
+            cached_prompt_tokens: 0,
         })
     }
 
@@ -332,7 +562,7 @@ impl BatchEngine {
         top_logprobs: Option<u32>,
         sender: &tokio::sync::mpsc::Sender<StreamingOutput>,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<mlx_rs::Array>,
+        image_inputs: Option<Vec<ImageInput>>,
     ) -> Result<(), EngineError> {
         self.generate_streaming_with_thinking(
             prompt_tokens,
@@ -345,7 +575,7 @@ impl BatchEngine {
             false,
             false,
             constraint,
-            pixel_values,
+            image_inputs,
         )
     }
 
@@ -364,13 +594,8 @@ impl BatchEngine {
         // share the streaming interface with SimpleEngine.
         _return_progress: bool,
         constraint: Option<crate::constrained::ConstrainedGenerator>,
-        pixel_values: Option<mlx_rs::Array>,
+        image_inputs: Option<Vec<ImageInput>>,
     ) -> Result<(), EngineError> {
-        if pixel_values.is_some() {
-            return Err(EngineError::Generation(
-                "Batch engine does not support multimodal (image) inputs".to_owned(),
-            ));
-        }
         if prompt_tokens.is_empty() {
             return Err(EngineError::Generation("Prompt is empty".to_owned()));
         }
@@ -395,10 +620,14 @@ impl BatchEngine {
 
         // Submit request -- the background loop sends tokens directly to
         // an internal channel, and we forward them to the caller's sender.
+        // The stop signal carries the route worker's thread-local generation
+        // stop so the worker observes disconnect/pressure/drain/watchdog at
+        // its allocation boundaries.
+        let stop = crate::stop::generation_stop().unwrap_or_default();
         let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel(32);
 
         self.request_tx
-            .blocking_send(BatchRequest {
+            .blocking_send(BatchCommand::Generate(BatchRequest {
                 prompt_tokens: prompt_tokens.to_vec(),
                 max_tokens,
                 params: params.clone(),
@@ -406,14 +635,35 @@ impl BatchEngine {
                 logprobs,
                 top_logprobs,
                 constraint,
+                image_inputs: image_inputs.unwrap_or_default(),
                 response_tx: internal_tx,
-            })
+                stop: stop.clone(),
+            }))
             .map_err(|_| EngineError::Generation("Engine shut down".to_owned()))?;
 
         while let Some(output) = internal_rx.blocking_recv() {
+            // Worker-sent error chunks (prefill/decode failures) fail the
+            // request; the caller surfaces the failure (the route sends an
+            // error-finish chunk to the SSE stream).
+            if matches!(
+                output.finish_reason.as_deref(),
+                Some(WORKER_ERROR_FINISH | WORKER_ERROR_FINISH_VISION)
+            ) {
+                return Err(worker_error_from_output(&output));
+            }
             let finished = output.finished;
             if sender.blocking_send(output).is_err() {
-                break; // Client disconnected
+                // Client disconnected mid-stream: record it so the worker
+                // stops allocating at its next boundary instead of decoding
+                // to max_tokens. Then keep draining (discarding) until the
+                // worker's terminal chunk or channel close confirms removal —
+                // returning here would release capacity the worker is still
+                // spending.
+                stop.stop(crate::stop::StopReason::ClientDisconnect);
+                if finished {
+                    break;
+                }
+                continue;
             }
             if finished {
                 break;
@@ -433,30 +683,89 @@ impl BatchEngine {
     }
 }
 
+impl Drop for BatchEngine {
+    fn drop(&mut self) {
+        if let Err(error) = self.shutdown_worker() {
+            tracing::warn!(%error, "batch engine worker join failed during drop");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Background worker loop
 // ---------------------------------------------------------------------------
+
+/// Safe-boundary liveness for one request: it is dead when a stop reason is
+/// recorded (disconnect signalled by the forwarder, critical pressure, drain,
+/// watchdog) or its response channel already closed. Checked before prefill
+/// start, between prefill chunks, and before every decode round — the points
+/// where the next unit of allocation is decided.
+fn request_is_dead(
+    stop: &crate::stop::GenerationStop,
+    response_tx: &tokio::sync::mpsc::Sender<StreamingOutput>,
+) -> bool {
+    stop.check().is_some() || response_tx.is_closed()
+}
+
+/// Remove dead requests before the next allocation unit. Each survivor notes
+/// progress (one decode round / prefill chunk = progress). Returns how many
+/// were removed.
+fn sweep_cancelled(active: &mut Vec<ActiveRequest>) -> usize {
+    let mut cancelled = Vec::new();
+    for (i, ar) in active.iter().enumerate() {
+        if request_is_dead(&ar.stop, &ar.response_tx) {
+            cancelled.push(i);
+        }
+    }
+    let removed = cancelled.len();
+    for i in cancelled.into_iter().rev() {
+        let ar = active.swap_remove(i);
+        tracing::debug!(reason = ?ar.stop.reason(), "batch request cancelled at allocation boundary");
+    }
+    for ar in active {
+        ar.stop.note_progress();
+    }
+    removed
+}
 
 #[allow(clippy::too_many_lines)]
 fn worker_loop(
     mut model: AnyModel,
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
-    mut request_rx: tokio::sync::mpsc::Receiver<BatchRequest>,
+    mut request_rx: tokio::sync::mpsc::Receiver<BatchCommand>,
+    cache_control: Arc<Mutex<CacheControlState>>,
+    prefix_cache_bytes: usize,
     prefill_yield_tokens: u32,
 ) {
-    let mut prefix_cache = PrefixCache::new(DEFAULT_PREFIX_CACHE_SIZE);
+    let mut prefix_cache =
+        PrefixCache::new(DEFAULT_PREFIX_CACHE_SIZE).with_max_bytes(prefix_cache_bytes);
     let mut active: Vec<ActiveRequest> = Vec::new();
     let mut pending_prefill: Option<PendingPrefill> = None;
 
     loop {
+        apply_pending_cache_control(&mut prefix_cache, &cache_control);
         // 1. Prefill at most one pending request per iteration.
         //    This interleaves prefill with decode so long prefills don't
         //    starve active requests, keeping TTFT low for new arrivals
         //    while maintaining token throughput for in-flight requests.
         if pending_prefill.is_none() {
-            if let Ok(req) = request_rx.try_recv() {
+            if let Ok(command) = request_rx.try_recv()
+                && let Some(req) = apply_batch_command(command, &mut prefix_cache, &cache_control)
+            {
+                // Safe boundary before prefill start: a dead request
+                // allocates nothing. Dropping it closes its response channel,
+                // which is the submitter's terminal signal.
+                if request_is_dead(&req.stop, &req.response_tx) {
+                    tracing::debug!("batch request cancelled before prefill start");
+                    continue;
+                }
+                // The Higgs caller already owns its process GPU gate. Take the
+                // lower-level MLX gate only for this unit of work; holding it
+                // while idle would deadlock a co-resident Simple engine.
+                let _mlx_gate = higgs_models::mlx_exec::acquire();
                 if prefill_yield_tokens == 0 {
+                    let response_tx = req.response_tx.clone();
                     match prefill_request(
                         &mut model,
                         &mut prefix_cache,
@@ -466,18 +775,35 @@ fn worker_loop(
                     ) {
                         Ok(Some(ar)) => active.push(ar),
                         Ok(None) => {}
-                        Err(e) => tracing::error!(error = %e, "Prefill failed"),
+                        Err(e) => {
+                            send_prefill_error(&response_tx, &e);
+                            tracing::error!(error = %e, "Prefill failed");
+                        }
                     }
                 } else {
-                    match start_prefill(&model, &mut prefix_cache, req) {
+                    let response_tx = req.response_tx.clone();
+                    match start_prefill(&model, tokenizer, &mut prefix_cache, req) {
                         Ok(prefill) => pending_prefill = Some(prefill),
-                        Err(e) => tracing::error!(error = %e, "Prefill failed"),
+                        Err(e) => {
+                            send_prefill_error(&response_tx, &e);
+                            tracing::error!(error = %e, "Prefill failed");
+                        }
                     }
                 }
             }
         }
 
         if let Some(prefill) = pending_prefill.take() {
+            // Safe boundary between prefill chunks: a dead request is
+            // dropped instead of advanced; its channel close is the
+            // submitter's terminal signal.
+            if request_is_dead(&prefill.req.stop, &prefill.req.response_tx) {
+                tracing::debug!("batch prefill cancelled before advance");
+                continue;
+            }
+            prefill.req.stop.note_progress();
+            let _mlx_gate = higgs_models::mlx_exec::acquire();
+            let response_tx = prefill.req.response_tx.clone();
             match advance_prefill(
                 &mut model,
                 &mut prefix_cache,
@@ -492,6 +818,7 @@ fn worker_loop(
                 Ok(PrefillAdvance::Complete(Some(ar))) => active.push(ar),
                 Ok(PrefillAdvance::Complete(None)) => {}
                 Err(e) => {
+                    send_prefill_error(&response_tx, &e);
                     tracing::error!(error = %e, "Prefill failed");
                 }
             }
@@ -499,8 +826,17 @@ fn worker_loop(
 
         // 2. If no active requests, block until one arrives.
         if active.is_empty() && pending_prefill.is_none() {
-            if let Some(req) = request_rx.blocking_recv() {
+            if let Some(req) =
+                blocking_next_request(&mut request_rx, &mut prefix_cache, &cache_control)
+            {
+                // Safe boundary before prefill start (idle path).
+                if request_is_dead(&req.stop, &req.response_tx) {
+                    tracing::debug!("batch request cancelled before prefill start");
+                    continue;
+                }
+                let _mlx_gate = higgs_models::mlx_exec::acquire();
                 if prefill_yield_tokens == 0 {
+                    let response_tx = req.response_tx.clone();
                     match prefill_request(
                         &mut model,
                         &mut prefix_cache,
@@ -511,14 +847,19 @@ fn worker_loop(
                         Ok(Some(ar)) => active.push(ar),
                         Ok(None) => continue,
                         Err(e) => {
+                            send_prefill_error(&response_tx, &e);
                             tracing::error!(error = %e, "Prefill failed");
                             continue;
                         }
                     }
                 } else {
-                    match start_prefill(&model, &mut prefix_cache, req) {
+                    let response_tx = req.response_tx.clone();
+                    match start_prefill(&model, tokenizer, &mut prefix_cache, req) {
                         Ok(prefill) => pending_prefill = Some(prefill),
-                        Err(e) => tracing::error!(error = %e, "Prefill failed"),
+                        Err(e) => {
+                            send_prefill_error(&response_tx, &e);
+                            tracing::error!(error = %e, "Prefill failed");
+                        }
                     }
                     continue;
                 }
@@ -532,13 +873,17 @@ fn worker_loop(
         //    Use batched decode when possible (Transformer architecture, >1
         //    request, no constrained generation). Falls back to pipelined
         //    sequential decode otherwise.
+        // Safe boundary before the decode round.
+        sweep_cancelled(&mut active);
+
         let mut finished_indices = Vec::new();
         let use_batched = active.len() > 1
             && model.supports_batched_decode()
             && active.iter().all(|ar| ar.constraint.is_none());
+        let _mlx_gate = higgs_models::mlx_exec::acquire();
 
         if use_batched {
-            if let Err(e) = with_stream(&Stream::new(), || {
+            if let Err(e) = with_new_default_stream(&Stream::new(), || {
                 run_batched_decode_round(
                     &mut model,
                     &mut active,
@@ -550,7 +895,7 @@ fn worker_loop(
                 tracing::error!(error = %e, "Batched decode round failed");
                 for (i, ar) in active.iter().enumerate() {
                     let _ = ar.response_tx.blocking_send(StreamingOutput {
-                        new_text: String::new(),
+                        new_text: format!("decode failed: {e}"),
                         finished: true,
                         finish_reason: Some("error".to_owned()),
                         prompt_tokens: ar.prompt_len,
@@ -562,7 +907,7 @@ fn worker_loop(
                 }
             }
         } else {
-            with_stream(&Stream::new(), || {
+            with_new_default_stream(&Stream::new(), || {
                 run_pipelined_decode_round(
                     &mut model,
                     &mut active,
@@ -576,6 +921,68 @@ fn worker_loop(
         // 4. Remove finished requests (reverse order to preserve indices).
         for i in finished_indices.into_iter().rev() {
             active.swap_remove(i);
+        }
+    }
+}
+
+fn apply_batch_command(
+    command: BatchCommand,
+    prefix_cache: &mut PrefixCache,
+    desired: &Arc<Mutex<CacheControlState>>,
+) -> Option<BatchRequest> {
+    match command {
+        BatchCommand::Generate(request) => Some(request),
+        BatchCommand::SetPrefixCacheBytes { requested_revision } => {
+            apply_pending_cache_control(prefix_cache, desired);
+            debug_assert!(
+                desired
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .applied_revision
+                    >= requested_revision
+            );
+            None
+        }
+    }
+}
+
+fn apply_pending_cache_control(
+    prefix_cache: &mut PrefixCache,
+    desired: &Arc<Mutex<CacheControlState>>,
+) {
+    let target = {
+        let state = desired.lock().unwrap_or_else(PoisonError::into_inner);
+        (state.desired_revision > state.applied_revision)
+            .then_some((state.desired_revision, state.desired_bytes))
+    };
+    let Some((revision, bytes)) = target else {
+        return;
+    };
+    let _mlx_gate = higgs_models::mlx_exec::acquire();
+    prefix_cache.set_capacity_max_bytes(bytes);
+    let mut state = desired.lock().unwrap_or_else(PoisonError::into_inner);
+    state.applied_revision = state.applied_revision.max(revision);
+    let applied = state.applied_revision;
+    let mut pending = Vec::new();
+    for (requested, acknowledged) in state.acknowledgements.drain(..) {
+        if requested <= applied {
+            let _ = acknowledged.send(applied);
+        } else {
+            pending.push((requested, acknowledged));
+        }
+    }
+    state.acknowledgements = pending;
+}
+
+fn blocking_next_request(
+    request_rx: &mut tokio::sync::mpsc::Receiver<BatchCommand>,
+    prefix_cache: &mut PrefixCache,
+    desired: &Arc<Mutex<CacheControlState>>,
+) -> Option<BatchRequest> {
+    loop {
+        let command = request_rx.blocking_recv()?;
+        if let Some(request) = apply_batch_command(command, prefix_cache, desired) {
+            return Some(request);
         }
     }
 }
@@ -604,7 +1011,7 @@ fn run_pipelined_decode_round(
                     Err(e) => {
                         tracing::error!(error = %e, "async_eval failed");
                         let _ = ar.response_tx.blocking_send(StreamingOutput {
-                            new_text: String::new(),
+                            new_text: format!("decode step failed: {e}"),
                             finished: true,
                             finish_reason: Some("error".to_owned()),
                             prompt_tokens: ar.prompt_len,
@@ -620,7 +1027,7 @@ fn run_pipelined_decode_round(
             Err(e) => {
                 tracing::error!(error = %e, "Decode graph build failed");
                 let _ = ar.response_tx.blocking_send(StreamingOutput {
-                    new_text: String::new(),
+                    new_text: format!("decode graph build failed: {e}"),
                     finished: true,
                     finish_reason: Some("error".to_owned()),
                     prompt_tokens: ar.prompt_len,
@@ -663,7 +1070,7 @@ fn run_batched_decode_round(
         .map(|ar| ar.current_token.index((.., NewAxis)))
         .collect();
     let token_refs: Vec<&Array> = token_arrays.iter().collect();
-    let batched_input = mlx_rs::ops::concatenate(&token_refs, 0).map_err(EngineError::Mlx)?;
+    let batched_input = mlx_rs::ops::concatenate_axis(&token_refs, 0).map_err(EngineError::Mlx)?;
 
     // Collect mutable cache references
     let mut cache_refs: Vec<&mut higgs_models::AnyCache> =
@@ -730,18 +1137,130 @@ fn run_batched_decode_round(
     Ok(())
 }
 
+/// Extract the vision metadata the HTTP layer needs from a loaded model's
+/// vision implementation (if any), before the model is moved into the worker
+/// thread. Returns `(is_vlm, image_marker_text, vision_capabilities)`.
+fn capture_vision_capabilities(
+    vision: Option<&dyn VisionModel>,
+) -> (bool, Option<&'static str>, Option<VisionCapabilities>) {
+    let Some(v) = vision else {
+        return (false, None, None);
+    };
+    (
+        true,
+        Some(v.image_marker_text()),
+        Some(v.vision_capabilities()),
+    )
+}
+
+/// Preprocess a multimodal request inside the worker thread.
+///
+/// Decodes and preprocesses the raw [`ImageInput`]s into a family-native
+/// [`ImageBatch`], then expands each family marker token in the prompt into
+/// the sentinel run the batch expects (so `sum(batch.per_image_tokens)`
+/// matches the sentinel count required by the embedding merge). The raw
+/// inputs are consumed; the produced batch is returned for the single-pass
+/// multimodal forward. Text-only requests pass through unchanged (`None`).
+fn preprocess_images_in_worker(
+    vision: Option<&dyn VisionModel>,
+    tokenizer: &Tokenizer,
+    req: &mut BatchRequest,
+) -> Result<Option<ImageBatch>, EngineError> {
+    if req.image_inputs.is_empty() {
+        return Ok(None);
+    }
+    let v = vision.ok_or_else(|| {
+        EngineError::Vision(VisionError::Preprocess(
+            "model has no vision; cannot process images".to_owned(),
+        ))
+    })?;
+    // Take the raw inputs so the (potentially large) decoded image bytes do
+    // not linger on the request for the whole generation.
+    let inputs = std::mem::take(&mut req.image_inputs);
+    let batch = v.preprocess_images(&inputs)?;
+    let mut tokens = std::mem::take(&mut req.prompt_tokens);
+    v.postprocess_image_tokens(&mut tokens, tokenizer, &batch)?;
+    req.prompt_tokens = tokens;
+    Ok(Some(batch))
+}
+
+/// `finish_reason` sent by the worker on prefill failure; the error message
+/// rides in `new_text` (the generate tails convert the chunk back into an
+/// `Err`). The `:vision` form marks client-caused image preprocessing
+/// failures so the tail reconstructs [`EngineError::Vision`] and the route
+/// maps it to a strict 400.
+const WORKER_ERROR_FINISH: &str = "error";
+/// See [`WORKER_ERROR_FINISH`].
+const WORKER_ERROR_FINISH_VISION: &str = "error:vision";
+
+/// Send an error-finish chunk to a failed request's response channel so the
+/// generate tail converts it into an `Err` — the client sees a failure
+/// instead of an empty success. The message rides in `new_text`.
+fn send_prefill_error(tx: &tokio::sync::mpsc::Sender<StreamingOutput>, error: &EngineError) {
+    let (finish_reason, message) = match error {
+        EngineError::Vision(_) => (WORKER_ERROR_FINISH_VISION, error.to_string()),
+        EngineError::Model(_)
+        | EngineError::Mlx(_)
+        | EngineError::Tokenization(_)
+        | EngineError::Template(_)
+        | EngineError::Generation(_)
+        | EngineError::Cancelled
+        | EngineError::CapacityInterrupted { .. }
+        | EngineError::RetainedSessionUnavailable(_) => (WORKER_ERROR_FINISH, error.to_string()),
+    };
+    let _ = tx.blocking_send(StreamingOutput {
+        new_text: message,
+        finished: true,
+        finish_reason: Some(finish_reason.to_owned()),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        token_logprob: None,
+        prefill_progress: None,
+    });
+}
+
+/// Convert a worker-sent error chunk back into an [`EngineError`] so the
+/// generate tails can fail the request (see [`send_prefill_error`]).
+fn worker_error_from_output(output: &StreamingOutput) -> EngineError {
+    match output.finish_reason.as_deref() {
+        Some(WORKER_ERROR_FINISH_VISION) => {
+            EngineError::Vision(VisionError::Preprocess(output.new_text.clone()))
+        }
+        _ => EngineError::Generation(if output.new_text.is_empty() {
+            "generation failed".to_owned()
+        } else {
+            output.new_text.clone()
+        }),
+    }
+}
+
 /// Set up cache reuse once, before the prompt begins advancing through chunks.
 fn start_prefill(
     model: &AnyModel,
+    tokenizer: &Tokenizer,
     prefix_cache: &mut PrefixCache,
-    req: BatchRequest,
+    mut req: BatchRequest,
 ) -> Result<PendingPrefill, EngineError> {
+    // Multimodal requests are preprocessed here, in the worker thread, where
+    // the model is owned: raw image inputs become an `ImageBatch` and marker
+    // tokens expand into sentinels before the first forward pass.
+    let image_batch = preprocess_images_in_worker(model.as_vision(), tokenizer, &mut req)?;
+    // `prompt_len` reflects the post-preprocess token count so multimodal
+    // usage reports match what the model actually prefilled (SimpleEngine
+    // reports the same expanded length).
     let prompt_len = req
         .prompt_tokens
         .len()
         .try_into()
         .map_err(|_| EngineError::Generation("Prompt too long".to_owned()))?;
-    let prefix_match = prefix_cache.find_longest_prefix(&req.prompt_tokens);
+    // Multimodal requests never reuse a prefix: image features are merged into
+    // the embedding sequence, so the cached text-only KV/SSM state would not
+    // match the prompt being prefilled.
+    let prefix_match = if image_batch.is_some() {
+        None
+    } else {
+        prefix_cache.find_longest_prefix(&req.prompt_tokens)
+    };
     let (tokens, cache) = if let Some(matched) = prefix_match {
         let suffix = req
             .prompt_tokens
@@ -770,6 +1289,7 @@ fn start_prefill(
         tokens,
         offset: 0,
         cache,
+        image_batch,
     })
 }
 
@@ -787,7 +1307,30 @@ fn advance_prefill(
         .min(prefill.tokens.len());
     let is_complete = end == prefill.tokens.len();
 
-    with_stream(&Stream::new(), || {
+    with_new_default_stream(Stream::new(), || {
+        if let Some(batch) = &prefill.image_batch {
+            // Single-pass multimodal prefill: image features are merged into
+            // the embedding sequence and cannot span chunk boundaries, so the
+            // whole prompt runs through one `forward_multimodal` call.
+            let input = Array::from(prefill.tokens.as_slice()).index(NewAxis);
+            let logits = model
+                .forward_multimodal(&input, batch, &mut prefill.cache)
+                .map_err(EngineError::Mlx)?;
+            let last_logits = logits.index((.., -1, ..));
+            prefill.offset = prefill.tokens.len();
+            return complete_prefill(
+                prefix_cache,
+                tokenizer,
+                eos_token_ids,
+                prefill.req,
+                prefill.prompt_len,
+                prefill.cache,
+                last_logits,
+                true,
+            )
+            .map(PrefillAdvance::Complete);
+        }
+
         let tokens = prefill
             .tokens
             .get(start..end)
@@ -819,6 +1362,7 @@ fn advance_prefill(
             prefill.prompt_len,
             prefill.cache,
             last_logits,
+            false,
         )
         .map(PrefillAdvance::Complete)
     })
@@ -832,7 +1376,7 @@ fn prefill_request(
     eos_token_ids: &[u32],
     req: BatchRequest,
 ) -> Result<Option<ActiveRequest>, EngineError> {
-    let prefill = start_prefill(model, prefix_cache, req)?;
+    let prefill = start_prefill(model, tokenizer, prefix_cache, req)?;
     match advance_prefill(
         model,
         prefix_cache,
@@ -849,25 +1393,36 @@ fn prefill_request(
 }
 
 /// Finish a prefill after its final forward pass has produced logits.
-#[allow(clippy::too_many_lines)]
+///
+/// `has_images` marks multimodal requests, which never enter the prefix cache
+/// (their KV/SSM state reflects merged image features).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn complete_prefill(
     prefix_cache: &mut PrefixCache,
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
-    req: BatchRequest,
+    mut req: BatchRequest,
     prompt_len: u32,
     cache: AnyCache,
     last_logits: Array,
+    has_images: bool,
 ) -> Result<Option<ActiveRequest>, EngineError> {
     {
-        let current_token = sample(&last_logits, &req.params).map_err(EngineError::Mlx)?;
+        // Mask T1 with the request's FSM before sampling/logprobs: an
+        // unconstrained first token would escape the grammar entirely.
+        let constrained_logits = if let Some(ref cg) = req.constraint {
+            cg.apply_mask(&last_logits)?
+        } else {
+            last_logits
+        };
+        let current_token = sample(&constrained_logits, &req.params).map_err(EngineError::Mlx)?;
 
         let logprob_top_n = req.logprobs.then(|| req.top_logprobs.unwrap_or(0));
         let first_logprob_data = if let Some(top_n) = logprob_top_n {
             let scaled = if req.params.temperature <= f32::EPSILON {
-                last_logits
+                constrained_logits
             } else {
-                last_logits
+                constrained_logits
                     .multiply(mlx_rs::array!(1.0 / req.params.temperature))
                     .map_err(EngineError::Mlx)?
             };
@@ -887,17 +1442,31 @@ fn complete_prefill(
             eval(eval_targets).map_err(EngineError::Mlx)?;
         }
 
-        // Cache the post-prefill state
-        prefix_cache.store(&req.prompt_tokens, cache.clone());
+        // Cache the post-prefill state. Multimodal requests never enter the
+        // prefix cache: their KV/SSM state reflects merged image features and
+        // would not match a text-only prefix.
+        if !has_images {
+            prefix_cache.store(&req.prompt_tokens, cache.clone());
+        }
         crate::simple::maybe_clear_mlx_cache(
             crate::simple::should_clear_mlx_cache_after_prefill(),
             "batch_post_prefill",
         );
 
-        let first_token_id: u32 = current_token.item_cast();
+        let first_token_id: u32 = current_token.item();
         let first_token_logprob = first_logprob_data
             .as_ref()
             .map(|lp| lp.materialize(first_token_id));
+
+        // Checked-advance T1 through the request's FSM. A one-token grammar is
+        // already final here: finish successfully without scheduling a decode,
+        // because a final state has no legal successor to mask.
+        let constraint_done = if let Some(ref mut cg) = req.constraint {
+            cg.advance_checked(first_token_id)?;
+            cg.is_finished()
+        } else {
+            false
+        };
 
         // Decode the first token incrementally (routes through IncrementalDetok
         // so partial UTF-8 is held back and prefix-before-stop is correctly emitted).
@@ -919,8 +1488,12 @@ fn complete_prefill(
             && find_stop_in_tail(&detok.text, first_chunk.len(), &req.stop_sequences).is_some();
         let at_max = req.max_tokens <= 1;
 
-        if is_eos || hit_stop || at_max {
-            let finish_reason = if is_eos || hit_stop { "stop" } else { "length" };
+        if is_eos || hit_stop || at_max || constraint_done {
+            let finish_reason = if is_eos || hit_stop || constraint_done {
+                "stop"
+            } else {
+                "length"
+            };
             let mut send_text = if hit_stop {
                 // Emit any prefix text before the stop sequence
                 find_stop_in_tail(&detok.text, first_chunk.len(), &req.stop_sequences)
@@ -978,6 +1551,7 @@ fn complete_prefill(
             response_tx: req.response_tx,
             prompt_len,
             detok,
+            stop: req.stop,
         }))
     }
 }
@@ -1005,7 +1579,7 @@ fn build_decode_graph(
         apply_penalties(&sliced, &ar.generated_tokens, &ar.params).map_err(EngineError::Mlx)?;
 
     let constrained = if let Some(ref cg) = ar.constraint {
-        cg.apply_mask(&penalized).map_err(EngineError::Mlx)?
+        cg.apply_mask(&penalized)?
     } else {
         penalized
     };
@@ -1039,11 +1613,17 @@ fn materialize_decode_step(
     tokenizer: &Tokenizer,
     eos_token_ids: &[u32],
 ) -> bool {
-    let token_id: u32 = result.next_token.item_cast();
+    let token_id: u32 = result.next_token.item();
 
-    // Advance constrained generator
+    // Advance constrained generator. A rejected token means the mask
+    // invariant broke: terminate the request through the worker error
+    // protocol instead of continuing off-grammar (the error chunk rides back
+    // to the generate tail, which reconstructs `EngineError::Generation`).
     if let Some(ref mut cg) = ar.constraint {
-        cg.advance(token_id);
+        if let Err(error) = cg.advance_checked(token_id) {
+            send_prefill_error(&ar.response_tx, &error);
+            return true;
+        }
     }
 
     let token_logprob = result
@@ -1117,10 +1697,559 @@ fn materialize_decode_step(
     finished || disconnected
 }
 
-#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_sign_loss,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
+    clippy::unwrap_used
+)]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use higgs_models::vision::{
+        IMAGE_TOKEN_INDEX, ImageInput, ImageTokenLayout, ImageTokenLayoutKind, VisionCapabilities,
+        VisionError, VisionModel,
+    };
+    use mlx_rs::error::Exception;
+
+    fn batch_prompt_test_engine() -> BatchEngine {
+        let tokenizer = Tokenizer::from_bytes(
+            br#"{
+                "version": "1.0",
+                "truncation": null,
+                "padding": null,
+                "added_tokens": [],
+                "normalizer": null,
+                "pre_tokenizer": {"type": "WhitespaceSplit"},
+                "post_processor": null,
+                "decoder": null,
+                "model": {
+                    "type": "WordLevel",
+                    "vocab": {
+                        "[UNK]": 0,
+                        "<|im_start|>": 1,
+                        "<|im_end|>": 2,
+                        "user": 3,
+                        "question": 4,
+                        "assistant": 5,
+                        "answer": 6
+                    },
+                    "unk_token": "[UNK]"
+                }
+            }"#,
+        )
+        .unwrap();
+        let template = ChatTemplateRenderer::new(
+            r#"{% for message in messages %}<|im_start|> {{ message.role }} {{ message.content }} <|im_end|> {% endfor %}
+{% if add_generation_prompt %}<|im_start|> assistant{% endif %}"#,
+        )
+        .unwrap();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let cache_control = Arc::new(Mutex::new(CacheControlState::default()));
+        let worker_control = Arc::clone(&cache_control);
+        let worker = std::thread::spawn(move || {
+            let mut prefix_cache = PrefixCache::new(1);
+            while let Some(command) = request_rx.blocking_recv() {
+                let _ = apply_batch_command(command, &mut prefix_cache, &worker_control);
+            }
+        });
+        BatchEngine {
+            request_tx,
+            cache_control,
+            worker: Some(worker),
+            tokenizer,
+            template,
+            model_name: "batch-prompt-test".to_owned(),
+            eos_token_ids: Vec::new(),
+            hidden_size: AtomicI32::new(1),
+            is_vlm: false,
+            image_marker_text: None,
+            vision_capabilities: None,
+        }
+    }
+
+    #[test]
+    fn sweep_removes_stopped_or_disconnected_requests_and_notes_progress() {
+        let (live_tx, _live_rx) = tokio::sync::mpsc::channel(4);
+        let (gone_tx, gone_rx) = tokio::sync::mpsc::channel(4);
+        drop(gone_rx);
+
+        let (alive, _alive_worker_rx) = make_active_request(8, vec![]);
+        let (pressured, _pressured_rx) = make_active_request(8, vec![]);
+        let (disconnected, _disconnected_rx) = make_active_request(8, vec![]);
+        let mut active = vec![alive, pressured, disconnected];
+        // 0: alive but stalled — no stop, open channel → survives and notes.
+        active[0].response_tx = live_tx.clone();
+        active[0].stop = crate::stop::GenerationStop::new(Some(std::time::Duration::from_secs(60)));
+        // 1: external stop (critical pressure) → removed.
+        active[1].response_tx = live_tx;
+        active[1]
+            .stop
+            .stop(crate::stop::StopReason::CriticalPressure {
+                boot_id: "boot".to_owned(),
+                generation: 3,
+            });
+        // 2: open stop but closed response channel → removed.
+        active[2].response_tx = gone_tx;
+
+        assert_eq!(sweep_cancelled(&mut active), 2);
+        assert_eq!(active.len(), 1);
+        // The survivor's watchdog was reset by the progress note.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(active[0].stop.check().is_none());
+    }
+
+    #[test]
+    fn request_is_dead_covers_stop_reason_and_closed_channel() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let stop = crate::stop::GenerationStop::new(None);
+        assert!(!request_is_dead(&stop, &tx));
+        stop.stop(crate::stop::StopReason::ModelDrain);
+        assert!(request_is_dead(&stop, &tx));
+
+        let stop = crate::stop::GenerationStop::new(None);
+        drop(rx);
+        assert!(request_is_dead(&stop, &tx));
+    }
+
+    #[test]
+    fn streaming_disconnect_signals_the_worker_stop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let cache_control = Arc::new(Mutex::new(CacheControlState::default()));
+        let first_sent = Arc::new(AtomicBool::new(false));
+        let client_dropped = Arc::new(AtomicBool::new(false));
+        let observed_reason = Arc::new(Mutex::new(None));
+        let worker_first = Arc::clone(&first_sent);
+        let worker_gate = Arc::clone(&client_dropped);
+        let worker_reason = Arc::clone(&observed_reason);
+        let worker = std::thread::spawn(move || {
+            while let Some(command) = request_rx.blocking_recv() {
+                let BatchCommand::Generate(req) = command else {
+                    continue;
+                };
+                let tx = req.response_tx;
+                let _ = tx.blocking_send(StreamingOutput {
+                    new_text: "a".to_owned(),
+                    finished: false,
+                    finish_reason: None,
+                    prompt_tokens: 3,
+                    completion_tokens: 1,
+                    token_logprob: None,
+                    prefill_progress: None,
+                });
+                worker_first.store(true, Ordering::SeqCst);
+                // Wait for the client to go away, then send the next round:
+                // the forwarder's send fails, which records ClientDisconnect
+                // into the request's stop — exactly what the worker observes
+                // at its next allocation boundary.
+                while !worker_gate.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                let _ = tx.blocking_send(StreamingOutput {
+                    new_text: "b".to_owned(),
+                    finished: false,
+                    finish_reason: None,
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    token_logprob: None,
+                    prefill_progress: None,
+                });
+                while req.stop.reason().is_none() {
+                    std::thread::yield_now();
+                }
+                *worker_reason.lock().unwrap() = Some(req.stop.reason());
+                let _ = tx.blocking_send(StreamingOutput {
+                    new_text: String::new(),
+                    finished: true,
+                    finish_reason: Some("length".to_owned()),
+                    prompt_tokens: 3,
+                    completion_tokens: 1,
+                    token_logprob: None,
+                    prefill_progress: None,
+                });
+            }
+        });
+        let engine = BatchEngine {
+            request_tx,
+            cache_control,
+            worker: Some(worker),
+            tokenizer: make_tokenizer(),
+            template: ChatTemplateRenderer::new("").unwrap(),
+            model_name: "disconnect-signal".to_owned(),
+            eos_token_ids: Vec::new(),
+            hidden_size: AtomicI32::new(1),
+            is_vlm: false,
+            image_marker_text: None,
+            vision_capabilities: None,
+        };
+
+        let (client_tx, client_rx) = tokio::sync::mpsc::channel(32);
+        let generate = std::thread::spawn(move || {
+            engine.generate_streaming_with_thinking(
+                &[1, 2, 3],
+                10,
+                &SamplingParams::default(),
+                &[],
+                false,
+                None,
+                &client_tx,
+                false,
+                false,
+                None,
+                None,
+            )
+        });
+        while !first_sent.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        drop(client_rx);
+        client_dropped.store(true, Ordering::SeqCst);
+        let result = generate.join().expect("generate must not panic");
+        assert!(result.is_ok());
+        assert_eq!(
+            *observed_reason.lock().unwrap(),
+            Some(Some(crate::stop::StopReason::ClientDisconnect))
+        );
+    }
+
+    #[test]
+    fn non_streaming_removal_without_terminal_is_a_typed_failure() {
+        // A worker that removes the request without a terminal chunk (what
+        // every stop boundary now does) must surface as the recorded stop
+        // reason, never as a partial success.
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let cache_control = Arc::new(Mutex::new(CacheControlState::default()));
+        let stop = crate::stop::GenerationStop::new(None);
+        stop.stop(crate::stop::StopReason::CriticalPressure {
+            boot_id: "boot-9".to_owned(),
+            generation: 11,
+        });
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || {
+            while let Some(command) = request_rx.blocking_recv() {
+                let BatchCommand::Generate(req) = command else {
+                    continue;
+                };
+                let _ = req.response_tx.blocking_send(StreamingOutput {
+                    new_text: "partial".to_owned(),
+                    finished: false,
+                    finish_reason: None,
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    token_logprob: None,
+                    prefill_progress: None,
+                });
+                // Simulate removal at a stop boundary: the recorded reason is
+                // what the worker observed, then the channel closes.
+                assert!(worker_stop.is_stopped());
+                drop(req.response_tx);
+            }
+        });
+        let engine = BatchEngine {
+            request_tx,
+            cache_control,
+            worker: Some(worker),
+            tokenizer: make_tokenizer(),
+            template: ChatTemplateRenderer::new("").unwrap(),
+            model_name: "non-streaming-removal".to_owned(),
+            eos_token_ids: Vec::new(),
+            hidden_size: AtomicI32::new(1),
+            is_vlm: false,
+            image_marker_text: None,
+            vision_capabilities: None,
+        };
+
+        let _guard = crate::stop::install_generation_stop(stop);
+        let result = engine.generate(
+            &[1, 2, 3],
+            10,
+            &SamplingParams::default(),
+            &[],
+            false,
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(EngineError::CapacityInterrupted {
+                boot_id,
+                generation: 11,
+            }) if boot_id == "boot-9"
+        ));
+    }
+
+    #[test]
+    fn batch_streaming_drains_to_worker_terminal_after_client_disconnect() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let cache_control = Arc::new(Mutex::new(CacheControlState::default()));
+        let first_sent = Arc::new(AtomicBool::new(false));
+        let terminal_sent = Arc::new(AtomicBool::new(false));
+        let client_dropped = Arc::new(AtomicBool::new(false));
+        let worker_first = Arc::clone(&first_sent);
+        let worker_terminal = Arc::clone(&terminal_sent);
+        let worker_gate = Arc::clone(&client_dropped);
+        let worker = std::thread::spawn(move || {
+            while let Some(command) = request_rx.blocking_recv() {
+                let BatchCommand::Generate(req) = command else {
+                    continue;
+                };
+                let tx = req.response_tx;
+                let _ = tx.blocking_send(StreamingOutput {
+                    new_text: "a".to_owned(),
+                    finished: false,
+                    finish_reason: None,
+                    prompt_tokens: 3,
+                    completion_tokens: 1,
+                    token_logprob: None,
+                    prefill_progress: None,
+                });
+                worker_first.store(true, Ordering::SeqCst);
+                while !worker_gate.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                // Next decode round lands after the HTTP client is gone: the
+                // internal worker still holds this request's allocation.
+                let _ = tx.blocking_send(StreamingOutput {
+                    new_text: "b".to_owned(),
+                    finished: false,
+                    finish_reason: None,
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    token_logprob: None,
+                    prefill_progress: None,
+                });
+                // Terminal worker chunk: allocation for the request stops.
+                let _ = tx.blocking_send(StreamingOutput {
+                    new_text: String::new(),
+                    finished: true,
+                    finish_reason: Some(WORKER_ERROR_FINISH.to_owned()),
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    token_logprob: None,
+                    prefill_progress: None,
+                });
+                worker_terminal.store(true, Ordering::SeqCst);
+            }
+        });
+        let engine = BatchEngine {
+            request_tx,
+            cache_control,
+            worker: Some(worker),
+            tokenizer: make_tokenizer(),
+            template: ChatTemplateRenderer::new("").unwrap(),
+            model_name: "disconnect-scripted".to_owned(),
+            eos_token_ids: Vec::new(),
+            hidden_size: AtomicI32::new(1),
+            is_vlm: false,
+            image_marker_text: None,
+            vision_capabilities: None,
+        };
+
+        let (client_tx, client_rx) = tokio::sync::mpsc::channel(32);
+        let generate = std::thread::spawn(move || {
+            engine.generate_streaming_with_thinking(
+                &[1, 2, 3],
+                10,
+                &SamplingParams::default(),
+                &[],
+                false,
+                None,
+                &client_tx,
+                false,
+                false,
+                None,
+                None,
+            )
+        });
+        while !first_sent.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        drop(client_rx);
+        client_dropped.store(true, Ordering::SeqCst);
+
+        let result = generate.join().expect("generate thread must not panic");
+        assert!(
+            terminal_sent.load(Ordering::SeqCst),
+            "worker must reach its terminal chunk"
+        );
+        assert!(
+            result.is_err(),
+            "streaming must hold until the batch worker's terminal chunk instead of returning on forward failure"
+        );
+    }
+
+    #[test]
+    fn batch_session_prefill_omits_generation_suffix_without_changing_default() {
+        let engine = batch_prompt_test_engine();
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_owned(),
+                content: "question".to_owned(),
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "assistant".to_owned(),
+                content: "answer".to_owned(),
+                tool_calls: None,
+            },
+        ];
+
+        let default = engine.prepare_chat_prompt(&messages, None).unwrap();
+        let generation = engine
+            .prepare_chat_prompt_for_mode(&messages, None, ChatPromptMode::Generation)
+            .unwrap();
+        let prefill = engine
+            .prepare_chat_prompt_for_mode(&messages, None, ChatPromptMode::SessionPrefill)
+            .unwrap();
+
+        assert_eq!(default, generation);
+        assert!(generation.starts_with(&prefill));
+        assert!(generation.len() > prefill.len());
+    }
+
+    #[test]
+    fn acknowledged_shutdown_joins_the_worker_before_returning() {
+        let engine = batch_prompt_test_engine();
+        engine.shutdown().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cache_limit_update_is_acknowledged_by_worker_before_returning() {
+        let engine = batch_prompt_test_engine();
+        engine.apply_capacity_cache_limit(1, 0).await.unwrap();
+        engine.shutdown().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn saturated_cache_control_queue_yields_instead_of_blocking_runtime() {
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let desired = Arc::new(Mutex::new(CacheControlState::default()));
+        request_tx
+            .send(BatchCommand::SetPrefixCacheBytes {
+                requested_revision: 1,
+            })
+            .await
+            .unwrap();
+        let worker_desired = Arc::clone(&desired);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let mut prefix_cache = PrefixCache::new(1);
+            while let Some(command) = request_rx.recv().await {
+                let _ = apply_batch_command(command, &mut prefix_cache, &worker_desired);
+            }
+        });
+
+        send_cache_control(
+            &request_tx,
+            &desired,
+            2,
+            2,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn abandoned_stale_control_wake_applies_the_latest_requested_revision() {
+        let (acknowledged, wait) = tokio::sync::oneshot::channel();
+        let desired = Arc::new(Mutex::new(CacheControlState {
+            desired_revision: 2,
+            desired_bytes: 2048,
+            acknowledgements: vec![(2, acknowledged)],
+            ..CacheControlState::default()
+        }));
+        let mut prefix_cache = PrefixCache::new(1).with_max_bytes(8192);
+
+        assert!(
+            apply_batch_command(
+                BatchCommand::SetPrefixCacheBytes {
+                    requested_revision: 1,
+                },
+                &mut prefix_cache,
+                &desired,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            desired
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .applied_revision,
+            2
+        );
+        assert_eq!(wait.blocking_recv().unwrap(), 2);
+    }
+
+    #[test]
+    fn idle_batch_worker_releases_mlx_gate_and_control_updates_serialize() {
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let desired = Arc::new(Mutex::new(CacheControlState {
+            desired_revision: 1,
+            desired_bytes: 1024,
+            ..CacheControlState::default()
+        }));
+        let worker_desired = Arc::clone(&desired);
+        let (worker_ready, wait_ready) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut cache = PrefixCache::new(1);
+            worker_ready.send(()).unwrap();
+            let _ = blocking_next_request(&mut request_rx, &mut cache, &worker_desired);
+        });
+        wait_ready.recv().unwrap();
+
+        let (gate_acquired, wait_acquired) = std::sync::mpsc::channel();
+        let (release_gate, wait_release) = std::sync::mpsc::channel();
+        let gate_owner = std::thread::spawn(move || {
+            let _gate = higgs_models::mlx_exec::acquire();
+            gate_acquired.send(()).unwrap();
+            wait_release.recv().unwrap();
+        });
+        wait_acquired
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("an idle Batch worker must not own the process MLX gate");
+
+        let (control_done, wait_control) = std::sync::mpsc::channel();
+        let control_desired = Arc::clone(&desired);
+        let control = std::thread::spawn(move || {
+            let (acknowledged, wait) = tokio::sync::oneshot::channel();
+            control_desired
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .acknowledgements
+                .push((1, acknowledged));
+            request_tx
+                .blocking_send(BatchCommand::SetPrefixCacheBytes {
+                    requested_revision: 1,
+                })
+                .unwrap();
+            wait.blocking_recv().unwrap();
+            control_done.send(()).unwrap();
+        });
+        assert!(
+            wait_control
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "a cache control operation must not overlap another MLX work unit"
+        );
+        release_gate.send(()).unwrap();
+        wait_control
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        gate_owner.join().unwrap();
+        control.join().unwrap();
+        worker.join().unwrap();
+    }
 
     // -----------------------------------------------------------------------
     // materialize_decode_step
@@ -1141,6 +2270,7 @@ mod tests {
             logprob_top_n: None,
             constraint: None,
             response_tx: tx,
+            stop: crate::stop::GenerationStop::default(),
             prompt_len: 5,
             detok: IncrementalDetok::new(
                 String::new(),
@@ -1193,6 +2323,132 @@ mod tests {
         assert!(finished, "Should be finished at max_tokens=1");
     }
 
+    #[test]
+    fn materialize_decode_step_constraint_rejection_fails_the_request() {
+        let (mut ar, mut rx) = make_active_request(100, vec![]);
+        let mut vocabulary = outlines_core::vocabulary::Vocabulary::new(0);
+        vocabulary.try_insert(vec![b'a'], 1).unwrap();
+        ar.constraint =
+            Some(crate::constrained::ConstrainedGenerator::from_regex("a", &vocabulary).unwrap());
+        let tokenizer = make_tokenizer();
+        // A masked decode can never sample a token the FSM rejects; when it
+        // happens anyway the invariant broke and the request must terminate
+        // through the worker error protocol, not continue off-grammar.
+        let result = DecodeGraphResult {
+            next_token: Array::from_slice(&[2_u32], &[1]),
+            logprob_data: None,
+        };
+        let finished = materialize_decode_step(&mut ar, result, &tokenizer, &[0]);
+        assert!(finished, "constraint rejection must terminate the request");
+        let chunk = rx.try_recv().expect("rejection must send a terminal chunk");
+        assert_eq!(chunk.finish_reason.as_deref(), Some("error"));
+        assert!(
+            chunk.new_text.contains("which the FSM rejected"),
+            "{:?}",
+            chunk.new_text
+        );
+        assert!(matches!(
+            worker_error_from_output(&chunk),
+            EngineError::Generation(_)
+        ));
+    }
+
+    #[test]
+    fn materialize_decode_step_mixed_constrained_failure_isolates_unconstrained_peer() {
+        // A batch mixing a constrained and an unconstrained request: when the
+        // constrained request's mask invariant breaks, only that request
+        // terminates with the typed error — the peer decodes on untouched.
+        let tokenizer = make_tokenizer();
+        let off_grammar = || DecodeGraphResult {
+            next_token: Array::from_slice(&[2_u32], &[1]),
+            logprob_data: None,
+        };
+
+        let (mut constrained, mut constrained_rx) = make_active_request(100, vec![]);
+        let mut vocabulary = outlines_core::vocabulary::Vocabulary::new(0);
+        vocabulary.try_insert(vec![b'a'], 1).unwrap();
+        constrained.constraint =
+            Some(crate::constrained::ConstrainedGenerator::from_regex("a", &vocabulary).unwrap());
+        assert!(materialize_decode_step(
+            &mut constrained,
+            off_grammar(),
+            &tokenizer,
+            &[0]
+        ));
+
+        let (mut peer, mut peer_rx) = make_active_request(100, vec![]);
+        assert!(!materialize_decode_step(
+            &mut peer,
+            off_grammar(),
+            &tokenizer,
+            &[0]
+        ));
+        assert_eq!(peer.generated_tokens, vec![2]);
+
+        let error_chunk = constrained_rx.try_recv().expect("constrained terminal");
+        assert_eq!(error_chunk.finish_reason.as_deref(), Some("error"));
+        assert!(matches!(
+            worker_error_from_output(&error_chunk),
+            EngineError::Generation(_)
+        ));
+        let peer_chunk = peer_rx.try_recv().expect("peer continues normally");
+        assert!(!peer_chunk.finished);
+        assert_eq!(peer_chunk.finish_reason, None);
+    }
+
+    #[test]
+    fn complete_prefill_constrained_t1_masks_advances_and_terminates() {
+        // T1 of a batched request: the mask must override the raw argmax
+        // ('b', id 2) with the grammar-legal 'a' (id 1), the checked advance
+        // must succeed, and the completed one-token grammar must finish the
+        // request at T1 ("stop", completion_tokens=1) even with max_tokens=8 —
+        // never escaping into an unconstrained decode.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut vocabulary = outlines_core::vocabulary::Vocabulary::new(0);
+        vocabulary.try_insert(vec![b'a'], 1).unwrap();
+        vocabulary.try_insert(vec![b'b'], 2).unwrap();
+        let req = BatchRequest {
+            prompt_tokens: vec![3, 4],
+            max_tokens: 8,
+            params: SamplingParams::default(),
+            stop_sequences: vec![],
+            logprobs: false,
+            top_logprobs: None,
+            constraint: Some(
+                crate::constrained::ConstrainedGenerator::from_regex("a", &vocabulary).unwrap(),
+            ),
+            image_inputs: Vec::new(),
+            response_tx: tx,
+            stop: crate::stop::GenerationStop::default(),
+        };
+        let last_logits = Array::from_slice(&[0.0_f32, 1.0, 9.0], &[3]);
+        let mut prefix_cache = PrefixCache::new(1);
+        let tokenizer = make_tokenizer();
+        let active = complete_prefill(
+            &mut prefix_cache,
+            &tokenizer,
+            &[0],
+            req,
+            2,
+            AnyCache::KV(vec![]),
+            last_logits,
+            false,
+        )
+        .expect("masked T1 must complete prefill");
+        assert!(
+            active.is_none(),
+            "a completed one-token grammar must not enter the decode set"
+        );
+        let chunk = rx.try_recv().expect("T1 terminal chunk");
+        assert!(chunk.finished);
+        assert_eq!(chunk.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(chunk.completion_tokens, 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "no decode may follow a grammar completed at T1"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Batched vs pipelined path selection
     // -----------------------------------------------------------------------
@@ -1238,5 +2494,486 @@ mod tests {
     fn prefill_chunk_ranges_cover_each_token_once() {
         let ranges = prefill_chunk_ranges(10, 4);
         assert_eq!(ranges, vec![0..4, 4..8, 8..10]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Vision capability capture
+    // -----------------------------------------------------------------------
+
+    /// A minimal `VisionModel` double so the pure capture/preprocess helpers
+    /// can be unit-tested without loading real VLM weights (no vision-capable
+    /// `AnyModel` is constructible from this crate with public APIs).
+    struct TestVisionModel;
+
+    impl VisionModel for TestVisionModel {
+        fn vision_capabilities(&self) -> VisionCapabilities {
+            VisionCapabilities {
+                families: vec!["test-vision"],
+                image_sizes: vec![16],
+                supported_media: vec!["image/png"],
+                layout_kind: ImageTokenLayoutKind::default(),
+            }
+        }
+
+        fn image_marker_text(&self) -> &'static str {
+            "<test-image>"
+        }
+
+        fn preprocess_images(&self, images: &[ImageInput]) -> Result<ImageBatch, VisionError> {
+            Ok(ImageBatch {
+                pixel_values: Array::from_slice(&[0.0_f32; 3], &[1, 1, 1, 3]),
+                per_image_tokens: vec![2; images.len()],
+                image_sizes: vec![(1, 1); images.len()],
+                image_offsets: vec![],
+                layout: ImageTokenLayout::default(),
+            })
+        }
+
+        fn postprocess_image_tokens(
+            &self,
+            tokens: &mut Vec<u32>,
+            _tokenizer: &Tokenizer,
+            _batch: &ImageBatch,
+        ) -> Result<(), VisionError> {
+            // Marker token id 42 expands into two sentinels per image, the
+            // count promised by `preprocess_images` above.
+            let sentinel = IMAGE_TOKEN_INDEX as u32;
+            let mut expanded = Vec::with_capacity(tokens.len());
+            for &t in tokens.iter() {
+                if t == 42 {
+                    expanded.extend(std::iter::repeat_n(sentinel, 2));
+                } else {
+                    expanded.push(t);
+                }
+            }
+            *tokens = expanded;
+            Ok(())
+        }
+
+        fn forward_multimodal(
+            &mut self,
+            _input_ids: &Array,
+            _batch: &ImageBatch,
+            _cache: &mut AnyCache,
+        ) -> Result<Array, Exception> {
+            Err(Exception::custom("unused in unit test"))
+        }
+    }
+
+    fn test_image_input() -> ImageInput {
+        ImageInput {
+            position: 0,
+            message_index: 0,
+            bytes: vec![0_u8; 8],
+            media_type: "image/png".to_owned(),
+            detail: higgs_models::vision::ImageDetail::Auto,
+            max_dims: None,
+        }
+    }
+
+    #[test]
+    fn capture_vision_capabilities_extracts_vlm_metadata() {
+        let vlm = TestVisionModel;
+        let (is_vlm, marker, caps) = capture_vision_capabilities(Some(&vlm));
+        assert!(is_vlm, "a loaded VLM must report vision");
+        assert_eq!(marker, Some("<test-image>"));
+        let caps_meta = caps.expect("VLM must expose vision capabilities");
+        assert_eq!(caps_meta.families, vec!["test-vision"]);
+        assert_eq!(caps_meta.image_sizes, vec![16]);
+    }
+
+    #[test]
+    fn capture_vision_capabilities_reports_none_for_text_only_model() {
+        let (is_vlm, marker, caps) = capture_vision_capabilities(None);
+        assert!(!is_vlm, "a text-only model must not report vision");
+        assert!(marker.is_none());
+        assert!(caps.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Worker-side multimodal preprocessing
+    // -----------------------------------------------------------------------
+
+    /// The worker preprocesses raw image inputs into an `ImageBatch` and
+    /// expands marker tokens into the sentinel run the batch expects.
+    #[test]
+    fn worker_preprocess_produces_batch_and_expands_markers() {
+        let tokenizer = make_tokenizer();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut req = BatchRequest {
+            prompt_tokens: vec![1, 2, 42, 3],
+            max_tokens: 4,
+            params: SamplingParams::default(),
+            stop_sequences: vec![],
+            logprobs: false,
+            top_logprobs: None,
+            constraint: None,
+            response_tx: tx,
+            stop: crate::stop::GenerationStop::default(),
+            image_inputs: vec![test_image_input()],
+        };
+
+        let batch = preprocess_images_in_worker(Some(&TestVisionModel), &tokenizer, &mut req)
+            .unwrap()
+            .expect("one image must produce a batch");
+        assert_eq!(batch.per_image_tokens, vec![2]);
+        let sentinel = IMAGE_TOKEN_INDEX as u32;
+        assert_eq!(
+            req.prompt_tokens,
+            vec![1, 2, sentinel, sentinel, 3],
+            "marker token must expand into the sentinel run"
+        );
+        assert!(
+            req.image_inputs.is_empty(),
+            "raw image inputs are consumed by preprocessing"
+        );
+    }
+
+    /// Text-only requests skip preprocessing entirely.
+    #[test]
+    fn worker_preprocess_returns_none_without_images() {
+        let tokenizer = make_tokenizer();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut req = BatchRequest {
+            prompt_tokens: vec![1, 2, 3],
+            max_tokens: 4,
+            params: SamplingParams::default(),
+            stop_sequences: vec![],
+            logprobs: false,
+            top_logprobs: None,
+            constraint: None,
+            response_tx: tx,
+            stop: crate::stop::GenerationStop::default(),
+            image_inputs: vec![],
+        };
+
+        let batch =
+            preprocess_images_in_worker(Some(&TestVisionModel), &tokenizer, &mut req).unwrap();
+        assert!(batch.is_none(), "no images means no ImageBatch");
+        assert_eq!(req.prompt_tokens, vec![1, 2, 3]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Multimodal prefill
+    // -----------------------------------------------------------------------
+
+    /// A multimodal request must bypass the prefix cache (the full prompt is
+    /// re-prefilled so image features can be merged) and dispatch prefill to
+    /// `forward_multimodal` instead of the chunked text forward.
+    ///
+    /// Since Task 14b, the worker preprocesses raw `ImageInput`s inside
+    /// `start_prefill` (the model lives in the worker thread). This tiny
+    /// model is text-only, so a multimodal request now fails at that
+    /// preprocessing step — proving the request flows through the worker-side
+    /// vision pipeline instead of being handed a pre-built `ImageBatch` with
+    /// no model interaction.
+    #[test]
+    fn multimodal_batch_request_flows_through_worker_vision_preprocessing() {
+        use higgs_models::qwen3_next::{Qwen3NextCausalLM, Qwen3NextModelArgs};
+
+        // Tiny hybrid model (structure only; `make_cache` needs no weights).
+        let args: Qwen3NextModelArgs = serde_json::from_str(
+            r#"{
+                "model_type": "qwen3_next",
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-06,
+                "vocab_size": 128,
+                "max_position_embeddings": 512,
+                "full_attention_interval": 4,
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 4,
+                "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8,
+                "linear_conv_kernel_dim": 4,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "decoder_sparse_step": 1,
+                "shared_expert_intermediate_size": 64,
+                "moe_intermediate_size": 32,
+                "norm_topk_prob": true
+            }"#,
+        )
+        .unwrap();
+        let model = AnyModel::Qwen3Next(Qwen3NextCausalLM::new(args).unwrap());
+
+        // Prompt longer than MIN_PREFIX_LEN (16); seed the cache with a
+        // 16-token prefix so a text request WOULD match it.
+        let prompt: Vec<u32> = (0..24).collect();
+        let mut prefix_cache = PrefixCache::new(8);
+        let partial_cache = model.make_cache().unwrap();
+        prefix_cache.store(&prompt[..16], partial_cache);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let make_req = |prompt_tokens: Vec<u32>, image_inputs: Vec<ImageInput>| BatchRequest {
+            prompt_tokens,
+            max_tokens: 4,
+            params: SamplingParams::default(),
+            stop_sequences: vec![],
+            logprobs: false,
+            top_logprobs: None,
+            constraint: None,
+            response_tx: tx.clone(),
+            image_inputs,
+            stop: crate::stop::GenerationStop::default(),
+        };
+        let tokenizer = make_tokenizer();
+
+        // Contrast: a text request with the same prompt reuses the cached
+        // prefix and prefills only the suffix.
+        let text_prefill = start_prefill(
+            &model,
+            &tokenizer,
+            &mut prefix_cache,
+            make_req(prompt.clone(), vec![]),
+        )
+        .unwrap();
+        assert_eq!(
+            text_prefill.tokens,
+            prompt[16..].to_vec(),
+            "text request should reuse the 16-token prefix cache"
+        );
+
+        // Multimodal: the worker must preprocess inside `start_prefill`. This
+        // text-only model has no vision, so the request fails with a vision
+        // preprocessing error rather than being prefilled without images.
+        let Err(err) = start_prefill(
+            &model,
+            &tokenizer,
+            &mut prefix_cache,
+            make_req(prompt, vec![test_image_input()]),
+        ) else {
+            panic!("multimodal request on a text-only model must fail at preprocessing")
+        };
+        assert!(
+            err.to_string().contains("has no vision"),
+            "expected worker-side vision preprocessing failure, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Worker prefill error protocol
+    // -----------------------------------------------------------------------
+
+    /// The worker's error-finish chunks must round-trip back into an
+    /// `EngineError` in the generate tails, with vision failures typed as
+    /// `EngineError::Vision` so the route can map them to 400s.
+    #[test]
+    fn worker_error_chunk_round_trips_into_engine_error() {
+        let output = StreamingOutput {
+            new_text: "image preprocessing failed: bad png".to_owned(),
+            finished: true,
+            finish_reason: Some(WORKER_ERROR_FINISH_VISION.to_owned()),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            token_logprob: None,
+            prefill_progress: None,
+        };
+        let err = worker_error_from_output(&output);
+        assert!(
+            matches!(err, EngineError::Vision(_)),
+            "vision-marked chunk must reconstruct EngineError::Vision, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("bad png"),
+            "error message must survive the round trip, got: {err}"
+        );
+
+        let generic = StreamingOutput {
+            new_text: "generation failed: boom".to_owned(),
+            finished: true,
+            finish_reason: Some(WORKER_ERROR_FINISH.to_owned()),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            token_logprob: None,
+            prefill_progress: None,
+        };
+        let err = worker_error_from_output(&generic);
+        assert!(
+            matches!(err, EngineError::Generation(_)),
+            "plain error chunk must reconstruct EngineError::Generation, got: {err}"
+        );
+        assert!(err.to_string().contains("boom"));
+
+        // An empty message degrades to a readable generic message.
+        let empty = StreamingOutput {
+            new_text: String::new(),
+            finished: true,
+            finish_reason: Some(WORKER_ERROR_FINISH.to_owned()),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            token_logprob: None,
+            prefill_progress: None,
+        };
+        assert_eq!(
+            worker_error_from_output(&empty).to_string(),
+            "Generation error: generation failed"
+        );
+    }
+
+    /// `send_prefill_error` emits the message and the vision marker so the
+    /// tail can reconstruct the error.
+    #[test]
+    fn send_prefill_error_carries_message_and_vision_marker() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let vision_err = EngineError::Vision(VisionError::Decode("corrupt png".to_owned()));
+        send_prefill_error(&tx, &vision_err);
+        let chunk = rx.blocking_recv().unwrap();
+        assert_eq!(
+            chunk.finish_reason.as_deref(),
+            Some(WORKER_ERROR_FINISH_VISION)
+        );
+        assert!(chunk.new_text.contains("corrupt png"));
+
+        let gen_err = EngineError::Generation("prompt too long".to_owned());
+        send_prefill_error(&tx, &gen_err);
+        let chunk = rx.blocking_recv().unwrap();
+        assert_eq!(chunk.finish_reason.as_deref(), Some(WORKER_ERROR_FINISH));
+        assert!(chunk.new_text.contains("prompt too long"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Multimodal prefill dispatch + cache behaviour
+    // -----------------------------------------------------------------------
+
+    /// A multimodal `PendingPrefill` must dispatch its single prefill pass to
+    /// `forward_multimodal` (not the chunked text forward), and `complete_prefill`
+    /// must never store a multimodal post-prefill state into the prefix cache.
+    #[test]
+    fn multimodal_prefill_dispatches_to_forward_multimodal_and_skips_cache_store() {
+        use higgs_models::qwen3_next::{Qwen3NextCausalLM, Qwen3NextModelArgs};
+        use higgs_models::vision::ImageTokenLayout;
+
+        let args: Qwen3NextModelArgs = serde_json::from_str(
+            r#"{
+                "model_type": "qwen3_next",
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-06,
+                "vocab_size": 128,
+                "max_position_embeddings": 512,
+                "full_attention_interval": 4,
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 4,
+                "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8,
+                "linear_conv_kernel_dim": 4,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "decoder_sparse_step": 1,
+                "shared_expert_intermediate_size": 64,
+                "moe_intermediate_size": 32,
+                "norm_topk_prob": true
+            }"#,
+        )
+        .unwrap();
+        let mut model = AnyModel::Qwen3Next(Qwen3NextCausalLM::new(args).unwrap());
+        let tokenizer = make_tokenizer();
+        let prompt: Vec<u32> = (0..24).collect();
+
+        // --- Dispatch: a multimodal prefill must run `forward_multimodal`. ---
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let req = BatchRequest {
+            prompt_tokens: prompt.clone(),
+            max_tokens: 4,
+            params: SamplingParams::default(),
+            stop_sequences: vec![],
+            logprobs: false,
+            top_logprobs: None,
+            constraint: None,
+            response_tx: tx,
+            stop: crate::stop::GenerationStop::default(),
+            image_inputs: vec![],
+        };
+        let dummy_batch = ImageBatch {
+            pixel_values: Array::from_slice(&[0.0_f32; 3], &[1, 1, 1, 3]),
+            per_image_tokens: vec![],
+            image_sizes: vec![],
+            image_offsets: vec![],
+            layout: ImageTokenLayout::default(),
+        };
+        let mut prefix_cache = PrefixCache::new(8);
+        let prefill = PendingPrefill {
+            request_id: 1,
+            req,
+            prompt_len: 24,
+            tokens: prompt.clone(),
+            offset: 0,
+            cache: model.make_cache().unwrap(),
+            image_batch: Some(dummy_batch),
+        };
+        // A tiny quantum must still run ONE multimodal forward: the prefill
+        // must dispatch to `forward_multimodal` (which errors on this
+        // non-VLM stub) instead of the chunked text path.
+        let Err(err) = advance_prefill(&mut model, &mut prefix_cache, &tokenizer, &[], prefill, 1)
+        else {
+            panic!("multimodal prefill must run forward_multimodal, not chunked forward")
+        };
+        assert!(
+            err.to_string()
+                .contains("does not support multimodal forward"),
+            "expected forward_multimodal dispatch error, got: {err}"
+        );
+
+        // --- Cache: `complete_prefill` must not store multimodal state. ---
+        // Seed a 16-token prefix so a text request WOULD match it; run
+        // `complete_prefill` with the same 24-token prompt and observe whether
+        // the cache gets extended to the full prompt.
+        let run_complete = |has_images: bool| {
+            let (tx, _rx) = tokio::sync::mpsc::channel(16);
+            let req = BatchRequest {
+                prompt_tokens: prompt.clone(),
+                max_tokens: 4,
+                params: SamplingParams::default(),
+                stop_sequences: vec![],
+                logprobs: false,
+                top_logprobs: None,
+                constraint: None,
+                response_tx: tx,
+                stop: crate::stop::GenerationStop::default(),
+                image_inputs: vec![],
+            };
+            let mut prefix_cache = PrefixCache::new(8);
+            let partial_cache = model.make_cache().unwrap();
+            prefix_cache.store(&prompt[..16], partial_cache);
+            let last_logits = Array::from_slice(&[0.0_f32; 128], &[1, 128]);
+            let cache = model.make_cache().unwrap();
+            let result = complete_prefill(
+                &mut prefix_cache,
+                &tokenizer,
+                &[],
+                req,
+                24,
+                cache,
+                last_logits,
+                has_images,
+            );
+            if let Err(e) = result {
+                panic!("complete_prefill must succeed: {e}");
+            }
+            let matched = prefix_cache
+                .find_longest_prefix(&prompt)
+                .expect("the seeded 16-token prefix must still match the 24-token prompt");
+            matched.prefix_len
+        };
+
+        assert_eq!(
+            run_complete(true),
+            16,
+            "multimodal prefill must NOT store its state into the prefix cache"
+        );
+        assert_eq!(
+            run_complete(false),
+            24,
+            "text prefill stores the full prompt so the contrast is meaningful"
+        );
     }
 }

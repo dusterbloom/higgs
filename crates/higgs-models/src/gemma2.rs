@@ -1,3 +1,6 @@
+// Model forward passes eval under the engine MLX gate (structurally on-gate); see clippy.toml.
+#![allow(clippy::disallowed_methods)]
+
 //! Gemma 2 model implementation.
 //!
 //! Differs from the standard transformer in several ways:
@@ -476,8 +479,8 @@ fn create_sliding_window_mask(L: i32, S: i32, window: i32) -> Result<Array, Exce
     // The causal mask already handles j <= (offset + i).
     // The remaining constraint: j >= (offset + i) - window + 1
 
-    let query_positions = mlx_rs::ops::arange::<_, f32>(offset, offset + L, None)?;
-    let key_positions = mlx_rs::ops::arange::<_, f32>(None, S, None)?;
+    let query_positions = mlx_rs::arange!(start = offset, stop = offset + L)?;
+    let key_positions = mlx_rs::arange!(stop = S)?;
 
     // lower_bound[i] = query_pos[i] - window + 1
     let lower_bounds = query_positions.subtract(array!(window - 1))?;

@@ -23,6 +23,7 @@ use crate::{
     types::openai::{
         ChoiceLogprobs, CompletionChoice, CompletionChunkChoice, CompletionRequest,
         CompletionResponse, CompletionUsage, StopSequence, TokenLogprob, TopLogprob,
+        merge_repetition_penalty,
     },
 };
 use higgs_models::SamplingParams;
@@ -37,7 +38,7 @@ pub async fn completions(
     // Captured before parsing and prompt preparation so TTFT measures
     // the client-observed wait, not only generation.
     let received_at = Instant::now();
-    let req: CompletionRequest = serde_json::from_slice(&body)
+    let mut req: CompletionRequest = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
     request_metrics.set_requested_model(&req.model);
 
@@ -58,7 +59,9 @@ pub async fn completions(
             engine,
             model_name,
             routing_method,
+            ..
         } => {
+            req.model.clone_from(&model_name);
             if req.stream == Some(true) {
                 let metrics = state.metrics.clone();
                 let stream = completions_stream(
@@ -69,7 +72,8 @@ pub async fn completions(
                     metrics,
                     routing_method,
                     received_at,
-                )?;
+                )
+                .await?;
                 let sse = Sse::new(stream).keep_alive(KeepAlive::default());
                 if state.metrics.is_some() {
                     request_metrics.mark_recorded();
@@ -169,19 +173,38 @@ async fn completions_non_streaming(
         .encode(req.prompt.as_str(), false)
         .map_err(|e| ServerError::BadRequest(format!("Tokenization error: {e}")))?;
     let prompt_tokens = encoding.get_ids().to_vec();
+    let max_tokens = crate::capacity::resolve_output_tokens(
+        &state,
+        &req.model,
+        prompt_tokens.len(),
+        req.max_tokens,
+        max_tokens,
+    );
+    let reservation = crate::capacity::admit_generation_request(
+        &state,
+        &req.model,
+        prompt_tokens.len(),
+        max_tokens,
+    )
+    .await?;
 
     let tokenizer = engine.tokenizer().clone();
+    let checkpoint_id = req.checkpoint_id.clone();
+    let watchdog = crate::capacity::request_watchdog(&state);
     let output = tokio::task::spawn_blocking(move || {
-        engine.generate(
-            &prompt_tokens,
-            max_tokens,
-            &sampling,
-            &stop_sequences,
-            want_logprobs,
-            top_logprobs,
-            None,
-            None,
-        )
+        crate::capacity::run_reserved_generation(reservation, watchdog, || {
+            engine.generate(
+                &prompt_tokens,
+                max_tokens,
+                &sampling,
+                &stop_sequences,
+                want_logprobs,
+                top_logprobs,
+                None,
+                None,
+                checkpoint_id.as_deref(),
+            )
+        })
     })
     .await
     .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
@@ -205,16 +228,12 @@ async fn completions_non_streaming(
             finish_reason: output.finish_reason,
             logprobs: logprobs_response,
         }],
-        usage: CompletionUsage {
-            prompt_tokens: output.prompt_tokens,
-            completion_tokens: output.completion_tokens,
-            total_tokens: output.prompt_tokens + output.completion_tokens,
-        },
+        usage: CompletionUsage::new(output.prompt_tokens, output.completion_tokens, 0),
     })
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn completions_stream(
+async fn completions_stream(
     state: SharedState,
     req: CompletionRequest,
     engine: Arc<Engine>,
@@ -234,29 +253,50 @@ fn completions_stream(
         .encode(req.prompt.as_str(), false)
         .map_err(|e| ServerError::BadRequest(format!("Tokenization error: {e}")))?;
     let prompt_tokens = encoding.get_ids().to_vec();
+    let max_tokens = crate::capacity::resolve_output_tokens(
+        &state,
+        &req.model,
+        prompt_tokens.len(),
+        req.max_tokens,
+        max_tokens,
+    );
     let input_token_count = u64::try_from(prompt_tokens.len()).unwrap_or(u64::MAX);
+    let reservation = crate::capacity::admit_generation_request(
+        &state,
+        &req.model,
+        prompt_tokens.len(),
+        max_tokens,
+    )
+    .await?;
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp();
     let model = req.model;
+    let checkpoint_id = req.checkpoint_id;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel::<crate::sse::WorkerTerminal>();
+    let watchdog = crate::capacity::request_watchdog(&state);
 
     tokio::task::spawn_blocking(move || {
-        let result = engine.generate_streaming(
-            &prompt_tokens,
-            max_tokens,
-            &sampling,
-            &stop_sequences,
-            want_logprobs,
-            top_logprobs,
-            &tx,
-            None,
-            None,
-        );
-        if let Err(e) = result {
+        let result = crate::capacity::run_reserved_generation(reservation, watchdog, || {
+            engine.generate_streaming(
+                &prompt_tokens,
+                max_tokens,
+                &sampling,
+                &stop_sequences,
+                want_logprobs,
+                top_logprobs,
+                &tx,
+                None,
+                None,
+                checkpoint_id.as_deref(),
+            )
+        });
+        if let Err(e) = &result {
             tracing::error!(error = %e, "Generation error during streaming");
         }
+        let _ = terminal_tx.send(crate::sse::WorkerTerminal::from_engine_result(result));
     });
 
     let start = received_at;
@@ -297,6 +337,21 @@ fn completions_stream(
             }
         }
 
+        match terminal_rx.await.unwrap_or_else(|error| {
+            crate::sse::WorkerTerminal::Failed(format!(
+                "streaming generation worker terminated unexpectedly: {error}"
+            ))
+        }) {
+            crate::sse::WorkerTerminal::Completed
+            | crate::sse::WorkerTerminal::Failed(_) => {}
+            crate::sse::WorkerTerminal::Capacity(info) => {
+                // Exact frozen v1 terminal event, then the normal [DONE].
+                yield Ok(Event::default().data(
+                    crate::sse::capacity_interrupted_event_json(&info, output_tokens),
+                ));
+            }
+        }
+
         if let Some(ref m) = metrics {
             if let Some(id) = pending_id {
                 m.finalize_stream(id, output_tokens, start.elapsed(), timing);
@@ -311,13 +366,17 @@ fn completions_stream(
 
 fn build_sampling_params(req: &CompletionRequest) -> SamplingParams {
     SamplingParams {
-        temperature: req.temperature.unwrap_or(1.0),
+        temperature: req.temperature.unwrap_or(0.0),
         top_p: req.top_p.unwrap_or(1.0),
         top_k: req.top_k,
         min_p: req.min_p,
-        repetition_penalty: req.repetition_penalty,
+        repetition_penalty: merge_repetition_penalty(req.repetition_penalty, req.repeat_penalty),
         frequency_penalty: req.frequency_penalty,
         presence_penalty: req.presence_penalty,
+        // Legacy text-completion endpoint: speculation method stays at the
+        // load-time default (DFlash if a drafter is loaded, else MTP).
+        speculation: higgs_models::Speculation::Auto,
+        thinking_budget: None,
     }
 }
 
@@ -350,4 +409,42 @@ fn logprobs_to_response(
         })
         .collect();
     ChoiceLogprobs { content }
+}
+
+#[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn capacity_admission_rejects_both_completion_variants_before_worker_mutation() {
+        let model = "prompt-limit-mutation-spy";
+        let (state, engine) = crate::capacity::rejecting_route_test_state(model);
+        let request = |stream| {
+            serde_json::from_value::<CompletionRequest>(serde_json::json!({
+                "model": model,
+                "prompt": "hi",
+                "max_tokens": 5120,
+                "stream": stream
+            }))
+            .unwrap()
+        };
+
+        let blocking =
+            completions_non_streaming(Arc::clone(&state), request(false), Arc::clone(&engine))
+                .await;
+        assert!(matches!(blocking, Err(ServerError::CapacityExceeded(_))));
+        let streaming = completions_stream(
+            Arc::clone(&state),
+            request(true),
+            Arc::clone(&engine),
+            model.to_owned(),
+            None,
+            crate::router::RoutingMethod::Direct,
+        )
+        .await;
+        assert!(matches!(streaming, Err(ServerError::CapacityExceeded(_))));
+        assert!(engine.route_test_mutation_sequence().is_empty());
+        assert_eq!(state.capacity.active_reservation_count(model), 0);
+    }
 }
