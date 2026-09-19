@@ -1748,6 +1748,23 @@ fn dflash_propose_tokens(
     } else {
         draft_hidden.clone()
     };
+    if drafter.config.is_dflash2() {
+        // DFlash2 walks the candidate selector over positions 1.. (the masked
+        // slots) starting from `anchor`. `forward_all_logits_from_hidden`
+        // applies the target's (bound) output head to the draft trunk.
+        let sliced = draft_hidden.index((.., 1.., ..));
+        let logits = model
+            .forward_all_logits_from_hidden(&sliced)
+            .map_err(EngineError::Mlx)?;
+        let tokens = drafter
+            .propose_dflash2_tokens(&sliced, &logits, anchor)
+            .map_err(EngineError::Mlx)?
+            .ok_or_else(|| EngineError::Generation("DFlash2 candidate selector missing".to_owned()))?;
+        return Ok(DflashProposal {
+            tokens,
+            host_tokens: None,
+        });
+    }
     let target_logits = if drafter.config.is_dspark() && dspark_target_head {
         Some(
             model

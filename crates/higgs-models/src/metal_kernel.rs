@@ -1667,7 +1667,7 @@ threadgroup OutT x_sh[CHUNK];
 auto tg = threadgroup_position_in_grid.x;
 auto sg = simdgroup_index_in_threadgroup;
 auto lane = thread_index_in_simdgroup;
-auto tid = thread_index_in_threadgroup;
+auto tid = thread_position_in_threadgroup;
 auto n_sg = simdgroups_per_threadgroup;
 uint tg_sz = n_sg * 32u;
 
@@ -2964,6 +2964,551 @@ pub fn bonsai_q2_qmv_ternary(
         mlx_sys::mlx_vector_array_free(inputs_vec);
         mlx_sys::mlx_vector_array_free(outputs_vec);
         mlx_sys::mlx_array_free(n_scalar);
+    }
+    result
+}
+
+/// Trit-packed ternary qmv (1.625 bits/weight): 128-trit groups packed as
+/// 26 bytes (25 full 5-trit bytes + one 3-trit tail), keeping group-scale
+/// boundaries byte-aligned. Reads weights + scales only (bias == -scale).
+/// One threadgroup (32 lanes) per output row; lanes parallelize K over whole
+/// groups. Stage-1 probe for the trit-packing thesis (fewer weight bytes =
+/// faster decode when DRAM-bound); loader repack lands only if it clears the
+/// go/no-go gate.
+const FAST_Q2_TRIT_QMV_KERNEL_SOURCE: &str = r"
+auto row = threadgroup_position_in_grid.x;
+auto batch = threadgroup_position_in_grid.y;
+uint lid = thread_index_in_simdgroup;
+
+auto xg_base = x + int(batch) * K;
+
+float partial = 0.0f;
+for (int g = int(lid); g < NumGroups; g += 32) {
+    auto base = w + row * KPacked + g * 26;
+    auto xg = xg_base + g * 128;
+    float pos = 0.0f;
+    float neg = 0.0f;
+    for (int j = 0; j < 25; ++j) {
+        uint v = base[j];
+        uint t0 = v % 3u; v /= 3u;
+        uint t1 = v % 3u; v /= 3u;
+        uint t2 = v % 3u; v /= 3u;
+        uint t3 = v % 3u; v /= 3u;
+        uint t4 = v % 3u;
+        float xv;
+        xv = float(xg[j * 5 + 0]); pos += (t0 == 2u) ? xv : 0.0f; neg += (t0 == 0u) ? xv : 0.0f;
+        xv = float(xg[j * 5 + 1]); pos += (t1 == 2u) ? xv : 0.0f; neg += (t1 == 0u) ? xv : 0.0f;
+        xv = float(xg[j * 5 + 2]); pos += (t2 == 2u) ? xv : 0.0f; neg += (t2 == 0u) ? xv : 0.0f;
+        xv = float(xg[j * 5 + 3]); pos += (t3 == 2u) ? xv : 0.0f; neg += (t3 == 0u) ? xv : 0.0f;
+        xv = float(xg[j * 5 + 4]); pos += (t4 == 2u) ? xv : 0.0f; neg += (t4 == 0u) ? xv : 0.0f;
+    }
+    uint v = base[25];
+    uint t0 = v % 3u; v /= 3u;
+    uint t1 = v % 3u; v /= 3u;
+    uint t2 = v % 3u;
+    float xv;
+    xv = float(xg[125]); pos += (t0 == 2u) ? xv : 0.0f; neg += (t0 == 0u) ? xv : 0.0f;
+    xv = float(xg[126]); pos += (t1 == 2u) ? xv : 0.0f; neg += (t1 == 0u) ? xv : 0.0f;
+    xv = float(xg[127]); pos += (t2 == 2u) ? xv : 0.0f; neg += (t2 == 0u) ? xv : 0.0f;
+    float s_val = float(sc[row * NumGroups + g]);
+    partial += s_val * (pos - neg);
+}
+float total = simd_sum(partial);
+if (lid == 0u) {
+    y[batch * n_param + row] = OutT(total);
+}
+";
+
+static FAST_Q2_TRIT_QMV_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+#[allow(unsafe_code)]
+fn create_fast_q2_trit_qmv_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"w", c"sc", c"x", c"n_param"]);
+    let out_vec = cstr_vec(&[c"y"]);
+    let source = CString::new(FAST_Q2_TRIT_QMV_KERNEL_SOURCE).unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_bonsai_q2_trit_qmv".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+/// Trit-packed ternary qmv: `y = x @ dequant(weight).T`. `weight` is u8
+/// `[out_features, 26 * (K/128)]`; `scales` `[out_features, K/128]`.
+#[allow(unsafe_code)]
+pub fn bonsai_q2_qmv_trit(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    group_size: i32,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let x_shape = x.shape();
+    let weight_shape = weight.shape();
+    let n_rows = *weight_shape
+        .first()
+        .ok_or_else(|| Exception::custom("trit qmv: weight has no rows"))?;
+    let k_dim = (*weight_shape
+        .get(1)
+        .ok_or_else(|| Exception::custom("trit qmv: weight has no columns"))?
+        / 26)
+        * 128;
+    let m_rows: i32 = x_shape
+        .iter()
+        .take(x_shape.len().saturating_sub(1))
+        .product();
+
+    let x_flat = x.reshape(&[m_rows, k_dim])?;
+    let w_flat = weight.reshape(&[-1])?;
+    let s_flat = scales.flatten(None, None)?;
+
+    let stream = Stream::task_local_or_default();
+    let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+
+    let cached =
+        FAST_Q2_TRIT_QMV_KERNEL.get_or_init(|| CachedMetalKernel(create_fast_q2_trit_qmv_kernel()));
+
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(config, c"OutT".as_ptr(), out_dtype);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"K".as_ptr(), k_dim);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"GroupSize".as_ptr(), group_size);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"KPacked".as_ptr(), 26 * (k_dim / group_size));
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"NumGroups".as_ptr(), k_dim / group_size);
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, n_rows * 32, m_rows, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1);
+        let y_shape = [m_rows, n_rows];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(config, y_shape.as_ptr(), y_shape.len(), out_dtype);
+
+        let n_scalar = mlx_sys::mlx_array_new_int(n_rows);
+        let input_ptrs = [w_flat.as_ptr(), s_flat.as_ptr(), x_flat.as_ptr(), n_scalar];
+        let inputs_vec = mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len());
+        let mut outputs_vec = mlx_sys::mlx_vector_array_new();
+        let status = mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec, cached.0, inputs_vec, config, stream.as_ptr(),
+        );
+
+        let result = if status != 0 {
+            Err(Exception::custom(format!(
+                "bonsai_q2_qmv_trit failed: {}",
+                take_last_error()
+            )))
+        } else {
+            let mut y_ptr = mlx_sys::mlx_array_new();
+            mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0);
+            let y = Array::from_ptr(y_ptr);
+            let trim_to = x_shape.len().saturating_sub(1);
+            let mut out_shape = x_shape
+                .get(..trim_to)
+                .ok_or_else(|| Exception::custom("trit qmv: x_shape too small"))?
+                .to_vec();
+            out_shape.push(n_rows);
+            y.reshape(&out_shape)
+        };
+
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        mlx_sys::mlx_array_free(n_scalar);
+        result
+    }
+}
+
+/// Batched ternary qmm (M>1 prefill): y[m,n] = sum_g s[n,g] * (pos-neg) with
+/// select-based {±1,0} unpack. Reads packed 2-bit weights ONCE, shared across
+/// the M batch rows (stock MLX dequantizes to dense at M>1 — measured 3-29
+/// GB/s vs our 67+ GB/s at M=1). 8x8 threadgroup tile; loop over 128-wide
+/// groups; weights/x broadcast-read within the tile.
+const FAST_Q2_TERNARY_QMM_KERNEL_SOURCE: &str = r"
+// One thread per output element (m, n); full K loop, no reduction. 32 lanes
+// cover a row-tile (n), 8 cover a batch-tile (m); the shared x/weight reads
+// are absorbed by L2/SLC (within-threadgroup broadcast).
+uint n = threadgroup_position_in_grid.x * 32 + thread_position_in_threadgroup.x;
+uint m = threadgroup_position_in_grid.y * 8 + thread_position_in_threadgroup.y;
+
+if (n < NRows && m < MRows) {
+    float acc = 0.0f;
+    auto wp = w + n * KPacked;
+    auto sp = sc + n * NumGroups;
+    auto xp = x + m * K;
+    for (int g = 0; g < NumGroups; ++g) {
+        float pos = 0.0f;
+        float neg = 0.0f;
+        for (int ww = 0; ww < 8; ++ww) {
+            uint packed = wp[g * 8 + ww];
+            int b = g * 128 + ww * 16;
+            uint c;
+            c = (packed >>  0u) & 3u; pos += (c == 2u) ? float(xp[b+0]) : 0.0f; neg += (c == 0u) ? float(xp[b+0]) : 0.0f;
+            c = (packed >>  2u) & 3u; pos += (c == 2u) ? float(xp[b+1]) : 0.0f; neg += (c == 0u) ? float(xp[b+1]) : 0.0f;
+            c = (packed >>  4u) & 3u; pos += (c == 2u) ? float(xp[b+2]) : 0.0f; neg += (c == 0u) ? float(xp[b+2]) : 0.0f;
+            c = (packed >>  6u) & 3u; pos += (c == 2u) ? float(xp[b+3]) : 0.0f; neg += (c == 0u) ? float(xp[b+3]) : 0.0f;
+            c = (packed >>  8u) & 3u; pos += (c == 2u) ? float(xp[b+4]) : 0.0f; neg += (c == 0u) ? float(xp[b+4]) : 0.0f;
+            c = (packed >> 10u) & 3u; pos += (c == 2u) ? float(xp[b+5]) : 0.0f; neg += (c == 0u) ? float(xp[b+5]) : 0.0f;
+            c = (packed >> 12u) & 3u; pos += (c == 2u) ? float(xp[b+6]) : 0.0f; neg += (c == 0u) ? float(xp[b+6]) : 0.0f;
+            c = (packed >> 14u) & 3u; pos += (c == 2u) ? float(xp[b+7]) : 0.0f; neg += (c == 0u) ? float(xp[b+7]) : 0.0f;
+            c = (packed >> 16u) & 3u; pos += (c == 2u) ? float(xp[b+8]) : 0.0f; neg += (c == 0u) ? float(xp[b+8]) : 0.0f;
+            c = (packed >> 18u) & 3u; pos += (c == 2u) ? float(xp[b+9]) : 0.0f; neg += (c == 0u) ? float(xp[b+9]) : 0.0f;
+            c = (packed >> 20u) & 3u; pos += (c == 2u) ? float(xp[b+10]) : 0.0f; neg += (c == 0u) ? float(xp[b+10]) : 0.0f;
+            c = (packed >> 22u) & 3u; pos += (c == 2u) ? float(xp[b+11]) : 0.0f; neg += (c == 0u) ? float(xp[b+11]) : 0.0f;
+            c = (packed >> 24u) & 3u; pos += (c == 2u) ? float(xp[b+12]) : 0.0f; neg += (c == 0u) ? float(xp[b+12]) : 0.0f;
+            c = (packed >> 26u) & 3u; pos += (c == 2u) ? float(xp[b+13]) : 0.0f; neg += (c == 0u) ? float(xp[b+13]) : 0.0f;
+            c = (packed >> 28u) & 3u; pos += (c == 2u) ? float(xp[b+14]) : 0.0f; neg += (c == 0u) ? float(xp[b+14]) : 0.0f;
+            c = (packed >> 30u) & 3u; pos += (c == 2u) ? float(xp[b+15]) : 0.0f; neg += (c == 0u) ? float(xp[b+15]) : 0.0f;
+        }
+        acc += float(sp[g]) * (pos - neg);
+    }
+    y[m * NRows + n] = OutT(acc);
+}
+";
+
+static FAST_Q2_TERNARY_QMM_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+#[allow(unsafe_code)]
+fn create_fast_q2_ternary_qmm_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"w", c"sc", c"x"]);
+    let out_vec = cstr_vec(&[c"y"]);
+    let source = CString::new(FAST_Q2_TERNARY_QMM_KERNEL_SOURCE).unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_bonsai_q2_ternary_qmm".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+/// Batched ternary qmm: y = x @ dequant(W).T for M>1. `weight` u32
+/// [N, K/16], `scales` [N, K/128], `x` [M, K]. bias == -scale, codes {0,1,2}.
+#[allow(unsafe_code)]
+pub fn bonsai_q2_qmm_ternary(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    group_size: i32,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let x_shape = x.shape();
+    let weight_shape = weight.shape();
+    let n_rows = *weight_shape.first().ok_or_else(|| Exception::custom("ternary qmm: weight rows"))?;
+    let k_dim = *weight_shape.get(1).ok_or_else(|| Exception::custom("ternary qmm: weight cols"))? * 16;
+    let m_rows = x_shape.iter().take(x_shape.len().saturating_sub(1)).product();
+
+    let x_flat = x.reshape(&[m_rows, k_dim])?;
+    let w_flat = weight.reshape(&[-1])?;
+    let s_flat = scales.flatten(None, None)?;
+
+    let stream = Stream::task_local_or_default();
+    let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+    let cached = FAST_Q2_TERNARY_QMM_KERNEL.get_or_init(|| CachedMetalKernel(create_fast_q2_ternary_qmm_kernel()));
+
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(config, c"OutT".as_ptr(), out_dtype);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"K".as_ptr(), k_dim);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"KPacked".as_ptr(), k_dim / 16);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"NumGroups".as_ptr(), k_dim / group_size);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"MRows".as_ptr(), m_rows);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"NRows".as_ptr(), n_rows);
+        // one threadgroup per output row; 32 lanes split K over groups, 8
+        // batch rows per threadgroup (threadgroup.y)
+        let nt = (n_rows + 31) / 32;
+        let mt = (m_rows + 7) / 8;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, nt * 32, mt * 8, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, 8, 1);
+
+        let y_shape = [m_rows, n_rows];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(config, y_shape.as_ptr(), y_shape.len(), out_dtype);
+
+        let input_ptrs = [w_flat.as_ptr(), s_flat.as_ptr(), x_flat.as_ptr()];
+        let inputs_vec = mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len());
+        let mut outputs_vec = mlx_sys::mlx_vector_array_new();
+        let status = mlx_sys::mlx_fast_metal_kernel_apply(&raw mut outputs_vec, cached.0, inputs_vec, config, stream.as_ptr());
+
+        let result = if status != 0 {
+            Err(Exception::custom(format!("bonsai_q2_qmm_ternary failed: {}", take_last_error())))
+        } else {
+            let mut y_ptr = mlx_sys::mlx_array_new();
+            mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0);
+            let y = Array::from_ptr(y_ptr);
+            let trim_to = x_shape.len().saturating_sub(1);
+            let mut out_shape = x_shape.get(..trim_to).ok_or_else(|| Exception::custom("ternary qmm: x_shape"))?.to_vec();
+            out_shape.push(n_rows);
+            y.reshape(&out_shape)
+        };
+
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ternary M<=8 MMA verify kernel (simdgroup_matrix<8,8>)
+// ---------------------------------------------------------------------------
+//
+// Port of avlp12/chad `qmm_mma4` / `mlx_qmm_mma.py` for the Prism ternary pack
+// (bits=2, group_size=128, bias == -scale). One 8x8 `simdgroup_matrix` tile
+// covers M <= 8 exactly: each 64-value weight group is dequantized once and
+// reused by every row, with K split across the 8 simdgroups of a threadgroup.
+// The product is computed transposed (out^T = W x^T), weights enter the MMA as
+// the exact bf16 of (2^bits + v) via a bit-insert, and the affine offset is
+// folded once per group: acc += s*C_g + (b - 2^bits*s)*sum(x_g).
+
+const Q2_MMA_M8_KERNEL_SOURCE: &str = r"
+    const int K = KD, N = ND, M = MD;
+    const int KPS = KD / SG;
+    const uint MAGIC = 129u << 7;          // (127 + 2) << 7
+    const uint MAGIC2 = MAGIC | (MAGIC << 16);
+    const float POW = 4.0f;                 // 1 << 2
+
+    uint tid  = thread_position_in_threadgroup.x;
+    uint tgid = threadgroup_position_in_grid.x;
+    uint sg   = tid >> 5;
+    uint lane = tid & 31;
+    uint qid = lane >> 2;
+    int fm = (int)((qid & 4) + ((lane >> 1) & 3));
+    int fn = (int)(((qid & 2) << 1) + ((lane & 1) << 1));
+
+    int n0 = (int)tgid * 8 * TILES;
+    threadgroup float red[SG * TILES * 64];
+
+    float acc0[TILES], acc1[TILES];
+    #pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) { acc0[t] = 0.0f; acc1[t] = 0.0f; }
+
+    const bool xa_ok = fn < M, xb_ok = fn + 1 < M;
+    const device bfloat16_t* xa_p = x + (size_t)(xa_ok ? fn : 0) * K + fm * 8;
+    const device bfloat16_t* xb_p = x + (size_t)(xb_ok ? fn + 1 : 0) * K + fm * 8;
+    const int hoff0 = (fn * 8) * 2, hoff1 = (fn * 8 + 8) * 2;
+    const int hw0 = hoff0 >> 5, hs0 = hoff0 & 31;
+    const int hw1 = hoff1 >> 5, hs1 = hoff1 & 31;
+
+    const int gbeg = (int)sg * (KPS / 64);
+    const int gend = gbeg + KPS / 64;
+    for (int g = gbeg; g < gend; ++g) {
+        uint4 xa = xa_ok ? *((const device uint4*)(xa_p + g * 64)) : uint4(0u);
+        uint4 xb = xb_ok ? *((const device uint4*)(xb_p + g * 64)) : uint4(0u);
+        simdgroup_matrix<bfloat16_t, 8, 8> B[8];
+        float sa = 0.0f, sb = 0.0f;
+        #pragma clang loop unroll(full)
+        for (int kt = 0; kt < 8; ++kt) {
+            uint wa = (kt & 1) ? (xa[kt >> 1] & 0xFFFF0000u) : (xa[kt >> 1] << 16);
+            uint wb = (kt & 1) ? (xb[kt >> 1] & 0xFFFF0000u) : (xb[kt >> 1] << 16);
+            sa += as_type<float>(wa);
+            sb += as_type<float>(wb);
+            thread auto& eb = B[kt].thread_elements();
+            reinterpret_cast<thread uint&>(eb) = (wa >> 16) | wb;
+        }
+        sa += simd_shuffle_xor(sa, 2u);  sb += simd_shuffle_xor(sb, 2u);
+        sa += simd_shuffle_xor(sa, 4u);  sb += simd_shuffle_xor(sb, 4u);
+        sa += simd_shuffle_xor(sa, 16u); sb += simd_shuffle_xor(sb, 16u);
+
+        #pragma clang loop unroll(full)
+        for (int t = 0; t < TILES; ++t) {
+            int n = n0 + t * 8 + fm;
+            bool ok = n < N;
+            int nn = ok ? n : 0;
+            float s  = (float)sc[(size_t)nn * (K / 128) + g / 2];
+            float bb = (float)bi[(size_t)nn * (K / 128) + g / 2];
+            const device uint* wr = w + (size_t)nn * (K * 2 / 32) + (size_t)g * 4;
+            ulong win0 = (ulong)(wr[hw0] >> hs0);
+            ulong win1 = (ulong)(wr[hw1] >> hs1);
+            simdgroup_matrix<float, 8, 8> Cg = simdgroup_matrix<float, 8, 8>(0);
+            simdgroup_matrix<bfloat16_t, 8, 8> A;
+            thread auto& ea = A.thread_elements();
+            #pragma clang loop unroll(full)
+            for (int kt = 0; kt < 8; ++kt) {
+                uint v0 = (uint)(win0 >> (kt * 2)) & 3u;
+                uint v1 = (uint)(win1 >> (kt * 2)) & 3u;
+                reinterpret_cast<thread uint&>(ea) = MAGIC2 | (v0 << 5) | (v1 << 21);
+                simdgroup_multiply_accumulate(Cg, A, B[kt], Cg);
+            }
+            thread auto& cg = Cg.thread_elements();
+            float bbs = ok ? (bb - POW * s) : 0.0f;
+            s = ok ? s : 0.0f;
+            acc0[t] += s * cg[0] + bbs * sa;
+            acc1[t] += s * cg[1] + bbs * sb;
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+        red[(sg * TILES + t) * 64 + fm * 8 + fn]     = acc0[t];
+        red[(sg * TILES + t) * 64 + fm * 8 + fn + 1] = acc1[t];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int i = (int)tid; i < TILES * 64; i += 32 * SG) {
+        int t = i >> 6, nl = (i >> 3) & 7, m = i & 7;
+        int n = n0 + t * 8 + nl;
+        if (m < M && n < N) {
+            float v = 0.0f;
+            for (int q = 0; q < SG; ++q) v += red[(q * TILES + t) * 64 + nl * 8 + m];
+            out[(size_t)m * N + n] = (bfloat16_t)v;
+        }
+    }
+";
+
+static Q2_MMA_M8_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+#[allow(unsafe_code)]
+fn create_q2_mma_m8_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"x", c"w", c"sc", c"bi"]);
+    let out_vec = cstr_vec(&[c"out"]);
+    let source = CString::new(Q2_MMA_M8_KERNEL_SOURCE).unwrap_or_default();
+    let header = CString::new("#include <metal_simdgroup>\n#include <metal_simdgroup_matrix>\n")
+        .unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_bonsai_q2_mma_m8_v1".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+#[allow(unsafe_code)]
+fn configure_q2_mma_m8_kernel(
+    out_dtype: mlx_sys::mlx_dtype,
+    m_rows: i32,
+    n_cols: i32,
+    k_dim: i32,
+) -> mlx_sys::mlx_fast_metal_kernel_config {
+    const SG: i32 = 8;
+    const TILES: i32 = 4;
+    const TG: i32 = 32 * SG;
+    let cols = 8 * TILES;
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"KD".as_ptr(), k_dim);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"ND".as_ptr(), n_cols);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"MD".as_ptr(), m_rows);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"TILES".as_ptr(), TILES);
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"SG".as_ptr(), SG);
+
+        let grid_x = ((n_cols + cols - 1) / cols) * TG;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, grid_x, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, TG, 1, 1);
+
+        let y_shape = [m_rows, n_cols];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            y_shape.as_ptr(),
+            y_shape.len(),
+            out_dtype,
+        );
+        config
+    }
+}
+
+/// Ternary (bits=2, group_size=128) M<=8 MMA matmul for the speculative-verify
+/// tile. `x` is `[M, K]` bf16 (M <= 8), `weight` `[N, K/16]` u32, `scales`/`biases`
+/// `[N, K/128]` bf16. Returns `[M, N]` bf16.
+#[allow(dead_code, unsafe_code)]
+pub fn bonsai_q2_mma_m8(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+) -> Result<Array, Exception> {
+    ensure_ffi_error_handler();
+
+    let x_shape = x.shape();
+    let m_rows: i32 = x_shape
+        .iter()
+        .take(x_shape.len().saturating_sub(1))
+        .product();
+    if m_rows > 8 {
+        return Err(Exception::custom(format!(
+            "bonsai_q2_mma_m8: M must be <= 8, got {m_rows}"
+        )));
+    }
+    let [n_cols, k_packed] = *weight.shape() else {
+        return Err(Exception::custom("bonsai_q2_mma_m8: weight must be [N, K/16]"));
+    };
+    let k_dim = k_packed * 16;
+    // The kernel's split-K loop walks 64-value chunks across SG=8 simdgroups
+    // (KPS/64 is truncating), so K must be a multiple of 512 or the tail is
+    // silently dropped. Fail loud rather than write a truncated output.
+    if k_dim % 512 != 0 {
+        return Err(Exception::custom(format!(
+            "bonsai_q2_mma_m8: K must be a multiple of 512, got {k_dim}"
+        )));
+    }
+
+    let x_flat = x.reshape(&[m_rows, k_dim])?;
+    let w_flat = weight.reshape(&[-1])?;
+    let s_flat = scales.flatten(None, None)?;
+    let b_flat = biases.flatten(None, None)?;
+
+    let stream = Stream::task_local_or_default();
+    let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+    let cached = Q2_MMA_M8_KERNEL.get_or_init(|| CachedMetalKernel(create_q2_mma_m8_kernel()));
+    let config = configure_q2_mma_m8_kernel(out_dtype, m_rows, n_cols, k_dim);
+
+    let input_ptrs = [x_flat.as_ptr(), w_flat.as_ptr(), s_flat.as_ptr(), b_flat.as_ptr()];
+    let inputs_vec =
+        unsafe { mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len()) };
+
+    let mut outputs_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        )
+    };
+
+    let result = if status != 0 {
+        Err(Exception::custom(format!(
+            "bonsai_q2_mma_m8 failed: {}",
+            take_last_error()
+        )))
+    } else {
+        let mut y_ptr = unsafe { mlx_sys::mlx_array_new() };
+        unsafe { mlx_sys::mlx_vector_array_get(&raw mut y_ptr, outputs_vec, 0) };
+        let y = unsafe { Array::from_ptr(y_ptr) };
+        let trim_to = x_shape.len().saturating_sub(1);
+        let mut out_shape = x_shape
+            .get(..trim_to)
+            .ok_or_else(|| Exception::custom("bonsai_q2_mma_m8: x_shape too small"))?
+            .to_vec();
+        out_shape.push(n_cols);
+        y.reshape(&out_shape)
+    };
+
+    unsafe {
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
     }
     result
 }

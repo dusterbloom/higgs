@@ -45,6 +45,11 @@ struct DFlashSubConfig {
     tap_semantics: Option<DFlashTapSemantics>,
     #[serde(default)]
     mask_token_id: Option<i32>,
+    /// DFlash2/Prism checkpoints carry `block_size` inside `dflash_config`;
+    /// older Modal checkpoints carry it at the top level. Prefer this value
+    /// when present.
+    #[serde(default)]
+    block_size: Option<i32>,
     /// Prism dSpark checkpoints use the `DFlash` trunk plus log-SNR conditioning
     /// and a sequential low-rank Markov resampler.
     #[serde(default)]
@@ -61,6 +66,18 @@ struct DFlashSubConfig {
     /// Verification remains distribution-exact; this only changes proposals.
     #[serde(default)]
     reuse_target_head: bool,
+    /// DFlash2 dynamic grouped-conv kernel size (0 = DFlash1, no convs).
+    #[serde(default)]
+    conv_kernel_size: i32,
+    /// DFlash2 dynamic grouped-conv group width (0 = DFlash1).
+    #[serde(default)]
+    conv_group_size: i32,
+    /// DFlash2 candidate-selector codebook rank (0 = DFlash1, no selector).
+    #[serde(default)]
+    selector_rank: i32,
+    /// DFlash2 candidate-selector per-position shortlist size.
+    #[serde(default)]
+    selector_top_k: i32,
     /// Exact target artifact this trained dSpark sidecar is allowed to pair
     /// with. Required for dSpark and ignored for generic DFlash checkpoints.
     #[serde(default)]
@@ -112,6 +129,9 @@ pub struct DFlashConfig {
     /// quantized matmul; when absent, they use dense matmul.
     #[serde(default)]
     pub quantization: Option<crate::qwen3_next::QuantizationConfig>,
+    /// Whether draft attention is causal (DFlash2). DFlash1 is non-causal.
+    #[serde(default)]
+    pub is_causal: Option<bool>,
     dflash_config: DFlashSubConfig,
 }
 
@@ -146,6 +166,27 @@ impl DFlashConfig {
 
     pub const fn reuse_target_head(&self) -> bool {
         self.dflash_config.reuse_target_head
+    }
+
+    /// DFlash2 (candidate-selector) drafter vs DFlash1/dSpark block-diffusion.
+    pub const fn is_dflash2(&self) -> bool {
+        self.dflash_config.selector_rank > 0
+    }
+
+    pub const fn conv_kernel_size(&self) -> i32 {
+        self.dflash_config.conv_kernel_size
+    }
+
+    pub const fn conv_group_size(&self) -> i32 {
+        self.dflash_config.conv_group_size
+    }
+
+    pub const fn selector_rank(&self) -> i32 {
+        self.dflash_config.selector_rank
+    }
+
+    pub const fn selector_top_k(&self) -> i32 {
+        self.dflash_config.selector_top_k
     }
 }
 
@@ -238,6 +279,8 @@ struct DFlashAttention {
     scale: f32,
     is_sliding: bool,
     sliding_window: i32,
+    /// DFlash2 sliding-window attention mask (DFlash1 attends fully non-causally).
+    use_sliding_mask: bool,
 }
 
 impl DFlashAttention {
@@ -284,6 +327,7 @@ impl DFlashAttention {
             .recip(),
             is_sliding,
             sliding_window,
+            use_sliding_mask: config.is_dflash2(),
         })
     }
 
@@ -419,13 +463,32 @@ impl DFlashAttention {
         let k = ops::concatenate_axis(&[ctx_k, &noise_k], 2)?;
         let v = ops::concatenate_axis(&[ctx_v, &noise_v], 2)?;
 
-        // Non-causal SDPA (no mask)
+        // DFlash2 restricts context attention to the sliding window while
+        // keeping the draft block fully bidirectional. DFlash1 is non-causal.
+        let sliding_mask = if self.use_sliding_mask {
+            let ctx_len = ctx_k.shape()[2];
+            let kv_len = ctx_len + q_len;
+            let query_pos = mlx_rs::arange!(start = ctx_len, stop = kv_len)?.reshape(&[q_len, 1])?;
+            let key_pos = mlx_rs::arange!(stop = kv_len)?.reshape(&[1, kv_len])?;
+            let in_window = query_pos
+                .subtract(&key_pos)?
+                .lt(&mlx_rs::array!(self.sliding_window))?;
+            let context = key_pos
+                .lt(&mlx_rs::array!(ctx_len))?
+                .logical_and(&in_window)?;
+            let block = key_pos.ge(&mlx_rs::array!(ctx_len))?;
+            Some(context.logical_or(&block)?)
+        } else {
+            None
+        };
         let output = mlx_rs::fast::scaled_dot_product_attention(
             q,
             k,
             v,
             self.scale,
-            None::<mlx_rs::fast::ScaledDotProductAttentionMask>,
+            sliding_mask
+                .as_ref()
+                .map(mlx_rs::fast::ScaledDotProductAttentionMask::Array),
             None::<&Array>,
         )?;
 
@@ -450,6 +513,10 @@ struct DFlashDecoderLayer {
     input_layernorm: nn::RmsNorm,
     #[param]
     post_attention_layernorm: nn::RmsNorm,
+    #[param]
+    attention_conv: Option<DFlashDynamicConv>,
+    #[param]
+    mlp_conv: Option<DFlashDynamicConv>,
 }
 
 impl DFlashDecoderLayer {
@@ -458,6 +525,24 @@ impl DFlashDecoderLayer {
         layer_idx: usize,
         spec: crate::qwen3_next::QuantSpec,
     ) -> Result<Self, Exception> {
+        let convs = if config.is_dflash2() {
+            (
+                Some(DFlashDynamicConv::new(
+                    config.hidden_size,
+                    config.conv_kernel_size(),
+                    config.conv_group_size(),
+                    spec,
+                )?),
+                Some(DFlashDynamicConv::new(
+                    config.hidden_size,
+                    config.conv_kernel_size(),
+                    config.conv_group_size(),
+                    spec,
+                )?),
+            )
+        } else {
+            (None, None)
+        };
         Ok(Self {
             self_attn: DFlashAttention::new(config, layer_idx, spec)?,
             mlp: DFlashMLP::new(config.hidden_size, config.intermediate_size, spec)?,
@@ -467,6 +552,8 @@ impl DFlashDecoderLayer {
             post_attention_layernorm: nn::RmsNormBuilder::new(config.hidden_size)
                 .eps(config.rms_norm_eps)
                 .build()?,
+            attention_conv: convs.0,
+            mlp_conv: convs.1,
         })
     }
 
@@ -476,6 +563,9 @@ impl DFlashDecoderLayer {
         cache: &Option<(Array, Array)>,
         noise_position: i32,
     ) -> Result<Array, Exception> {
+        if self.attention_conv.is_some() {
+            return self.forward_dflash2(noise, cache, noise_position);
+        }
         let normed = self.input_layernorm.forward(noise)?;
         let attn_out = self
             .self_attn
@@ -484,6 +574,38 @@ impl DFlashDecoderLayer {
         let normed_post = self.post_attention_layernorm.forward(&h)?;
         let mlp_out = self.mlp.forward(&normed_post)?;
         h.add(mlp_out)
+    }
+
+    /// DFlash2 layer: dynamic grouped convs wrap attention and MLP.
+    fn forward_dflash2(
+        &mut self,
+        x: &Array,
+        cache: &Option<(Array, Array)>,
+        noise_position: i32,
+    ) -> Result<Array, Exception> {
+        let attention_conv = self
+            .attention_conv
+            .as_ref()
+            .ok_or_else(|| Exception::custom("DFlash2 layer missing attention_conv"))?;
+        let mlp_conv = self
+            .mlp_conv
+            .as_ref()
+            .ok_or_else(|| Exception::custom("DFlash2 layer missing mlp_conv"))?;
+        let residual = x.clone();
+        let normed = self.input_layernorm.forward(x)?;
+        let (conv_x, kernel) = attention_conv.prepare(&normed)?;
+        let attn_out = self
+            .self_attn
+            .forward_noise(&conv_x, cache, noise_position)?;
+        let attn_finished = attention_conv.finish(&attn_out, &kernel)?;
+        let h = residual.add(&attn_finished)?;
+
+        let residual = h.clone();
+        let normed_post = self.post_attention_layernorm.forward(&h)?;
+        let (conv_x, kernel) = mlp_conv.prepare(&normed_post)?;
+        let mlp_out = self.mlp.forward(&conv_x)?;
+        let mlp_finished = mlp_conv.finish(&mlp_out, &kernel)?;
+        residual.add(&mlp_finished)
     }
 
     fn prime_target_context(
@@ -495,6 +617,171 @@ impl DFlashDecoderLayer {
         self.self_attn
             .append_target_context(target_hidden, cache, cache_offset)?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DFlash2 dynamic grouped causal conv
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, ModuleParameters)]
+struct DFlashDynamicConv {
+    #[param]
+    base_kernel: Param<Array>,
+    #[param]
+    kernel_projection: crate::qwen3_next::QLinear,
+    kernel_size: i32,
+    group_size: i32,
+}
+
+impl DFlashDynamicConv {
+    fn new(
+        hidden_size: i32,
+        kernel_size: i32,
+        group_size: i32,
+        spec: crate::qwen3_next::QuantSpec,
+    ) -> Result<Self, Exception> {
+        Ok(Self {
+            base_kernel: Param::new(
+                Array::zeros::<f32>(&[2, kernel_size, hidden_size])?
+                    .as_dtype(mlx_rs::Dtype::Bfloat16)?,
+            ),
+            kernel_projection: crate::qwen3_next::QLinear::new_spec(spec)?,
+            kernel_size,
+            group_size,
+        })
+    }
+
+    /// Causal grouped 1D conv: `out[t] = sum_o (base[o] + dynamic[t,o]) * x[t-o]`.
+    fn convolve(
+        hidden: &Array,
+        dynamic: &Array,
+        base: &Array,
+        group_size: i32,
+    ) -> Result<Array, Exception> {
+        let b = hidden.shape()[0];
+        let t = hidden.shape()[1];
+        let h = hidden.shape()[2];
+        let k = base.shape()[0];
+        let groups = h / group_size;
+        let blocks = hidden.reshape(&[b, t, groups, group_size])?;
+        let dynamic = dynamic.reshape(&[b, t, k, groups, 1])?;
+        let mut output = Array::zeros::<f32>(&[b, t, groups, group_size])?
+            .as_dtype(hidden.dtype())?;
+        for offset in 0..k {
+            let values = if offset == 0 {
+                blocks.clone()
+            } else {
+                let zeros = Array::zeros::<f32>(&[b, offset, groups, group_size])?
+                    .as_dtype(hidden.dtype())?;
+                let tail = blocks.index((.., ..(t - offset), .., ..));
+                ops::concatenate_axis(&[&zeros, &tail], 1)?
+            };
+            let base_k = base
+                .index(offset)
+                .reshape(&[1, 1, groups, group_size])?
+                .as_dtype(hidden.dtype())?;
+            output = output.add(&base_k.multiply(&values)?)?;
+            let dyn_k = dynamic.index((.., .., offset, .., ..));
+            output = output.add(&dyn_k.multiply(&values)?)?;
+        }
+        output.reshape(&[b, t, h])
+    }
+
+    fn prepare(&self, hidden: &Array) -> Result<(Array, Array), Exception> {
+        let b = hidden.shape()[0];
+        let t = hidden.shape()[1];
+        let h = hidden.shape()[2];
+        let groups = h / self.group_size;
+        let dynamic = self
+            .kernel_projection
+            .forward(hidden)?
+            .reshape(&[b, t, 2, self.kernel_size, groups])?;
+        let dynamic_prep = dynamic.index((.., .., 0, .., ..));
+        let base_prep = (*self.base_kernel).index(0);
+        let conv = Self::convolve(hidden, &dynamic_prep, &base_prep, self.group_size)?;
+        let dynamic_fin = dynamic.index((.., .., 1, .., ..));
+        Ok((conv, dynamic_fin))
+    }
+
+    fn finish(&self, hidden: &Array, dynamic: &Array) -> Result<Array, Exception> {
+        let base_fin = (*self.base_kernel).index(1);
+        Self::convolve(hidden, dynamic, &base_fin, self.group_size)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DFlash2 candidate selector
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, ModuleParameters)]
+struct DFlashCandidateSelector {
+    #[param]
+    hidden_projection: crate::qwen3_next::QLinear,
+    #[param]
+    predecessor_codebook: crate::qwen3_next::QEmbedding,
+    #[param]
+    successor_codebook: crate::qwen3_next::QEmbedding,
+    top_k: i32,
+    rank: i32,
+}
+
+impl DFlashCandidateSelector {
+    fn new(config: &DFlashConfig, spec: crate::qwen3_next::QuantSpec) -> Result<Self, Exception> {
+        // DFlash2 MLX checkpoints quantize the selector codebooks at 8-bit
+        // (higher precision than the 4-bit linear layers); the codebook weight
+        // width `rank * 8 / 32` only fits an 8-bit layout. `load_dflash_weights`
+        // shape-checks every tensor and fails closed on any mismatch.
+        let codebook_spec = crate::qwen3_next::QuantSpec {
+            bits: 8,
+            ..spec
+        };
+        Ok(Self {
+            hidden_projection: crate::qwen3_next::QLinear::new_spec(spec)?,
+            predecessor_codebook: crate::qwen3_next::QEmbedding::new_spec(codebook_spec),
+            successor_codebook: crate::qwen3_next::QEmbedding::new_spec(codebook_spec),
+            top_k: config.selector_top_k(),
+            rank: config.selector_rank(),
+        })
+    }
+
+    /// Greedy path walk over the per-position top-k candidate shortlist.
+    fn select(&self, hidden: &Array, logits: &Array, anchor: i32) -> Result<Array, Exception> {
+        let b = hidden.shape()[0];
+        let t = hidden.shape()[1];
+        let neg = logits.negative()?;
+        let partition = ops::argpartition_axis(&neg, self.top_k - 1, -1)?;
+        let candidates = partition.index((.., .., 0..self.top_k));
+        let unary = logits.take_along_axis(&candidates, -1)?;
+        let h_proj = self.hidden_projection.forward(hidden)?;
+
+        let mut predecessor = Array::from_slice(&[anchor], &[b]);
+        let mut path = Vec::with_capacity(t as usize);
+        for position in 0..t {
+            let cand_ids = candidates.index((.., position, ..));
+            let pred_emb = self.predecessor_codebook.forward(&predecessor)?;
+            let cand_emb = self.successor_codebook.forward(&cand_ids)?;
+            let pred_exp = pred_emb.reshape(&[b, 1, self.rank])?;
+            let hp = h_proj
+                .index((.., position, ..))
+                .reshape(&[b, 1, self.rank])?;
+            let edges = pred_exp
+                .multiply(&hp)?
+                .multiply(&cand_emb)?
+                .sum_axis(-1, None)?;
+            let scores = unary.index((.., position, ..)).add(&edges)?;
+            let selected = mlx_rs::argmax_axis!(&scores, -1)?;
+            predecessor = cand_ids
+                .take_along_axis(&selected.reshape(&[b, 1])?, -1)?
+                .reshape(&[b])?;
+            path.push(predecessor.clone());
+        }
+        let cols = path
+            .iter()
+            .map(|p| p.reshape(&[b, 1]))
+            .collect::<Result<Vec<_>, _>>()?;
+        let refs: Vec<&Array> = cols.iter().collect();
+        ops::concatenate_axis(&refs, 1)
     }
 }
 
@@ -902,6 +1189,8 @@ pub struct DFlashDrafter {
     norm: nn::RmsNorm,
     #[param]
     dspark: Option<DsparkExtras>,
+    #[param]
+    candidate_selector: Option<DFlashCandidateSelector>,
     pub config: DFlashConfig,
 }
 
@@ -1253,6 +1542,10 @@ impl DFlashDrafter {
             dspark: config
                 .is_dspark()
                 .then(|| DsparkExtras::new(&config, spec))
+                .transpose()?,
+            candidate_selector: config
+                .is_dflash2()
+                .then(|| DFlashCandidateSelector::new(&config, spec))
                 .transpose()?,
             config,
         })
@@ -1660,6 +1953,22 @@ impl DFlashDrafter {
         self.dspark
             .as_ref()
             .map(|dspark| dspark.propose_tokens(hidden, anchor, base_logits))
+            .transpose()
+    }
+
+    /// Produce DFlash2 draft tokens via the candidate selector.
+    ///
+    /// `logits` is the target head's output over the full trunk (all block
+    /// positions). Returns `None` for non-DFlash2 checkpoints.
+    pub fn propose_dflash2_tokens(
+        &self,
+        hidden: &Array,
+        logits: &Array,
+        anchor: i32,
+    ) -> Result<Option<Array>, Exception> {
+        self.candidate_selector
+            .as_ref()
+            .map(|selector| selector.select(hidden, logits, anchor))
             .transpose()
     }
 }
@@ -2079,8 +2388,24 @@ fn load_dflash_drafter_inner(
     let config_path = model_path.join("config.json");
     let config_str = std::fs::read_to_string(&config_path)
         .map_err(|e| ModelError::Io(std::io::Error::other(format!("reading config.json: {e}"))))?;
-    let config: DFlashConfig = serde_json::from_str(&config_str)
+    let mut config: DFlashConfig = serde_json::from_str(&config_str)
         .map_err(|e| ModelError::Io(std::io::Error::other(format!("parsing config.json: {e}"))))?;
+
+    if config.is_dflash2() && config.quantization.is_none() {
+        // DFlash2 MLX checkpoints (e.g. nathansutton/*-DFlash2-MLX) ship 4-bit
+        // group-64 affine weights but omit the `quantization` block from
+        // config.json. Declare it here; `load_dflash_weights` shape-checks every
+        // tensor and fails closed on any mismatch.
+        config.quantization = Some(crate::qwen3_next::QuantizationConfig {
+            group_size: 64,
+            bits: 4,
+            mode: crate::quant_mode::QuantMode::Affine,
+        });
+    }
+
+    if let Some(block_size) = config.dflash_config.block_size {
+        config.block_size = block_size;
+    }
 
     if config.is_dspark() {
         let target_path = target_path.ok_or_else(|| {
@@ -2180,6 +2505,7 @@ mod tests {
             layer_types: None,
             sliding_window: None,
             quantization: None,
+            is_causal: None,
             dflash_config: super::DFlashSubConfig {
                 target_layer_ids: vec![0],
                 tap_semantics: Some(super::DFlashTapSemantics::PostLayerResidualV1),
@@ -2191,6 +2517,11 @@ mod tests {
                 max_log_snr: 9.0,
                 reuse_target_head: true,
                 target_binding: None,
+                block_size: None,
+                conv_kernel_size: 0,
+                conv_group_size: 0,
+                selector_rank: 0,
+                selector_top_k: 0,
             },
         }
     }
@@ -2210,6 +2541,7 @@ mod tests {
             layer_types: sliding_window.map(|_| vec!["sliding_attention".to_owned()]),
             sliding_window,
             quantization: None,
+            is_causal: None,
             dflash_config: super::DFlashSubConfig {
                 target_layer_ids: vec![0],
                 tap_semantics: None,
@@ -2221,6 +2553,11 @@ mod tests {
                 max_log_snr: 0.0,
                 reuse_target_head: false,
                 target_binding: None,
+                block_size: None,
+                conv_kernel_size: 0,
+                conv_group_size: 0,
+                selector_rank: 0,
+                selector_top_k: 0,
             },
         }
     }
@@ -3031,6 +3368,7 @@ mod tests {
             ]),
             sliding_window: Some(4),
             quantization: None,
+            is_causal: None,
             dflash_config: DFlashSubConfig {
                 target_layer_ids: vec![0],
                 tap_semantics: None,
@@ -3042,6 +3380,11 @@ mod tests {
                 max_log_snr: 0.0,
                 reuse_target_head: false,
                 target_binding: None,
+                block_size: None,
+                conv_kernel_size: 0,
+                conv_group_size: 0,
+                selector_rank: 0,
+                selector_top_k: 0,
             },
         };
         let mut drafter = DFlashDrafter::new(config).unwrap();
@@ -3106,6 +3449,50 @@ mod tests {
             c.hidden_size,
             c.num_taps(),
             c.num_taps() as i32 * c.hidden_size
+        );
+    }
+
+    #[test]
+    #[ignore = "load: set HIGGS_DFLASH2_DRAFTER_DIR to the nathansutton DFlash2 dflash snapshot dir"]
+    #[allow(clippy::print_stderr)]
+    fn loads_dflash2_drafter_against_real_weights() {
+        let Ok(dir) = std::env::var("HIGGS_DFLASH2_DRAFTER_DIR") else {
+            eprintln!("skip: set HIGGS_DFLASH2_DRAFTER_DIR");
+            return;
+        };
+        let d = super::load_dflash_drafter(std::path::Path::new(&dir))
+            .expect("load DFlash2 drafter");
+        let c = &d.config;
+        assert!(c.is_dflash2(), "selector rank must mark DFlash2");
+        assert_eq!(c.num_hidden_layers, 5, "layers");
+        assert_eq!(c.hidden_size, 5120, "hidden");
+        assert_eq!(c.num_taps(), 5, "taps");
+        assert_eq!(c.target_layer_ids(), &[5, 19, 33, 47, 61], "tap ids");
+        assert_eq!(c.selector_rank(), 256, "selector rank");
+        assert_eq!(c.selector_top_k(), 16, "selector top k");
+        assert_eq!(c.conv_kernel_size(), 2, "conv kernel size");
+        assert_eq!(c.conv_group_size(), 16, "conv group size");
+        assert!(d.candidate_selector.is_some(), "selector built");
+
+        let base_kernel = &d.layers[0].attention_conv.as_ref().unwrap().base_kernel;
+        let base_prod: i32 = base_kernel.shape().iter().product();
+        assert!(
+            base_prod > 1,
+            "attention_conv.base_kernel placeholder! shape={:?}",
+            base_kernel.shape()
+        );
+        let selector = d.candidate_selector.as_ref().unwrap();
+        assert_eq!(selector.predecessor_codebook.bits, 8, "codebook bits");
+        assert_eq!(selector.predecessor_codebook.group_size, 64, "codebook group");
+        eprintln!(
+            "DFlash2 drafter loaded OK: {} layers, hidden {}, {} taps, selector rank {} top_k {}, conv k{} g{}",
+            c.num_hidden_layers,
+            c.hidden_size,
+            c.num_taps(),
+            c.selector_rank(),
+            c.selector_top_k(),
+            c.conv_kernel_size(),
+            c.conv_group_size()
         );
     }
 }

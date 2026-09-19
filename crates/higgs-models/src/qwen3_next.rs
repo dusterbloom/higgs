@@ -1022,6 +1022,11 @@ impl QLinear {
     }
 
     fn q2_row2_m5_ternary_forward(&self, x: &Array) -> Result<Option<Array>, Exception> {
+        // The row2 M=5 kernels are an unvalidated probe (they fail at eval);
+        // when the MMA verify kernel is enabled it supersedes them for M<=8.
+        if mma_m8_enabled() {
+            return Ok(None);
+        }
         let row2_enabled = std::env::var("HIGGS_DSPARK_Q2_ROW2_MLP").map_or(true, |v| v != "0");
         if !row2_enabled
             || self.mode != crate::quant_mode::QuantMode::Affine
@@ -1049,10 +1054,20 @@ impl QLinear {
             .get()
             .ok_or_else(|| Exception::custom("Q2 row2 cache was not initialized"))?
             .as_ref();
-        if packed.n_rows() == 5120 && packed.k_dim() == 17408 {
-            return crate::metal_kernel::bonsai_q2_row2_m5_ternary_splitk(x, packed, 4).map(Some);
-        }
-        crate::metal_kernel::bonsai_q2_row2_m5_ternary_direct(x, packed).map(Some)
+        // The row2 kernels return a flat [5, n_rows] output; restore the
+        // caller's leading dims so the [B, T] (or [B, L]) shape is preserved.
+        // Without this a [1, 5, K] input collapses to a 2D [5, N] output, which
+        // breaks any downstream 3-component index.
+        let mut out_shape = x_shape.to_vec();
+        *out_shape
+            .last_mut()
+            .ok_or_else(|| Exception::custom("q2 row2: scalar x"))? = packed.n_rows();
+        let y = if packed.n_rows() == 5120 && packed.k_dim() == 17408 {
+            crate::metal_kernel::bonsai_q2_row2_m5_ternary_splitk(x, packed, 4)?
+        } else {
+            crate::metal_kernel::bonsai_q2_row2_m5_ternary_direct(x, packed)?
+        };
+        Ok(Some(y.reshape(&out_shape)?))
     }
 
     fn bonsai_row4(&self) -> Result<Option<crate::metal_kernel::BonsaiQ1Row4Ref<'_>>, Exception> {
@@ -1258,6 +1273,9 @@ impl QLinear {
                 // Ternary prism packs (`bias == -scale`): select-based no-bias
                 // qmv. `hadamard_block > 0` is the pack marker and guarantees
                 // codes {0,1,2}; M=1 (decode) only, prefill stays on stock.
+                // (M>1 select is compute-bound and re-reads the weight per row,
+                // so it loses to stock — the batched verify needs the 8x-weight-
+                // reuse MMA kernel, gated by HIGGS_MMA_M8.)
                 if self.bits == 2 && self.hadamard_block > 0 && ternary_qmv_enabled() {
                     let row_count: i32 =
                         x.shape().iter().take(x.ndim().saturating_sub(1)).product();
@@ -1267,6 +1285,31 @@ impl QLinear {
                             &self.weight,
                             &self.scales,
                             self.group_size,
+                        );
+                    }
+                    if row_count > 1 && row_count <= 8 && mma_m8_enabled() {
+                        if std::env::var("HIGGS_MMA_M8_TRACE").is_ok_and(|v| v == "1") {
+                            tracing::info!(
+                                row_count,
+                                n = self.weight.shape()[0],
+                                dtype = ?x.dtype(),
+                                "MMA verify gate"
+                            );
+                        }
+                        // The hadamard rotation emits fp32; chad's runtime keeps
+                        // the rotation in the model's native dtype, so the MMA
+                        // kernel sees bf16 x. Cast to match (the kernel is only
+                        // ~1-2 bf16 ulps off stock anyway, greedy-correct).
+                        let x_bf16 = if x.dtype() == mlx_rs::Dtype::Bfloat16 {
+                            x.clone()
+                        } else {
+                            x.as_dtype(mlx_rs::Dtype::Bfloat16)?
+                        };
+                        return crate::metal_kernel::bonsai_q2_mma_m8(
+                            &x_bf16,
+                            &self.weight,
+                            &self.scales,
+                            &self.biases,
                         );
                     }
                 }
@@ -1844,9 +1887,26 @@ fn gdn_state_mlx_dtype() -> mlx_sys::mlx_dtype {
 /// (bits=2 affine, hadamard-rotated, `bias == -scale`). Default on; the
 /// select-based kernel reads fewer bytes than stock and measured 1.3-1.8x
 /// faster at M=1 across all dominant shapes. Kill-switch: HIGGS_TERNARY_QMV=0.
+/// GDN-only self-drafter prototype: skip the 16 full-attention layers
+/// (identity passthrough), leaving the 48 recurrent GDN layers. Measures how
+/// much faster a skip-FA draft is and how well it predicts the next token.
+/// HIGGS_SKIP_FA_DRAFT=1 to enable (draft-model measurement only).
+fn skip_full_attention_draft() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("HIGGS_SKIP_FA_DRAFT").is_ok_and(|v| v == "1"))
+}
+
 fn ternary_qmv_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("HIGGS_TERNARY_QMV").map_or(true, |v| v != "0"))
+}
+
+/// Whether the M<=8 MMA verify kernel (simdgroup_matrix<8,8>, affine-offset)
+/// replaces stock quantized_matmul for the ternary pack's batched projections.
+/// Default off; opt in with HIGGS_MMA_M8=1.
+fn mma_m8_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("HIGGS_MMA_M8").is_ok_and(|v| v == "1"))
 }
 
 /// Whether the reduced-precision state store applies stochastic rounding
@@ -8036,6 +8096,13 @@ impl DecoderLayer {
         mask: Option<&AttentionMask>,
         cache: &mut LayerCache,
     ) -> Result<Array, Exception> {
+        // GDN-only drafter: pass full-attention layers through untouched. The
+        // recurrent GDN layers still update their state; FA layers contribute
+        // neither attention nor MLP, so the draft is ~30% cheaper and predicts
+        // from a partial model. Draft-quality probe only.
+        if !self.is_linear && skip_full_attention_draft() {
+            return Ok(x.clone());
+        }
         let normed = self.input_layernorm.forward(x)?;
         let r = if self.is_linear {
             let attn = self
