@@ -179,6 +179,26 @@ pub struct TurboQuantKvView {
     pub seq_len: i32,
 }
 
+#[allow(unsafe_code)]
+fn contiguous_array(array: &Array) -> Result<Array, Exception> {
+    unsafe {
+        let mut result = mlx_sys::mlx_array_new();
+        let status = mlx_sys::mlx_contiguous(
+            &raw mut result,
+            array.as_ptr(),
+            false,
+            Stream::task_local_or_default().as_ptr(),
+        );
+        if status != 0 {
+            mlx_sys::mlx_array_free(result);
+            return Err(Exception::custom(format!(
+                "mlx_contiguous failed with status {status}"
+            )));
+        }
+        Ok(Array::from_ptr(result))
+    }
+}
+
 impl TurboQuantKvView {
     pub fn materialize_dense(&self) -> Result<(Array, Array), Exception> {
         let num_kv_heads = usize_from_i32(self.context.num_kv_heads, "num_kv_heads")?;
@@ -189,24 +209,35 @@ impl TurboQuantKvView {
         let value_code_bytes = usize_from_i32(self.context.value_code_bytes, "value_code_bytes")?;
         let value_code_words = usize_from_i32(self.context.value_code_words, "value_code_words")?;
 
+        // These are `slice_axis` sub-ranges of larger pre-allocated capacity
+        // buffers (see `TurboQuantStorage::view`), so they are routinely
+        // non-contiguous whenever `seq_len < capacity` — the common case
+        // mid-decode. `as_slice` requires contiguous row-major storage, so
+        // force a materialized contiguous copy before eval+as_slice.
+        let key_codes_arr = contiguous_array(&self.key_codes)?;
+        let key_norms_arr = contiguous_array(&self.key_norms)?;
+        let key_gammas_arr = contiguous_array(&self.key_gammas)?;
+        let value_codes_arr = contiguous_array(&self.value_codes)?;
+        let value_norms_arr = contiguous_array(&self.value_norms)?;
+
         // Eval all view arrays — they may be lazy GPU results from the pack kernel.
-        self.key_codes.eval()?;
-        self.key_norms.eval()?;
-        self.key_gammas.eval()?;
-        self.value_codes.eval()?;
-        self.value_norms.eval()?;
+        key_codes_arr.eval()?;
+        key_norms_arr.eval()?;
+        key_gammas_arr.eval()?;
+        value_codes_arr.eval()?;
+        value_norms_arr.eval()?;
 
         // Code arrays are u32 words — reinterpret as bytes for CPU dequant
-        let key_codes_u32 = self.key_codes.as_slice::<u32>();
+        let key_codes_u32 = key_codes_arr.as_slice::<u32>();
         let key_codes_u8: Vec<u8> = key_codes_u32.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let key_norms = self.key_norms.as_slice::<f32>();
-        let key_gammas = self.key_gammas.as_slice::<f32>();
-        let value_codes_u32 = self.value_codes.as_slice::<u32>();
+        let key_norms = key_norms_arr.as_slice::<f32>();
+        let key_gammas = key_gammas_arr.as_slice::<f32>();
+        let value_codes_u32 = value_codes_arr.as_slice::<u32>();
         let value_codes_u8: Vec<u8> = value_codes_u32
             .iter()
             .flat_map(|w| w.to_le_bytes())
             .collect();
-        let value_norms = self.value_norms.as_slice::<f32>();
+        let value_norms = value_norms_arr.as_slice::<f32>();
 
         // Each row occupies key_code_words * 4 bytes in the reinterpreted buffer
         let key_row_bytes = checked_mul(key_code_words, 4, "key row bytes")?;

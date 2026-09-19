@@ -842,8 +842,14 @@ fn newest_metallib_candidate(profile_dir: &Path) -> Option<PathBuf> {
             if !is_mlx_sys {
                 return None;
             }
-            let candidate = entry.path().join("out/build/lib/mlx.metallib");
-            candidate.exists().then(|| {
+            let build_dir = entry.path().join("out/build");
+            [
+                build_dir.join("lib/mlx.metallib"),
+                build_dir.join("_deps/mlx-build/mlx/backend/metal/kernels/mlx.metallib"),
+            ]
+            .into_iter()
+            .find(|candidate| candidate.exists())
+            .map(|candidate| {
                 (
                     fs::metadata(&candidate)
                         .and_then(|meta| meta.modified())
