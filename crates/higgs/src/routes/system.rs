@@ -53,16 +53,17 @@ pub async fn system(State(state): State<SharedState>) -> Json<SystemResponse> {
         .router
         .local_engines()
         .iter()
-        .map(|(name, engine)| {
+        .map(|engine| {
+            let name = engine.model_name().to_owned();
             let configured = state
                 .config
                 .models
                 .iter()
                 .find(|m| m.name.as_deref() == Some(name.as_str()) || m.path == *name);
             LoadedModel {
-                name: name.clone(),
+                name,
                 path: configured.map(|m| m.path.clone()),
-                engine: engine_kind(engine),
+                engine: engine_kind(engine.as_ref()),
                 mlx_profile: configured.and_then(|m| serialized_name(&m.mlx_profile)),
                 kv_cache: configured.and_then(|m| serialized_name(&m.kv_cache)),
             }
@@ -97,18 +98,13 @@ const fn engine_kind(engine: &Engine) -> &'static str {
 }
 
 fn memory_info() -> MemoryInfo {
+    let mlx = higgs_engine::mlx_tuning::MlxAllocatorTelemetry::measure().ok();
     MemoryInfo {
         physical_total_bytes: *PHYSICAL_MEMORY,
         process_rss_bytes: process_rss_bytes(),
-        mlx_active_bytes: mlx_rs::memory::active_memory()
-            .ok()
-            .and_then(|b| u64::try_from(b).ok()),
-        mlx_peak_bytes: mlx_rs::memory::peak_memory()
-            .ok()
-            .and_then(|b| u64::try_from(b).ok()),
-        mlx_cache_bytes: mlx_rs::memory::cache_memory()
-            .ok()
-            .and_then(|b| u64::try_from(b).ok()),
+        mlx_active_bytes: mlx.map(|telemetry| telemetry.memory.active_bytes),
+        mlx_peak_bytes: mlx.map(|telemetry| telemetry.memory.peak_bytes),
+        mlx_cache_bytes: mlx.map(|telemetry| telemetry.cached_bytes),
     }
 }
 

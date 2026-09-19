@@ -9,7 +9,7 @@
 //! pre-norm, self-attention, MLP with GELU activation).
 
 use mlx_rs::{
-    Array,
+    Array, arange,
     builder::Builder,
     error::Exception,
     module::{Module, Param},

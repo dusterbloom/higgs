@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use mlx_rs::{Array, Dtype, Stream, error::Exception, ops, ops::concatenate};
+use mlx_rs::{Array, Dtype, Stream, error::Exception, ops, ops::concatenate_axis};
 
 /// RoPE parameters needed to re-rotate cached keys when token positions are
 /// renumbered after a prune. Mirrors the `nn::Rope` fields the model builds
@@ -179,6 +179,26 @@ pub struct TurboQuantKvView {
     pub seq_len: i32,
 }
 
+#[allow(unsafe_code)]
+fn contiguous_array(array: &Array) -> Result<Array, Exception> {
+    unsafe {
+        let mut result = mlx_sys::mlx_array_new();
+        let status = mlx_sys::mlx_contiguous(
+            &raw mut result,
+            array.as_ptr(),
+            false,
+            Stream::task_local_or_default().as_ptr(),
+        );
+        if status != 0 {
+            mlx_sys::mlx_array_free(result);
+            return Err(Exception::custom(format!(
+                "mlx_contiguous failed with status {status}"
+            )));
+        }
+        Ok(Array::from_ptr(result))
+    }
+}
+
 impl TurboQuantKvView {
     pub fn materialize_dense(&self) -> Result<(Array, Array), Exception> {
         let num_kv_heads = usize_from_i32(self.context.num_kv_heads, "num_kv_heads")?;
@@ -194,11 +214,11 @@ impl TurboQuantKvView {
         // non-contiguous whenever `seq_len < capacity` — the common case
         // mid-decode. `as_slice` requires contiguous row-major storage, so
         // force a materialized contiguous copy before eval+as_slice.
-        let key_codes_arr = self.key_codes.contiguous()?;
-        let key_norms_arr = self.key_norms.contiguous()?;
-        let key_gammas_arr = self.key_gammas.contiguous()?;
-        let value_codes_arr = self.value_codes.contiguous()?;
-        let value_norms_arr = self.value_norms.contiguous()?;
+        let key_codes_arr = contiguous_array(&self.key_codes)?;
+        let key_norms_arr = contiguous_array(&self.key_norms)?;
+        let key_gammas_arr = contiguous_array(&self.key_gammas)?;
+        let value_codes_arr = contiguous_array(&self.value_codes)?;
+        let value_norms_arr = contiguous_array(&self.value_norms)?;
 
         // Eval all view arrays — they may be lazy GPU results from the pack kernel.
         key_codes_arr.eval()?;
@@ -1792,7 +1812,7 @@ fn slice_update_axis2(
             ends.len(),
             strides.as_ptr(),
             strides.len(),
-            Stream::thread_local_or_default().as_ptr(),
+            Stream::task_local_or_default().as_ptr(),
         );
         if status != 0 {
             mlx_sys::mlx_array_free(result);
@@ -1828,7 +1848,7 @@ fn slice_axis(arr: &Array, axis: usize, start: i32, end: i32) -> Result<Array, E
             ends.len(),
             strides.as_ptr(),
             strides.len(),
-            Stream::thread_local_or_default().as_ptr(),
+            Stream::task_local_or_default().as_ptr(),
         );
         if status != 0 {
             mlx_sys::mlx_array_free(result);
@@ -1871,7 +1891,7 @@ fn slice_update_axis(
             ends.len(),
             strides.as_ptr(),
             strides.len(),
-            Stream::thread_local_or_default().as_ptr(),
+            Stream::task_local_or_default().as_ptr(),
         );
         if status != 0 {
             mlx_sys::mlx_array_free(result);

@@ -13,7 +13,6 @@ use higgs_models::{
 use mlx_rs::{
     Array, argmax_axis,
     ops::{self, concatenate_axis, indexing::IndexOp},
-    transforms::eval,
 };
 
 use crate::error::EngineError;

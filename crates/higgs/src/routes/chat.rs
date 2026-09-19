@@ -1467,23 +1467,19 @@ async fn chat_completions_stream(
         let mut cached_prompt_tokens: u32 = 0;
         let mut pending_finish_reason: Option<String> = None;
         let mut pending_finish_logprobs: Option<ChoiceLogprobs> = None;
-        let mut timing = RequestTiming::default();
-
         while let Some(output) = rx.recv().await {
             // Prefill-progress events carry no tokens: forward as
             // `prompt_progress` chunks when the client opted in, and keep
             // them away from the delta/tool trackers either way.
             if let Some(p) = output.prefill_progress {
                 cached_prompt_tokens = cached_prompt_tokens.max(p.cached);
+                metrics_guard.set_cached_tokens(u64::from(p.cached));
                 if return_progress {
                     let time_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
                     let json = writer.write_prompt_progress(p.total, p.cached, p.processed, time_ms);
                     yield Ok(Event::default().data(json));
                 }
                 continue;
-            }
-            if timing.ttft_ms.is_none() {
-                timing.ttft_ms = Some(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
             }
             output_token_count = output.completion_tokens;
             metrics_guard.update(u64::from(output_token_count));

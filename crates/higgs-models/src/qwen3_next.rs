@@ -2007,7 +2007,7 @@ fn sigmoid_mul(gate: &Array, x: &Array) -> Result<Array, Exception> {
 }
 
 fn compiled_gdn_output_gate((y, weight, z): (&Array, &Array, &Array)) -> Result<Array, Exception> {
-    let normed = fast::rms_norm(y, Some(weight), 1e-6)?;
+    let normed = fast::rms_norm(y, weight, 1e-6)?;
     nn::silu(z)?.multiply(&normed)
 }
 
@@ -2024,7 +2024,7 @@ fn gdn_output_gate(y: &Array, weight: &Array, eps: f32, z: &Array) -> Result<Arr
             compiled((y, weight, z))
         })
     } else {
-        let normed = fast::rms_norm(y, Some(weight), eps)?;
+        let normed = fast::rms_norm(y, weight, eps)?;
         nn::silu(z)?.multiply(&normed)
     }
 }
@@ -2053,7 +2053,7 @@ pub(crate) fn gather_qmm(
 ) -> Result<Array, Exception> {
     ensure_ffi_error_handler();
 
-    let stream = Stream::thread_local_or_default();
+    let stream = Stream::task_local_or_default();
     let null_lhs = unsafe { mlx_sys::mlx_array_new() };
     let mut result = unsafe { mlx_sys::mlx_array_new() };
     let status = unsafe {
@@ -2752,7 +2752,7 @@ fn gated_delta_kernel_ffi(
     )?;
     ensure_ffi_error_handler();
 
-    let stream = Stream::thread_local_or_default();
+    let stream = Stream::task_local_or_default();
     let in_dtype = unsafe { mlx_sys::mlx_array_dtype(q.as_ptr()) };
 
     let cached = GATED_DELTA_KERNEL.get_or_init(|| CachedMetalKernel(create_gated_delta_kernel()));
@@ -4538,7 +4538,7 @@ pub(crate) fn qgemv_4bit(
     let s_flat = scales.flatten(None, None)?;
     let b_flat = biases.flatten(None, None)?;
 
-    let stream = Stream::thread_local_or_default();
+    let stream = Stream::task_local_or_default();
     let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
 
     let cached = QGEMV_KERNEL.get_or_init(|| CachedMetalKernel(create_qgemv_kernel()));
@@ -4980,7 +4980,7 @@ impl Qwen3NextAttention {
         // Q is projected to 2 * num_heads * head_dim (doubled for gating)
         let q_proj_output = self.q_proj.forward_decode_fast(x)?;
         let q_reshaped = q_proj_output.reshape(&[B, L, self.num_attention_heads, -1])?;
-        let q_halves = q_reshaped.split_equal(2, Some(-1))?;
+        let q_halves = q_reshaped.split(2, Some(-1))?;
         let queries_pre = q_halves
             .first()
             .ok_or_else(|| Exception::custom("split produced empty result"))?;
@@ -5290,7 +5290,7 @@ impl DenseQwen3NextAttention {
 
         let q_proj_output = self.q_proj.forward(x)?;
         let q_reshaped = q_proj_output.reshape(&[B, L, self.num_attention_heads, -1])?;
-        let q_halves = q_reshaped.split_equal(2, Some(-1))?;
+        let q_halves = q_reshaped.split(2, Some(-1))?;
         let queries_pre = q_halves
             .first()
             .ok_or_else(|| Exception::custom("split produced empty result"))?;
@@ -6115,7 +6115,7 @@ impl SwitchMlpWeights {
             true,
         )?;
         // Split at intermediate boundary → gate_out, up_out
-        let parts = fused_out.split_at_indices(&[*intermediate], Some(-1))?;
+        let parts = fused_out.split_axis(&[*intermediate], Some(-1))?;
         let gate_out = parts
             .first()
             .ok_or_else(|| Exception::custom("fused split failed"))?;
@@ -6278,12 +6278,16 @@ impl ArraysCache {
 }
 
 impl Updatable for ArraysCache {
-    fn state_projection(
-        &mut self,
-    ) -> Result<mlx_rs::utils::StateProjection<'_>, mlx_rs::error::StateProjectionError> {
-        let mut projection = mlx_rs::utils::StateProjection::new();
-        projection.optional("ssm_state", &mut self.ssm_state)?;
-        Ok(projection)
+    fn updatable_states_len(&self) -> usize {
+        usize::from(self.ssm_state.is_some())
+    }
+
+    fn updatable_states(&self) -> impl IntoIterator<Item = &Array> {
+        self.ssm_state.iter()
+    }
+
+    fn updatable_states_mut(&mut self) -> impl IntoIterator<Item = &mut Array> {
+        self.ssm_state.iter_mut()
     }
 }
 
@@ -6340,7 +6344,7 @@ fn compiled_gdn_decode_step(
         .multiply(&q_t.expand_dims(-2)?)?
         .sum_axes(&[-1], false)?;
     let y = y_t.expand_dims(1)?;
-    let normed = fast::rms_norm(&y, Some(norm_weight), 1e-6)?;
+    let normed = fast::rms_norm(&y, norm_weight, 1e-6)?;
     let gated = nn::silu(z)?.multiply(&normed)?;
     Ok(vec![gated])
 }
@@ -6708,7 +6712,7 @@ impl GatedDeltaNet {
             let a = a_proj.forward_decode_fast(inputs)?;
 
             let split_indices = &[self.key_dim, self.key_dim * 2];
-            let qkv_parts = qkv.split_at_indices(split_indices, Some(-1))?;
+            let qkv_parts = qkv.split_axis(split_indices, Some(-1))?;
             let q = qkv_parts
                 .first()
                 .ok_or_else(|| Exception::custom("qkv split failed"))?
@@ -6835,7 +6839,7 @@ impl GatedDeltaNet {
 
         // Split conv output back to q, k, v
         let split_indices = &[self.key_dim, self.key_dim * 2];
-        let conv_parts = conv_out.split_at_indices(split_indices, Some(-1))?;
+        let conv_parts = conv_out.split_axis(split_indices, Some(-1))?;
         let conv_q = conv_parts
             .first()
             .ok_or_else(|| Exception::custom("conv split failed"))?
@@ -6856,8 +6860,8 @@ impl GatedDeltaNet {
             self.qk_norm_weight_k = self.qk_norm_weight_k.as_dtype(in_dt)?;
         }
 
-        let norm_q = fast::rms_norm(&conv_q, Some(&self.qk_norm_weight_q), 1e-6)?;
-        let norm_k = fast::rms_norm(&conv_k, Some(&self.qk_norm_weight_k), 1e-6)?;
+        let norm_q = fast::rms_norm(&conv_q, &self.qk_norm_weight_q, 1e-6)?;
+        let norm_k = fast::rms_norm(&conv_k, &self.qk_norm_weight_k, 1e-6)?;
 
         let use_compiled_decode = compiled_gdn_decode_enabled() && S == 1;
         if use_compiled_decode {
@@ -6973,7 +6977,7 @@ impl GatedDeltaNet {
 
         // Split qkvz at [dn, 2*dn, 2*dn + v_per_k*dv]
         let split_at = &[dn, 2 * dn, 2 * dn + v_per_k * dv];
-        let qkvz_parts = qkvz.split_at_indices(split_at, Some(-1))?;
+        let qkvz_parts = qkvz.split_axis(split_at, Some(-1))?;
         let q = qkvz_parts
             .first()
             .ok_or_else(|| Exception::custom("qkvz split failed"))?
@@ -6993,7 +6997,7 @@ impl GatedDeltaNet {
         let z = z_raw.reshape(&[B, S, nv, dv])?;
 
         // Split ba at [v_per_k]
-        let ba_parts = ba.split_at_indices(&[v_per_k], Some(-1))?;
+        let ba_parts = ba.split_axis(&[v_per_k], Some(-1))?;
         let b_raw = ba_parts
             .first()
             .ok_or_else(|| Exception::custom("ba split failed"))?;
@@ -7824,7 +7828,7 @@ impl FfnBlock {
                 }
             }
         };
-        let parts = fused_out.split_at_indices(&[*intermediate], Some(-1))?;
+        let parts = fused_out.split_axis(&[*intermediate], Some(-1))?;
         let gate_out = parts
             .first()
             .ok_or_else(|| Exception::custom("fused split failed"))?;
@@ -29748,7 +29752,7 @@ fn forward_attention_sparse(
     // Q is projected to 2 * num_heads * head_dim (doubled for gating)
     let q_proj_output = attn.q_proj.forward_decode_fast(x)?;
     let q_reshaped = q_proj_output.reshape(&[b, l, attn.num_attention_heads, -1])?;
-    let q_halves = q_reshaped.split_equal(2, Some(-1))?;
+    let q_halves = q_reshaped.split(2, Some(-1))?;
     let queries_pre = q_halves
         .first()
         .ok_or_else(|| Exception::custom("split produced empty result"))?;

@@ -252,6 +252,7 @@ pub async fn create_message(
                     engine,
                     state.metrics.clone(),
                     routing_method,
+                    received_at,
                 )
                 .await?;
                 let sse = Sse::new(stream).keep_alive(KeepAlive::default());
@@ -976,11 +977,8 @@ async fn create_message_stream(
 
         while let Some(output) = rx.recv().await {
             if let Some(p) = output.prefill_progress {
-                timing.cached_tokens = Some(u64::from(p.cached));
+                metrics_guard.set_cached_tokens(u64::from(p.cached));
                 continue;
-            }
-            if timing.ttft_ms.is_none() {
-                timing.ttft_ms = Some(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
             }
             let (visible, _reasoning) = reasoning_tracker.process(&output.new_text);
             total_output_tokens = output.completion_tokens;
@@ -1262,6 +1260,7 @@ mod tests {
             Arc::new(crate::state::Engine::test_stub(model)),
             None,
             crate::router::RoutingMethod::Direct,
+            Instant::now(),
         )
         .await
         .unwrap();
@@ -1310,6 +1309,7 @@ mod tests {
             Arc::new(crate::state::Engine::test_stub(model)),
             None,
             crate::router::RoutingMethod::Direct,
+            Instant::now(),
         )
         .await?;
         let response = axum::response::sse::Sse::new(stream).into_response();

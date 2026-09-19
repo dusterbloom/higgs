@@ -57,8 +57,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::mlx_exec::eval;
 use mlx_rs::module::ModuleParametersExt;
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::transforms::eval;
-use mlx_rs::{Array, argmax_axis, array, categorical, error::Exception, ops, random};
+use mlx_rs::{Array, array, error::Exception, ops, random};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -1741,7 +1740,7 @@ pub fn apply_penalties(
             let pos_arr = Array::from_slice(&pos_factors, &[vocab_size_i32]).reshape(&shape)?;
             let neg_arr = Array::from_slice(&neg_factors, &[vocab_size_i32]).reshape(&shape)?;
             let is_positive = result.gt(Array::from_f32(0.0))?;
-            let factor = mlx_rs::ops::select(&is_positive, &pos_arr, &neg_arr)?;
+            let factor = mlx_rs::ops::r#where(&is_positive, &pos_arr, &neg_arr)?;
             result = result.multiply(factor)?;
         }
     }
@@ -1844,7 +1843,9 @@ fn sample_filtered_topk(
     k: usize,
     params: &SamplingParams,
 ) -> Result<Array, Exception> {
-    use mlx_rs::ops::{argpartition_axis, argsort_axis, concatenate, indexing::IndexOp, maximum};
+    use mlx_rs::ops::{
+        argpartition_axis, argsort_axis, concatenate_axis, indexing::IndexOp, maximum,
+    };
 
     let k_i32 = i32::try_from(k).map_err(|_| Exception::custom("k overflow for i32"))?;
 
@@ -1909,7 +1910,7 @@ fn sample_filtered_full(
     effective_k: usize,
     params: &SamplingParams,
 ) -> Result<Array, Exception> {
-    use mlx_rs::ops::{argsort_axis, concatenate, maximum};
+    use mlx_rs::ops::{argsort_axis, concatenate_axis, maximum};
 
     // Sort descending: negate, ascending argsort
     let neg_probs = probs.negative()?;

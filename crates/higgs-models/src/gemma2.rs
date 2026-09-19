@@ -305,7 +305,7 @@ where
                             let neg_inf = self.cached_neg_inf.as_ref().ok_or_else(|| {
                                 Exception::custom("cached_neg_inf not initialized")
                             })?;
-                            scores = ops::select(&window_mask, &scores, neg_inf)?;
+                            scores = ops::r#where(&window_mask, &scores, neg_inf)?;
                         }
                     }
 
@@ -322,7 +322,7 @@ where
                             .cached_neg_inf
                             .as_ref()
                             .ok_or_else(|| Exception::custom("cached_neg_inf not initialized"))?;
-                        scores = ops::select(m, &scores, neg_inf)?;
+                        scores = ops::r#where(m, &scores, neg_inf)?;
                     }
 
                     let weights = ops::softmax_axis(&scores, -1, None)?;
@@ -420,7 +420,7 @@ where
                     .cached_neg_inf
                     .as_ref()
                     .ok_or_else(|| Exception::custom("cached_neg_inf not initialized"))?;
-                scores = ops::select(&window_mask, &scores, neg_inf)?;
+                scores = ops::r#where(&window_mask, &scores, neg_inf)?;
             }
         }
 
@@ -437,7 +437,7 @@ where
                 .cached_neg_inf
                 .as_ref()
                 .ok_or_else(|| Exception::custom("cached_neg_inf not initialized"))?;
-            scores = ops::select(m, &scores, neg_inf)?;
+            scores = ops::r#where(m, &scores, neg_inf)?;
         }
 
         let weights = ops::softmax_axis(&scores, -1, None)?;

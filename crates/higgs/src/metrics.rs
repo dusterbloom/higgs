@@ -442,6 +442,7 @@ pub struct StreamMetricsGuard {
     last_semantic_event_at: Option<Instant>,
     max_semantic_gap: Duration,
     semantic_event_count: u64,
+    timing: RequestTiming,
     done: bool,
 }
 
@@ -462,6 +463,10 @@ impl StreamMetricsGuard {
             last_semantic_event_at: None,
             max_semantic_gap: Duration::ZERO,
             semantic_event_count: 0,
+            timing: RequestTiming {
+                ttft_ms: None,
+                cached_tokens: None,
+            },
             done: false,
         }
     }
@@ -472,9 +477,25 @@ impl StreamMetricsGuard {
             return;
         }
         let now = Instant::now();
+        if self.first_generated_at.is_none() {
+            self.timing.ttft_ms = Some(
+                u64::try_from(now.saturating_duration_since(self.start).as_millis())
+                    .unwrap_or(u64::MAX),
+            );
+        }
         self.output_tokens = output_tokens;
         self.first_generated_at.get_or_insert(now);
         self.last_generated_at = Some(now);
+    }
+
+    pub fn set_cached_tokens(&mut self, cached_tokens: u64) {
+        if !self.done {
+            self.timing.cached_tokens = Some(
+                self.timing
+                    .cached_tokens
+                    .map_or(cached_tokens, |current| current.max(cached_tokens)),
+            );
+        }
     }
 
     /// Record an emitted semantic stream event and its inter-event gap.
@@ -514,9 +535,15 @@ impl StreamMetricsGuard {
         let duration = self.start.elapsed();
         if let (Some(metrics), Some(id)) = (&self.metrics, self.pending_id) {
             if let Some(terminal_error) = error.as_ref() {
-                metrics.fail_stream(id, self.output_tokens, duration, terminal_error.clone());
+                metrics.fail_stream(
+                    id,
+                    self.output_tokens,
+                    duration,
+                    self.timing,
+                    terminal_error.clone(),
+                );
             } else {
-                metrics.finalize_stream(id, self.output_tokens, duration);
+                metrics.finalize_stream(id, self.output_tokens, duration, self.timing);
             }
         }
 
@@ -555,7 +582,7 @@ impl Drop for StreamMetricsGuard {
             );
             let duration = self.start.elapsed();
             if let (Some(metrics), Some(id)) = (&self.metrics, self.pending_id) {
-                metrics.disconnect_stream(id, self.output_tokens, duration);
+                metrics.disconnect_stream(id, self.output_tokens, duration, self.timing);
             }
             tracing::debug!(
                 pending_id = ?self.pending_id,

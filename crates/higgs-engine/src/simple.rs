@@ -28,7 +28,6 @@ use higgs_models::{
 use mlx_rs::{
     Array, Dtype, Stream,
     ops::indexing::{IndexOp, NewAxis},
-    transforms::{async_eval, eval},
     with_new_default_stream,
 };
 use sha2::{Digest, Sha256};
@@ -8885,7 +8884,7 @@ impl SimpleEngine {
             return Err(EngineError::Generation("Input is empty".to_owned()));
         }
 
-        with_new_default_stream(&Stream::new(), || {
+        with_new_default_stream(Stream::new(), || {
             let input = Array::from(token_ids).index(NewAxis);
             let mut model = self
                 .model
@@ -9142,7 +9141,7 @@ impl SimpleEngine {
 
         // Set a task-local default stream so every MLX operation reuses it
         // instead of creating a new Stream (5 FFI calls) per operation.
-        with_new_default_stream(&Stream::new(), || {
+        with_new_default_stream(Stream::new(), || {
             self.generate_inner(
                 resolved_tokens.as_ref(),
                 max_tokens,
@@ -13194,7 +13193,7 @@ impl SimpleEngine {
             return Ok(());
         }
 
-        with_new_default_stream(&Stream::new(), || {
+        with_new_default_stream(Stream::new(), || {
             self.generate_streaming_inner(
                 resolved_tokens.as_ref(),
                 max_tokens,

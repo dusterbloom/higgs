@@ -1833,7 +1833,7 @@ pub fn bonsai_q1_qmv_legacy(
         biases.flatten(None, None)?
     };
 
-    let stream = Stream::thread_local_or_default();
+    let stream = Stream::task_local_or_default();
     let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
 
     let cached = QMV_KERNEL.get_or_init(|| CachedMetalKernel(create_qmv_kernel()));
@@ -2245,7 +2245,7 @@ fn bonsai_q1_qmv_fast_impl(
         biases.flatten(None, None)?
     };
 
-    let stream = Stream::thread_local_or_default();
+    let stream = Stream::task_local_or_default();
     let out_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
 
     let cached = FAST_QMV_KERNEL.get_or_init(|| CachedMetalKernel(create_fast_qmv_kernel()));
@@ -8846,7 +8846,7 @@ pub fn bonsai_q1_dequant(
         biases.flatten(None, None)?
     };
 
-    let stream = Stream::thread_local_or_default();
+    let stream = Stream::task_local_or_default();
     let out_dtype = unsafe { mlx_sys::mlx_array_dtype(scales.as_ptr()) };
 
     let cached = DEQUANT_KERNEL.get_or_init(|| CachedMetalKernel(create_dequant_kernel()));

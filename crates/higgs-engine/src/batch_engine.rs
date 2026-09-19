@@ -19,7 +19,6 @@ use higgs_models::{
 use mlx_rs::{
     Array, Stream,
     ops::indexing::{IndexOp, NewAxis},
-    transforms::{async_eval, eval},
     with_new_default_stream,
 };
 use tokenizers::Tokenizer;
@@ -883,7 +882,7 @@ fn worker_loop(
         let _mlx_gate = higgs_models::mlx_exec::acquire();
 
         if use_batched {
-            if let Err(e) = with_new_default_stream(&Stream::new(), || {
+            if let Err(e) = with_new_default_stream(Stream::new(), || {
                 run_batched_decode_round(
                     &mut model,
                     &mut active,
@@ -907,7 +906,7 @@ fn worker_loop(
                 }
             }
         } else {
-            with_new_default_stream(&Stream::new(), || {
+            with_new_default_stream(Stream::new(), || {
                 run_pipelined_decode_round(
                     &mut model,
                     &mut active,

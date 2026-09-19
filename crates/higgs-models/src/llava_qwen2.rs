@@ -17,7 +17,8 @@ use mlx_rs::{
     error::Exception,
     module::{Module, Param},
     nn,
-    ops::indexing::IndexOp,
+    ops::indexing::{IndexOp, NewAxis},
+    transforms::eval,
 };
 use serde::Deserialize;
 use tokenizers::Tokenizer;
@@ -348,7 +349,7 @@ impl VisionModel for LlavaQwen2Model {
         let sentinel = Array::from_slice(&[IMAGE_TOKEN_INDEX], &[1]);
         let is_sentinel = input_ids.eq(&sentinel)?;
         let zero = Array::from_slice(&[0_i32], &[1]);
-        let safe_ids = mlx_rs::ops::select(&is_sentinel, &zero, input_ids)?;
+        let safe_ids = mlx_rs::ops::r#where(&is_sentinel, &zero, input_ids)?;
         let text_embeddings = self.language_model.embed_tokens(&safe_ids)?;
         let combined =
             crate::vision::merge_embeddings(input_ids, &text_embeddings, &image_features, batch)?;

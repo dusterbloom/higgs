@@ -12,7 +12,7 @@ use higgs_models::turboquant::TurboQuantContext;
 use higgs_models::{AnyCache, LayerCache};
 use mlx_rs::Array;
 use mlx_rs::error::Exception;
-use mlx_rs::ops::concatenate;
+use mlx_rs::ops::concatenate_axis;
 
 use crate::cache::paired::{
     LivePair, PairedCacheError, RadixDFlashForkPlan, RadixDFlashSnapshot, RadixPairCheckpoint,

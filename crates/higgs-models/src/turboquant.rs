@@ -797,7 +797,7 @@ pub(crate) fn decode_scores(
     }
     ensure_ffi_error_handler();
 
-    let stream = Stream::thread_local_or_default();
+    let stream = Stream::task_local_or_default();
     let kernel = SCORE_KERNEL.get_or_init(|| CachedMetalKernel(create_scores_kernel()));
     let config = configure_scores_kernel(
         num_heads,
@@ -875,7 +875,7 @@ pub(crate) fn decode_weighted_values(
     }
     ensure_ffi_error_handler();
 
-    let stream = Stream::thread_local_or_default();
+    let stream = Stream::task_local_or_default();
     let kernel = VALUE_KERNEL.get_or_init(|| CachedMetalKernel(create_values_kernel()));
     let config = configure_values_kernel(
         num_heads,
@@ -1522,7 +1522,7 @@ pub(crate) fn pack_indices_gpu(
 ) -> Result<Array, Exception> {
     ensure_ffi_error_handler();
 
-    let stream = Stream::thread_local_or_default();
+    let stream = Stream::task_local_or_default();
     let kernel = PACK_KERNEL.get_or_init(|| CachedMetalKernel(create_pack_kernel()));
     let config = configure_pack_kernel(n, head_dim, bits, code_words);
 

@@ -42,8 +42,13 @@ fn copy_metallib() -> Result<(), &'static str> {
             if !is_mlx_sys {
                 return None;
             }
-            let metallib = entry.path().join("out/build/lib/mlx.metallib");
-            metallib.exists().then_some(metallib)
+            let build_dir = entry.path().join("out/build");
+            [
+                build_dir.join("lib/mlx.metallib"),
+                build_dir.join("_deps/mlx-build/mlx/backend/metal/kernels/mlx.metallib"),
+            ]
+            .into_iter()
+            .find(|metallib| metallib.exists())
         })
         .collect();
 
