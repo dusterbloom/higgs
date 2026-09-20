@@ -59,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Retention { ref action } => {
             let RetentionAction::Plan {
                 model,
+                draft_model,
                 bytes,
                 tokens,
                 sessions,
@@ -72,8 +73,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 higgs::retention_plan::BudgetRequest::Bytes,
             );
-            let plan =
-                higgs::retention_plan::plan_model(model, request, *sessions, *output_tokens)?;
+            let plan = higgs::retention_plan::plan_model_with_draft(
+                model,
+                draft_model.as_deref(),
+                request,
+                *sessions,
+                *output_tokens,
+            )?;
             println!(
                 "model: {}\nretained budget bytes: {}\nsafe prompt tokens: {}\noutput reserve tokens: {}\ntarget after compaction: {}\npersist: kv_max_retained_bytes = {}",
                 plan.model,

@@ -112,6 +112,8 @@ pub enum RetentionAction {
     Plan {
         #[arg(long)]
         model: PathBuf,
+        #[arg(long)]
+        draft_model: Option<PathBuf>,
         #[arg(long, conflicts_with = "tokens", required_unless_present = "tokens")]
         bytes: Option<u64>,
         #[arg(long, conflicts_with = "bytes", required_unless_present = "bytes")]

@@ -109,6 +109,16 @@ pub fn plan_model(
     sessions: u64,
     output: u64,
 ) -> Result<RetentionPlan, String> {
+    plan_model_with_draft(path, None, request, sessions, output)
+}
+
+pub fn plan_model_with_draft(
+    path: &Path,
+    draft: Option<&Path>,
+    request: BudgetRequest,
+    sessions: u64,
+    output: u64,
+) -> Result<RetentionPlan, String> {
     let raw = std::fs::read_to_string(path.join("config.json")).map_err(|e| e.to_string())?;
     let json: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     let context = json
@@ -122,8 +132,9 @@ pub fn plan_model(
         max_prompt_tokens: u64::MAX,
         max_chunk_tokens: u64::MAX,
     };
-    let cost = higgs_engine::EngineCostDescription::runtime_from_model_dir(path, 0, 0, transient)
-        .ok_or("model lacks supported retained-cache geometry")?;
+    let cost =
+        higgs_engine::EngineCostDescription::runtime_pair_from_model_dirs(path, draft, transient)
+            .ok_or("model lacks supported retained-cache geometry")?;
     plan_from_geometry(
         &path.display().to_string(),
         context,
