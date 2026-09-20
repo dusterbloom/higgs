@@ -214,7 +214,11 @@ fn correctness() -> ProbeResult<()> {
                 round_through_bf16_to_f16(&scales)?,
                 round_through_bf16_to_f16(&biases)?,
             ),
-            ActivationDtype::Bf16 => (x.clone(), scales.clone(), biases.clone()),
+            ActivationDtype::Bf16 => (
+                x.clone(),
+                mlx(scales.as_dtype(Dtype::Bfloat16))?,
+                mlx(biases.as_dtype(Dtype::Bfloat16))?,
+            ),
         };
         let native_stock = mlx(quantized_matmul(
             &x,
