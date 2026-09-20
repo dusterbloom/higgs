@@ -156,6 +156,23 @@ impl DFlashConfig {
         self.dflash_config.target_layer_ids.len()
     }
 
+    /// Worst-case raw target-tap tail retained between fixed 32-row projection
+    /// tiles. Target residual taps may be FP32, so charge four bytes per value.
+    #[must_use]
+    pub fn retained_pending_taps_bound_bytes(&self) -> Option<u64> {
+        let hidden = u64::try_from(self.hidden_size)
+            .ok()
+            .filter(|value| *value > 0)?;
+        let taps = u64::try_from(self.num_taps())
+            .ok()
+            .filter(|value| *value > 0)?;
+        u64::try_from(DFLASH_CONTEXT_TILE_ROWS - 1)
+            .ok()?
+            .checked_mul(taps)?
+            .checked_mul(hidden)?
+            .checked_mul(4)
+    }
+
     pub fn mask_token_id(&self) -> i32 {
         self.dflash_config.mask_token_id.unwrap_or(248_070)
     }
@@ -188,6 +205,15 @@ impl DFlashConfig {
     pub const fn selector_top_k(&self) -> i32 {
         self.dflash_config.selector_top_k
     }
+}
+
+/// Parse only the drafter geometry needed by retained-capacity planning.
+#[must_use]
+pub fn retained_pending_taps_bound_from_model_dir(model_path: &std::path::Path) -> Option<u64> {
+    let config = std::fs::read_to_string(model_path.join("config.json")).ok()?;
+    serde_json::from_str::<DFlashConfig>(&config)
+        .ok()?
+        .retained_pending_taps_bound_bytes()
 }
 
 const fn default_head_dim() -> i32 {
@@ -468,7 +494,8 @@ impl DFlashAttention {
         let sliding_mask = if self.use_sliding_mask {
             let ctx_len = ctx_k.shape()[2];
             let kv_len = ctx_len + q_len;
-            let query_pos = mlx_rs::arange!(start = ctx_len, stop = kv_len)?.reshape(&[q_len, 1])?;
+            let query_pos =
+                mlx_rs::arange!(start = ctx_len, stop = kv_len)?.reshape(&[q_len, 1])?;
             let key_pos = mlx_rs::arange!(stop = kv_len)?.reshape(&[1, kv_len])?;
             let in_window = query_pos
                 .subtract(&key_pos)?
@@ -666,8 +693,8 @@ impl DFlashDynamicConv {
         let groups = h / group_size;
         let blocks = hidden.reshape(&[b, t, groups, group_size])?;
         let dynamic = dynamic.reshape(&[b, t, k, groups, 1])?;
-        let mut output = Array::zeros::<f32>(&[b, t, groups, group_size])?
-            .as_dtype(hidden.dtype())?;
+        let mut output =
+            Array::zeros::<f32>(&[b, t, groups, group_size])?.as_dtype(hidden.dtype())?;
         for offset in 0..k {
             let values = if offset == 0 {
                 blocks.clone()
@@ -693,10 +720,13 @@ impl DFlashDynamicConv {
         let t = hidden.shape()[1];
         let h = hidden.shape()[2];
         let groups = h / self.group_size;
-        let dynamic = self
-            .kernel_projection
-            .forward(hidden)?
-            .reshape(&[b, t, 2, self.kernel_size, groups])?;
+        let dynamic = self.kernel_projection.forward(hidden)?.reshape(&[
+            b,
+            t,
+            2,
+            self.kernel_size,
+            groups,
+        ])?;
         let dynamic_prep = dynamic.index((.., .., 0, .., ..));
         let base_prep = (*self.base_kernel).index(0);
         let conv = Self::convolve(hidden, &dynamic_prep, &base_prep, self.group_size)?;
@@ -732,10 +762,7 @@ impl DFlashCandidateSelector {
         // (higher precision than the 4-bit linear layers); the codebook weight
         // width `rank * 8 / 32` only fits an 8-bit layout. `load_dflash_weights`
         // shape-checks every tensor and fails closed on any mismatch.
-        let codebook_spec = crate::qwen3_next::QuantSpec {
-            bits: 8,
-            ..spec
-        };
+        let codebook_spec = crate::qwen3_next::QuantSpec { bits: 8, ..spec };
         Ok(Self {
             hidden_projection: crate::qwen3_next::QLinear::new_spec(spec)?,
             predecessor_codebook: crate::qwen3_next::QEmbedding::new_spec(codebook_spec),
@@ -3161,6 +3188,26 @@ mod tests {
     }
 
     #[test]
+    fn pending_tap_bound_covers_snapshot_tail_across_tile_boundaries() {
+        let config = tiny_dense_config(None);
+        let bound = config.retained_pending_taps_bound_bytes().unwrap();
+        for position in [0_i32, 1, 31, 32, 33, 63, 64] {
+            let rows = position.rem_euclid(super::DFLASH_CONTEXT_TILE_ROWS);
+            let pending_taps =
+                (rows > 0).then(|| mlx_rs::Array::zeros::<f32>(&[1, rows, 4]).unwrap());
+            let snapshot = super::DFlashSnapshot {
+                layers: vec![None],
+                pending_taps,
+                position,
+            };
+            assert!(
+                u64::try_from(snapshot.estimated_bytes()).unwrap() <= bound,
+                "position {position} exceeds the projected pending-tap bound"
+            );
+        }
+    }
+
+    #[test]
     fn dflash_branch_counter_rejects_wraparound() {
         let counter = std::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -3460,8 +3507,8 @@ mod tests {
             eprintln!("skip: set HIGGS_DFLASH2_DRAFTER_DIR");
             return;
         };
-        let d = super::load_dflash_drafter(std::path::Path::new(&dir))
-            .expect("load DFlash2 drafter");
+        let d =
+            super::load_dflash_drafter(std::path::Path::new(&dir)).expect("load DFlash2 drafter");
         let c = &d.config;
         assert!(c.is_dflash2(), "selector rank must mark DFlash2");
         assert_eq!(c.num_hidden_layers, 5, "layers");
@@ -3483,7 +3530,10 @@ mod tests {
         );
         let selector = d.candidate_selector.as_ref().unwrap();
         assert_eq!(selector.predecessor_codebook.bits, 8, "codebook bits");
-        assert_eq!(selector.predecessor_codebook.group_size, 64, "codebook group");
+        assert_eq!(
+            selector.predecessor_codebook.group_size, 64,
+            "codebook group"
+        );
         eprintln!(
             "DFlash2 drafter loaded OK: {} layers, hidden {}, {} taps, selector rank {} top_k {}, conv k{} g{}",
             c.num_hidden_layers,

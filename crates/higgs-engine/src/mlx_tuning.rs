@@ -504,10 +504,13 @@ impl EngineCostDescription {
             return Some(target);
         };
         let draft = Self::runtime_from_model_dir(draft_path, 0, 0, transient_prefill)?;
+        let pending_taps =
+            higgs_models::dflash::retained_pending_taps_bound_from_model_dir(draft_path)?;
         Some(Self {
             fixed_live_session_bytes: target
                 .fixed_live_session_bytes
-                .checked_add(draft.fixed_live_session_bytes)?,
+                .checked_add(draft.fixed_live_session_bytes)?
+                .checked_add(pending_taps)?,
             persistent_bytes_per_token: target
                 .persistent_bytes_per_token
                 .checked_add(draft.persistent_bytes_per_token)?,
@@ -2279,6 +2282,53 @@ mod tests {
         }
         assert!(65_863_680 + 11_264_u64 * 40_960 <= 512 * 1024 * 1024);
         assert!(65_863_680 + 11_520_u64 * 40_960 > 512 * 1024 * 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn paired_runtime_cost_includes_dflash_pending_tap_tail() -> std::io::Result<()> {
+        let target = TempDir::new().map_err(std::io::Error::other)?;
+        let draft = TempDir::new().map_err(std::io::Error::other)?;
+        let common = serde_json::json!({
+            "num_hidden_layers": 2,
+            "num_key_value_heads": 1,
+            "num_attention_heads": 1,
+            "hidden_size": 16,
+            "head_dim": 16,
+            "intermediate_size": 32,
+            "vocab_size": 64
+        });
+        write_json(&target.path().join("config.json"), &common)?;
+        let mut draft_config = common;
+        draft_config["dflash_config"] = serde_json::json!({
+            "target_layer_ids": [0, 1]
+        });
+        write_json(&draft.path().join("config.json"), &draft_config)?;
+        let transient = TransientPrefillEstimate {
+            base_bytes: 0,
+            bytes_per_prompt_token: 0,
+            bytes_per_chunk_token: 0,
+            max_prompt_tokens: 1024,
+            max_chunk_tokens: 1024,
+        };
+        let target_cost =
+            EngineCostDescription::runtime_from_model_dir(target.path(), 0, 0, transient).unwrap();
+        let draft_cost =
+            EngineCostDescription::runtime_from_model_dir(draft.path(), 0, 0, transient).unwrap();
+        let paired = EngineCostDescription::runtime_pair_from_model_dirs(
+            target.path(),
+            Some(draft.path()),
+            transient,
+        )
+        .unwrap();
+        let pending_tap_bytes = 31_u64 * 2 * 16 * 4;
+
+        assert_eq!(
+            paired.fixed_live_session_bytes,
+            target_cost.fixed_live_session_bytes
+                + draft_cost.fixed_live_session_bytes
+                + pending_tap_bytes
+        );
         Ok(())
     }
 
