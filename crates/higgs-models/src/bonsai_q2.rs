@@ -1251,15 +1251,15 @@ mod tests {
         assert_eq!(rank3.shape(), &[1, 9, n as i32]);
 
         let expect_contract_error = |result: Result<mlx_rs::Array, mlx_rs::error::Exception>,
-                                     contract: &str| {
+                                     expected_phrase: &str| {
             let error = match result {
-                Ok(_) => panic!("expected {contract} validation error"),
+                Ok(_) => panic!("expected {expected_phrase} validation error"),
                 Err(error) => error,
             };
-            let message = error.to_string().to_lowercase();
+            let message = error.to_string();
             assert!(
-                message.contains(contract),
-                "expected {contract} contract in error message, got: {message}"
+                message.contains(expected_phrase),
+                "expected contract phrase {expected_phrase:?} in error message, got: {message}"
             );
         };
 
@@ -1278,7 +1278,7 @@ mod tests {
                 &s,
                 GROUP_SIZE as i32,
             ),
-            "k",
+            "input K mismatch",
         );
         let short_scales = mlx_rs::Array::from_slice(&p.scales[..n], &[n as i32, 1]);
         let flat_x = mlx_rs::Array::from_slice(&values, &[9, k as i32])
@@ -1304,7 +1304,7 @@ mod tests {
                 &s,
                 GROUP_SIZE as i32,
             ),
-            "m",
+            "M must be > 8",
         );
     }
 
