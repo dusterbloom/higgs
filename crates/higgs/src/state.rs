@@ -261,6 +261,10 @@ pub enum Engine {
     Stub(RouteTestStub),
 }
 
+pub struct EngineRetentionClaim {
+    simple: Option<higgs_engine::simple::RetainedReservationClaim>,
+}
+
 impl Engine {
     #[must_use]
     pub const fn cache_capabilities(&self) -> crate::capacity::CacheCapabilities {
@@ -668,7 +672,7 @@ impl Engine {
         }
     }
 
-    pub fn reserve_retained_session(&self, session_id: u64) -> bool {
+    pub fn reserve_retained_session(&self, session_id: u64) -> Option<EngineRetentionClaim> {
         self.reserve_retained_session_replacing(session_id, &[])
     }
 
@@ -676,16 +680,31 @@ impl Engine {
         &self,
         session_id: u64,
         retired_session_ids: &[u64],
-    ) -> bool {
+    ) -> Option<EngineRetentionClaim> {
         match self {
-            Self::Simple(engine) => {
-                engine.reserve_retained_session_replacing(session_id, retired_session_ids)
-            }
-            Self::Batch(_) => false,
+            Self::Simple(engine) => engine
+                .reserve_retained_session_replacing(session_id, retired_session_ids)
+                .map(|simple| EngineRetentionClaim {
+                    simple: Some(simple),
+                }),
+            Self::Batch(_) => None,
             #[cfg(test)]
-            Self::Stub(stub) => {
-                matches!(stub.name(), "seed-binding" | "rotated-seed" | "drop-target")
+            Self::Stub(stub)
+                if matches!(stub.name(), "seed-binding" | "rotated-seed" | "drop-target") =>
+            {
+                Some(EngineRetentionClaim { simple: None })
             }
+            #[cfg(test)]
+            Self::Stub(_) => None,
+        }
+    }
+
+    pub fn release_retained_reservation(&self, claim: EngineRetentionClaim) -> bool {
+        match (self, claim.simple) {
+            (Self::Simple(engine), Some(simple)) => engine.release_retained_reservation(simple),
+            #[cfg(test)]
+            (Self::Stub(_), None) => true,
+            _ => false,
         }
     }
 
@@ -1916,6 +1935,26 @@ impl AppState {
         true
     }
 
+    pub fn claim_exclusively_reserved_seed(
+        &self,
+        model: &str,
+        session_id: u64,
+        revision: &str,
+        epoch: u64,
+        _reservation: &EngineRetentionClaim,
+    ) -> bool {
+        let mut bindings = self
+            .retention_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        bindings.retain(|(bound_model, _), _| bound_model != model);
+        bindings.insert(
+            (model.to_owned(), session_id),
+            (revision.to_owned(), epoch, false),
+        );
+        true
+    }
+
     pub fn publish_retention_seed(&self, model: &str, session_id: u64) -> bool {
         let mut bindings = self
             .retention_bindings
@@ -2270,5 +2309,20 @@ mod tests {
         assert!(!facts.cache_capabilities.retained_sessions);
         assert_eq!(facts.guaranteed_retained_sessions, 0);
         assert_eq!(facts.retained_session_tokens, 0);
+    }
+
+    #[test]
+    fn exclusive_engine_claim_replaces_binding_left_by_idle_expiry() {
+        let (state, _) = crate::capacity::retained_contract_route_test_state(
+            "model",
+            4 * 1024 * 1024 * 1024,
+            128 * 1024,
+        );
+        assert!(state.claim_retention_seed("model", 7, "old", 1));
+        assert!(state.publish_retention_seed("model", 7));
+        let claim = EngineRetentionClaim { simple: None };
+        assert!(state.claim_exclusively_reserved_seed("model", 8, "new", 2, &claim));
+        assert!(!state.retention_binding_matches("model", 7, "old", 1));
+        assert!(!state.retention_binding_matches("model", 8, "new", 2));
     }
 }

@@ -1276,6 +1276,66 @@ struct RetentionMutation {
     oversized: bool,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct RetainedReservationClaim {
+    session_id: u64,
+    owner: u64,
+}
+
+#[derive(Debug, Default)]
+struct RetainedReservations {
+    owners: std::collections::HashMap<u64, u64>,
+    next_owner: u64,
+}
+
+impl RetainedReservations {
+    fn claim_replacing(
+        &mut self,
+        session_id: u64,
+        retired_session_ids: &[u64],
+    ) -> Option<RetainedReservationClaim> {
+        for retired in retired_session_ids {
+            if *retired != session_id {
+                self.owners.remove(retired);
+            }
+        }
+        if !self.owners.is_empty() {
+            return None;
+        }
+        self.next_owner = self.next_owner.checked_add(1)?;
+        self.owners.insert(session_id, self.next_owner);
+        Some(RetainedReservationClaim {
+            session_id,
+            owner: self.next_owner,
+        })
+    }
+
+    fn release(&mut self, claim: RetainedReservationClaim) -> bool {
+        if self.owners.get(&claim.session_id) != Some(&claim.owner) {
+            return false;
+        }
+        self.owners.remove(&claim.session_id);
+        true
+    }
+
+    fn remove_session(&mut self, session_id: u64) -> bool {
+        self.owners.remove(&session_id).is_some()
+    }
+
+    fn is_reserved(&self, session_id: u64) -> bool {
+        self.owners.contains_key(&session_id)
+    }
+
+    fn reserved_ids(&self) -> std::collections::HashSet<u64> {
+        self.owners.keys().copied().collect()
+    }
+
+    fn retain_sessions(&mut self, keep: &std::collections::HashSet<u64>) {
+        self.owners
+            .retain(|session_id, _| keep.contains(session_id));
+    }
+}
+
 /// Registry pressure intent for cache enforcement. Admission reclamation may
 /// only evict unleased entries; ordinary policy reductions honor their hard
 /// allocation and therefore revoke the minimum remaining leases when needed.
@@ -1288,6 +1348,7 @@ pub enum CachePressurePolicy {
 
 fn enforce_retained_byte_limit(
     map: &mut std::collections::HashMap<u64, RetainedKv>,
+    reserved: &std::collections::HashSet<u64>,
     max_bytes: usize,
     policy: CachePressurePolicy,
 ) -> RetentionMutation {
@@ -1305,7 +1366,7 @@ fn enforce_retained_byte_limit(
     while total > max_bytes {
         let Some(id) = map
             .iter()
-            .filter(|(_, entry)| entry.lease_expires_at.is_none())
+            .filter(|(id, entry)| !reserved.contains(id) && entry.lease_expires_at.is_none())
             .min_by_key(|(_, entry)| entry.last_used)
             .map(|(&id, _)| id)
         else {
@@ -1319,6 +1380,7 @@ fn enforce_retained_byte_limit(
     while total > max_bytes && policy != CachePressurePolicy::Admission {
         let Some(id) = map
             .iter()
+            .filter(|(id, _)| !reserved.contains(id))
             .filter_map(|(&id, entry)| entry.lease_expires_at.map(|expiry| (id, expiry)))
             .min_by_key(|(_, expiry)| *expiry)
             .map(|(id, _)| id)
@@ -1342,6 +1404,9 @@ fn stash_into_bounded_with_reservations(
     limits: RetentionLimits,
     source: RetainedPromptSource,
 ) -> RetentionMutation {
+    if !reserved.is_empty() && !reserved.contains(&session_id) {
+        return RetentionMutation::default();
+    }
     let now = std::time::Instant::now();
     let mut result = RetentionMutation::default();
     for entry in map.values_mut() {
@@ -3029,7 +3094,7 @@ pub struct SimpleEngine {
     retained: Mutex<std::collections::HashMap<u64, RetainedKv>>,
     /// Retained slots claimed before seed inference. Reserved entries are an
     /// ACK floor: ordinary LRU and live leases cannot displace them.
-    retained_reservations: Mutex<std::collections::HashSet<u64>>,
+    retained_reservations: Mutex<RetainedReservations>,
     /// Per-`session_id` serialization locks, held for the whole duration of a
     /// `generate_continued` call so two concurrent requests for the same
     /// conversation can never interleave their take/generate/stash of the
@@ -4028,7 +4093,7 @@ impl SimpleEngine {
             scheduler: Mutex::new(RoundRobinScheduler::new()),
             sessions: Mutex::new(std::collections::HashMap::new()),
             retained: Mutex::new(std::collections::HashMap::new()),
-            retained_reservations: Mutex::new(std::collections::HashSet::new()),
+            retained_reservations: Mutex::new(RetainedReservations::default()),
             session_locks: Mutex::new(std::collections::HashMap::new()),
             cache_metrics: CacheMetrics::default(),
             tokenizer,
@@ -4111,6 +4176,10 @@ impl SimpleEngine {
         let Some(expiry) = std::time::Instant::now().checked_add(ttl) else {
             return false;
         };
+        let reservations = lock_or_recover(&self.retained_reservations);
+        if !reservations.owners.is_empty() && !reservations.is_reserved(session_id) {
+            return false;
+        }
         let mut retained = lock_or_recover(&self.retained);
         let Some(entry) = retained.get_mut(&session_id) else {
             return false;
@@ -4406,8 +4475,11 @@ impl SimpleEngine {
             .capacity_retained_bytes
             .swap(retained_bytes, Ordering::AcqRel);
         if retained_bytes < previous {
+            let reservations = lock_or_recover(&self.retained_reservations);
+            let reserved_ids = reservations.reserved_ids();
             let mutation = enforce_retained_byte_limit(
                 &mut lock_or_recover(&self.retained),
+                &reserved_ids,
                 retained_bytes,
                 policy,
             );
@@ -4422,9 +4494,15 @@ impl SimpleEngine {
     /// the live leased floor the registry must acknowledge before retrying.
     pub fn reclaim_unleased_retained_for_capacity(&self, prefix_bytes: usize) -> usize {
         let (mutation, retained_bytes) = {
+            let reservations = lock_or_recover(&self.retained_reservations);
+            let reserved_ids = reservations.reserved_ids();
             let mut retained = lock_or_recover(&self.retained);
-            let mutation =
-                enforce_retained_byte_limit(&mut retained, 0, CachePressurePolicy::Admission);
+            let mutation = enforce_retained_byte_limit(
+                &mut retained,
+                &reserved_ids,
+                0,
+                CachePressurePolicy::Admission,
+            );
             let retained_bytes = retained.values().fold(0usize, |sum, entry| {
                 sum.saturating_add(entry.state.estimated_bytes())
             });
@@ -4603,7 +4681,8 @@ impl SimpleEngine {
         let _session_guard = session_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let reservation_removed = lock_or_recover(&self.retained_reservations).remove(&session_id);
+        let reservation_removed =
+            lock_or_recover(&self.retained_reservations).remove_session(session_id);
         lock_or_recover(&self.retained)
             .remove(&session_id)
             .is_some()
@@ -4612,13 +4691,14 @@ impl SimpleEngine {
 
     /// Best-effort release for the eager-reclaim endpoint; busy sessions stay retained.
     pub fn try_drop_retained_session(&self, session_id: u64) -> bool {
-        let reservation_removed = lock_or_recover(&self.retained_reservations).remove(&session_id);
         let session_lock = self.session_lock_for(session_id);
         let _session_guard = match session_lock.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return false,
         };
+        let reservation_removed =
+            lock_or_recover(&self.retained_reservations).remove_session(session_id);
         lock_or_recover(&self.retained)
             .remove(&session_id)
             .is_some()
@@ -4628,7 +4708,7 @@ impl SimpleEngine {
     /// Exclusively reserve the bounded retained pool before seed inference.
     /// The current V2 contract advertises one guaranteed session, so a second
     /// reservation fails closed instead of overcommitting live KV memory.
-    pub fn reserve_retained_session(&self, session_id: u64) -> bool {
+    pub fn reserve_retained_session(&self, session_id: u64) -> Option<RetainedReservationClaim> {
         self.reserve_retained_session_replacing(session_id, &[])
     }
 
@@ -4636,7 +4716,7 @@ impl SimpleEngine {
         &self,
         session_id: u64,
         retired_session_ids: &[u64],
-    ) -> bool {
+    ) -> Option<RetainedReservationClaim> {
         let session_lock = self.session_lock_for(session_id);
         let _session_guard = session_lock
             .lock()
@@ -4645,25 +4725,23 @@ impl SimpleEngine {
         let mut retained = lock_or_recover(&self.retained);
         for retired_session_id in retired_session_ids {
             if *retired_session_id != session_id {
-                reservations.remove(retired_session_id);
                 retained.remove(retired_session_id);
             }
         }
-        if reservations.contains(&session_id) {
-            return true;
-        }
-        if !reservations.is_empty() {
-            return false;
-        }
+        let claim = reservations.claim_replacing(session_id, retired_session_ids)?;
         let now = std::time::Instant::now();
         if retained.iter().any(|(&id, entry)| {
             id != session_id && entry.lease_expires_at.is_some_and(|expiry| expiry > now)
         }) {
-            return false;
+            reservations.release(claim);
+            return None;
         }
         retained.retain(|&id, _| id == session_id);
-        reservations.insert(session_id);
-        true
+        Some(claim)
+    }
+
+    pub fn release_retained_reservation(&self, claim: RetainedReservationClaim) -> bool {
+        lock_or_recover(&self.retained_reservations).release(claim)
     }
 
     /// Evict retained caches idle longer than `ttl`; returns how many were
@@ -4691,7 +4769,17 @@ impl SimpleEngine {
                 }
             }
         }
-        let mutation = evict_idle_except_from(&mut lock_or_recover(&self.retained), ttl, &active);
+        let mut reservations = lock_or_recover(&self.retained_reservations);
+        let mut retained = lock_or_recover(&self.retained);
+        let mutation = evict_idle_except_from(&mut retained, ttl, &active);
+        let keep_reservations = retained
+            .keys()
+            .copied()
+            .chain(active.iter().copied())
+            .collect();
+        reservations.retain_sessions(&keep_reservations);
+        drop(retained);
+        drop(reservations);
         drop(inactive_guards);
         drop(session_locks);
         if mutation.evicted > 0 {
@@ -4864,10 +4952,11 @@ impl SimpleEngine {
             );
         }
         let reservations = lock_or_recover(&self.retained_reservations);
+        let reserved_ids = reservations.reserved_ids();
         let mut retained = lock_or_recover(&self.retained);
         let mutation = stash_into_bounded_with_reservations(
             &mut retained,
-            &reservations,
+            &reserved_ids,
             session_id,
             state,
             RetentionLimits {
@@ -15943,7 +16032,7 @@ mod tests {
             scheduler: std::sync::Mutex::new(RoundRobinScheduler::new()),
             sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
             retained: std::sync::Mutex::new(std::collections::HashMap::new()),
-            retained_reservations: std::sync::Mutex::new(std::collections::HashSet::new()),
+            retained_reservations: std::sync::Mutex::new(super::RetainedReservations::default()),
             session_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             cache_metrics: super::CacheMetrics::default(),
             tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
@@ -18034,10 +18123,14 @@ mod tests {
         ]);
         let leased_bytes = retained[&1].state.estimated_bytes();
 
-        let mutation =
-            enforce_retained_byte_limit(&mut retained, leased_bytes, CachePressurePolicy::Normal);
+        let mutation = enforce_retained_byte_limit(
+            &mut retained,
+            &std::collections::HashSet::new(),
+            leased_bytes,
+            CachePressurePolicy::Normal,
+        );
         assert_eq!(mutation.evicted, 1);
-        assert_eq!(mutation.broken_leases, 0);
+        assert_eq!(mutation, super::RetentionMutation::default());
         assert!(retained.contains_key(&1));
         assert!(!retained.contains_key(&2));
     }
@@ -18061,7 +18154,12 @@ mod tests {
                 source: super::RetainedPromptSource::GeneratedAssistantReplay,
             },
         )]);
-        let mutation = enforce_retained_byte_limit(&mut retained, 0, CachePressurePolicy::Critical);
+        let mutation = enforce_retained_byte_limit(
+            &mut retained,
+            &std::collections::HashSet::new(),
+            0,
+            CachePressurePolicy::Critical,
+        );
         assert_eq!(mutation.broken_leases, 1);
         assert!(!retained.contains_key(&1));
     }
@@ -18097,8 +18195,12 @@ mod tests {
             ),
         ]);
 
-        let mutation =
-            enforce_retained_byte_limit(&mut retained, 0, CachePressurePolicy::Admission);
+        let mutation = enforce_retained_byte_limit(
+            &mut retained,
+            &std::collections::HashSet::new(),
+            0,
+            CachePressurePolicy::Admission,
+        );
         assert_eq!(mutation.evicted, 1);
         assert_eq!(mutation.broken_leases, 0);
         assert!(retained.contains_key(&1), "live lease is the ACK floor");
@@ -18137,8 +18239,12 @@ mod tests {
         ]);
         let one_entry = retained[&1].state.estimated_bytes();
 
-        let mutation =
-            enforce_retained_byte_limit(&mut retained, one_entry, CachePressurePolicy::Normal);
+        let mutation = enforce_retained_byte_limit(
+            &mut retained,
+            &std::collections::HashSet::new(),
+            one_entry,
+            CachePressurePolicy::Normal,
+        );
         assert_eq!(mutation.evicted, 1);
         assert_eq!(mutation.broken_leases, 1);
         assert!(!retained.contains_key(&1), "earliest lease is broken first");
@@ -18256,10 +18362,83 @@ mod tests {
             ),
             false,
         );
-        assert!(engine.reserve_retained_session(2));
+        assert!(engine.reserve_retained_session(2).is_some());
         assert!(!lock_or_recover(&engine.retained).contains_key(&1));
-        assert!(!engine.reserve_retained_session(3));
-        assert!(engine.reserve_retained_session_replacing(3, &[2]));
+        assert!(engine.reserve_retained_session(3).is_none());
+        assert!(engine.reserve_retained_session_replacing(3, &[2]).is_some());
+    }
+
+    #[test]
+    fn reservation_claim_ownership_rejects_duplicate_and_foreign_release() {
+        let mut reservations = super::RetainedReservations::default();
+        let owner = reservations.claim_replacing(7, &[]).unwrap();
+        assert!(reservations.claim_replacing(7, &[]).is_none());
+        assert!(!reservations.release(super::RetainedReservationClaim {
+            session_id: 7,
+            owner: owner.owner.wrapping_add(1),
+        }));
+        assert!(reservations.is_reserved(7));
+        assert!(reservations.release(owner));
+        assert!(!reservations.is_reserved(7));
+    }
+
+    #[test]
+    fn reservation_claim_rotates_slot_atomically() {
+        let mut reservations = super::RetainedReservations::default();
+        let old = reservations.claim_replacing(7, &[]).unwrap();
+        let new = reservations.claim_replacing(8, &[7]).unwrap();
+        assert!(!reservations.release(old));
+        assert!(reservations.is_reserved(8));
+        assert!(reservations.release(new));
+    }
+
+    #[test]
+    fn idle_cleanup_releases_abandoned_claim_for_next_seed() {
+        let mut reservations = super::RetainedReservations::default();
+        reservations.claim_replacing(7, &[]).unwrap();
+        reservations.retain_sessions(&std::collections::HashSet::new());
+        assert!(reservations.claim_replacing(8, &[]).is_some());
+    }
+
+    #[test]
+    fn normal_and_critical_pressure_preserve_reserved_guarantee() {
+        use super::{CachePressurePolicy, RetainedKv, enforce_retained_byte_limit};
+        use crate::cache::paired::RetainedState;
+        use std::collections::{HashMap, HashSet};
+        use std::time::Instant;
+
+        for policy in [CachePressurePolicy::Normal, CachePressurePolicy::Critical] {
+            let mut retained = HashMap::from([(
+                7,
+                RetainedKv {
+                    state: RetainedState::target_only_unchecked_for_test(
+                        AnyCache::KV(Vec::new()),
+                        vec![1],
+                    ),
+                    last_used: Instant::now(),
+                    lease_expires_at: None,
+                    source: super::RetainedPromptSource::GeneratedAssistantReplay,
+                },
+            )]);
+            let mutation =
+                enforce_retained_byte_limit(&mut retained, &HashSet::from([7]), 0, policy);
+            assert_eq!(mutation.evicted, 0);
+            assert!(retained.contains_key(&7));
+        }
+    }
+
+    #[test]
+    #[ignore = "synthetic MLX engine aborts on this host before lock interleaving runs"]
+    fn best_effort_drop_cannot_strip_busy_seed_reservation() {
+        let engine = session_cache_test_engine();
+        assert!(engine.reserve_retained_session(7).is_some());
+        let lock = engine.session_lock_for(7);
+        let guard = lock.lock().unwrap();
+        assert!(!engine.try_drop_retained_session(7));
+        assert!(lock_or_recover(&engine.retained_reservations).is_reserved(7));
+        drop(guard);
+        assert!(engine.try_drop_retained_session(7));
+        assert!(!lock_or_recover(&engine.retained_reservations).is_reserved(7));
     }
 
     /// Write a config.json file into the given directory with the provided JSON content.

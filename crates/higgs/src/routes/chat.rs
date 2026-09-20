@@ -276,6 +276,7 @@ struct RetentionSeedClaim {
     engine: Arc<Engine>,
     model: String,
     session_id: u64,
+    reservation: Option<crate::state::EngineRetentionClaim>,
     published: bool,
 }
 
@@ -293,7 +294,9 @@ impl Drop for RetentionSeedClaim {
         if !self.published {
             self.state
                 .abort_retention_seed(&self.model, self.session_id);
-            self.engine.drop_retained_session(self.session_id);
+            if let Some(reservation) = self.reservation.take() {
+                self.engine.release_retained_reservation(reservation);
+            }
         }
     }
 }
@@ -359,21 +362,26 @@ fn validate_required_retention(
             if engine
                 .retained_session_receipt(retention.session_id)
                 .is_some()
-                || !engine
-                    .reserve_retained_session_replacing(retention.session_id, retired_session_ids)
             {
                 return Err(ServerError::Conflict(
                     "retention seed conflicts with an existing session identity".to_owned(),
                 ));
             }
-            if !state.claim_retention_seed_replacing(
+            let Some(reservation) = engine
+                .reserve_retained_session_replacing(retention.session_id, retired_session_ids)
+            else {
+                return Err(ServerError::Conflict(
+                    "retention seed conflicts with an existing session identity".to_owned(),
+                ));
+            };
+            if !state.claim_exclusively_reserved_seed(
                 model,
                 retention.session_id,
                 &retention.contract_revision,
                 retention.epoch,
-                retired_session_ids,
+                &reservation,
             ) {
-                engine.drop_retained_session(retention.session_id);
+                engine.release_retained_reservation(reservation);
                 return Err(ServerError::Conflict(
                     "retention seed conflicts with an existing session identity".to_owned(),
                 ));
@@ -383,6 +391,7 @@ fn validate_required_retention(
                 engine: Arc::clone(engine),
                 model: model.to_owned(),
                 session_id: retention.session_id,
+                reservation: Some(reservation),
                 published: false,
             }))
         }
