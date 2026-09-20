@@ -204,8 +204,12 @@ fn correctness() -> ProbeResult<()> {
             reference.extend(dense_matvec_reference(&p, row));
         }
 
-        let matched_scales = mlx(scales.as_dtype(dtype.mlx()))?;
-        let matched_biases = mlx(biases.as_dtype(dtype.mlx()))?;
+        let matched_x = match dtype {
+            ActivationDtype::F16 => mlx(x.as_dtype(Dtype::Bfloat16))?,
+            ActivationDtype::Bf16 => x.clone(),
+        };
+        let matched_scales = mlx(scales.as_dtype(Dtype::Bfloat16))?;
+        let matched_biases = mlx(biases.as_dtype(Dtype::Bfloat16))?;
         let native_stock = mlx(quantized_matmul(
             &x,
             &weight,
@@ -216,8 +220,8 @@ fn correctness() -> ProbeResult<()> {
             2,
             QuantMode::Affine,
         ))?;
-        let cast_matched_stock = mlx(quantized_matmul(
-            &x,
+        let cast_matched_stock_bf16 = mlx(quantized_matmul(
+            &matched_x,
             &weight,
             &matched_scales,
             Some(&matched_biases),
@@ -238,6 +242,7 @@ fn correctness() -> ProbeResult<()> {
             &scales,
             GROUP_SIZE as i32,
         ))?;
+        let cast_matched_stock = mlx(cast_matched_stock_bf16.as_dtype(tiled.dtype()))?;
 
         for output in [&native_stock, &cast_matched_stock, &scalar, &tiled] {
             eval(output)?;
