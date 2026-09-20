@@ -17,6 +17,19 @@ pub struct ErrorDetail {
     pub message: String,
     pub r#type: String,
     pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "contractRevision")]
+    pub contract_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "sessionId")]
+    pub session_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetentionErrorContext {
+    pub contract_revision: String,
+    pub session_id: u64,
+    pub epoch: u64,
 }
 
 /// Server error types.
@@ -40,10 +53,13 @@ pub enum ServerError {
     RetainedSessionUnavailable(u64),
 
     #[error("Retained request requires compaction before inference")]
-    RetentionCompactionRequired,
+    RetentionCompactionRequired(RetentionErrorContext),
 
     #[error("Retention contract is stale")]
-    StaleRetentionContract,
+    StaleRetentionContract(RetentionErrorContext),
+
+    #[error("Retained session is unavailable for required continuation")]
+    RequiredRetentionUnavailable(RetentionErrorContext),
 
     #[error("Model not found: {0}")]
     ModelNotFound(String),
@@ -124,17 +140,26 @@ impl ServerError {
                 format!("Retained session {session_id} is unavailable for required continuation"),
                 Some("retained_session_unavailable"),
             ),
-            Self::RetentionCompactionRequired => (
+            Self::RetentionCompactionRequired(_) => (
                 StatusCode::CONFLICT,
                 "conflict",
                 "Retained request requires compaction before inference".to_owned(),
                 Some("retention_compaction_required"),
             ),
-            Self::StaleRetentionContract => (
+            Self::StaleRetentionContract(_) => (
                 StatusCode::CONFLICT,
                 "conflict",
                 "Retention contract is stale".to_owned(),
                 Some("stale_retention_contract"),
+            ),
+            Self::RequiredRetentionUnavailable(context) => (
+                StatusCode::CONFLICT,
+                "conflict",
+                format!(
+                    "Retained session {} is unavailable for required continuation",
+                    context.session_id
+                ),
+                Some("retained_session_unavailable"),
             ),
             Self::ModelNotFound(model) => (
                 StatusCode::NOT_FOUND,
@@ -167,11 +192,20 @@ impl ServerError {
             }
         };
 
+        let retention = match &self {
+            Self::RetentionCompactionRequired(context)
+            | Self::StaleRetentionContract(context)
+            | Self::RequiredRetentionUnavailable(context) => Some(context),
+            _ => None,
+        };
         let body = Json(ErrorResponse {
             error: ErrorDetail {
                 message,
                 r#type: error_type.to_owned(),
                 code: code.map(str::to_owned),
+                contract_revision: retention.map(|value| value.contract_revision.clone()),
+                session_id: retention.map(|value| value.session_id),
+                epoch: retention.map(|value| value.epoch),
             },
         });
 

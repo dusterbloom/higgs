@@ -218,8 +218,12 @@ pub async fn create_message(
     request_metrics.set_requested_model(&req.model);
 
     if let Some(retention) = req.retention.as_ref() {
-        return Err(ServerError::RetainedSessionUnavailable(
-            retention.session_id,
+        return Err(ServerError::RequiredRetentionUnavailable(
+            crate::error::RetentionErrorContext {
+                contract_revision: retention.contract_revision.clone(),
+                session_id: retention.session_id,
+                epoch: retention.epoch,
+            },
         ));
     }
 

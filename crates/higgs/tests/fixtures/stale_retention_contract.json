@@ -1,0 +1,1 @@
+{"error":{"message":"Retention contract is stale","type":"conflict","code":"stale_retention_contract","contractRevision":"stale:revision","sessionId":42,"epoch":7}}

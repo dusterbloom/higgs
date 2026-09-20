@@ -1,0 +1,1 @@
+{"schemaVersion":2,"contractRevision":"boot:7:sha256:model","model":"model","maxContextTokens":65536,"maxOutputTokens":4096,"retainedBudgetBytes":4294967296,"guaranteedFastPromptTokens":28672,"softCompactionPromptTokens":24576,"targetAfterCompactionTokens":4096,"guaranteedSessions":1}

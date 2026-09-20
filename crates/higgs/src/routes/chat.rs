@@ -27,9 +27,9 @@ use crate::{
     types::openai::{
         ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage, ChatCompletionRequest,
         ChatCompletionResponse, ChoiceLogprobs, CompletionUsage, ContentPart, MessageContent,
-        RetentionReceipt, RetentionRequest, SessionCachePolicy, StopSequence, TokenLogprob, ToolCall,
-        ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta, ToolChoice, ToolChoiceMode,
-        TopLogprob, merge_repetition_penalty,
+        RetentionReceipt, RetentionRequest, SessionCachePolicy, StopSequence, TokenLogprob,
+        ToolCall, ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta, ToolChoice,
+        ToolChoiceMode, TopLogprob, merge_repetition_penalty,
     },
 };
 use higgs_models::SamplingParams;
@@ -274,10 +274,15 @@ fn validate_required_retention(
     let Some(retention) = retention else {
         return Ok(());
     };
+    let error_context = crate::error::RetentionErrorContext {
+        contract_revision: retention.contract_revision.clone(),
+        session_id: retention.session_id,
+        epoch: retention.epoch,
+    };
     let contract = state
         .capacity
         .fast_session_contract(model)
-        .map_err(|_| ServerError::RetentionCompactionRequired)?;
+        .map_err(|_| ServerError::RetentionCompactionRequired(error_context.clone()))?;
     contract
         .admit_required(
             &retention.contract_revision,
@@ -286,16 +291,14 @@ fn validate_required_retention(
         )
         .map_err(|error| match error {
             crate::capacity::RequiredRetentionAdmissionError::StaleContract => {
-                ServerError::StaleRetentionContract
+                ServerError::StaleRetentionContract(error_context.clone())
             }
             crate::capacity::RequiredRetentionAdmissionError::CompactionRequired => {
-                ServerError::RetentionCompactionRequired
+                ServerError::RetentionCompactionRequired(error_context.clone())
             }
         })?;
     if !engine.retained_session_can_continue(retention.session_id, prompt_tokens) {
-        return Err(ServerError::RetainedSessionUnavailable(
-            retention.session_id,
-        ));
+        return Err(ServerError::RequiredRetentionUnavailable(error_context));
     }
     Ok(())
 }
@@ -310,6 +313,27 @@ fn map_session_engine_error(error: higgs_engine::error::EngineError) -> ServerEr
         higgs_engine::error::EngineError::Vision(v) => ServerError::BadRequest(v.to_string()),
         other => ServerError::Engine(other),
     }
+}
+
+fn map_required_session_engine_error(
+    error: higgs_engine::error::EngineError,
+    retention: Option<&RetentionRequest>,
+) -> ServerError {
+    if matches!(
+        error,
+        higgs_engine::error::EngineError::RetainedSessionUnavailable(_)
+    ) {
+        if let Some(retention) = retention {
+            return ServerError::RequiredRetentionUnavailable(
+                crate::error::RetentionErrorContext {
+                    contract_revision: retention.contract_revision.clone(),
+                    session_id: retention.session_id,
+                    epoch: retention.epoch,
+                },
+            );
+        }
+    }
+    map_session_engine_error(error)
 }
 
 fn streaming_error_json(message: &str) -> String {
@@ -749,7 +773,7 @@ async fn chat_completions_non_streaming(
         })
         .await
         .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
-        .map_err(map_session_engine_error)?;
+        .map_err(|error| map_required_session_engine_error(error, required_retention.as_ref()))?;
 
         let retention_receipt = required_retention.as_ref().and_then(|retention| {
             engine
@@ -4024,10 +4048,14 @@ mod tests {
             GenerationDefaults::default(),
         )
         .await;
-        assert!(matches!(
-            blocking,
-            Err(ServerError::RetentionCompactionRequired)
-        ));
+        let Err(ServerError::RetentionCompactionRequired(blocking_context)) = blocking else {
+            panic!("blocking route must return the typed compact-required error");
+        };
+        assert_eq!(blocking_context.contract_revision, revision);
+        assert_eq!(
+            (blocking_context.session_id, blocking_context.epoch),
+            (42, 7)
+        );
 
         engine.test_set_chat_prompt_tokens(vec![7; 8]);
         let streaming = chat_completions_stream(
@@ -4039,10 +4067,14 @@ mod tests {
             crate::router::RoutingMethod::Direct,
         )
         .await;
-        assert!(matches!(
-            streaming,
-            Err(ServerError::StaleRetentionContract)
-        ));
+        let Err(ServerError::StaleRetentionContract(streaming_context)) = streaming else {
+            panic!("streaming route must return the typed stale-contract error");
+        };
+        assert_eq!(streaming_context.contract_revision, "stale:revision");
+        assert_eq!(
+            (streaming_context.session_id, streaming_context.epoch),
+            (42, 7)
+        );
         assert_eq!(engine.route_test_retained_sessions(), [42]);
         assert!(engine.route_test_mutation_sequence().is_empty());
         assert_eq!(state.capacity.active_reservation_count(model), 0);

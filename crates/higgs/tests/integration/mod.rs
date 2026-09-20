@@ -8,4 +8,5 @@ mod request_validation;
 mod response_contract;
 mod retained_contract;
 mod retention_plan;
+mod retained_wire_contract;
 mod router;

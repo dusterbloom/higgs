@@ -1,0 +1,1 @@
+{"error":{"message":"Retained request requires compaction before inference","type":"conflict","code":"retention_compaction_required","contractRevision":"boot:7:sha256:model","sessionId":42,"epoch":7}}
