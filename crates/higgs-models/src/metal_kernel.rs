@@ -3262,14 +3262,14 @@ pub fn bonsai_q2_qmm_ternary(
 }
 
 // ---------------------------------------------------------------------------
-// Tiled BF16-staged ternary QMM probe (BM=8, BN=32, BK=128)
+// Tiled BF16-staged ternary QMM probe (BM=32, BN=32, BK=128)
 // ---------------------------------------------------------------------------
 
 /// First tiled ternary QMM candidate. It stages one 128-value quantization
 /// group at a time, so each packed word is decoded once and reused across the
-/// 8 input rows. BF16 staging deliberately differs from the stock FP32 path.
+/// 32 input rows. BF16 staging deliberately differs from the stock FP32 path.
 const Q2_TILED_TERNARY_QMM_V1_SOURCE: &str = r"
-constexpr int BM = 8;
+constexpr int BM = 32;
 constexpr int BN = 32;
 constexpr int BK = 128;
 
@@ -3281,10 +3281,14 @@ const uint tid = thread_position_in_threadgroup.x;
 const uint m0 = threadgroup_position_in_grid.y * uint(BM);
 const uint n0 = threadgroup_position_in_grid.x * uint(BN);
 
-simdgroup_matrix<float, 8, 8> acc = simdgroup_matrix<float, 8, 8>(0.0f);
+const uint n_fragment = simdgroup_index_in_threadgroup;
+simdgroup_matrix<float, 8, 8> acc[4];
+for (uint m_fragment = 0u; m_fragment < 4u; ++m_fragment) {
+    acc[m_fragment] = simdgroup_matrix<float, 8, 8>(0.0f);
+}
 
 for (int group = 0; group < NumGroups; ++group) {
-    // Each of the 128 threads writes eight K-major activation values.
+    // Each of the 128 threads writes 32 K-major activation values.
     for (uint i = tid; i < uint(BM * BK); i += 128u) {
         const uint local_m = i % uint(BM);
         const uint local_k = i / uint(BM);
@@ -3318,16 +3322,20 @@ for (int group = 0; group < NumGroups; ++group) {
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // One SIMD group owns one disjoint 8-column fragment of the output tile.
-    const uint n_fragment = simdgroup_index_in_threadgroup;
+    // Each SIMD group owns one 8-column N fragment and four 8-row M fragments.
+    // Load each B fragment once and reuse it across the four A fragments.
     for (uint k_fragment = 0u; k_fragment < uint(BK / 8); ++k_fragment) {
-        simdgroup_matrix<bfloat16_t, 8, 8> a;
         simdgroup_matrix<bfloat16_t, 8, 8> b;
-        simdgroup_load(a, &x_sh[k_fragment * 8u * uint(BM)],
-                       ulong(BM), ulong2(0, 0), true);
         simdgroup_load(b, &w_sh[k_fragment * 8u * uint(BN) + n_fragment * 8u],
                        ulong(BN), ulong2(0, 0), false);
-        simdgroup_multiply_accumulate(acc, a, b, acc);
+        for (uint m_fragment = 0u; m_fragment < 4u; ++m_fragment) {
+            simdgroup_matrix<bfloat16_t, 8, 8> a;
+            simdgroup_load(a,
+                           &x_sh[k_fragment * 8u * uint(BM) + m_fragment * 8u],
+                           ulong(BM), ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(acc[m_fragment], a, b,
+                                          acc[m_fragment]);
+        }
     }
 
     // All simdgroups must finish reading the current scratch tile before the
@@ -3335,8 +3343,11 @@ for (int group = 0; group < NumGroups; ++group) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-const uint n_fragment = simdgroup_index_in_threadgroup;
-simdgroup_store(acc, &out_sh[n_fragment * 8u], ulong(BN), ulong2(0, 0), false);
+for (uint m_fragment = 0u; m_fragment < 4u; ++m_fragment) {
+    simdgroup_store(acc[m_fragment],
+                    &out_sh[m_fragment * 8u * uint(BN) + n_fragment * 8u],
+                    ulong(BN), ulong2(0, 0), false);
+}
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
 for (uint i = tid; i < uint(BM * BN); i += 128u) {
@@ -3466,7 +3477,7 @@ pub fn bonsai_q2_qmm_tiled_ternary(
 
     let grid_x = i32::try_from((i64::from(n_rows) + 31) / 32 * 128)
         .map_err(|_| Exception::custom("bonsai_q2_qmm_tiled_ternary: N grid overflow"))?;
-    let grid_y = i32::try_from((i64::from(m_rows) + 7) / 8)
+    let grid_y = i32::try_from((i64::from(m_rows) + 31) / 32)
         .map_err(|_| Exception::custom("bonsai_q2_qmm_tiled_ternary: M grid overflow"))?;
     let out_shape = [m_rows, n_rows];
     let cached = Q2_TILED_TERNARY_QMM_V1
