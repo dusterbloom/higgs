@@ -1901,6 +1901,15 @@ fn ternary_qmv_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("HIGGS_TERNARY_QMV").map_or(true, |v| v != "0"))
 }
 
+fn dense_fused_ternary_qmv_eligible(
+    bits: i32,
+    has_hadamard: bool,
+    enabled: bool,
+    row_count: i32,
+) -> bool {
+    bits == 2 && has_hadamard && enabled && row_count == 1
+}
+
 /// Whether the M<=8 MMA verify kernel (simdgroup_matrix<8,8>, affine-offset)
 /// replaces stock quantized_matmul for the ternary pack's batched projections.
 /// Default off; opt in with HIGGS_MMA_M8=1.
@@ -7891,6 +7900,11 @@ impl FfnBlock {
         };
 
         let gate_up_started = profiling.then(std::time::Instant::now);
+        let row_count: i32 = x
+            .shape()
+            .iter()
+            .take(x.ndim().saturating_sub(1))
+            .product();
         let fused_out = match gp.mode {
             crate::quant_mode::QuantMode::MxFp4 => crate::quant_mode::quantized_matmul(
                 x,
@@ -7907,9 +7921,15 @@ impl FfnBlock {
             crate::quant_mode::QuantMode::Affine => {
                 if gp.bits == 1 {
                     affine_q1_forward(x, fw, fs, fb, gp.group_size)?
-                } else if fused_hadamard.is_some() && ternary_qmv_enabled() {
+                } else if dense_fused_ternary_qmv_eligible(
+                    gp.bits,
+                    fused_hadamard.is_some(),
+                    ternary_qmv_enabled(),
+                    row_count,
+                ) {
                     // Ternary prism pack: fused gate_up on the rotated input,
-                    // no bias read. `x` is already hadamard-rotated above.
+                    // no bias read. Decode only: batched prefill must use QMM.
+                    // `x` is already hadamard-rotated above.
                     crate::metal_kernel::bonsai_q2_qmv_ternary(x, fw, fs, gp.group_size)?
                 } else if use_fused_gemv {
                     qgemv_4bit(x, fw, fs, fb, gp.group_size)?
@@ -29426,6 +29446,16 @@ mod tests {
             "Apple M5"
         )));
         assert!(!should_force_dense_decode_safe_defaults_for_brand(None));
+    }
+
+    #[test]
+    fn fused_ternary_qmv_is_decode_only() {
+        assert!(dense_fused_ternary_qmv_eligible(2, true, true, 1));
+        assert!(!dense_fused_ternary_qmv_eligible(2, true, true, 2));
+        assert!(!dense_fused_ternary_qmv_eligible(2, true, true, 1024));
+        assert!(!dense_fused_ternary_qmv_eligible(4, true, true, 1));
+        assert!(!dense_fused_ternary_qmv_eligible(2, false, true, 1));
+        assert!(!dense_fused_ternary_qmv_eligible(2, true, false, 1));
     }
 
     #[test]
