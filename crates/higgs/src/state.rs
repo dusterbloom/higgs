@@ -668,6 +668,27 @@ impl Engine {
         }
     }
 
+    pub fn reserve_retained_session(&self, session_id: u64) -> bool {
+        self.reserve_retained_session_replacing(session_id, &[])
+    }
+
+    pub fn reserve_retained_session_replacing(
+        &self,
+        session_id: u64,
+        retired_session_ids: &[u64],
+    ) -> bool {
+        match self {
+            Self::Simple(engine) => {
+                engine.reserve_retained_session_replacing(session_id, retired_session_ids)
+            }
+            Self::Batch(_) => false,
+            #[cfg(test)]
+            Self::Stub(stub) => {
+                matches!(stub.name(), "seed-binding" | "rotated-seed" | "drop-target")
+            }
+        }
+    }
+
     /// Confirm an idle-eviction lease only when the requested retained session exists.
     pub fn lease_retained_session(&self, session_id: u64, ttl_seconds: u32) -> bool {
         match self {
@@ -1725,6 +1746,20 @@ fn build_capacity_facts_from_measurements(
     if model_cfg.max_context_tokens == 0 {
         return Err("max_context_tokens must be greater than zero".to_owned());
     }
+    let legacy_retained_tokens = u64::try_from(model_cfg.kv_max_session_tokens)
+        .map_err(|_| "retained-session token ceiling overflows u64".to_owned())?;
+    let output_reserve = u64::from(config.server.max_tokens);
+    let retained_session_tokens = if legacy_retained_tokens == 0 {
+        0
+    } else if let Some(tokens) = legacy_retained_tokens.checked_sub(output_reserve) {
+        tokens
+    } else {
+        cache_capabilities.retained_sessions = false;
+        0
+    };
+    if legacy_retained_tokens > 0 && retained_session_tokens == 0 {
+        cache_capabilities.retained_sessions = false;
+    }
     let (retained_fixed_bytes_per_session, retained_bytes_per_token) =
         retained_session_geometry(resolved, model_cfg, cache_capabilities)?;
     if retained_bytes_per_token == 0 {
@@ -1734,9 +1769,7 @@ fn build_capacity_facts_from_measurements(
         model: name.to_owned(),
         model_fingerprint: identity.fingerprint,
         architectural_max_tokens,
-        retained_session_tokens: u64::try_from(model_cfg.kv_max_session_tokens)
-            .map_err(|_| "retained-session token ceiling overflows u64".to_owned())?
-            .saturating_sub(u64::from(config.server.max_tokens)),
+        retained_session_tokens,
         retained_bytes_ceiling: u64::try_from(model_cfg.kv_max_retained_bytes)
             .map_err(|_| "retained byte ceiling overflows u64".to_owned())?,
         guaranteed_retained_sessions: if cache_capabilities.retained_sessions {
@@ -1855,10 +1888,24 @@ impl AppState {
         revision: &str,
         epoch: u64,
     ) -> bool {
+        self.claim_retention_seed_replacing(model, session_id, revision, epoch, &[])
+    }
+
+    pub fn claim_retention_seed_replacing(
+        &self,
+        model: &str,
+        session_id: u64,
+        revision: &str,
+        epoch: u64,
+        retired_session_ids: &[u64],
+    ) -> bool {
         let mut bindings = self
             .retention_bindings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for retired_session_id in retired_session_ids {
+            bindings.remove(&(model.to_owned(), *retired_session_id));
+        }
         let key = (model.to_owned(), session_id);
         if bindings.contains_key(&key)
             || bindings.keys().any(|(bound_model, _)| bound_model == model)
@@ -2192,5 +2239,36 @@ mod tests {
         assert!(!facts.cache_capabilities.retained_sessions);
         assert_eq!(facts.guaranteed_retained_sessions, 0);
         assert_eq!(facts.retained_bytes_per_token, 0);
+    }
+
+    #[test]
+    fn legacy_token_cap_consumed_by_output_reserve_disables_retention() {
+        let model = tempfile::tempdir().unwrap();
+        std::fs::write(
+            model.path().join("config.json"),
+            br#"{"max_position_embeddings":8192,"num_hidden_layers":8,"num_key_value_heads":4,"hidden_size":1024,"num_attention_heads":8}"#,
+        )
+        .unwrap();
+        let mut model_config = ModelConfig::default();
+        model_config.kv_max_session_tokens = 1024;
+        let mut config = HiggsConfig::default();
+        config.server.max_tokens = 1024;
+
+        let facts = build_capacity_facts_from_measurements(
+            "model",
+            model.path(),
+            &model_config,
+            &config,
+            ModelContentIdentity {
+                fingerprint: "sha256:legacy-cap".to_owned(),
+                artifact_bytes: 1,
+            },
+            crate::capacity::CacheCapabilities::SIMPLE,
+        )
+        .unwrap();
+
+        assert!(!facts.cache_capabilities.retained_sessions);
+        assert_eq!(facts.guaranteed_retained_sessions, 0);
+        assert_eq!(facts.retained_session_tokens, 0);
     }
 }

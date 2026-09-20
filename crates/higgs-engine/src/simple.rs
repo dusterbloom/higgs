@@ -1334,8 +1334,9 @@ fn enforce_retained_byte_limit(
     result
 }
 
-fn stash_into_bounded_with_source(
+fn stash_into_bounded_with_reservations(
     map: &mut std::collections::HashMap<u64, RetainedKv>,
+    reserved: &std::collections::HashSet<u64>,
     session_id: u64,
     state: RetainedState,
     limits: RetentionLimits,
@@ -1356,9 +1357,10 @@ fn stash_into_bounded_with_source(
     {
         // Too large to retain — also forget any prior smaller cache for this id
         // so it can't linger past the cap. Not counted as an eviction.
-        if map
-            .remove(&session_id)
-            .is_some_and(|prior| prior.lease_expires_at.is_some_and(|expiry| expiry > now))
+        if !reserved.contains(&session_id)
+            && map
+                .remove(&session_id)
+                .is_some_and(|prior| prior.lease_expires_at.is_some_and(|expiry| expiry > now))
         {
             result.broken_leases = result.broken_leases.saturating_add(1);
         }
@@ -1387,15 +1389,10 @@ fn stash_into_bounded_with_source(
     while map.len() > cap || total_bytes(map) > limits.max_bytes {
         let unleased_oldest = map
             .iter()
-            .filter(|(_, kept)| kept.lease_expires_at.is_none())
+            .filter(|(id, kept)| !reserved.contains(id) && kept.lease_expires_at.is_none())
             .min_by_key(|(_, kept)| kept.last_used)
             .map(|(&id, _)| id);
-        let earliest_lease = map
-            .iter()
-            .filter_map(|(&id, kept)| kept.lease_expires_at.map(|expiry| (id, expiry)))
-            .min_by_key(|(_, expiry)| *expiry)
-            .map(|(id, _)| id);
-        match unleased_oldest.or(earliest_lease) {
+        match unleased_oldest {
             Some(id) => {
                 if map
                     .remove(&id)
@@ -1409,6 +1406,24 @@ fn stash_into_bounded_with_source(
         }
     }
     result
+}
+
+#[cfg(test)]
+fn stash_into_bounded_with_source(
+    map: &mut std::collections::HashMap<u64, RetainedKv>,
+    session_id: u64,
+    state: RetainedState,
+    limits: RetentionLimits,
+    source: RetainedPromptSource,
+) -> RetentionMutation {
+    stash_into_bounded_with_reservations(
+        map,
+        &std::collections::HashSet::new(),
+        session_id,
+        state,
+        limits,
+        source,
+    )
 }
 
 #[cfg(test)]
@@ -3012,6 +3027,9 @@ pub struct SimpleEngine {
     /// Retained per-conversation live KV caches for cache-resident multi-turn
     /// tool loops (suffix-only prefill across tool hops). Keyed by session id.
     retained: Mutex<std::collections::HashMap<u64, RetainedKv>>,
+    /// Retained slots claimed before seed inference. Reserved entries are an
+    /// ACK floor: ordinary LRU and live leases cannot displace them.
+    retained_reservations: Mutex<std::collections::HashSet<u64>>,
     /// Per-`session_id` serialization locks, held for the whole duration of a
     /// `generate_continued` call so two concurrent requests for the same
     /// conversation can never interleave their take/generate/stash of the
@@ -4010,6 +4028,7 @@ impl SimpleEngine {
             scheduler: Mutex::new(RoundRobinScheduler::new()),
             sessions: Mutex::new(std::collections::HashMap::new()),
             retained: Mutex::new(std::collections::HashMap::new()),
+            retained_reservations: Mutex::new(std::collections::HashSet::new()),
             session_locks: Mutex::new(std::collections::HashMap::new()),
             cache_metrics: CacheMetrics::default(),
             tokenizer,
@@ -4584,13 +4603,16 @@ impl SimpleEngine {
         let _session_guard = session_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let reservation_removed = lock_or_recover(&self.retained_reservations).remove(&session_id);
         lock_or_recover(&self.retained)
             .remove(&session_id)
             .is_some()
+            || reservation_removed
     }
 
     /// Best-effort release for the eager-reclaim endpoint; busy sessions stay retained.
     pub fn try_drop_retained_session(&self, session_id: u64) -> bool {
+        let reservation_removed = lock_or_recover(&self.retained_reservations).remove(&session_id);
         let session_lock = self.session_lock_for(session_id);
         let _session_guard = match session_lock.try_lock() {
             Ok(guard) => guard,
@@ -4600,6 +4622,48 @@ impl SimpleEngine {
         lock_or_recover(&self.retained)
             .remove(&session_id)
             .is_some()
+            || reservation_removed
+    }
+
+    /// Exclusively reserve the bounded retained pool before seed inference.
+    /// The current V2 contract advertises one guaranteed session, so a second
+    /// reservation fails closed instead of overcommitting live KV memory.
+    pub fn reserve_retained_session(&self, session_id: u64) -> bool {
+        self.reserve_retained_session_replacing(session_id, &[])
+    }
+
+    pub fn reserve_retained_session_replacing(
+        &self,
+        session_id: u64,
+        retired_session_ids: &[u64],
+    ) -> bool {
+        let session_lock = self.session_lock_for(session_id);
+        let _session_guard = session_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut reservations = lock_or_recover(&self.retained_reservations);
+        let mut retained = lock_or_recover(&self.retained);
+        for retired_session_id in retired_session_ids {
+            if *retired_session_id != session_id {
+                reservations.remove(retired_session_id);
+                retained.remove(retired_session_id);
+            }
+        }
+        if reservations.contains(&session_id) {
+            return true;
+        }
+        if !reservations.is_empty() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if retained.iter().any(|(&id, entry)| {
+            id != session_id && entry.lease_expires_at.is_some_and(|expiry| expiry > now)
+        }) {
+            return false;
+        }
+        retained.retain(|&id, _| id == session_id);
+        reservations.insert(session_id);
+        true
     }
 
     /// Evict retained caches idle longer than `ttl`; returns how many were
@@ -4799,9 +4863,11 @@ impl SimpleEngine {
                 token_len, effective_cap
             );
         }
+        let reservations = lock_or_recover(&self.retained_reservations);
         let mut retained = lock_or_recover(&self.retained);
-        let mutation = stash_into_bounded_with_source(
+        let mutation = stash_into_bounded_with_reservations(
             &mut retained,
+            &reservations,
             session_id,
             state,
             RetentionLimits {
@@ -4815,6 +4881,7 @@ impl SimpleEngine {
             .get(&session_id)
             .map_or(0, |entry| entry.state.estimated_bytes());
         drop(retained);
+        drop(reservations);
         record_request_retained_bytes(u64::try_from(retained_bytes).unwrap_or(u64::MAX));
         if mutation.oversized {
             self.cache_metrics
@@ -15876,6 +15943,7 @@ mod tests {
             scheduler: std::sync::Mutex::new(RoundRobinScheduler::new()),
             sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
             retained: std::sync::Mutex::new(std::collections::HashMap::new()),
+            retained_reservations: std::sync::Mutex::new(std::collections::HashSet::new()),
             session_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             cache_metrics: super::CacheMetrics::default(),
             tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
@@ -17884,7 +17952,7 @@ mod tests {
     }
 
     #[test]
-    fn hard_limits_evict_unleased_then_earliest_expiring_lease() {
+    fn hard_limits_evict_unleased_without_breaking_live_leases() {
         use super::{RetainedKv, RetentionLimits, stash_into_bounded};
         use crate::cache::paired::RetainedState;
         use std::collections::HashMap;
@@ -17926,21 +17994,12 @@ mod tests {
         assert!(!retained.contains_key(&2));
 
         retained.get_mut(&3).unwrap().lease_expires_at = Some(now + Duration::from_secs(90));
-        retained.insert(
-            4,
-            RetainedKv {
-                state: dummy(),
-                last_used: now,
-                lease_expires_at: Some(now + Duration::from_secs(120)),
-                source: super::RetainedPromptSource::GeneratedAssistantReplay,
-            },
-        );
         let all_leased = stash_into_bounded(&mut retained, 4, dummy(), limits);
         assert_eq!(all_leased.evicted, 1);
-        assert_eq!(all_leased.broken_leases, 1);
-        assert!(!retained.contains_key(&1), "earliest lease expires first");
+        assert_eq!(all_leased.broken_leases, 0);
+        assert!(retained.contains_key(&1));
         assert!(retained.contains_key(&3));
-        assert!(retained.contains_key(&4));
+        assert!(!retained.contains_key(&4));
     }
 
     #[test]
@@ -18130,6 +18189,77 @@ mod tests {
         let rejected = stash_into_bounded(&mut retained, 9, state(), oversized_limits);
         assert!(rejected.oversized);
         assert!(!retained.contains_key(&9));
+    }
+
+    #[test]
+    fn ordinary_lru_cannot_evict_a_reserved_or_leased_retained_session() {
+        use super::{RetainedKv, RetentionLimits, stash_into_bounded_with_reservations};
+        use std::collections::{HashMap, HashSet};
+        use std::time::{Duration, Instant};
+
+        let state = || {
+            crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+                validated_session_target(1),
+                vec![7],
+            )
+        };
+        let bytes = state().estimated_bytes();
+        let now = Instant::now();
+        let mut retained = HashMap::from([
+            (
+                1,
+                RetainedKv {
+                    state: state(),
+                    last_used: now - Duration::from_secs(10),
+                    lease_expires_at: None,
+                    source: super::RetainedPromptSource::GeneratedAssistantReplay,
+                },
+            ),
+            (
+                2,
+                RetainedKv {
+                    state: state(),
+                    last_used: now,
+                    lease_expires_at: Some(now + Duration::from_secs(60)),
+                    source: super::RetainedPromptSource::GeneratedAssistantReplay,
+                },
+            ),
+        ]);
+        let reserved = HashSet::from([1]);
+        let mutation = stash_into_bounded_with_reservations(
+            &mut retained,
+            &reserved,
+            3,
+            state(),
+            RetentionLimits {
+                max_sessions: 2,
+                max_session_tokens: 32_768,
+                max_bytes: bytes.saturating_mul(2),
+            },
+            super::RetainedPromptSource::GeneratedAssistantReplay,
+        );
+
+        assert_eq!(mutation.broken_leases, 0);
+        assert!(retained.contains_key(&1));
+        assert!(retained.contains_key(&2));
+        assert!(!retained.contains_key(&3));
+    }
+
+    #[test]
+    fn retained_capacity_reservation_reclaims_ordinary_cache_and_rotates_after_drop() {
+        let engine = session_cache_test_engine();
+        engine.stash_retained(
+            1,
+            crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+                validated_session_target(1),
+                vec![7],
+            ),
+            false,
+        );
+        assert!(engine.reserve_retained_session(2));
+        assert!(!lock_or_recover(&engine.retained).contains_key(&1));
+        assert!(!engine.reserve_retained_session(3));
+        assert!(engine.reserve_retained_session_replacing(3, &[2]));
     }
 
     /// Write a config.json file into the given directory with the provided JSON content.

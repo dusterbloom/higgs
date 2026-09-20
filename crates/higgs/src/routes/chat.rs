@@ -273,6 +273,7 @@ fn apply_required_retention(
 
 struct RetentionSeedClaim {
     state: SharedState,
+    engine: Arc<Engine>,
     model: String,
     session_id: u64,
     published: bool,
@@ -292,17 +293,19 @@ impl Drop for RetentionSeedClaim {
         if !self.published {
             self.state
                 .abort_retention_seed(&self.model, self.session_id);
+            self.engine.drop_retained_session(self.session_id);
         }
     }
 }
 
 fn validate_required_retention(
     state: &SharedState,
-    engine: &Engine,
+    engine: &Arc<Engine>,
     model: &str,
     prompt_tokens: &[u32],
     output_tokens: u32,
     retention: Option<&RetentionRequest>,
+    retired_session_ids: &[u64],
 ) -> Result<Option<RetentionSeedClaim>, ServerError> {
     let Some(retention) = retention else {
         return Ok(None);
@@ -356,19 +359,28 @@ fn validate_required_retention(
             if engine
                 .retained_session_receipt(retention.session_id)
                 .is_some()
-                || !state.claim_retention_seed(
-                    model,
-                    retention.session_id,
-                    &retention.contract_revision,
-                    retention.epoch,
-                )
+                || !engine
+                    .reserve_retained_session_replacing(retention.session_id, retired_session_ids)
             {
+                return Err(ServerError::Conflict(
+                    "retention seed conflicts with an existing session identity".to_owned(),
+                ));
+            }
+            if !state.claim_retention_seed_replacing(
+                model,
+                retention.session_id,
+                &retention.contract_revision,
+                retention.epoch,
+                retired_session_ids,
+            ) {
+                engine.drop_retained_session(retention.session_id);
                 return Err(ServerError::Conflict(
                     "retention seed conflicts with an existing session identity".to_owned(),
                 ));
             }
             Ok(Some(RetentionSeedClaim {
                 state: Arc::clone(state),
+                engine: Arc::clone(engine),
                 model: model.to_owned(),
                 session_id: retention.session_id,
                 published: false,
@@ -739,6 +751,8 @@ async fn chat_completions_non_streaming(
     );
     validate_prompt_limit(req.max_prompt_tokens, prompt_tokens.len())?;
     validate_session_lease_ttl(req.session_lease.map(|lease| lease.ttl_seconds))?;
+    let dropped_binding_ids =
+        retained_session_drop_ids(req.drop_session_id, req.drop_session_ids.as_deref());
     let seed_claim = validate_required_retention(
         &state,
         &engine,
@@ -746,6 +760,7 @@ async fn chat_completions_non_streaming(
         &prompt_tokens,
         max_tokens,
         required_retention.as_ref(),
+        &dropped_binding_ids,
     )?;
     // Multimodal requests: hand the raw decoded images to the engine, which
     // preprocesses them into a family-native `ImageBatch` (SimpleEngine under
@@ -814,10 +829,6 @@ async fn chat_completions_non_streaming(
     .await?;
     let assumed_retained_prefix = u64::try_from(retained_prefix).unwrap_or(u64::MAX);
     let watchdog = crate::capacity::request_watchdog(&state);
-    let mut dropped_binding_ids = req.drop_session_ids.clone().unwrap_or_default();
-    if let Some(session_id) = req.drop_session_id {
-        dropped_binding_ids.push(session_id);
-    }
     state.drop_retention_bindings(&req.model, &dropped_binding_ids);
     drop_requested_retained_sessions(
         Arc::clone(&engine),
@@ -1318,6 +1329,8 @@ async fn chat_completions_stream(
     );
     validate_prompt_limit(req.max_prompt_tokens, prompt_tokens.len())?;
     validate_session_lease_ttl(req.session_lease.map(|lease| lease.ttl_seconds))?;
+    let dropped_binding_ids =
+        retained_session_drop_ids(req.drop_session_id, req.drop_session_ids.as_deref());
     let seed_claim = validate_required_retention(
         &state,
         &engine,
@@ -1325,6 +1338,7 @@ async fn chat_completions_stream(
         &prompt_tokens,
         max_tokens,
         required_retention.as_ref(),
+        &dropped_binding_ids,
     )?;
     // Multimodal requests: hand the raw decoded images to the engine, which
     // preprocesses them into a family-native `ImageBatch` (SimpleEngine under
@@ -1395,10 +1409,6 @@ async fn chat_completions_stream(
             .await?;
     let assumed_retained_prefix = u64::try_from(retained_prefix).unwrap_or(u64::MAX);
     let watchdog = crate::capacity::request_watchdog(&state);
-    let mut dropped_binding_ids = req.drop_session_ids.clone().unwrap_or_default();
-    if let Some(session_id) = req.drop_session_id {
-        dropped_binding_ids.push(session_id);
-    }
     state.drop_retention_bindings(&model, &dropped_binding_ids);
     drop_requested_retained_sessions(
         Arc::clone(&engine),
@@ -2334,6 +2344,7 @@ pub async fn drop_sessions(
             "session drop requires a higgs-routed model".to_owned(),
         ));
     };
+    state.drop_retention_bindings(&req.model, &ids);
     let mut dropped = Vec::with_capacity(ids.len());
     for session_id in ids {
         dropped.push(serde_json::json!({
@@ -4298,7 +4309,7 @@ mod tests {
             Some(SessionCachePolicy::BestEffort)
         );
         let claim =
-            validate_required_retention(&state, &engine, model, &[1, 2], 1, Some(&retention))
+            validate_required_retention(&state, &engine, model, &[1, 2], 1, Some(&retention), &[])
                 .unwrap()
                 .unwrap();
         engine.test_retain_session_tokens(42, vec![1, 2]);
@@ -4307,18 +4318,52 @@ mod tests {
         let mut required = retention.clone();
         required.mode = crate::types::openai::RetentionMode::Required;
         assert!(
-            validate_required_retention(&state, &engine, model, &[1, 2, 3], 1, Some(&required))
-                .is_ok()
+            validate_required_retention(
+                &state,
+                &engine,
+                model,
+                &[1, 2, 3],
+                1,
+                Some(&required),
+                &[]
+            )
+            .is_ok()
         );
         required.epoch = 8;
         assert!(matches!(
-            validate_required_retention(&state, &engine, model, &[1, 2, 3], 1, Some(&required)),
+            validate_required_retention(
+                &state,
+                &engine,
+                model,
+                &[1, 2, 3],
+                1,
+                Some(&required),
+                &[]
+            ),
             Err(ServerError::RequiredRetentionUnavailable(_))
         ));
 
         seed.drop_session_id = Some(42);
         assert!(apply_required_retention(&mut seed).is_err());
         assert_eq!(engine.route_test_retained_sessions(), [42]);
+    }
+
+    #[test]
+    fn rotated_seed_atomically_retires_old_binding_before_claiming_slot() {
+        let model = "rotated-seed";
+        let (state, _) = crate::capacity::retained_contract_route_test_state(
+            model,
+            4 * 1024 * 1024 * 1024,
+            128 * 1024,
+        );
+        assert!(state.claim_retention_seed(model, 41, "old", 6));
+        assert!(state.publish_retention_seed(model, 41));
+
+        assert!(state.claim_retention_seed_replacing(model, 42, "new", 7, &[41]));
+        assert!(!state.retention_binding_matches(model, 41, "old", 6));
+        assert!(!state.retention_binding_matches(model, 42, "new", 7));
+        assert!(state.publish_retention_seed(model, 42));
+        assert!(state.retention_binding_matches(model, 42, "new", 7));
     }
 
     #[tokio::test]
@@ -4513,9 +4558,11 @@ mod tests {
             reqwest::Client::new(),
             None,
         ));
+        assert!(state.claim_retention_seed(engine_name, 7, "rev", 1));
+        assert!(state.publish_retention_seed(engine_name, 7));
         let app = axum::Router::new()
             .route("/v1/sessions/drop", axum::routing::post(drop_sessions))
-            .with_state(state);
+            .with_state(Arc::clone(&state));
 
         let response = app
             .clone()
@@ -4548,6 +4595,10 @@ mod tests {
         for entry in dropped {
             assert_eq!(entry["dropped"], false, "stub engine retains nothing");
         }
+        assert!(
+            !state.retention_binding_matches(engine_name, 7, "rev", 1),
+            "the HTTP drop must retire the contract binding synchronously"
+        );
 
         // Empty id list is a 400.
         let response = app
