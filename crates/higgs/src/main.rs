@@ -17,8 +17,8 @@ use higgs::{
         start_capacity_pressure_observer,
     },
     config::{
-        self, Cli, Commands, ConfigAction, HiggsConfig, MetricsLogConfig, ServeArgs, StartArgs,
-        StopArgs,
+        self, Cli, Commands, ConfigAction, HiggsConfig, MetricsLogConfig, ModelsAction,
+        RetentionAction, ServeArgs, StartArgs, StopArgs,
     },
     model_download, model_resolver,
     router::Router,
@@ -39,6 +39,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let profile = cli.profile.as_deref();
 
     match cli.command {
+        Commands::Models { ref action } => {
+            let ModelsAction::Scan { roots } = action;
+            let roots = if roots.is_empty() {
+                directories::BaseDirs::new().map_or_else(Vec::new, |d| {
+                    vec![
+                        d.home_dir().join(".cache/huggingface/hub"),
+                        d.home_dir().join(".cache/lm-studio/models"),
+                    ]
+                })
+            } else {
+                roots.clone()
+            };
+            for path in higgs::retention_plan::scan_roots(&roots) {
+                println!("{}", path.display());
+            }
+            Ok(())
+        }
+        Commands::Retention { ref action } => {
+            let RetentionAction::Plan {
+                model,
+                bytes,
+                tokens,
+                sessions,
+                output_tokens,
+            } = action;
+            let request = bytes.map_or_else(
+                || {
+                    higgs::retention_plan::BudgetRequest::Tokens(
+                        tokens.expect("clap requires tokens"),
+                    )
+                },
+                higgs::retention_plan::BudgetRequest::Bytes,
+            );
+            let plan =
+                higgs::retention_plan::plan_model(model, request, *sessions, *output_tokens)?;
+            println!(
+                "model: {}\nretained budget bytes: {}\nsafe prompt tokens: {}\noutput reserve tokens: {}\ntarget after compaction: {}\npersist: kv_max_retained_bytes = {}",
+                plan.model,
+                plan.retained_budget_bytes,
+                plan.safe_prompt_tokens,
+                plan.output_reserve_tokens,
+                plan.target_after_compaction_tokens,
+                plan.retained_budget_bytes
+            );
+            Ok(())
+        }
         Commands::Serve(ref args) => cmd_serve(&cli, args).await,
         Commands::Start(ref args) => {
             reject_legacy_start_flags(args)?;

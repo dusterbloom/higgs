@@ -7,4 +7,5 @@ mod proxy_e2e;
 mod request_validation;
 mod response_contract;
 mod retained_contract;
+mod retention_plan;
 mod router;

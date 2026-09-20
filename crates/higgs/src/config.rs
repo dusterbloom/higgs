@@ -60,6 +60,16 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Discover supported local model artifacts.
+    Models {
+        #[command(subcommand)]
+        action: ModelsAction,
+    },
+    /// Inspect retained-KV memory requirements.
+    Retention {
+        #[command(subcommand)]
+        action: RetentionAction,
+    },
     /// Start the server in the foreground.
     Serve(ServeArgs),
     /// Start the server as a background daemon from config or profile.
@@ -87,6 +97,30 @@ pub enum Commands {
     },
     /// Validate config, check model paths, and probe providers.
     Doctor(ServeArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ModelsAction {
+    Scan {
+        #[arg(long = "root")]
+        roots: Vec<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RetentionAction {
+    Plan {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, conflicts_with = "tokens", required_unless_present = "tokens")]
+        bytes: Option<u64>,
+        #[arg(long, conflicts_with = "bytes", required_unless_present = "bytes")]
+        tokens: Option<u64>,
+        #[arg(long, default_value_t = 1)]
+        sessions: u64,
+        #[arg(long, default_value_t = 4096)]
+        output_tokens: u64,
+    },
 }
 
 #[derive(Subcommand, Debug)]

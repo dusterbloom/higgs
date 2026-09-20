@@ -1,5 +1,9 @@
 # Configuration
 
+## Retained KV planning
+
+Use `higgs models scan` to list supported checkpoints in the standard Hugging Face and LM Studio caches. Use `higgs retention plan --model PATH --bytes BYTES` to inspect a byte budget, or `--tokens TOKENS` to resolve the minimum byte budget for a desired fast prompt. The command is read-only and prints the authoritative `kv_max_retained_bytes` recommendation.
+
 This document collects the full CLI, environment, and config-file reference for Higgs.
 
 ## Modes

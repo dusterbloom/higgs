@@ -12,6 +12,7 @@ pub mod metrics;
 pub mod metrics_log;
 pub mod model_download;
 pub mod model_resolver;
+pub mod retention_plan;
 pub mod proxy;
 pub(crate) mod reasoning;
 pub mod router;
