@@ -622,7 +622,7 @@ impl Engine {
             Self::Batch(_) => false,
             #[cfg(test)]
             Self::Stub(stub) => {
-                if stub.name() == "zero-prefix-accept" {
+                if matches!(stub.name(), "zero-prefix-accept" | "seed-binding") {
                     return stub.drop_session(session_id);
                 }
                 if stub.name() == "prompt-limit-mutation-spy" {
@@ -678,7 +678,7 @@ impl Engine {
             Self::Batch(_) => false,
             #[cfg(test)]
             Self::Stub(stub) => {
-                if stub.name() == "zero-prefix-accept" {
+                if matches!(stub.name(), "zero-prefix-accept" | "seed-binding") {
                     return stub.lease_session(session_id, ttl_seconds);
                 }
                 if stub.name() == "prompt-limit-mutation-spy" {
@@ -694,7 +694,7 @@ impl Engine {
             Self::Simple(e) => e.retained_session_can_continue(session_id, prompt_tokens),
             Self::Batch(_) => false,
             #[cfg(test)]
-            Self::Stub(stub) => stub.name() == "raw-accept-worker-reject",
+            Self::Stub(stub) => matches!(stub.name(), "raw-accept-worker-reject" | "seed-binding"),
         }
     }
 
@@ -1713,7 +1713,7 @@ fn build_capacity_facts_from_measurements(
     model_cfg: &ModelConfig,
     config: &HiggsConfig,
     identity: ModelContentIdentity,
-    cache_capabilities: crate::capacity::CacheCapabilities,
+    mut cache_capabilities: crate::capacity::CacheCapabilities,
 ) -> Result<ModelCapacityFacts, String> {
     let model_json = std::fs::read(resolved.join("config.json"))
         .map_err(|error| format!("failed to read model config: {error}"))?;
@@ -1727,16 +1727,23 @@ fn build_capacity_facts_from_measurements(
     }
     let (retained_fixed_bytes_per_session, retained_bytes_per_token) =
         retained_session_geometry(resolved, model_cfg, cache_capabilities)?;
+    if retained_bytes_per_token == 0 {
+        cache_capabilities.retained_sessions = false;
+    }
     Ok(ModelCapacityFacts {
         model: name.to_owned(),
         model_fingerprint: identity.fingerprint,
         architectural_max_tokens,
         retained_session_tokens: u64::try_from(model_cfg.kv_max_session_tokens)
-            .map_err(|_| "retained-session token ceiling overflows u64".to_owned())?,
+            .map_err(|_| "retained-session token ceiling overflows u64".to_owned())?
+            .saturating_sub(u64::from(config.server.max_tokens)),
         retained_bytes_ceiling: u64::try_from(model_cfg.kv_max_retained_bytes)
             .map_err(|_| "retained byte ceiling overflows u64".to_owned())?,
-        guaranteed_retained_sessions: u64::try_from(model_cfg.kv_max_sessions)
-            .map_err(|_| "retained-session count overflows u64".to_owned())?,
+        guaranteed_retained_sessions: if cache_capabilities.retained_sessions {
+            1
+        } else {
+            0
+        },
         retained_fixed_bytes_per_session,
         retained_bytes_per_token,
         prefix_cache_bytes_ceiling: u64::try_from(model_cfg.kv_cache_config().kv_cache_bytes)
@@ -1762,30 +1769,22 @@ fn retained_session_geometry(
         max_prompt_tokens: u64::MAX,
         max_chunk_tokens: u64::MAX,
     };
-    let target =
-        higgs_engine::EngineCostDescription::runtime_from_model_dir(model, 0, 0, transient)
-            .ok_or_else(|| "model lacks retained-cache geometry".to_owned())?;
     let draft_path = model_cfg
         .draft_model
         .as_deref()
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HIGGS_DFLASH_PATH").map(PathBuf::from));
-    let draft = draft_path
-        .as_deref()
-        .map(|path| {
-            higgs_engine::EngineCostDescription::runtime_from_model_dir(path, 0, 0, transient)
-                .ok_or_else(|| "draft model lacks retained-cache geometry".to_owned())
-        })
-        .transpose()?;
-    let fixed = target
-        .fixed_live_session_bytes
-        .checked_add(draft.map_or(0, |cost| cost.fixed_live_session_bytes))
-        .ok_or_else(|| "retained fixed-byte geometry overflows u64".to_owned())?;
-    let per_token = target
-        .persistent_bytes_per_token
-        .checked_add(draft.map_or(0, |cost| cost.persistent_bytes_per_token))
-        .ok_or_else(|| "retained per-token geometry overflows u64".to_owned())?;
-    Ok((fixed, per_token))
+    let Some(cost) = higgs_engine::EngineCostDescription::runtime_pair_from_model_dirs(
+        model,
+        draft_path.as_deref(),
+        transient,
+    ) else {
+        return Ok((0, 0));
+    };
+    Ok((
+        cost.fixed_live_session_bytes,
+        cost.persistent_bytes_per_token,
+    ))
 }
 
 fn config_u64(config: &serde_json::Value, key: &str) -> Option<u64> {
@@ -1812,6 +1811,8 @@ pub struct AppState {
     pub metrics: Option<Arc<MetricsStore>>,
     /// Sole process-wide authority for local-model capacity and lifecycle state.
     pub capacity: Arc<CapacityRegistry>,
+    retention_bindings:
+        std::sync::Mutex<std::collections::HashMap<(String, u64), (String, u64, bool)>>,
 }
 
 impl AppState {
@@ -1843,6 +1844,73 @@ impl AppState {
             http_client,
             metrics,
             capacity,
+            retention_bindings: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub fn claim_retention_seed(
+        &self,
+        model: &str,
+        session_id: u64,
+        revision: &str,
+        epoch: u64,
+    ) -> bool {
+        let mut bindings = self
+            .retention_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (model.to_owned(), session_id);
+        if bindings.contains_key(&key)
+            || bindings.keys().any(|(bound_model, _)| bound_model == model)
+        {
+            return false;
+        }
+        bindings.insert(key, (revision.to_owned(), epoch, false));
+        true
+    }
+
+    pub fn publish_retention_seed(&self, model: &str, session_id: u64) -> bool {
+        let mut bindings = self
+            .retention_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(binding) = bindings.get_mut(&(model.to_owned(), session_id)) else {
+            return false;
+        };
+        binding.2 = true;
+        true
+    }
+
+    pub fn abort_retention_seed(&self, model: &str, session_id: u64) {
+        self.retention_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(model.to_owned(), session_id));
+    }
+
+    pub fn retention_binding_matches(
+        &self,
+        model: &str,
+        session_id: u64,
+        revision: &str,
+        epoch: u64,
+    ) -> bool {
+        self.retention_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(model.to_owned(), session_id))
+            .is_some_and(|(bound_revision, bound_epoch, published)| {
+                *published && bound_revision == revision && *bound_epoch == epoch
+            })
+    }
+
+    pub fn drop_retention_bindings(&self, model: &str, session_ids: &[u64]) {
+        let mut bindings = self
+            .retention_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for session_id in session_ids {
+            bindings.remove(&(model.to_owned(), *session_id));
         }
     }
 }
@@ -2097,6 +2165,32 @@ mod tests {
         assert_eq!(facts.prefix_cache_bytes_ceiling, 1_073_741_824);
         assert_eq!(facts.retained_bytes_ceiling, 2_147_483_648);
         assert_eq!(facts.guaranteed_retained_sessions, 1);
+        assert_eq!(facts.retained_session_tokens, 28_672);
         assert!(facts.retained_bytes_per_token > 0);
+    }
+
+    #[test]
+    fn unknown_retained_geometry_disables_only_retention_capability() {
+        let model = tempfile::tempdir().unwrap();
+        std::fs::write(
+            model.path().join("config.json"),
+            br#"{"max_position_embeddings":8192,"num_hidden_layers":8}"#,
+        )
+        .unwrap();
+        let facts = build_capacity_facts_from_measurements(
+            "stateless-model",
+            model.path(),
+            &ModelConfig::default(),
+            &HiggsConfig::default(),
+            ModelContentIdentity {
+                fingerprint: "sha256:unknown-geometry".to_owned(),
+                artifact_bytes: 1,
+            },
+            crate::capacity::CacheCapabilities::SIMPLE,
+        )
+        .expect("unsupported retained geometry must not fail stateless model registration");
+        assert!(!facts.cache_capabilities.retained_sessions);
+        assert_eq!(facts.guaranteed_retained_sessions, 0);
+        assert_eq!(facts.retained_bytes_per_token, 0);
     }
 }

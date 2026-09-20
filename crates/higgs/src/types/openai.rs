@@ -131,6 +131,7 @@ pub struct RetentionRequest {
 #[serde(rename_all = "snake_case")]
 pub enum RetentionMode {
     Required,
+    Seed,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]

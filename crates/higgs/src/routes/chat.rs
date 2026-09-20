@@ -253,14 +253,47 @@ fn apply_required_retention(
     };
     if req.session_id.is_some_and(|id| id != retention.session_id)
         || req.session_cache_policy == Some(SessionCachePolicy::BestEffort)
+        || req.drop_session_id == Some(retention.session_id)
+        || req
+            .drop_session_ids
+            .as_deref()
+            .is_some_and(|ids| ids.contains(&retention.session_id))
     {
         return Err(ServerError::BadRequest(
             "retention conflicts with legacy session controls".to_owned(),
         ));
     }
     req.session_id = Some(retention.session_id);
-    req.session_cache_policy = Some(SessionCachePolicy::RequireContinuation);
+    req.session_cache_policy = Some(match retention.mode {
+        crate::types::openai::RetentionMode::Required => SessionCachePolicy::RequireContinuation,
+        crate::types::openai::RetentionMode::Seed => SessionCachePolicy::BestEffort,
+    });
     Ok(Some(retention))
+}
+
+struct RetentionSeedClaim {
+    state: SharedState,
+    model: String,
+    session_id: u64,
+    published: bool,
+}
+
+impl RetentionSeedClaim {
+    fn publish(mut self) -> bool {
+        self.published = self
+            .state
+            .publish_retention_seed(&self.model, self.session_id);
+        self.published
+    }
+}
+
+impl Drop for RetentionSeedClaim {
+    fn drop(&mut self) {
+        if !self.published {
+            self.state
+                .abort_retention_seed(&self.model, self.session_id);
+        }
+    }
 }
 
 fn validate_required_retention(
@@ -270,9 +303,9 @@ fn validate_required_retention(
     prompt_tokens: &[u32],
     output_tokens: u32,
     retention: Option<&RetentionRequest>,
-) -> Result<(), ServerError> {
+) -> Result<Option<RetentionSeedClaim>, ServerError> {
     let Some(retention) = retention else {
-        return Ok(());
+        return Ok(None);
     };
     let error_context = crate::error::RetentionErrorContext {
         contract_revision: retention.contract_revision.clone(),
@@ -283,24 +316,65 @@ fn validate_required_retention(
         .capacity
         .fast_session_contract(model)
         .map_err(|_| ServerError::RetentionCompactionRequired(error_context.clone()))?;
-    contract
-        .admit_required(
+    let admission = match retention.mode {
+        crate::types::openai::RetentionMode::Required => contract.admit_required(
             &retention.contract_revision,
             u64::try_from(prompt_tokens.len()).unwrap_or(u64::MAX),
             u64::from(output_tokens),
-        )
-        .map_err(|error| match error {
-            crate::capacity::RequiredRetentionAdmissionError::StaleContract => {
-                ServerError::StaleRetentionContract(error_context.clone())
+        ),
+        crate::types::openai::RetentionMode::Seed => contract.admit_seed(
+            &retention.contract_revision,
+            u64::try_from(prompt_tokens.len()).unwrap_or(u64::MAX),
+            u64::from(output_tokens),
+        ),
+    };
+    admission.map_err(|error| match error {
+        crate::capacity::RequiredRetentionAdmissionError::StaleContract => {
+            ServerError::StaleRetentionContract(error_context.clone())
+        }
+        crate::capacity::RequiredRetentionAdmissionError::CompactionRequired => {
+            ServerError::RetentionCompactionRequired(error_context.clone())
+        }
+    })?;
+    match retention.mode {
+        crate::types::openai::RetentionMode::Required => {
+            if !state.retention_binding_matches(
+                model,
+                retention.session_id,
+                &retention.contract_revision,
+                retention.epoch,
+            ) || !engine.retained_session_can_continue(retention.session_id, prompt_tokens)
+            {
+                return Err(ServerError::RequiredRetentionUnavailable(error_context));
             }
-            crate::capacity::RequiredRetentionAdmissionError::CompactionRequired => {
-                ServerError::RetentionCompactionRequired(error_context.clone())
+            if !engine.lease_retained_session(retention.session_id, 300) {
+                return Err(ServerError::RequiredRetentionUnavailable(error_context));
             }
-        })?;
-    if !engine.retained_session_can_continue(retention.session_id, prompt_tokens) {
-        return Err(ServerError::RequiredRetentionUnavailable(error_context));
+            Ok(None)
+        }
+        crate::types::openai::RetentionMode::Seed => {
+            if engine
+                .retained_session_receipt(retention.session_id)
+                .is_some()
+                || !state.claim_retention_seed(
+                    model,
+                    retention.session_id,
+                    &retention.contract_revision,
+                    retention.epoch,
+                )
+            {
+                return Err(ServerError::Conflict(
+                    "retention seed conflicts with an existing session identity".to_owned(),
+                ));
+            }
+            Ok(Some(RetentionSeedClaim {
+                state: Arc::clone(state),
+                model: model.to_owned(),
+                session_id: retention.session_id,
+                published: false,
+            }))
+        }
     }
-    Ok(())
 }
 
 fn map_session_engine_error(error: higgs_engine::error::EngineError) -> ServerError {
@@ -665,7 +739,7 @@ async fn chat_completions_non_streaming(
     );
     validate_prompt_limit(req.max_prompt_tokens, prompt_tokens.len())?;
     validate_session_lease_ttl(req.session_lease.map(|lease| lease.ttl_seconds))?;
-    validate_required_retention(
+    let seed_claim = validate_required_retention(
         &state,
         &engine,
         &req.model,
@@ -710,6 +784,15 @@ async fn chat_completions_non_streaming(
         want_logprobs,
         !stop_sequences.is_empty(),
     );
+    if required_retention.as_ref().is_some_and(|retention| {
+        retention.mode == crate::types::openai::RetentionMode::Seed
+            && session_id != Some(retention.session_id)
+    }) {
+        return Err(ServerError::BadRequest(
+            "retention seed is incompatible with request features that disable exact sessions"
+                .to_owned(),
+        ));
+    }
     if continuation_policy == SessionContinuationPolicy::RequireContinuation && session_id.is_none()
     {
         engine.record_required_continuation_miss();
@@ -731,6 +814,11 @@ async fn chat_completions_non_streaming(
     .await?;
     let assumed_retained_prefix = u64::try_from(retained_prefix).unwrap_or(u64::MAX);
     let watchdog = crate::capacity::request_watchdog(&state);
+    let mut dropped_binding_ids = req.drop_session_ids.clone().unwrap_or_default();
+    if let Some(session_id) = req.drop_session_id {
+        dropped_binding_ids.push(session_id);
+    }
+    state.drop_retention_bindings(&req.model, &dropped_binding_ids);
     drop_requested_retained_sessions(
         Arc::clone(&engine),
         req.drop_session_id,
@@ -779,7 +867,10 @@ async fn chat_completions_non_streaming(
             engine
                 .retained_session_receipt(sid)
                 .map(|(tokens, bytes)| RetentionReceipt {
-                    outcome: "retained_exact",
+                    outcome: match retention.mode {
+                        crate::types::openai::RetentionMode::Seed => "seeded",
+                        crate::types::openai::RetentionMode::Required => "continued",
+                    },
                     session_id: sid,
                     epoch: retention.epoch,
                     retained_tokens: u64::try_from(tokens).unwrap_or(u64::MAX),
@@ -787,6 +878,35 @@ async fn chat_completions_non_streaming(
                     contract_revision: retention.contract_revision.clone(),
                 })
         });
+        if retention_receipt.is_none() {
+            if let Some(retention) = required_retention.as_ref() {
+                return Err(ServerError::RequiredRetentionUnavailable(
+                    crate::error::RetentionErrorContext {
+                        contract_revision: retention.contract_revision.clone(),
+                        session_id: retention.session_id,
+                        epoch: retention.epoch,
+                    },
+                ));
+            }
+        }
+        if let Some(seed_claim) = seed_claim {
+            if !engine.lease_retained_session(sid, 300) {
+                return Err(ServerError::RequiredRetentionUnavailable(
+                    crate::error::RetentionErrorContext {
+                        contract_revision: required_retention
+                            .as_ref()
+                            .map_or_else(String::new, |value| value.contract_revision.clone()),
+                        session_id: sid,
+                        epoch: required_retention.as_ref().map_or(0, |value| value.epoch),
+                    },
+                ));
+            }
+            if !seed_claim.publish() {
+                return Err(ServerError::Conflict(
+                    "retention seed publication lost its identity reservation".to_owned(),
+                ));
+            }
+        }
         return build_session_response(
             &req.model,
             &request_id,
@@ -1198,7 +1318,7 @@ async fn chat_completions_stream(
     );
     validate_prompt_limit(req.max_prompt_tokens, prompt_tokens.len())?;
     validate_session_lease_ttl(req.session_lease.map(|lease| lease.ttl_seconds))?;
-    validate_required_retention(
+    let seed_claim = validate_required_retention(
         &state,
         &engine,
         &req.model,
@@ -1248,6 +1368,15 @@ async fn chat_completions_stream(
         want_logprobs,
         !stop_sequences.is_empty(),
     );
+    if required_retention.as_ref().is_some_and(|retention| {
+        retention.mode == crate::types::openai::RetentionMode::Seed
+            && stream_session_id != Some(retention.session_id)
+    }) {
+        return Err(ServerError::BadRequest(
+            "retention seed is incompatible with request features that disable exact sessions"
+                .to_owned(),
+        ));
+    }
     if continuation_policy == SessionContinuationPolicy::RequireContinuation
         && stream_session_id.is_none()
     {
@@ -1266,6 +1395,11 @@ async fn chat_completions_stream(
             .await?;
     let assumed_retained_prefix = u64::try_from(retained_prefix).unwrap_or(u64::MAX);
     let watchdog = crate::capacity::request_watchdog(&state);
+    let mut dropped_binding_ids = req.drop_session_ids.clone().unwrap_or_default();
+    if let Some(session_id) = req.drop_session_id {
+        dropped_binding_ids.push(session_id);
+    }
+    state.drop_retention_bindings(&model, &dropped_binding_ids);
     drop_requested_retained_sessions(
         Arc::clone(&engine),
         req.drop_session_id,
@@ -1301,23 +1435,41 @@ async fn chat_completions_stream(
         let messages_c = messages.clone();
         let pflash_policy_c = pflash_policy.clone();
         tokio::task::spawn_blocking(move || {
-            let result = crate::capacity::run_reserved_generation(reservation, watchdog, || {
-                worker_engine.generate_session_routed_streaming_with_thinking(
-                    sid,
-                    &prompt_tokens,
-                    &messages_c,
-                    prompt_tools_c.as_deref(),
-                    max_tokens,
-                    &sampling,
-                    &tx,
-                    thinking_enabled_stream,
-                    tool_payload,
-                    &pflash_policy_c,
-                    continuation_policy,
-                    acceptance,
-                    assumed_retained_prefix,
-                )
-            });
+            let mut result =
+                crate::capacity::run_reserved_generation(reservation, watchdog, || {
+                    worker_engine.generate_session_routed_streaming_with_thinking(
+                        sid,
+                        &prompt_tokens,
+                        &messages_c,
+                        prompt_tools_c.as_deref(),
+                        max_tokens,
+                        &sampling,
+                        &tx,
+                        thinking_enabled_stream,
+                        tool_payload,
+                        &pflash_policy_c,
+                        continuation_policy,
+                        acceptance,
+                        assumed_retained_prefix,
+                    )
+                });
+            if result.is_ok() {
+                if let Some(seed_claim) = seed_claim {
+                    if worker_engine.retained_session_receipt(sid).is_some() {
+                        if !worker_engine.lease_retained_session(sid, 300) || !seed_claim.publish()
+                        {
+                            result = Err(higgs_engine::error::EngineError::Generation(
+                                "retention seed publication lost its identity reservation"
+                                    .to_owned(),
+                            ));
+                        }
+                    } else {
+                        result = Err(higgs_engine::error::EngineError::Generation(
+                            "retention seed completed without exact publication".to_owned(),
+                        ));
+                    }
+                }
+            }
             match &result {
                 Ok(()) => {}
                 Err(higgs_engine::error::EngineError::Cancelled) => {
@@ -1361,6 +1513,15 @@ async fn chat_completions_stream(
         match acceptance_rx.await {
             Ok(Ok(())) => {}
             Ok(Err(session_id)) => {
+                if let Some(retention) = required_retention.as_ref() {
+                    return Err(ServerError::RequiredRetentionUnavailable(
+                        crate::error::RetentionErrorContext {
+                            contract_revision: retention.contract_revision.clone(),
+                            session_id: retention.session_id,
+                            epoch: retention.epoch,
+                        },
+                    ));
+                }
                 return Err(ServerError::RetainedSessionUnavailable(session_id));
             }
             Err(_) => {
@@ -1739,13 +1900,47 @@ async fn chat_completions_stream(
         }
 
         // Emit final chunk with usage only when explicitly requested.
-        if include_usage {
+        if include_usage || required_retention.is_some() {
+            let retention_receipt = required_retention.as_ref().and_then(|retention| {
+                stream_session_id.and_then(|session_id| {
+                    engine.retained_session_receipt(session_id).map(|(tokens, bytes)| {
+                        RetentionReceipt {
+                            outcome: match retention.mode {
+                                crate::types::openai::RetentionMode::Seed => "seeded",
+                                crate::types::openai::RetentionMode::Required => "continued",
+                            },
+                            session_id,
+                            epoch: retention.epoch,
+                            retained_tokens: u64::try_from(tokens).unwrap_or(u64::MAX),
+                            retained_bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+                            contract_revision: retention.contract_revision.clone(),
+                        }
+                    })
+                })
+            });
+            if let Some(retention) = required_retention.as_ref() {
+                if retention_receipt.is_none() {
+                    let json = serde_json::json!({
+                        "error": {
+                            "message": format!("Retained session {} is unavailable for required continuation", retention.session_id),
+                            "type": "conflict",
+                            "code": "retained_session_unavailable",
+                            "contractRevision": retention.contract_revision,
+                            "sessionId": retention.session_id,
+                            "epoch": retention.epoch,
+                        }
+                    });
+                    yield Ok(Event::default().data(json.to_string()));
+                    return;
+                }
+            }
             let usage = CompletionUsage::new(
                 prompt_token_count,
                 output_token_count,
                 cached_prompt_tokens,
             )
-            .with_session_lease_active(lease_active);
+            .with_session_lease_active(lease_active)
+            .with_retention_receipt(retention_receipt);
             match writer.write_usage(&usage) {
                 Ok(json) => yield Ok(Event::default().data(json)),
                 Err(e) => tracing::error!(error = %e, "Failed to serialize usage chunk"),
@@ -4078,6 +4273,52 @@ mod tests {
         assert_eq!(engine.route_test_retained_sessions(), [42]);
         assert!(engine.route_test_mutation_sequence().is_empty());
         assert_eq!(state.capacity.active_reservation_count(model), 0);
+    }
+
+    #[test]
+    fn seed_claim_binds_revision_session_and_epoch_and_rejects_self_drop() {
+        let model = "seed-binding";
+        let (state, engine) = crate::capacity::retained_contract_route_test_state(
+            model,
+            4 * 1024 * 1024 * 1024,
+            128 * 1024,
+        );
+        let revision = state
+            .capacity
+            .fast_session_contract(model)
+            .unwrap()
+            .contract_revision()
+            .to_owned();
+        let mut seed: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":model,"messages":[],"retention":{"mode":"seed","sessionId":42,"epoch":7,"contractRevision":revision}
+        })).unwrap();
+        let retention = apply_required_retention(&mut seed).unwrap().unwrap();
+        assert_eq!(
+            seed.session_cache_policy,
+            Some(SessionCachePolicy::BestEffort)
+        );
+        let claim =
+            validate_required_retention(&state, &engine, model, &[1, 2], 1, Some(&retention))
+                .unwrap()
+                .unwrap();
+        engine.test_retain_session_tokens(42, vec![1, 2]);
+        assert!(claim.publish());
+
+        let mut required = retention.clone();
+        required.mode = crate::types::openai::RetentionMode::Required;
+        assert!(
+            validate_required_retention(&state, &engine, model, &[1, 2, 3], 1, Some(&required))
+                .is_ok()
+        );
+        required.epoch = 8;
+        assert!(matches!(
+            validate_required_retention(&state, &engine, model, &[1, 2, 3], 1, Some(&required)),
+            Err(ServerError::RequiredRetentionUnavailable(_))
+        ));
+
+        seed.drop_session_id = Some(42);
+        assert!(apply_required_retention(&mut seed).is_err());
+        assert_eq!(engine.route_test_retained_sessions(), [42]);
     }
 
     #[tokio::test]

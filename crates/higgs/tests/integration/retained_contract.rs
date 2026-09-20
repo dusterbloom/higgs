@@ -84,7 +84,7 @@ fn retention_receipt_is_additive_and_absent_for_stateless_usage() {
     assert!(stateless.get("higgs_retention").is_none());
 
     let retained = CompletionUsage::new(8, 2, 8).with_retention_receipt(Some(RetentionReceipt {
-        outcome: "retained_exact",
+        outcome: "seeded",
         session_id: 42,
         epoch: 7,
         retained_tokens: 10,
@@ -92,10 +92,37 @@ fn retention_receipt_is_additive_and_absent_for_stateless_usage() {
         contract_revision: "boot:3:sha256:model".to_owned(),
     }));
     let json = serde_json::to_value(retained).unwrap();
-    assert_eq!(json["higgs_retention"]["outcome"], "retained_exact");
+    assert_eq!(json["higgs_retention"]["outcome"], "seeded");
     assert_eq!(json["higgs_retention"]["retainedBytes"], 1_310_720);
     assert_eq!(
         json["higgs_retention"]["contractRevision"],
         "boot:3:sha256:model"
     );
+}
+
+#[test]
+fn seed_is_bounded_by_compaction_target_while_required_uses_fast_wall() {
+    let contract = FastSessionContractV2::new(inputs(128 * 1024)).unwrap();
+    assert!(
+        contract
+            .admit_seed(
+                contract.contract_revision(),
+                contract.target_after_compaction_tokens(),
+                contract.max_output_tokens()
+            )
+            .is_ok()
+    );
+    assert_eq!(
+        contract.admit_seed(
+            contract.contract_revision(),
+            contract.target_after_compaction_tokens() + 1,
+            1
+        ),
+        Err(RequiredRetentionAdmissionError::CompactionRequired)
+    );
+
+    let seed: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model":"model","messages":[],"retention":{"mode":"seed","sessionId":99,"epoch":8,"contractRevision":"boot:3:sha256:model"}
+    })).unwrap();
+    assert_eq!(seed.retention.unwrap().mode, RetentionMode::Seed);
 }

@@ -1460,6 +1460,26 @@ fn retention_token_cap(
     }
 }
 
+const fn successor_fits_retention_token_cap(
+    prompt_tokens: usize,
+    output_reserve_tokens: u32,
+    max_session_tokens: usize,
+) -> bool {
+    max_session_tokens == 0
+        || prompt_tokens.saturating_add(output_reserve_tokens as usize) <= max_session_tokens
+}
+
+#[cfg(test)]
+mod successor_cap_tests {
+    use super::successor_fits_retention_token_cap;
+
+    #[test]
+    fn legacy_cap_reserves_the_full_requested_output() {
+        assert!(successor_fits_retention_token_cap(28_672, 4_096, 32_768));
+        assert!(!successor_fits_retention_token_cap(28_673, 4_096, 32_768));
+    }
+}
+
 const fn continued_dspark_cold_retry_allowed(
     continued: bool,
     retried_cold: bool,
@@ -1759,7 +1779,9 @@ fn dflash_propose_tokens(
         let tokens = drafter
             .propose_dflash2_tokens(&sliced, &logits, anchor)
             .map_err(EngineError::Mlx)?
-            .ok_or_else(|| EngineError::Generation("DFlash2 candidate selector missing".to_owned()))?;
+            .ok_or_else(|| {
+                EngineError::Generation("DFlash2 candidate selector missing".to_owned())
+            })?;
         return Ok(DflashProposal {
             tokens,
             host_tokens: None,
@@ -4499,9 +4521,9 @@ impl SimpleEngine {
 
     /// Exact retained state published for one session after generation.
     pub fn retained_session_receipt(&self, session_id: u64) -> Option<(usize, usize)> {
-        lock_or_recover(&self.retained).get(&session_id).map(|kept| {
-            (kept.state.tokens().len(), kept.state.estimated_bytes())
-        })
+        lock_or_recover(&self.retained)
+            .get(&session_id)
+            .map(|kept| (kept.state.tokens().len(), kept.state.estimated_bytes()))
     }
 
     fn retained_prompt_source_for_tokens(
@@ -6609,6 +6631,13 @@ impl SimpleEngine {
             tools,
             enable_thinking,
         );
+        if !successor_fits_retention_token_cap(
+            continued_prompt.len(),
+            max_tokens,
+            self.kv_cache_config.max_session_tokens,
+        ) {
+            return Err(EngineError::RetainedSessionUnavailable(session_id));
+        }
         self.reject_diverged_retained_session(
             session_id,
             retained_tokens.as_deref(),
@@ -6767,6 +6796,16 @@ impl SimpleEngine {
             tools,
             enable_thinking,
         );
+        if !successor_fits_retention_token_cap(
+            continued_prompt.len(),
+            max_tokens,
+            self.kv_cache_config.max_session_tokens,
+        ) {
+            if let Some(acceptance) = acceptance.take() {
+                let _ = acceptance.send(Err(session_id));
+            }
+            return Err(EngineError::RetainedSessionUnavailable(session_id));
+        }
         if let Err(error) = self.reject_diverged_retained_session(
             session_id,
             retained_tokens.as_deref(),

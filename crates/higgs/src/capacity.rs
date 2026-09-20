@@ -493,6 +493,23 @@ impl FastSessionContractV2 {
         }
         Ok(())
     }
+
+    pub fn admit_seed(
+        &self,
+        contract_revision: &str,
+        prompt_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<(), RequiredRetentionAdmissionError> {
+        if contract_revision != self.contract_revision {
+            return Err(RequiredRetentionAdmissionError::StaleContract);
+        }
+        if prompt_tokens > self.target_after_compaction_tokens
+            || output_tokens > self.max_output_tokens
+        {
+            return Err(RequiredRetentionAdmissionError::CompactionRequired);
+        }
+        Ok(())
+    }
 }
 
 fn deserialize_schema_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
@@ -889,8 +906,12 @@ mod fast_session_contract_tests {
             contract.guaranteed_fast_prompt_tokens() + contract.max_output_tokens()
                 <= contract.max_context_tokens()
         );
-        assert!(contract.target_after_compaction_tokens() < contract.soft_compaction_prompt_tokens());
-        assert!(contract.soft_compaction_prompt_tokens() < contract.guaranteed_fast_prompt_tokens());
+        assert!(
+            contract.target_after_compaction_tokens() < contract.soft_compaction_prompt_tokens()
+        );
+        assert!(
+            contract.soft_compaction_prompt_tokens() < contract.guaranteed_fast_prompt_tokens()
+        );
     }
 
     #[test]

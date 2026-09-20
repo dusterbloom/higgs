@@ -494,6 +494,51 @@ pub struct EngineCostDescription {
 }
 
 impl EngineCostDescription {
+    pub fn runtime_pair_from_model_dirs(
+        target: &Path,
+        draft: Option<&Path>,
+        transient_prefill: TransientPrefillEstimate,
+    ) -> Option<Self> {
+        let target = Self::runtime_from_model_dir(target, 0, 0, transient_prefill)?;
+        let Some(draft_path) = draft else {
+            return Some(target);
+        };
+        let draft = Self::runtime_from_model_dir(draft_path, 0, 0, transient_prefill)?;
+        Some(Self {
+            fixed_live_session_bytes: target
+                .fixed_live_session_bytes
+                .checked_add(draft.fixed_live_session_bytes)?,
+            persistent_bytes_per_token: target
+                .persistent_bytes_per_token
+                .checked_add(draft.persistent_bytes_per_token)?,
+            decode_workspace_bytes: target
+                .decode_workspace_bytes
+                .checked_add(draft.decode_workspace_bytes)?,
+            transient_prefill: TransientPrefillEstimate {
+                base_bytes: target
+                    .transient_prefill
+                    .base_bytes
+                    .checked_add(draft.transient_prefill.base_bytes)?,
+                bytes_per_prompt_token: target
+                    .transient_prefill
+                    .bytes_per_prompt_token
+                    .checked_add(draft.transient_prefill.bytes_per_prompt_token)?,
+                bytes_per_chunk_token: target
+                    .transient_prefill
+                    .bytes_per_chunk_token
+                    .checked_add(draft.transient_prefill.bytes_per_chunk_token)?,
+                max_prompt_tokens: target
+                    .transient_prefill
+                    .max_prompt_tokens
+                    .min(draft.transient_prefill.max_prompt_tokens),
+                max_chunk_tokens: target
+                    .transient_prefill
+                    .max_chunk_tokens
+                    .min(draft.transient_prefill.max_chunk_tokens),
+            },
+        })
+    }
+
     /// Charge the cache dtype produced by the selected model execution path.
     /// Native Escha projections return FP32 and promote subsequent K/V arrays;
     /// the checkpoint's BF16 label therefore cannot describe runtime KV storage.
@@ -556,8 +601,32 @@ impl EngineCostDescription {
             .checked_mul(head_dim)?
             .checked_mul(2)?;
 
+        let recurrent_layers = layers.checked_sub(dense_layers)?;
+        let recurrent_fixed_bytes = if recurrent_layers == 0 {
+            0
+        } else {
+            let key_heads = u64::try_from(metadata.linear_num_key_heads?).ok()?;
+            let value_heads = u64::try_from(metadata.linear_num_value_heads?).ok()?;
+            let key_dim = u64::try_from(metadata.linear_key_head_dim?).ok()?;
+            let value_dim = u64::try_from(metadata.linear_value_head_dim?).ok()?;
+            let kernel = u64::try_from(metadata.linear_conv_kernel_dim?).ok()?;
+            if key_heads == 0 || value_heads == 0 || key_dim == 0 || value_dim == 0 || kernel == 0 {
+                return None;
+            }
+            let conv_dim = key_heads
+                .checked_mul(key_dim)?
+                .checked_mul(2)?
+                .checked_add(value_heads.checked_mul(value_dim)?)?;
+            let conv_values = kernel.checked_sub(1)?.checked_mul(conv_dim)?;
+            let recurrent_values = value_heads.checked_mul(value_dim)?.checked_mul(key_dim)?;
+            recurrent_layers
+                .checked_mul(conv_values.checked_add(recurrent_values)?)?
+                .checked_mul(4)?
+        };
+
         Some(Self {
-            fixed_live_session_bytes,
+            fixed_live_session_bytes: fixed_live_session_bytes
+                .checked_add(recurrent_fixed_bytes)?,
             persistent_bytes_per_token,
             decode_workspace_bytes,
             transient_prefill,
@@ -691,6 +760,11 @@ struct ModelMetadata {
     num_key_value_heads: Option<usize>,
     head_dim: Option<usize>,
     full_attention_interval: Option<usize>,
+    linear_num_value_heads: Option<usize>,
+    linear_num_key_heads: Option<usize>,
+    linear_key_head_dim: Option<usize>,
+    linear_value_head_dim: Option<usize>,
+    linear_conv_kernel_dim: Option<usize>,
     max_position_embeddings: Option<usize>,
     weight_bytes: Option<u64>,
 }
@@ -718,6 +792,16 @@ impl ModelMetadata {
                 .and_then(|v| usize::try_from(v).ok()),
             head_dim: config_lookup_u64(&config, "head_dim").and_then(|v| usize::try_from(v).ok()),
             full_attention_interval: config_lookup_u64(&config, "full_attention_interval")
+                .and_then(|v| usize::try_from(v).ok()),
+            linear_num_value_heads: config_lookup_u64(&config, "linear_num_value_heads")
+                .and_then(|v| usize::try_from(v).ok()),
+            linear_num_key_heads: config_lookup_u64(&config, "linear_num_key_heads")
+                .and_then(|v| usize::try_from(v).ok()),
+            linear_key_head_dim: config_lookup_u64(&config, "linear_key_head_dim")
+                .and_then(|v| usize::try_from(v).ok()),
+            linear_value_head_dim: config_lookup_u64(&config, "linear_value_head_dim")
+                .and_then(|v| usize::try_from(v).ok()),
+            linear_conv_kernel_dim: config_lookup_u64(&config, "linear_conv_kernel_dim")
                 .and_then(|v| usize::try_from(v).ok()),
             max_position_embeddings: config_lookup_u64(&config, "max_position_embeddings")
                 .and_then(|v| usize::try_from(v).ok()),
@@ -2135,7 +2219,12 @@ mod tests {
                 "num_hidden_layers": 40,
                 "num_key_value_heads": 2,
                 "head_dim": 256,
-                "full_attention_interval": 4
+                "full_attention_interval": 4,
+                "linear_num_key_heads": 4,
+                "linear_num_value_heads": 4,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4
             }),
         )?;
         let transient = TransientPrefillEstimate {
@@ -2150,6 +2239,7 @@ mod tests {
             .expect("complete Escha cache geometry");
 
         assert_eq!(cost.persistent_bytes_per_token, 20_480);
+        assert!(cost.fixed_live_session_bytes > 0);
         assert_eq!(cost.persistent_bytes(49_152), Some(960 * 1024 * 1024));
         Ok(())
     }
@@ -2162,6 +2252,9 @@ mod tests {
             &serde_json::json!({
                 "model_type": "qwen3_5_moe", "num_hidden_layers": 40,
                 "num_key_value_heads": 2, "head_dim": 256, "full_attention_interval": 4,
+                "linear_num_key_heads": 4, "linear_num_value_heads": 4,
+                "linear_key_head_dim": 128, "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
                 "quantization_config": {"quant_method": "eschamoe"}
             }),
         )?;
