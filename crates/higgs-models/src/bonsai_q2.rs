@@ -369,6 +369,53 @@ mod tests {
         y
     }
 
+    fn qmm_error(actual: &mlx_rs::Array, reference: &[f32]) -> (f32, f32) {
+        let actual = actual.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        actual.eval().unwrap();
+        let got = actual.as_slice::<f32>();
+        assert_eq!(got.len(), reference.len());
+        let mut max_abs = 0.0_f32;
+        let mut error_sq = 0.0_f32;
+        let mut reference_sq = 0.0_f32;
+        for (&value, &want) in got.iter().zip(reference) {
+            let error = value - want;
+            max_abs = max_abs.max(error.abs());
+            error_sq += error * error;
+            reference_sq += want * want;
+            assert!(value.is_finite());
+        }
+        (max_abs, (error_sq / reference_sq.max(1.0e-12)).sqrt())
+    }
+
+    fn make_ternary_q2(out_features: usize, in_features: usize, seed: u64) -> PackedQ2Linear {
+        let packed_cols = in_features / WEIGHTS_PER_WORD;
+        let n_groups = in_features / GROUP_SIZE;
+        let mut st = seed;
+        let w_packed: Vec<u32> = (0..out_features * packed_cols)
+            .map(|_| {
+                let mut word = 0u32;
+                for shift in 0..16 {
+                    word |= (lcg(&mut st) % 3) << (2 * shift);
+                }
+                word
+            })
+            .collect();
+        let scales: Vec<f16> = (0..out_features * n_groups)
+            .map(|i| f16::from_f32(0.05 + 0.013 * ((i % 7) as f32)))
+            .collect();
+        let biases = scales
+            .iter()
+            .map(|&scale| f16::from_f32(-scale.to_f32()))
+            .collect();
+        PackedQ2Linear {
+            w_packed,
+            scales,
+            biases,
+            out_features,
+            in_features,
+        }
+    }
+
     /// Upload a PackedQ2Linear's packed weight, scales, and biases to MLX
     /// arrays matching the kernel's expected layout.
     fn upload_to_mlx(p: &PackedQ2Linear) -> (mlx_rs::Array, mlx_rs::Array, mlx_rs::Array) {
@@ -1091,6 +1138,289 @@ mod tests {
                 let stock = time(&mut || crate::quant_mode::quantized_matmul(&x, &w, &s, Some(&b), true, 128, 2, crate::quant_mode::QuantMode::Affine).unwrap());
                 let ternary = time(&mut || crate::metal_kernel::bonsai_q2_qmm_ternary(&x, &w, &s, GROUP_SIZE as i32).unwrap());
                 println!("QMM-PROBE {label} M={m}: stock={stock:.0}us ternary={ternary:.0}us speedup={:.2}x", stock / ternary);
+            }
+        }
+    }
+
+    #[test]
+    fn q2_qmm_tiled_ternary_matches_cpu_reference() {
+        let _exec = crate::mlx_exec::acquire();
+
+        for &(n, k, m, dtype, seed) in &[
+            (96usize, 256usize, 9usize, mlx_rs::Dtype::Float16, 0x1234_5678_u64),
+            (130, 4096, 17, mlx_rs::Dtype::Bfloat16, 0x5EED_5EED),
+            (5120, 5120, 31, mlx_rs::Dtype::Bfloat16, 0x0BAD_F00D),
+            (96, 17408, 33, mlx_rs::Dtype::Float16, 0xCAFEBABE),
+        ] {
+            let p = make_ternary_q2(n, k, seed);
+            let (w, s, b) = upload_to_mlx(&p);
+            let mut st = 0xABCD_EF01_u64;
+            let x_f32: Vec<f32> = (0..m * k)
+                .map(|_| (lcg(&mut st) as f32 / u32::MAX as f32).mul_add(2.0, -1.0))
+                .collect();
+            let x = mlx_rs::Array::from_slice(&x_f32, &[m as i32, k as i32])
+                .as_dtype(dtype)
+                .unwrap();
+            let x_ref: Vec<f32> = x_f32
+                .iter()
+                .map(|&value| match dtype {
+                    mlx_rs::Dtype::Float16 => half::f16::from_f32(value).to_f32(),
+                    mlx_rs::Dtype::Bfloat16 => half::bf16::from_f32(value).to_f32(),
+                    _ => unreachable!("oracle cases use fp16 or bf16"),
+                })
+                .collect();
+            let mut reference = Vec::with_capacity(m * n);
+            for row in 0..m {
+                reference.extend(dense_matvec_reference(&p, &x_ref[row * k..(row + 1) * k]));
+            }
+
+            let s_matched = s.as_dtype(dtype).unwrap();
+            let b_matched = b.as_dtype(dtype).unwrap();
+            let native_stock = crate::quant_mode::quantized_matmul(
+                &x,
+                &w,
+                &s,
+                Some(&b),
+                true,
+                GROUP_SIZE as i32,
+                2,
+                crate::quant_mode::QuantMode::Affine,
+            )
+            .unwrap();
+            let cast_matched_stock = crate::quant_mode::quantized_matmul(
+                &x,
+                &w,
+                &s_matched,
+                Some(&b_matched),
+                true,
+                GROUP_SIZE as i32,
+                2,
+                crate::quant_mode::QuantMode::Affine,
+            )
+            .unwrap();
+            let candidate = crate::metal_kernel::bonsai_q2_qmm_tiled_ternary(
+                &x,
+                &w,
+                &s,
+                GROUP_SIZE as i32,
+            )
+            .unwrap();
+
+            native_stock.eval().unwrap();
+            cast_matched_stock.eval().unwrap();
+            candidate.eval().unwrap();
+            assert_eq!(candidate.shape(), &[m as i32, n as i32]);
+            assert_eq!(candidate.dtype(), dtype);
+            let native_metrics = qmm_error(&native_stock, &reference);
+            let cast_metrics = qmm_error(&cast_matched_stock, &reference);
+            let candidate_metrics = qmm_error(&candidate, &reference);
+            println!(
+                "TILED-QMM-ORACLE N={n} K={k} M={m} dtype={dtype:?}: native_stock={native_metrics:?} cast_matched_stock={cast_metrics:?} candidate={candidate_metrics:?}"
+            );
+            assert!(
+                candidate_metrics.1 <= 1.0e-2,
+                "tiled qmm normalized RMS error {} at N={n} K={k} M={m}",
+                candidate_metrics.1
+            );
+            assert!(
+                candidate_metrics.0 <= 0.25,
+                "tiled qmm maximum absolute error {} at N={n} K={k} M={m}",
+                candidate_metrics.0
+            );
+        }
+    }
+
+    #[test]
+    fn q2_qmm_tiled_ternary_preserves_rank_and_checks_contracts() {
+        let _exec = crate::mlx_exec::acquire();
+        let n = 96usize;
+        let k = 256usize;
+        let p = make_ternary_q2(n, k, 0xD00D_F00D);
+        let (w, s, _) = upload_to_mlx(&p);
+        let values = vec![0.25_f32; 9 * k];
+        let x = mlx_rs::Array::from_slice(&values, &[1, 9, k as i32])
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        let rank3 = crate::metal_kernel::bonsai_q2_qmm_tiled_ternary(
+            &x,
+            &w,
+            &s,
+            GROUP_SIZE as i32,
+        )
+        .unwrap();
+        assert_eq!(rank3.shape(), &[1, 9, n as i32]);
+
+        let expect_contract_error = |result: Result<mlx_rs::Array, mlx_rs::error::Exception>,
+                                     contract: &str| {
+            let error = match result {
+                Ok(_) => panic!("expected {contract} validation error"),
+                Err(error) => error,
+            };
+            let message = error.to_string().to_lowercase();
+            assert!(
+                message.contains(contract),
+                "expected {contract} contract in error message, got: {message}"
+            );
+        };
+
+        expect_contract_error(
+            crate::metal_kernel::bonsai_q2_qmm_tiled_ternary(&x, &w, &s, 64),
+            "group",
+        );
+        let short_k_values = vec![0.25_f32; 9 * (k - 16)];
+        let short_k = mlx_rs::Array::from_slice(&short_k_values, &[9, (k - 16) as i32])
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        expect_contract_error(
+            crate::metal_kernel::bonsai_q2_qmm_tiled_ternary(
+                &short_k,
+                &w,
+                &s,
+                GROUP_SIZE as i32,
+            ),
+            "k",
+        );
+        let short_scales = mlx_rs::Array::from_slice(&p.scales[..n], &[n as i32, 1]);
+        let flat_x = mlx_rs::Array::from_slice(&values, &[9, k as i32])
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        expect_contract_error(
+            crate::metal_kernel::bonsai_q2_qmm_tiled_ternary(
+                &flat_x,
+                &w,
+                &short_scales,
+                GROUP_SIZE as i32,
+            ),
+            "scale",
+        );
+        let short_values = vec![0.25_f32; 8 * k];
+        let short_m = mlx_rs::Array::from_slice(&short_values, &[8, k as i32])
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        expect_contract_error(
+            crate::metal_kernel::bonsai_q2_qmm_tiled_ternary(
+                &short_m,
+                &w,
+                &s,
+                GROUP_SIZE as i32,
+            ),
+            "m",
+        );
+    }
+
+    #[allow(unsafe_code)]
+    fn time_qmm_with_peak_memory(f: &mut dyn FnMut() -> mlx_rs::Array) -> (f64, usize) {
+        use std::time::Instant;
+
+        let mut before = 0_usize;
+        unsafe {
+            assert_eq!(mlx_sys::mlx_get_active_memory(&mut before), 0);
+            assert_eq!(mlx_sys::mlx_reset_peak_memory(), 0);
+        }
+        let started = Instant::now();
+        let output = f();
+        output.eval().unwrap();
+        let elapsed_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+        drop(output);
+        let mut peak = 0_usize;
+        unsafe {
+            assert_eq!(mlx_sys::mlx_get_peak_memory(&mut peak), 0);
+        }
+        (elapsed_us, peak.saturating_sub(before))
+    }
+
+    fn median_us(values: &mut [f64]) -> f64 {
+        values.sort_by(f64::total_cmp);
+        values[values.len() / 2]
+    }
+
+    /// Compare tiled ternary QMM against stock MLX; scalar QMM is informational.
+    /// Run: cargo test --release -p higgs-models q2_qmm_tiled_ternary_go_no_go -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn q2_qmm_tiled_ternary_go_no_go() {
+        let _exec = crate::mlx_exec::acquire();
+        let mut st = 0x7654_3210_u64;
+
+        for &(n, k, label) in &[
+            (34_816usize, 5_120usize, "gate_up"),
+            (5_120, 17_408, "down"),
+        ] {
+            let p = make_ternary_q2(n, k, st);
+            st = st.wrapping_add(1);
+            let (w, s, b) = upload_to_mlx(&p);
+            for m in [16usize, 32, 64, 512, 1024] {
+                let x_values: Vec<f16> = (0..m * k)
+                    .map(|_| f16::from_f32((lcg(&mut st) as f32 / u32::MAX as f32).mul_add(0.2, -0.1)))
+                    .collect();
+                let x = mlx_rs::Array::from_slice(&x_values, &[m as i32, k as i32]);
+                let mut stock = || {
+                    crate::quant_mode::quantized_matmul(
+                        &x,
+                        &w,
+                        &s,
+                        Some(&b),
+                        true,
+                        GROUP_SIZE as i32,
+                        2,
+                        crate::quant_mode::QuantMode::Affine,
+                    )
+                    .unwrap()
+                };
+                let mut scalar = || {
+                    crate::metal_kernel::bonsai_q2_qmm_ternary(
+                        &x,
+                        &w,
+                        &s,
+                        GROUP_SIZE as i32,
+                    )
+                    .unwrap()
+                };
+                let mut candidate = || {
+                    crate::metal_kernel::bonsai_q2_qmm_tiled_ternary(
+                        &x,
+                        &w,
+                        &s,
+                        GROUP_SIZE as i32,
+                    )
+                    .unwrap()
+                };
+
+                stock().eval().unwrap();
+                scalar().eval().unwrap();
+                candidate().eval().unwrap();
+                let mut times = [Vec::with_capacity(7), Vec::with_capacity(7), Vec::with_capacity(7)];
+                let mut peaks = [0_usize; 3];
+                for round in 0..7 {
+                    let order = match round % 3 {
+                        0 => [0, 1, 2],
+                        1 => [1, 2, 0],
+                        _ => [2, 0, 1],
+                    };
+                    for path in order {
+                        let (elapsed, peak) = match path {
+                            0 => time_qmm_with_peak_memory(&mut stock),
+                            1 => time_qmm_with_peak_memory(&mut scalar),
+                            _ => time_qmm_with_peak_memory(&mut candidate),
+                        };
+                        times[path].push(elapsed);
+                        peaks[path] = peaks[path].max(peak);
+                    }
+                }
+                let medians = [
+                    median_us(&mut times[0]),
+                    median_us(&mut times[1]),
+                    median_us(&mut times[2]),
+                ];
+                println!(
+                    "TILED-QMM-BENCH {label} N={n} K={k} M={m}: stock={:.0}us/{}B scalar={:.0}us/{}B candidate={:.0}us/{}B candidate-vs-stock={:.2}x",
+                    medians[0], peaks[0], medians[1], peaks[1], medians[2], peaks[2], medians[0] / medians[2]
+                );
+                assert!(
+                    medians[2] < medians[0],
+                    "tiled QMM candidate did not beat stock MLX for {label} N={n} K={k} M={m}: candidate={}us stock={}us",
+                    medians[2], medians[0]
+                );
             }
         }
     }
