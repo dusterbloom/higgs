@@ -3963,6 +3963,83 @@ fn tq_profile_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("HIGGS_PROFILE").is_ok_and(|v| v == "1"))
 }
 
+#[derive(Default)]
+struct MlpProfileCounters {
+    input_ready_ns: u128,
+    input_ready_samples: u32,
+    hadamard_ns: u128,
+    hadamard_samples: u32,
+    gate_up_ns: u128,
+    gate_up_samples: u32,
+    swiglu_ns: u128,
+    swiglu_samples: u32,
+    down_ns: u128,
+    down_samples: u32,
+    residual_ns: u128,
+    residual_samples: u32,
+    fused_path_samples: u32,
+}
+
+thread_local! {
+    static PROF_MLP_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PROF_MLP_COUNTERS: RefCell<MlpProfileCounters> = RefCell::new(MlpProfileCounters::default());
+}
+
+fn with_mlp_profile_active<T>(f: impl FnOnce() -> Result<T, Exception>) -> Result<T, Exception> {
+    PROF_MLP_ACTIVE.with(|active| {
+        let previous = active.replace(true);
+        let result = f();
+        active.set(previous);
+        result
+    })
+}
+
+#[derive(Clone, Copy)]
+enum MlpProfileStage {
+    InputReady,
+    Hadamard,
+    GateUp,
+    SwiGlu,
+    Down,
+    Residual,
+}
+
+fn record_mlp_profile(stage: MlpProfileStage, elapsed: std::time::Duration) {
+    PROF_MLP_COUNTERS.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        match stage {
+            MlpProfileStage::InputReady => {
+                counters.input_ready_ns += elapsed.as_nanos();
+                counters.input_ready_samples += 1;
+            }
+            MlpProfileStage::Hadamard => {
+                counters.hadamard_ns += elapsed.as_nanos();
+                counters.hadamard_samples += 1;
+            }
+            MlpProfileStage::GateUp => {
+                counters.gate_up_ns += elapsed.as_nanos();
+                counters.gate_up_samples += 1;
+            }
+            MlpProfileStage::SwiGlu => {
+                counters.swiglu_ns += elapsed.as_nanos();
+                counters.swiglu_samples += 1;
+            }
+            MlpProfileStage::Down => {
+                counters.down_ns += elapsed.as_nanos();
+                counters.down_samples += 1;
+            }
+            MlpProfileStage::Residual => {
+                counters.residual_ns += elapsed.as_nanos();
+                counters.residual_samples += 1;
+            }
+        }
+    });
+}
+
+fn take_mlp_profile_counters() -> MlpProfileCounters {
+    PROF_MLP_COUNTERS.with(|counters| std::mem::take(&mut *counters.borrow_mut()))
+}
+
 fn make_compiled_gdn_decode() -> Box<CompiledGdnDecodeFn> {
     Box::new(compile_with_state(compiled_gdn_decode_step, true))
 }
@@ -7798,17 +7875,30 @@ impl FfnBlock {
             .as_ref()
             .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
 
+        let profiling = PROF_MLP_ACTIVE.with(std::cell::Cell::get);
+        if profiling {
+            PROF_MLP_COUNTERS.with(|counters| {
+                counters.borrow_mut().fused_path_samples += 1;
+            });
+        }
+
         // Prism packs: the packed halves live in the rotated basis, so the
         // shared input rotation is applied exactly once here (the fused qmm
         // bypasses QLinear::forward, which would rotate per projection).
         let rotated_input;
         let x = if let Some(block) = fused_hadamard {
+            let started = profiling.then(std::time::Instant::now);
             rotated_input = hadamard_rotate(x, block, &gp.signs, false)?;
+            if let Some(started) = started {
+                mlx_rs::transforms::eval([&rotated_input])?;
+                record_mlp_profile(MlpProfileStage::Hadamard, started.elapsed());
+            }
             &rotated_input
         } else {
             x
         };
 
+        let gate_up_started = profiling.then(std::time::Instant::now);
         let fused_out = match gp.mode {
             crate::quant_mode::QuantMode::MxFp4 => crate::quant_mode::quantized_matmul(
                 x,
@@ -7836,6 +7926,11 @@ impl FfnBlock {
                 }
             }
         };
+        if let Some(started) = gate_up_started {
+            mlx_rs::transforms::eval([&fused_out])?;
+            record_mlp_profile(MlpProfileStage::GateUp, started.elapsed());
+        }
+        let swiglu_started = profiling.then(std::time::Instant::now);
         let parts = fused_out.split_axis(&[*intermediate], Some(-1))?;
         let gate_out = parts
             .first()
@@ -7843,7 +7938,12 @@ impl FfnBlock {
         let up_out = parts
             .get(1)
             .ok_or_else(|| Exception::custom("fused split failed"))?;
-        silu_mul(gate_out, up_out)
+        let hidden = silu_mul(gate_out, up_out)?;
+        if let Some(started) = swiglu_started {
+            mlx_rs::transforms::eval([&hidden])?;
+            record_mlp_profile(MlpProfileStage::SwiGlu, started.elapsed());
+        }
+        Ok(hidden)
     }
 
     fn dense_hidden_mxfp4_fused_verify(&self, x: &Array) -> Result<Option<Array>, Exception> {
@@ -7979,6 +8079,13 @@ impl FfnBlock {
                 .ok_or_else(|| Exception::custom("dense gate_proj missing"))?;
 
             let seq_len = *x.shape().get(1).unwrap_or(&0);
+            let input_started = PROF_MLP_ACTIVE
+                .with(std::cell::Cell::get)
+                .then(std::time::Instant::now);
+            if let Some(started) = input_started {
+                mlx_rs::transforms::eval([x])?;
+                record_mlp_profile(MlpProfileStage::InputReady, started.elapsed());
+            }
             let use_decode_gemv = seq_len == 1 && gp.bits == 4;
             let gemv_mode = if std::env::var_os("HIGGS_QGEMV_FFN_MODE").is_none()
                 && should_force_dense_decode_safe_defaults_for_brand(apple_cpu_brand())
@@ -8009,6 +8116,9 @@ impl FfnBlock {
             };
 
             // Down projection
+            let down_started = PROF_MLP_ACTIVE
+                .with(std::cell::Cell::get)
+                .then(std::time::Instant::now);
             let out = if let Some(out) = self.dense_down_tg_lut4(&hidden)? {
                 Ok(out)
             } else {
@@ -8022,6 +8132,10 @@ impl FfnBlock {
                     dp.forward(&hidden)
                 }
             }?;
+            if let Some(started) = down_started {
+                mlx_rs::transforms::eval([&out])?;
+                record_mlp_profile(MlpProfileStage::Down, started.elapsed());
+            }
             if seq_len == 1 {
                 mlx_rs::stop_gradient(&out)
             } else {
@@ -9350,6 +9464,9 @@ impl Qwen3NextCausalLM {
         // barriers measure one full-attention cycle (leading GDN layers plus
         // first FA layer); the extrapolation is diagnostic, not wall time.
         let profiling = std::env::var("HIGGS_PROFILE").is_ok_and(|v| v == "1");
+        if profiling {
+            let _ = take_mlp_profile_counters();
+        }
         let prof_fa_layers = self.model.layers.iter().filter(|l| !l.is_linear).count();
         let prof_gdn_layers = self.model.layers.len() - prof_fa_layers;
         // Sample through the first FA layer so both layer types are covered for
@@ -9419,9 +9536,12 @@ impl Qwen3NextCausalLM {
                 mlx_rs::transforms::eval([&h2])?;
                 let attn_ns = start.elapsed().as_nanos();
                 let t1 = std::time::Instant::now();
-                let mlp_out = layer.mlp.forward(&normed_post)?;
+                let mlp_out = with_mlp_profile_active(|| layer.mlp.forward(&normed_post))?;
+                mlx_rs::transforms::eval([&mlp_out])?;
+                let residual_started = std::time::Instant::now();
                 h = h2.add(&mlp_out)?;
                 mlx_rs::transforms::eval([&h])?;
+                record_mlp_profile(MlpProfileStage::Residual, residual_started.elapsed());
                 let mlp_ns = t1.elapsed().as_nanos();
 
                 if layer.is_linear {
@@ -9495,6 +9615,38 @@ impl Qwen3NextCausalLM {
                     fa_mlp_ms = format!("{:.2}", fa_mlp_avg / 1e6),
                     est_total_ms = format!("{:.1}", est_total / 1e6),
                     "PROFILE: per-layer avg (×{prof_gdn_layers} GDN + ×{prof_fa_layers} FA)"
+                );
+            }
+        }
+
+        if profiling {
+            let mlp = take_mlp_profile_counters();
+            #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+            {
+                let avg_ms = |ns: u128, samples: u32| {
+                    if samples == 0 {
+                        0.0
+                    } else {
+                        ns as f64 / f64::from(samples) / 1e6
+                    }
+                };
+                tracing::info!(
+                    query_tokens = T,
+                    input_ready_ms =
+                        format!("{:.3}", avg_ms(mlp.input_ready_ns, mlp.input_ready_samples)),
+                    input_ready_samples = mlp.input_ready_samples,
+                    hadamard_ms = format!("{:.3}", avg_ms(mlp.hadamard_ns, mlp.hadamard_samples)),
+                    hadamard_samples = mlp.hadamard_samples,
+                    gate_up_ms = format!("{:.3}", avg_ms(mlp.gate_up_ns, mlp.gate_up_samples)),
+                    gate_up_samples = mlp.gate_up_samples,
+                    swiglu_ms = format!("{:.3}", avg_ms(mlp.swiglu_ns, mlp.swiglu_samples)),
+                    swiglu_samples = mlp.swiglu_samples,
+                    down_ms = format!("{:.3}", avg_ms(mlp.down_ns, mlp.down_samples)),
+                    down_samples = mlp.down_samples,
+                    residual_ms = format!("{:.3}", avg_ms(mlp.residual_ns, mlp.residual_samples)),
+                    residual_samples = mlp.residual_samples,
+                    fused_path_samples = mlp.fused_path_samples,
+                    "PROFILE-MLP: per-sampled-layer stage avg"
                 );
             }
         }
