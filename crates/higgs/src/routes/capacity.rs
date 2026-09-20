@@ -13,6 +13,8 @@ use crate::state::SharedState;
 #[derive(Deserialize)]
 pub struct CapacityQuery {
     model: String,
+    #[serde(default, rename = "schemaVersion")]
+    schema_version: Option<u32>,
 }
 
 /// Return fixed model context limits; pressure is advisory telemetry.
@@ -22,6 +24,12 @@ pub async fn capacity(
 ) -> Response {
     if query.model.trim().is_empty() {
         return ServerError::BadRequest("model must not be blank".to_owned()).into_response();
+    }
+    if query.schema_version == Some(2) {
+        return match state.capacity.fast_session_contract(&query.model) {
+            Ok(contract) => Json(contract).into_response(),
+            Err(error) => ServerError::Conflict(error.to_string()).into_response(),
+        };
     }
     match state.capacity.snapshot(&query.model) {
         Ok(snapshot) => Json(snapshot).into_response(),
@@ -126,6 +134,36 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body(response).await, expected);
+    }
+
+    #[tokio::test]
+    async fn v2_route_returns_only_the_validated_retained_byte_contract() {
+        let registry = CapacityRegistry::new(["escha".to_owned()]);
+        let mut facts = active_facts();
+        facts.retained_bytes_ceiling = 4 * GIB;
+        facts.retained_session_tokens = 96_576;
+        facts.guaranteed_retained_sessions = 1;
+        facts.retained_bytes_per_token = 128 * 1024;
+        registry.refresh_memory(MlxMemorySnapshot::default());
+        let ticket = registry.begin_registration("escha".to_owned()).unwrap();
+        registry.commit_active(ticket, facts).unwrap().publish();
+        let app = crate::build_router(state_with(registry), 30.0, None, 0, 1024, None);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/capacity?model=escha&schemaVersion=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body(response).await;
+        assert_eq!(json["schemaVersion"], 2);
+        assert_eq!(json["model"], "escha");
+        assert_eq!(json["retainedBudgetBytes"], 4 * GIB);
+        assert!(json.get("retainedSessionTokens").is_none());
     }
 
     #[tokio::test]

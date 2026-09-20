@@ -1,6 +1,7 @@
 use super::{
     CAPACITY_SCHEMA_VERSION, CapacityAvailability, CapacityBasis, CapacityExceededError,
-    CapacitySnapshot, CapacityUnavailableError, MemoryPressure, PressureObservation,
+    CapacitySnapshot, CapacityUnavailableError, FastSessionContractError,
+    FastSessionContractInputs, FastSessionContractV2, MemoryPressure, PressureObservation,
     PressureTelemetry, RequestCost,
 };
 use higgs_engine::MlxMemorySnapshot;
@@ -45,6 +46,9 @@ pub struct ModelCapacityFacts {
     pub architectural_max_tokens: u64,
     pub retained_session_tokens: u64,
     pub retained_bytes_ceiling: u64,
+    pub guaranteed_retained_sessions: u64,
+    pub retained_fixed_bytes_per_session: u64,
+    pub retained_bytes_per_token: u64,
     pub prefix_cache_bytes_ceiling: u64,
     pub cache_capabilities: CacheCapabilities,
     pub configured_total_token_ceiling: Option<u64>,
@@ -318,6 +322,42 @@ impl CapacityRegistry {
             .get(model)
             .ok_or_else(|| RegistrationError::UnknownModel(model.to_owned()))?;
         Ok(snapshot_for(&self.boot_id, model, entry, state.pressure))
+    }
+
+    pub fn fast_session_contract(
+        &self,
+        model: &str,
+    ) -> Result<FastSessionContractV2, FastSessionContractError> {
+        let state = self.lock();
+        let entry = state
+            .models
+            .get(model)
+            .and_then(|entry| entry.active.as_ref().map(|active| (entry, active)))
+            .filter(|(_, active)| active.published && !active.draining)
+            .ok_or(FastSessionContractError::InsufficientRetainedBudget)?;
+        let (model_entry, active) = entry;
+        let total = fixed_total(&active.facts);
+        let output = active
+            .facts
+            .configured_output_token_ceiling
+            .unwrap_or(4096)
+            .min(total);
+        FastSessionContractV2::new(FastSessionContractInputs {
+            contract_revision: format!(
+                "{}:{}:{}",
+                self.boot_id, model_entry.generation, active.facts.model_fingerprint
+            ),
+            model: model.to_owned(),
+            max_context_tokens: total,
+            max_output_tokens: output,
+            retained_budget_bytes: active.facts.retained_bytes_ceiling,
+            guaranteed_sessions: active.facts.guaranteed_retained_sessions,
+            legacy_token_upper_bound: active.facts.retained_session_tokens,
+            fixed_bytes_per_session: active.facts.retained_fixed_bytes_per_session,
+            conservative_bytes_per_token: active.facts.retained_bytes_per_token,
+            worst_case_turn_tokens: output,
+            target_after_compaction_tokens: output,
+        })
     }
     pub fn cache_allocations(&self) -> Vec<(String, u64, u64)> {
         self.cache_allocation_plan().allocations
@@ -695,9 +735,11 @@ fn snapshot_for(
         retained_session_tokens: active.map_or(0, |a| {
             if a.facts.cache_capabilities.retained_sessions {
                 if a.facts.retained_session_tokens == 0 {
-                    total
+                    total.saturating_sub(output)
                 } else {
-                    a.facts.retained_session_tokens.min(total)
+                    a.facts
+                        .retained_session_tokens
+                        .min(total.saturating_sub(output))
                 }
             } else {
                 0
@@ -1008,6 +1050,36 @@ mod fixed_contract_tests {
             registry.try_reserve_request("fixed", request),
             RequestReservationAttempt::Rejected(CapacityAdmissionError::Exceeded(_))
         ));
+    }
+
+    #[test]
+    fn registry_publishes_a_revision_bound_byte_derived_contract() {
+        let registry = CapacityRegistry::new(["fixed".to_owned()]);
+        let mut facts = super::super::route_test_facts(
+            "fixed",
+            MlxMemorySnapshot::default(),
+            64 * 1024,
+            65_536,
+        );
+        facts.retained_bytes_ceiling = 4 * 1024 * 1024 * 1024;
+        facts.retained_session_tokens = 96_576;
+        facts.guaranteed_retained_sessions = 1;
+        facts.retained_fixed_bytes_per_session = 0;
+        facts.retained_bytes_per_token = 64 * 1024;
+        facts.configured_output_token_ceiling = Some(4_096);
+        let ticket = registry.begin_registration("fixed".to_owned()).unwrap();
+        registry.commit_active(ticket, facts).unwrap().publish();
+
+        let contract = registry.fast_session_contract("fixed").unwrap();
+
+        assert_eq!(contract.max_context_tokens(), 65_536);
+        assert_eq!(contract.max_output_tokens(), 4_096);
+        assert_eq!(contract.guaranteed_fast_prompt_tokens(), 61_440);
+        assert!(
+            contract
+                .contract_revision()
+                .starts_with(&registry.boot_id())
+        );
     }
 }
 

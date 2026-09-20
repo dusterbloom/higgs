@@ -217,6 +217,12 @@ pub async fn create_message(
         .map_err(|e| ServerError::BadRequest(format!("Invalid request body: {e}")))?;
     request_metrics.set_requested_model(&req.model);
 
+    if let Some(retention) = req.retention.as_ref() {
+        return Err(ServerError::RetainedSessionUnavailable(
+            retention.session_id,
+        ));
+    }
+
     if req.messages.is_empty() {
         return Err(ServerError::BadRequest(
             "messages array must not be empty".to_owned(),

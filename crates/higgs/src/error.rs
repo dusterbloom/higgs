@@ -39,6 +39,12 @@ pub enum ServerError {
     #[error("Retained session {0} is unavailable for required continuation")]
     RetainedSessionUnavailable(u64),
 
+    #[error("Retained request requires compaction before inference")]
+    RetentionCompactionRequired,
+
+    #[error("Retention contract is stale")]
+    StaleRetentionContract,
+
     #[error("Model not found: {0}")]
     ModelNotFound(String),
 
@@ -117,6 +123,18 @@ impl ServerError {
                 "conflict",
                 format!("Retained session {session_id} is unavailable for required continuation"),
                 Some("retained_session_unavailable"),
+            ),
+            Self::RetentionCompactionRequired => (
+                StatusCode::CONFLICT,
+                "conflict",
+                "Retained request requires compaction before inference".to_owned(),
+                Some("retention_compaction_required"),
+            ),
+            Self::StaleRetentionContract => (
+                StatusCode::CONFLICT,
+                "conflict",
+                "Retention contract is stale".to_owned(),
+                Some("stale_retention_contract"),
             ),
             Self::ModelNotFound(model) => (
                 StatusCode::NOT_FOUND,

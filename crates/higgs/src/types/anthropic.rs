@@ -54,6 +54,10 @@ pub struct CreateMessageRequest {
     /// (including while streaming), else the built-in MTP head.
     #[serde(default)]
     pub speculation: Option<String>,
+    /// Higgs V2 exact-continuation extension. Anthropic-local retained
+    /// continuation is currently unavailable and therefore fails closed.
+    #[serde(default)]
+    pub retention: Option<crate::types::openai::RetentionRequest>,
 }
 
 /// Anthropic policy for whether the model may or must call a tool.

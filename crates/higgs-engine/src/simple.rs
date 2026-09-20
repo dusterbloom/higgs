@@ -4497,6 +4497,13 @@ impl SimpleEngine {
             })
     }
 
+    /// Exact retained state published for one session after generation.
+    pub fn retained_session_receipt(&self, session_id: u64) -> Option<(usize, usize)> {
+        lock_or_recover(&self.retained).get(&session_id).map(|kept| {
+            (kept.state.tokens().len(), kept.state.estimated_bytes())
+        })
+    }
+
     fn retained_prompt_source_for_tokens(
         &self,
         session_id: u64,

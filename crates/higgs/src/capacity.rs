@@ -123,7 +123,7 @@ fn ensure_route_test_capacity(state: &crate::state::SharedState, model: &str) {
 pub(crate) fn route_test_facts(
     model: &str,
     _memory: MlxMemorySnapshot,
-    _persistent_bytes_per_token: u64,
+    persistent_bytes_per_token: u64,
     token_ceiling: u64,
 ) -> ModelCapacityFacts {
     ModelCapacityFacts {
@@ -132,6 +132,9 @@ pub(crate) fn route_test_facts(
         architectural_max_tokens: 1_048_576,
         retained_session_tokens: 0,
         retained_bytes_ceiling: 0,
+        guaranteed_retained_sessions: 1,
+        retained_fixed_bytes_per_session: 0,
+        retained_bytes_per_token: persistent_bytes_per_token,
         prefix_cache_bytes_ceiling: 0,
         cache_capabilities: CacheCapabilities {
             retained_sessions: false,
@@ -251,6 +254,56 @@ pub(crate) fn suffix_charging_route_test_state(
     (state, engine)
 }
 
+#[cfg(test)]
+pub(crate) fn retained_contract_route_test_state(
+    model: &str,
+    retained_budget_bytes: u64,
+    retained_bytes_per_token: u64,
+) -> (
+    crate::state::SharedState,
+    std::sync::Arc<crate::state::Engine>,
+) {
+    use std::collections::HashMap;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let engine = std::sync::Arc::new(crate::state::Engine::test_stub(model));
+    let config = crate::config::HiggsConfig::default();
+    let router = crate::router::Router::from_config(
+        &config,
+        HashMap::from([(model.to_owned(), std::sync::Arc::clone(&engine))]),
+    )
+    .expect("test router");
+    let state = std::sync::Arc::new(crate::state::AppState::new(
+        router,
+        config,
+        reqwest::Client::new(),
+        None,
+    ));
+    state.capacity.refresh_memory(MlxMemorySnapshot {
+        active_bytes: GIB,
+        peak_bytes: GIB,
+        memory_limit_bytes: Some(64 * GIB),
+        metal_recommended_working_set_bytes: Some(64 * GIB),
+    });
+    let ticket = state
+        .capacity
+        .begin_registration(model.to_owned())
+        .expect("begin test registration");
+    let mut facts = route_test_facts(model, MlxMemorySnapshot::default(), 0, 65_536);
+    facts.cache_capabilities.retained_sessions = true;
+    facts.retained_session_tokens = 65_536;
+    facts.retained_bytes_ceiling = retained_budget_bytes;
+    facts.guaranteed_retained_sessions = 1;
+    facts.retained_bytes_per_token = retained_bytes_per_token;
+    facts.configured_output_token_ceiling = Some(4_096);
+    state
+        .capacity
+        .commit_active(ticket, facts)
+        .expect("commit test registration")
+        .publish();
+    (state, engine)
+}
+
 /// Arm the reservation's stop with the configured request-timeout watchdog
 /// and install it thread-locally for the worker's engine call. Engines
 /// observe it at every bounded prefill chunk and decode step; disconnect and
@@ -293,6 +346,154 @@ fn capacity_server_error(error: CapacityAdmissionError) -> crate::error::ServerE
 
 pub const CAPACITY_SCHEMA_VERSION: u32 = 1;
 pub const CAPACITY_RETRY_AFTER_MS: u64 = 5_000;
+
+/// Immutable inputs used to derive the retained-byte safety envelope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FastSessionContractInputs {
+    pub contract_revision: String,
+    pub model: String,
+    pub max_context_tokens: u64,
+    pub max_output_tokens: u64,
+    pub retained_budget_bytes: u64,
+    pub guaranteed_sessions: u64,
+    pub legacy_token_upper_bound: u64,
+    pub fixed_bytes_per_session: u64,
+    pub conservative_bytes_per_token: u64,
+    pub worst_case_turn_tokens: u64,
+    pub target_after_compaction_tokens: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum FastSessionContractError {
+    #[error("fast-session contract fields must be positive")]
+    NonPositive,
+    #[error("fast-session contract arithmetic overflowed")]
+    ArithmeticOverflow,
+    #[error("retained-byte budget cannot guarantee a compactable session")]
+    InsufficientRetainedBudget,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum RequiredRetentionAdmissionError {
+    #[error("retention contract is stale")]
+    StaleContract,
+    #[error("retained request requires compaction")]
+    CompactionRequired,
+}
+
+/// Validated V2 retained-byte contract. Private fields prevent contradictory
+/// wire values from being assembled independently.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FastSessionContractV2 {
+    schema_version: u32,
+    contract_revision: String,
+    model: String,
+    max_context_tokens: u64,
+    max_output_tokens: u64,
+    retained_budget_bytes: u64,
+    guaranteed_fast_prompt_tokens: u64,
+    soft_compaction_prompt_tokens: u64,
+    target_after_compaction_tokens: u64,
+    guaranteed_sessions: u64,
+}
+
+impl FastSessionContractV2 {
+    pub fn new(input: FastSessionContractInputs) -> Result<Self, FastSessionContractError> {
+        if input.contract_revision.is_empty()
+            || input.model.is_empty()
+            || input.max_context_tokens == 0
+            || input.max_output_tokens == 0
+            || input.retained_budget_bytes == 0
+            || input.guaranteed_sessions == 0
+            || input.conservative_bytes_per_token == 0
+            || input.worst_case_turn_tokens == 0
+            || input.target_after_compaction_tokens == 0
+        {
+            return Err(FastSessionContractError::NonPositive);
+        }
+        let per_session_bytes = input.retained_budget_bytes / input.guaranteed_sessions;
+        let output_bytes = input
+            .conservative_bytes_per_token
+            .checked_mul(input.max_output_tokens)
+            .ok_or(FastSessionContractError::ArithmeticOverflow)?;
+        let retained_tokens = per_session_bytes
+            .checked_sub(input.fixed_bytes_per_session)
+            .and_then(|bytes| bytes.checked_sub(output_bytes))
+            .ok_or(FastSessionContractError::InsufficientRetainedBudget)?
+            / input.conservative_bytes_per_token;
+        let context_prompt = input
+            .max_context_tokens
+            .checked_sub(input.max_output_tokens)
+            .ok_or(FastSessionContractError::InsufficientRetainedBudget)?;
+        let mut guaranteed = retained_tokens.min(context_prompt);
+        if input.legacy_token_upper_bound != 0 {
+            guaranteed = guaranteed.min(input.legacy_token_upper_bound);
+        }
+        let soft = guaranteed
+            .checked_sub(input.worst_case_turn_tokens)
+            .ok_or(FastSessionContractError::InsufficientRetainedBudget)?;
+        let target = input
+            .target_after_compaction_tokens
+            .min(soft.saturating_sub(1));
+        if target == 0 || target >= soft || soft >= guaranteed {
+            return Err(FastSessionContractError::InsufficientRetainedBudget);
+        }
+        Ok(Self {
+            schema_version: 2,
+            contract_revision: input.contract_revision,
+            model: input.model,
+            max_context_tokens: input.max_context_tokens,
+            max_output_tokens: input.max_output_tokens,
+            retained_budget_bytes: input.retained_budget_bytes,
+            guaranteed_fast_prompt_tokens: guaranteed,
+            soft_compaction_prompt_tokens: soft,
+            target_after_compaction_tokens: target,
+            guaranteed_sessions: input.guaranteed_sessions,
+        })
+    }
+
+    pub const fn max_context_tokens(&self) -> u64 {
+        self.max_context_tokens
+    }
+
+    pub const fn max_output_tokens(&self) -> u64 {
+        self.max_output_tokens
+    }
+
+    pub const fn guaranteed_fast_prompt_tokens(&self) -> u64 {
+        self.guaranteed_fast_prompt_tokens
+    }
+
+    pub const fn soft_compaction_prompt_tokens(&self) -> u64 {
+        self.soft_compaction_prompt_tokens
+    }
+
+    pub const fn target_after_compaction_tokens(&self) -> u64 {
+        self.target_after_compaction_tokens
+    }
+
+    pub fn contract_revision(&self) -> &str {
+        &self.contract_revision
+    }
+
+    pub fn admit_required(
+        &self,
+        contract_revision: &str,
+        prompt_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<(), RequiredRetentionAdmissionError> {
+        if contract_revision != self.contract_revision {
+            return Err(RequiredRetentionAdmissionError::StaleContract);
+        }
+        if prompt_tokens > self.guaranteed_fast_prompt_tokens
+            || output_tokens > self.max_output_tokens
+        {
+            return Err(RequiredRetentionAdmissionError::CompactionRequired);
+        }
+        Ok(())
+    }
+}
 
 fn deserialize_schema_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
 where
@@ -648,5 +849,66 @@ mod output_default_tests {
             resolve_output_tokens(&state, "output-default", 3000, Some(0), 32768),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod fast_session_contract_tests {
+    use super::{FastSessionContractInputs, FastSessionContractV2};
+
+    fn inputs(bytes_per_token: u64) -> FastSessionContractInputs {
+        FastSessionContractInputs {
+            contract_revision: "boot:7:sha256:model".to_owned(),
+            model: "model".to_owned(),
+            max_context_tokens: 65_536,
+            max_output_tokens: 4_096,
+            retained_budget_bytes: 4 * 1024 * 1024 * 1024,
+            guaranteed_sessions: 1,
+            legacy_token_upper_bound: 96_576,
+            fixed_bytes_per_session: 0,
+            conservative_bytes_per_token: bytes_per_token,
+            worst_case_turn_tokens: 4_096,
+            target_after_compaction_tokens: 4_096,
+        }
+    }
+
+    #[test]
+    fn rejects_a_contract_that_cannot_leave_soft_and_target_headroom() {
+        let mut input = inputs(1024 * 1024);
+        input.retained_budget_bytes = 8 * 1024 * 1024;
+
+        assert!(FastSessionContractV2::new(input).is_err());
+    }
+
+    #[test]
+    fn retained_guarantee_never_exceeds_the_safe_prompt_limit() {
+        let contract = FastSessionContractV2::new(inputs(64 * 1024)).unwrap();
+
+        assert!(contract.guaranteed_fast_prompt_tokens() <= 61_440);
+        assert!(
+            contract.guaranteed_fast_prompt_tokens() + contract.max_output_tokens()
+                <= contract.max_context_tokens()
+        );
+        assert!(contract.target_after_compaction_tokens() < contract.soft_compaction_prompt_tokens());
+        assert!(contract.soft_compaction_prompt_tokens() < contract.guaranteed_fast_prompt_tokens());
+    }
+
+    #[test]
+    fn same_byte_budget_derives_model_specific_prompt_limits() {
+        let cheap = FastSessionContractV2::new(inputs(64 * 1024)).unwrap();
+        let expensive = FastSessionContractV2::new(inputs(128 * 1024)).unwrap();
+
+        assert!(cheap.guaranteed_fast_prompt_tokens() > expensive.guaranteed_fast_prompt_tokens());
+    }
+
+    #[test]
+    fn serializes_the_v2_wire_contract_without_independent_v1_limits() {
+        let contract = FastSessionContractV2::new(inputs(128 * 1024)).unwrap();
+        let json = serde_json::to_value(contract).unwrap();
+
+        assert_eq!(json["schemaVersion"], 2);
+        assert_eq!(json["contractRevision"], "boot:7:sha256:model");
+        assert_eq!(json["retainedBudgetBytes"], 4 * 1024 * 1024 * 1024_u64);
+        assert!(json.get("retainedSessionTokens").is_none());
     }
 }

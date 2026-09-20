@@ -102,6 +102,9 @@ pub struct ChatCompletionRequest {
     /// Whether a missing retained continuation may cold-prefill.
     #[serde(default)]
     pub session_cache_policy: Option<SessionCachePolicy>,
+    /// V2 exact-continuation contract. Required mode never cold-prefills.
+    #[serde(default)]
+    pub retention: Option<RetentionRequest>,
     /// Optional Higgs extension: drop a retained per-session KV cache before
     /// serving this request. This is for logical session resets; it does not
     /// clear exact radix/disk prefix caches.
@@ -113,6 +116,21 @@ pub struct ChatCompletionRequest {
     /// the route.
     #[serde(default)]
     pub drop_session_ids: Option<Vec<u64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetentionRequest {
+    pub mode: RetentionMode,
+    pub session_id: u64,
+    pub epoch: u64,
+    pub contract_revision: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionMode {
+    Required,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -523,6 +541,20 @@ pub struct CompletionUsage {
     /// Higgs extension emitted as `1` only after a lease is confirmed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub higgs_session_lease_active: Option<u32>,
+    /// Higgs V2 exact-retention receipt. Absent for ordinary/stateless calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub higgs_retention: Option<RetentionReceipt>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionReceipt {
+    pub outcome: &'static str,
+    pub session_id: u64,
+    pub epoch: u64,
+    pub retained_tokens: u64,
+    pub retained_bytes: u64,
+    pub contract_revision: String,
 }
 
 impl CompletionUsage {
@@ -538,12 +570,19 @@ impl CompletionUsage {
             prompt_tokens_details: (cached_tokens > 0)
                 .then_some(PromptTokensDetails { cached_tokens }),
             higgs_session_lease_active: None,
+            higgs_retention: None,
         }
     }
 
     #[must_use]
     pub fn with_session_lease_active(mut self, active: bool) -> Self {
         self.higgs_session_lease_active = active.then_some(1);
+        self
+    }
+
+    #[must_use]
+    pub fn with_retention_receipt(mut self, receipt: Option<RetentionReceipt>) -> Self {
+        self.higgs_retention = receipt;
         self
     }
 }

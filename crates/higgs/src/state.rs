@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use higgs_engine::batch_engine::BatchEngine;
@@ -656,6 +656,15 @@ impl Engine {
             Self::Batch(_) => None,
             #[cfg(test)]
             Self::Stub(stub) => stub.retained_session_prefix_len(session_id, prompt_tokens),
+        }
+    }
+
+    pub fn retained_session_receipt(&self, session_id: u64) -> Option<(usize, usize)> {
+        match self {
+            Self::Simple(engine) => engine.retained_session_receipt(session_id),
+            Self::Batch(_) => None,
+            #[cfg(test)]
+            Self::Stub(_) => None,
         }
     }
 
@@ -1716,6 +1725,8 @@ fn build_capacity_facts_from_measurements(
     if model_cfg.max_context_tokens == 0 {
         return Err("max_context_tokens must be greater than zero".to_owned());
     }
+    let (retained_fixed_bytes_per_session, retained_bytes_per_token) =
+        retained_session_geometry(resolved, model_cfg, cache_capabilities)?;
     Ok(ModelCapacityFacts {
         model: name.to_owned(),
         model_fingerprint: identity.fingerprint,
@@ -1724,12 +1735,57 @@ fn build_capacity_facts_from_measurements(
             .map_err(|_| "retained-session token ceiling overflows u64".to_owned())?,
         retained_bytes_ceiling: u64::try_from(model_cfg.kv_max_retained_bytes)
             .map_err(|_| "retained byte ceiling overflows u64".to_owned())?,
+        guaranteed_retained_sessions: u64::try_from(model_cfg.kv_max_sessions)
+            .map_err(|_| "retained-session count overflows u64".to_owned())?,
+        retained_fixed_bytes_per_session,
+        retained_bytes_per_token,
         prefix_cache_bytes_ceiling: u64::try_from(model_cfg.kv_cache_config().kv_cache_bytes)
             .map_err(|_| "prefix-cache byte ceiling overflows u64".to_owned())?,
         cache_capabilities,
         configured_total_token_ceiling: Some(u64::from(model_cfg.max_context_tokens)),
         configured_output_token_ceiling: Some(u64::from(config.server.max_tokens)),
     })
+}
+
+fn retained_session_geometry(
+    model: &Path,
+    model_cfg: &ModelConfig,
+    cache_capabilities: crate::capacity::CacheCapabilities,
+) -> Result<(u64, u64), String> {
+    if !cache_capabilities.retained_sessions {
+        return Ok((0, 0));
+    }
+    let transient = higgs_engine::TransientPrefillEstimate {
+        base_bytes: 0,
+        bytes_per_prompt_token: 0,
+        bytes_per_chunk_token: 0,
+        max_prompt_tokens: u64::MAX,
+        max_chunk_tokens: u64::MAX,
+    };
+    let target =
+        higgs_engine::EngineCostDescription::runtime_from_model_dir(model, 0, 0, transient)
+            .ok_or_else(|| "model lacks retained-cache geometry".to_owned())?;
+    let draft_path = model_cfg
+        .draft_model
+        .as_deref()
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HIGGS_DFLASH_PATH").map(PathBuf::from));
+    let draft = draft_path
+        .as_deref()
+        .map(|path| {
+            higgs_engine::EngineCostDescription::runtime_from_model_dir(path, 0, 0, transient)
+                .ok_or_else(|| "draft model lacks retained-cache geometry".to_owned())
+        })
+        .transpose()?;
+    let fixed = target
+        .fixed_live_session_bytes
+        .checked_add(draft.map_or(0, |cost| cost.fixed_live_session_bytes))
+        .ok_or_else(|| "retained fixed-byte geometry overflows u64".to_owned())?;
+    let per_token = target
+        .persistent_bytes_per_token
+        .checked_add(draft.map_or(0, |cost| cost.persistent_bytes_per_token))
+        .ok_or_else(|| "retained per-token geometry overflows u64".to_owned())?;
+    Ok((fixed, per_token))
 }
 
 fn config_u64(config: &serde_json::Value, key: &str) -> Option<u64> {
@@ -2019,7 +2075,7 @@ mod tests {
         // An engine-supported architecture needs no KV cost-estimator geometry.
         std::fs::write(
             model.path().join("config.json"),
-            br#"{"max_position_embeddings":8192}"#,
+            br#"{"max_position_embeddings":8192,"num_hidden_layers":8,"num_key_value_heads":4,"hidden_size":1024,"num_attention_heads":8}"#,
         )
         .unwrap();
         let model_config = ModelConfig::default();
@@ -2040,5 +2096,7 @@ mod tests {
         assert_eq!(facts.configured_total_token_ceiling, Some(65_536));
         assert_eq!(facts.prefix_cache_bytes_ceiling, 1_073_741_824);
         assert_eq!(facts.retained_bytes_ceiling, 2_147_483_648);
+        assert_eq!(facts.guaranteed_retained_sessions, 1);
+        assert!(facts.retained_bytes_per_token > 0);
     }
 }

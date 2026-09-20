@@ -27,8 +27,9 @@ use crate::{
     types::openai::{
         ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessage, ChatCompletionRequest,
         ChatCompletionResponse, ChoiceLogprobs, CompletionUsage, ContentPart, MessageContent,
-        SessionCachePolicy, StopSequence, TokenLogprob, ToolCall, ToolCallDelta, ToolCallFunction,
-        ToolCallFunctionDelta, ToolChoice, ToolChoiceMode, TopLogprob, merge_repetition_penalty,
+        RetentionReceipt, RetentionRequest, SessionCachePolicy, StopSequence, TokenLogprob, ToolCall,
+        ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta, ToolChoice, ToolChoiceMode,
+        TopLogprob, merge_repetition_penalty,
     },
 };
 use higgs_models::SamplingParams;
@@ -242,6 +243,61 @@ fn continuation_policy(policy: Option<SessionCachePolicy>) -> SessionContinuatio
         SessionCachePolicy::BestEffort => SessionContinuationPolicy::BestEffort,
         SessionCachePolicy::RequireContinuation => SessionContinuationPolicy::RequireContinuation,
     }
+}
+
+fn apply_required_retention(
+    req: &mut ChatCompletionRequest,
+) -> Result<Option<RetentionRequest>, ServerError> {
+    let Some(retention) = req.retention.clone() else {
+        return Ok(None);
+    };
+    if req.session_id.is_some_and(|id| id != retention.session_id)
+        || req.session_cache_policy == Some(SessionCachePolicy::BestEffort)
+    {
+        return Err(ServerError::BadRequest(
+            "retention conflicts with legacy session controls".to_owned(),
+        ));
+    }
+    req.session_id = Some(retention.session_id);
+    req.session_cache_policy = Some(SessionCachePolicy::RequireContinuation);
+    Ok(Some(retention))
+}
+
+fn validate_required_retention(
+    state: &SharedState,
+    engine: &Engine,
+    model: &str,
+    prompt_tokens: &[u32],
+    output_tokens: u32,
+    retention: Option<&RetentionRequest>,
+) -> Result<(), ServerError> {
+    let Some(retention) = retention else {
+        return Ok(());
+    };
+    let contract = state
+        .capacity
+        .fast_session_contract(model)
+        .map_err(|_| ServerError::RetentionCompactionRequired)?;
+    contract
+        .admit_required(
+            &retention.contract_revision,
+            u64::try_from(prompt_tokens.len()).unwrap_or(u64::MAX),
+            u64::from(output_tokens),
+        )
+        .map_err(|error| match error {
+            crate::capacity::RequiredRetentionAdmissionError::StaleContract => {
+                ServerError::StaleRetentionContract
+            }
+            crate::capacity::RequiredRetentionAdmissionError::CompactionRequired => {
+                ServerError::RetentionCompactionRequired
+            }
+        })?;
+    if !engine.retained_session_can_continue(retention.session_id, prompt_tokens) {
+        return Err(ServerError::RetainedSessionUnavailable(
+            retention.session_id,
+        ));
+    }
+    Ok(())
 }
 
 fn map_session_engine_error(error: higgs_engine::error::EngineError) -> ServerError {
@@ -516,10 +572,11 @@ pub async fn chat_completions(
 #[allow(clippy::too_many_lines)]
 async fn chat_completions_non_streaming(
     state: SharedState,
-    req: ChatCompletionRequest,
+    mut req: ChatCompletionRequest,
     engine: Arc<Engine>,
     generation_defaults: GenerationDefaults,
 ) -> Result<ChatCompletionResponse, ServerError> {
+    let required_retention = apply_required_retention(&mut req)?;
     let max_tokens =
         resolved_max_tokens(&req, &generation_defaults, state.config.server.max_tokens);
     let prompt_mode = chat_prompt_mode(req.session_id, max_tokens);
@@ -584,6 +641,14 @@ async fn chat_completions_non_streaming(
     );
     validate_prompt_limit(req.max_prompt_tokens, prompt_tokens.len())?;
     validate_session_lease_ttl(req.session_lease.map(|lease| lease.ttl_seconds))?;
+    validate_required_retention(
+        &state,
+        &engine,
+        &req.model,
+        &prompt_tokens,
+        max_tokens,
+        required_retention.as_ref(),
+    )?;
     // Multimodal requests: hand the raw decoded images to the engine, which
     // preprocesses them into a family-native `ImageBatch` (SimpleEngine under
     // its model lock; BatchEngine inside its worker thread) and expands each
@@ -686,6 +751,18 @@ async fn chat_completions_non_streaming(
         .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
         .map_err(map_session_engine_error)?;
 
+        let retention_receipt = required_retention.as_ref().and_then(|retention| {
+            engine
+                .retained_session_receipt(sid)
+                .map(|(tokens, bytes)| RetentionReceipt {
+                    outcome: "retained_exact",
+                    session_id: sid,
+                    epoch: retention.epoch,
+                    retained_tokens: u64::try_from(tokens).unwrap_or(u64::MAX),
+                    retained_bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+                    contract_revision: retention.contract_revision.clone(),
+                })
+        });
         return build_session_response(
             &req.model,
             &request_id,
@@ -696,6 +773,7 @@ async fn chat_completions_non_streaming(
             lease_active,
             required_call,
             required_name.as_deref(),
+            retention_receipt,
         );
     } else {
         tokio::task::spawn_blocking(move || {
@@ -889,8 +967,11 @@ fn build_session_response(
     lease_active: bool,
     required_call: bool,
     required_name: Option<&str>,
+    retention_receipt: Option<RetentionReceipt>,
 ) -> Result<ChatCompletionResponse, ServerError> {
-    let usage = session_usage(&output).with_session_lease_active(lease_active);
+    let usage = session_usage(&output)
+        .with_session_lease_active(lease_active)
+        .with_retention_receipt(retention_receipt);
     let generation_finish_reason = output.finish_reason.clone();
     let output_text = output.text;
     // Same reasoning-tag handling as the normal path: the template opens
@@ -996,12 +1077,13 @@ fn session_usage(output: &higgs_engine::simple::SessionGeneration) -> Completion
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 async fn chat_completions_stream(
     state: SharedState,
-    req: ChatCompletionRequest,
+    mut req: ChatCompletionRequest,
     engine: Arc<Engine>,
     generation_defaults: GenerationDefaults,
     metrics: Option<Arc<MetricsStore>>,
     routing_method: crate::router::RoutingMethod,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>, ServerError> {
+    let required_retention = apply_required_retention(&mut req)?;
     let tool_choice = resolve_tool_choice(
         req.tool_choice.as_ref(),
         req.tools.as_deref(),
@@ -1092,6 +1174,14 @@ async fn chat_completions_stream(
     );
     validate_prompt_limit(req.max_prompt_tokens, prompt_tokens.len())?;
     validate_session_lease_ttl(req.session_lease.map(|lease| lease.ttl_seconds))?;
+    validate_required_retention(
+        &state,
+        &engine,
+        &req.model,
+        &prompt_tokens,
+        max_tokens,
+        required_retention.as_ref(),
+    )?;
     // Multimodal requests: hand the raw decoded images to the engine, which
     // preprocesses them into a family-native `ImageBatch` (SimpleEngine under
     // its model lock; BatchEngine inside its worker thread) and expands each
@@ -2751,6 +2841,7 @@ mod tests {
             false,
             true,
             None,
+            None,
         )
         .expect_err("session-routed required materialization must fail closed");
         assert!(matches!(
@@ -2871,7 +2962,7 @@ mod tests {
         };
 
         let response = build_session_response(
-            "model", "request", output, None, false, false, false, false, None,
+            "model", "request", output, None, false, false, false, false, None, None,
         )
         .unwrap();
         assert_eq!(response.choices[0].finish_reason, "length");
@@ -2889,7 +2980,7 @@ mod tests {
             outcome: higgs_engine::simple::SessionOutcome::ExactBootstrap,
         };
         let response = build_session_response(
-            "model", "request", output, None, false, false, true, false, None,
+            "model", "request", output, None, false, false, true, false, None, None,
         )
         .unwrap();
         assert_eq!(response.usage.higgs_session_lease_active, Some(1));
@@ -3892,6 +3983,69 @@ mod tests {
             state.capacity.admission_test_memory().1,
             initial_memory_revision
         );
+    }
+
+    #[tokio::test]
+    async fn v2_retention_rejects_stale_and_oversized_before_worker_or_cache_mutation() {
+        let model = "raw-accept-worker-reject";
+        let (state, engine) = crate::capacity::retained_contract_route_test_state(
+            model,
+            4 * 1024 * 1024 * 1024,
+            128 * 1024,
+        );
+        engine.test_retain_session_tokens(42, vec![7; 8]);
+        let revision = state
+            .capacity
+            .fast_session_contract(model)
+            .unwrap()
+            .contract_revision()
+            .to_owned();
+        let request = |stream, contract_revision: &str| {
+            serde_json::from_value::<ChatCompletionRequest>(serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 4096,
+                "stream": stream,
+                "retention": {
+                    "mode": "required",
+                    "sessionId": 42,
+                    "epoch": 7,
+                    "contractRevision": contract_revision
+                }
+            }))
+            .unwrap()
+        };
+
+        engine.test_set_chat_prompt_tokens(vec![7; 30_000]);
+        let blocking = chat_completions_non_streaming(
+            Arc::clone(&state),
+            request(false, &revision),
+            Arc::clone(&engine),
+            GenerationDefaults::default(),
+        )
+        .await;
+        assert!(matches!(
+            blocking,
+            Err(ServerError::RetentionCompactionRequired)
+        ));
+
+        engine.test_set_chat_prompt_tokens(vec![7; 8]);
+        let streaming = chat_completions_stream(
+            Arc::clone(&state),
+            request(true, "stale:revision"),
+            Arc::clone(&engine),
+            GenerationDefaults::default(),
+            None,
+            crate::router::RoutingMethod::Direct,
+        )
+        .await;
+        assert!(matches!(
+            streaming,
+            Err(ServerError::StaleRetentionContract)
+        ));
+        assert_eq!(engine.route_test_retained_sessions(), [42]);
+        assert!(engine.route_test_mutation_sequence().is_empty());
+        assert_eq!(state.capacity.active_reservation_count(model), 0);
     }
 
     #[tokio::test]
