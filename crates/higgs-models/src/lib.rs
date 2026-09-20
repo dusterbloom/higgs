@@ -32,6 +32,29 @@ pub mod q2_row2_bench {
         }
     }
 }
+#[doc(hidden)]
+pub mod q2_tiled_qmm_bench {
+    //! Opaque release-probe seam for the tiled and scalar QMM operators; not model dispatch.
+    use mlx_rs::{Array, error::Exception};
+
+    pub fn tiled(
+        x: &Array,
+        weight: &Array,
+        scales: &Array,
+        group_size: i32,
+    ) -> Result<Array, Exception> {
+        crate::metal_kernel::bonsai_q2_qmm_tiled_ternary(x, weight, scales, group_size)
+    }
+
+    pub fn scalar(
+        x: &Array,
+        weight: &Array,
+        scales: &Array,
+        group_size: i32,
+    ) -> Result<Array, Exception> {
+        crate::metal_kernel::bonsai_q2_qmm_ternary(x, weight, scales, group_size)
+    }
+}
 pub mod mlx_exec;
 pub mod phi3;
 pub mod progress;
