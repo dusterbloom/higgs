@@ -3262,6 +3262,308 @@ pub fn bonsai_q2_qmm_ternary(
 }
 
 // ---------------------------------------------------------------------------
+// Tiled BF16-staged ternary QMM probe (BM=8, BN=32, BK=128)
+// ---------------------------------------------------------------------------
+
+/// First tiled ternary QMM candidate. It stages one 128-value quantization
+/// group at a time, so each packed word is decoded once and reused across the
+/// 8 input rows. BF16 staging deliberately differs from the stock FP32 path.
+const Q2_TILED_TERNARY_QMM_V1_SOURCE: &str = r"
+constexpr int BM = 8;
+constexpr int BN = 32;
+constexpr int BK = 128;
+
+threadgroup bfloat16_t x_sh[BM * BK];
+threadgroup bfloat16_t w_sh[BK * BN];
+threadgroup float out_sh[BM * BN];
+
+const uint tid = thread_position_in_threadgroup.x;
+const uint m0 = threadgroup_position_in_grid.y * uint(BM);
+const uint n0 = threadgroup_position_in_grid.x * uint(BN);
+
+simdgroup_matrix<float, 8, 8> acc = simdgroup_matrix<float, 8, 8>(0.0f);
+
+for (int group = 0; group < NumGroups; ++group) {
+    // Each of the 128 threads writes eight K-major activation values.
+    for (uint i = tid; i < uint(BM * BK); i += 128u) {
+        const uint local_m = i % uint(BM);
+        const uint local_k = i / uint(BM);
+        const uint m = m0 + local_m;
+        const uint k = uint(group * BK) + local_k;
+        const float value = (m < uint(MRows))
+            ? float(x[size_t(m) * size_t(K) + size_t(k)])
+            : 0.0f;
+        x_sh[local_k * uint(BM) + local_m] = bfloat16_t(value);
+    }
+
+    // Each thread decodes two of the 256 packed words for this 32x128 tile.
+    for (uint word = tid; word < uint(BN * (BK / 16)); word += 128u) {
+        const uint local_n = word / uint(BK / 16);
+        const uint word_in_group = word % uint(BK / 16);
+        const uint n = n0 + local_n;
+        uint packed = 0u;
+        float scale = 0.0f;
+        if (n < uint(NRows)) {
+            packed = w[size_t(n) * size_t(KPacked)
+                + size_t(group * (BK / 16)) + size_t(word_in_group)];
+            scale = float(sc[size_t(n) * size_t(NumGroups) + size_t(group)]);
+        }
+        for (uint code_index = 0u; code_index < 16u; ++code_index) {
+            const uint k = word_in_group * 16u + code_index;
+            const int code = int((packed >> (code_index * 2u)) & 3u) - 1;
+            const float scaled_weight = float(code) * scale;
+            w_sh[k * uint(BN) + local_n] = bfloat16_t(scaled_weight);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // One SIMD group owns one disjoint 8-column fragment of the output tile.
+    const uint n_fragment = simdgroup_index_in_threadgroup;
+    for (uint k_fragment = 0u; k_fragment < uint(BK / 8); ++k_fragment) {
+        simdgroup_matrix<bfloat16_t, 8, 8> a;
+        simdgroup_matrix<bfloat16_t, 8, 8> b;
+        simdgroup_load(a, &x_sh[k_fragment * 8u * uint(BM)],
+                       ulong(BM), ulong2(0, 0), true);
+        simdgroup_load(b, &w_sh[k_fragment * 8u * uint(BN) + n_fragment * 8u],
+                       ulong(BN), ulong2(0, 0), false);
+        simdgroup_multiply_accumulate(acc, a, b, acc);
+    }
+
+    // All simdgroups must finish reading the current scratch tile before the
+    // next group overwrites it.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+const uint n_fragment = simdgroup_index_in_threadgroup;
+simdgroup_store(acc, &out_sh[n_fragment * 8u], ulong(BN), ulong2(0, 0), false);
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+for (uint i = tid; i < uint(BM * BN); i += 128u) {
+    const uint local_m = i / uint(BN);
+    const uint local_n = i % uint(BN);
+    const uint m = m0 + local_m;
+    const uint n = n0 + local_n;
+    if (m < uint(MRows) && n < uint(NRows)) {
+        y[size_t(m) * size_t(NRows) + size_t(n)] = OutT(out_sh[i]);
+    }
+}
+";
+
+static Q2_TILED_TERNARY_QMM_V1: OnceLock<CachedMetalKernel> = OnceLock::new();
+
+#[allow(unsafe_code)]
+fn create_q2_tiled_ternary_qmm_v1_kernel() -> mlx_sys::mlx_fast_metal_kernel {
+    let in_vec = cstr_vec(&[c"x", c"w", c"sc"]);
+    let out_vec = cstr_vec(&[c"y"]);
+    let source = CString::new(Q2_TILED_TERNARY_QMM_V1_SOURCE).unwrap_or_default();
+    let header = CString::new(
+        "#include <metal_simdgroup>\n#include <metal_simdgroup_matrix>\n",
+    )
+    .unwrap_or_default();
+    unsafe {
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            c"higgs_bonsai_q2_tiled_ternary_qmm_v1".as_ptr(),
+            in_vec,
+            out_vec,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,
+            false,
+        );
+        mlx_sys::mlx_vector_string_free(in_vec);
+        mlx_sys::mlx_vector_string_free(out_vec);
+        kernel
+    }
+}
+
+/// Tiled ternary QMM for flattened `M > 8` inputs. The packed weights use
+/// canonical `[N,K/16]` uint32 storage and scales use `[N,K/128]`.
+#[allow(unsafe_code)]
+pub fn bonsai_q2_qmm_tiled_ternary(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    group_size: i32,
+) -> Result<Array, Exception> {
+    if group_size != 128 {
+        return Err(Exception::custom(format!(
+            "bonsai_q2_qmm_tiled_ternary: group size must be 128, got {group_size}"
+        )));
+    }
+
+    let x_shape = x.shape();
+    let weight_shape = weight.shape();
+    let [n_rows, packed_cols] = *weight_shape else {
+        return Err(Exception::custom(
+            "bonsai_q2_qmm_tiled_ternary: weight must have rank 2 [N,K/16]",
+        ));
+    };
+    if weight.dtype() != Dtype::Uint32 {
+        return Err(Exception::custom(format!(
+            "bonsai_q2_qmm_tiled_ternary: weight must be Uint32, got {:?}",
+            weight.dtype()
+        )));
+    }
+    if n_rows <= 0 {
+        return Err(Exception::custom(
+            "bonsai_q2_qmm_tiled_ternary: weight N must be positive",
+        ));
+    }
+    let k_dim = packed_cols.checked_mul(16).ok_or_else(|| {
+        Exception::custom("bonsai_q2_qmm_tiled_ternary: weight K dimension overflow")
+    })?;
+    if k_dim <= 0 || k_dim % 128 != 0 {
+        return Err(Exception::custom(format!(
+            "bonsai_q2_qmm_tiled_ternary: K must be positive and divisible by 128, got {k_dim}"
+        )));
+    }
+    if x_shape.last().copied() != Some(k_dim) {
+        return Err(Exception::custom(format!(
+            "bonsai_q2_qmm_tiled_ternary: input K mismatch: got {:?}, expected {k_dim}",
+            x_shape.last()
+        )));
+    }
+    let expected_scales = [n_rows, k_dim / 128];
+    if scales.shape() != expected_scales {
+        return Err(Exception::custom(format!(
+            "bonsai_q2_qmm_tiled_ternary: scale shape mismatch: got {:?}, expected {:?}",
+            scales.shape(),
+            expected_scales
+        )));
+    }
+    if !matches!(x.dtype(), Dtype::Float16 | Dtype::Bfloat16) {
+        return Err(Exception::custom(format!(
+            "bonsai_q2_qmm_tiled_ternary: unsupported input dtype {:?}; expected Float16 or Bfloat16",
+            x.dtype()
+        )));
+    }
+    if !matches!(scales.dtype(), Dtype::Float16 | Dtype::Bfloat16) {
+        return Err(Exception::custom(format!(
+            "bonsai_q2_qmm_tiled_ternary: unsupported scale dtype {:?}; expected Float16 or Bfloat16",
+            scales.dtype()
+        )));
+    }
+
+    let m_rows = x_shape[..x_shape.len() - 1]
+        .iter()
+        .try_fold(1_i64, |rows, &dim| rows.checked_mul(i64::from(dim)))
+        .and_then(|rows| i32::try_from(rows).ok())
+        .ok_or_else(|| Exception::custom("bonsai_q2_qmm_tiled_ternary: M dimension overflow"))?;
+    if m_rows <= 8 {
+        return Err(Exception::custom(format!(
+            "bonsai_q2_qmm_tiled_ternary: M must be > 8, got {m_rows}"
+        )));
+    }
+
+    let x_flat = x.reshape(&[m_rows, k_dim])?;
+    let w_flat = weight.reshape(&[-1])?;
+    let s_flat = scales.reshape(&[-1])?;
+    ensure_ffi_error_handler();
+    let stream = Stream::task_local_or_default();
+    let input_dtype = unsafe { mlx_sys::mlx_array_dtype(x.as_ptr()) };
+    let scale_dtype = unsafe { mlx_sys::mlx_array_dtype(scales.as_ptr()) };
+
+    let grid_x = i32::try_from((i64::from(n_rows) + 31) / 32 * 128)
+        .map_err(|_| Exception::custom("bonsai_q2_qmm_tiled_ternary: N grid overflow"))?;
+    let grid_y = i32::try_from((i64::from(m_rows) + 7) / 8)
+        .map_err(|_| Exception::custom("bonsai_q2_qmm_tiled_ternary: M grid overflow"))?;
+    let out_shape = [m_rows, n_rows];
+    let cached = Q2_TILED_TERNARY_QMM_V1
+        .get_or_init(|| CachedMetalKernel(create_q2_tiled_ternary_qmm_v1_kernel()));
+
+    unsafe {
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        let config_status = mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"InT".as_ptr(),
+            input_dtype,
+        ) | mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"ScaleT".as_ptr(),
+            scale_dtype,
+        ) | mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"OutT".as_ptr(),
+            input_dtype,
+        ) | mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"K".as_ptr(),
+            k_dim,
+        ) | mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"KPacked".as_ptr(),
+            packed_cols,
+        ) | mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"NumGroups".as_ptr(),
+            k_dim / 128,
+        ) | mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"MRows".as_ptr(),
+            m_rows,
+        ) | mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"NRows".as_ptr(),
+            n_rows,
+        ) | mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, grid_x, grid_y, 1)
+            | mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1)
+            | mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+                config,
+                out_shape.as_ptr(),
+                out_shape.len(),
+                input_dtype,
+            );
+        if config_status != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            return Err(Exception::custom(format!(
+                "bonsai_q2_qmm_tiled_ternary: kernel configuration failed: {}",
+                take_last_error()
+            )));
+        }
+
+        let input_ptrs = [x_flat.as_ptr(), w_flat.as_ptr(), s_flat.as_ptr()];
+        let inputs_vec =
+            mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len());
+        let mut outputs_vec = mlx_sys::mlx_vector_array_new();
+        let status = mlx_sys::mlx_fast_metal_kernel_apply(
+            &raw mut outputs_vec,
+            cached.0,
+            inputs_vec,
+            config,
+            stream.as_ptr(),
+        );
+
+        let result = if status != 0 {
+            Err(Exception::custom(format!(
+                "bonsai_q2_qmm_tiled_ternary failed: {}",
+                take_last_error()
+            )))
+        } else {
+            let mut output_ptr = mlx_sys::mlx_array_new();
+            let get_status = mlx_sys::mlx_vector_array_get(&raw mut output_ptr, outputs_vec, 0);
+            if get_status != 0 {
+                mlx_sys::mlx_array_free(output_ptr);
+                Err(Exception::custom(format!(
+                    "bonsai_q2_qmm_tiled_ternary: reading output failed: {}",
+                    take_last_error()
+                )))
+            } else {
+                let output = Array::from_ptr(output_ptr);
+                let mut output_shape = x_shape[..x_shape.len() - 1].to_vec();
+                output_shape.push(n_rows);
+                output.reshape(&output_shape)
+            }
+        };
+
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs_vec);
+        mlx_sys::mlx_vector_array_free(outputs_vec);
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Ternary M<=8 MMA verify kernel (simdgroup_matrix<8,8>)
 // ---------------------------------------------------------------------------
 //
