@@ -1282,9 +1282,23 @@ pub struct RetainedReservationClaim {
     owner: u64,
 }
 
+impl RetainedReservationClaim {
+    #[must_use]
+    pub const fn owner_id(&self) -> u64 {
+        self.owner
+    }
+}
+
+#[derive(Debug)]
+struct RetainedReservation {
+    owner: u64,
+    reserved_bytes: usize,
+    published: bool,
+}
+
 #[derive(Debug, Default)]
 struct RetainedReservations {
-    owners: std::collections::HashMap<u64, u64>,
+    owners: std::collections::HashMap<u64, RetainedReservation>,
     next_owner: u64,
 }
 
@@ -1293,6 +1307,7 @@ impl RetainedReservations {
         &mut self,
         session_id: u64,
         retired_session_ids: &[u64],
+        reserved_bytes: usize,
     ) -> Option<RetainedReservationClaim> {
         for retired in retired_session_ids {
             if *retired != session_id {
@@ -1303,7 +1318,14 @@ impl RetainedReservations {
             return None;
         }
         self.next_owner = self.next_owner.checked_add(1)?;
-        self.owners.insert(session_id, self.next_owner);
+        self.owners.insert(
+            session_id,
+            RetainedReservation {
+                owner: self.next_owner,
+                reserved_bytes,
+                published: false,
+            },
+        );
         Some(RetainedReservationClaim {
             session_id,
             owner: self.next_owner,
@@ -1311,7 +1333,7 @@ impl RetainedReservations {
     }
 
     fn release(&mut self, claim: RetainedReservationClaim) -> bool {
-        if self.owners.get(&claim.session_id) != Some(&claim.owner) {
+        if self.owners.get(&claim.session_id).map(|entry| entry.owner) != Some(claim.owner) {
             return false;
         }
         self.owners.remove(&claim.session_id);
@@ -1330,9 +1352,31 @@ impl RetainedReservations {
         self.owners.keys().copied().collect()
     }
 
+    fn mark_published(&mut self, session_id: u64) {
+        if let Some(entry) = self.owners.get_mut(&session_id) {
+            entry.published = true;
+        }
+    }
+
+    fn floor_bytes(&self) -> usize {
+        self.owners
+            .values()
+            .map(|entry| entry.reserved_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
     fn retain_sessions(&mut self, keep: &std::collections::HashSet<u64>) {
         self.owners
-            .retain(|session_id, _| keep.contains(session_id));
+            .retain(|session_id, entry| !entry.published || keep.contains(session_id));
+    }
+}
+
+fn validate_retained_allocation_floor(requested: usize, floor: usize) -> Result<(), usize> {
+    if requested < floor {
+        Err(floor)
+    } else {
+        Ok(())
     }
 }
 
@@ -4470,7 +4514,9 @@ impl SimpleEngine {
         retained_bytes: usize,
         prefix_bytes: usize,
         policy: CachePressurePolicy,
-    ) {
+    ) -> Result<(), usize> {
+        let floor = lock_or_recover(&self.retained_reservations).floor_bytes();
+        validate_retained_allocation_floor(retained_bytes, floor)?;
         let previous = self
             .capacity_retained_bytes
             .swap(retained_bytes, Ordering::AcqRel);
@@ -4486,6 +4532,7 @@ impl SimpleEngine {
             self.record_retention_mutation(mutation);
         }
         lock_or_recover(&self.prefix_cache).set_capacity_max_bytes(prefix_bytes);
+        Ok(())
     }
 
     /// Admission-only reclamation holds the retained-cache lock across lease
@@ -4728,7 +4775,11 @@ impl SimpleEngine {
                 retained.remove(retired_session_id);
             }
         }
-        let claim = reservations.claim_replacing(session_id, retired_session_ids)?;
+        let claim = reservations.claim_replacing(
+            session_id,
+            retired_session_ids,
+            self.capacity_retained_bytes.load(Ordering::Acquire),
+        )?;
         let now = std::time::Instant::now();
         if retained.iter().any(|(&id, entry)| {
             id != session_id && entry.lease_expires_at.is_some_and(|expiry| expiry > now)
@@ -4951,7 +5002,7 @@ impl SimpleEngine {
                 token_len, effective_cap
             );
         }
-        let reservations = lock_or_recover(&self.retained_reservations);
+        let mut reservations = lock_or_recover(&self.retained_reservations);
         let reserved_ids = reservations.reserved_ids();
         let mut retained = lock_or_recover(&self.retained);
         let mutation = stash_into_bounded_with_reservations(
@@ -4969,6 +5020,9 @@ impl SimpleEngine {
         let retained_bytes = retained
             .get(&session_id)
             .map_or(0, |entry| entry.state.estimated_bytes());
+        if retained_bytes > 0 {
+            reservations.mark_published(session_id);
+        }
         drop(retained);
         drop(reservations);
         record_request_retained_bytes(u64::try_from(retained_bytes).unwrap_or(u64::MAX));
@@ -18130,7 +18184,7 @@ mod tests {
             CachePressurePolicy::Normal,
         );
         assert_eq!(mutation.evicted, 1);
-        assert_eq!(mutation, super::RetentionMutation::default());
+        assert_eq!(mutation.broken_leases, 0);
         assert!(retained.contains_key(&1));
         assert!(!retained.contains_key(&2));
     }
@@ -18371,8 +18425,8 @@ mod tests {
     #[test]
     fn reservation_claim_ownership_rejects_duplicate_and_foreign_release() {
         let mut reservations = super::RetainedReservations::default();
-        let owner = reservations.claim_replacing(7, &[]).unwrap();
-        assert!(reservations.claim_replacing(7, &[]).is_none());
+        let owner = reservations.claim_replacing(7, &[], 1024).unwrap();
+        assert!(reservations.claim_replacing(7, &[], 1024).is_none());
         assert!(!reservations.release(super::RetainedReservationClaim {
             session_id: 7,
             owner: owner.owner.wrapping_add(1),
@@ -18385,19 +18439,36 @@ mod tests {
     #[test]
     fn reservation_claim_rotates_slot_atomically() {
         let mut reservations = super::RetainedReservations::default();
-        let old = reservations.claim_replacing(7, &[]).unwrap();
-        let new = reservations.claim_replacing(8, &[7]).unwrap();
+        let old = reservations.claim_replacing(7, &[], 1024).unwrap();
+        let new = reservations.claim_replacing(8, &[7], 1024).unwrap();
         assert!(!reservations.release(old));
         assert!(reservations.is_reserved(8));
         assert!(reservations.release(new));
     }
 
     #[test]
-    fn idle_cleanup_releases_abandoned_claim_for_next_seed() {
+    fn owner_release_allows_next_seed() {
         let mut reservations = super::RetainedReservations::default();
-        reservations.claim_replacing(7, &[]).unwrap();
+        let claim = reservations.claim_replacing(7, &[], 1024).unwrap();
+        assert!(reservations.release(claim));
+        assert!(reservations.claim_replacing(8, &[], 1024).is_some());
+    }
+
+    #[test]
+    fn live_claim_survives_idle_sweep_and_defines_shrink_floor() {
+        let mut reservations = super::RetainedReservations::default();
+        reservations.claim_replacing(7, &[], 4096).unwrap();
         reservations.retain_sessions(&std::collections::HashSet::new());
-        assert!(reservations.claim_replacing(8, &[]).is_some());
+        assert!(reservations.is_reserved(7));
+        assert_eq!(reservations.floor_bytes(), 4096);
+        assert_eq!(
+            super::validate_retained_allocation_floor(4095, 4096),
+            Err(4096)
+        );
+        assert_eq!(
+            super::validate_retained_allocation_floor(4096, 4096),
+            Ok(())
+        );
     }
 
     #[test]

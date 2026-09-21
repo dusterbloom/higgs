@@ -282,9 +282,13 @@ struct RetentionSeedClaim {
 
 impl RetentionSeedClaim {
     fn publish(mut self) -> bool {
-        self.published = self
-            .state
-            .publish_retention_seed(&self.model, self.session_id);
+        self.published = self.reservation.as_ref().is_some_and(|reservation| {
+            self.state.publish_owned_retention_seed(
+                &self.model,
+                self.session_id,
+                reservation.owner_id(),
+            )
+        });
         self.published
     }
 }
@@ -292,9 +296,12 @@ impl RetentionSeedClaim {
 impl Drop for RetentionSeedClaim {
     fn drop(&mut self) {
         if !self.published {
-            self.state
-                .abort_retention_seed(&self.model, self.session_id);
             if let Some(reservation) = self.reservation.take() {
+                self.state.abort_owned_retention_seed(
+                    &self.model,
+                    self.session_id,
+                    reservation.owner_id(),
+                );
                 self.engine.release_retained_reservation(reservation);
             }
         }

@@ -263,6 +263,13 @@ pub enum Engine {
 
 pub struct EngineRetentionClaim {
     simple: Option<higgs_engine::simple::RetainedReservationClaim>,
+    owner_id: u64,
+}
+
+impl EngineRetentionClaim {
+    pub const fn owner_id(&self) -> u64 {
+        self.owner_id
+    }
 }
 
 impl Engine {
@@ -685,6 +692,7 @@ impl Engine {
             Self::Simple(engine) => engine
                 .reserve_retained_session_replacing(session_id, retired_session_ids)
                 .map(|simple| EngineRetentionClaim {
+                    owner_id: simple.owner_id(),
                     simple: Some(simple),
                 }),
             Self::Batch(_) => None,
@@ -692,7 +700,12 @@ impl Engine {
             Self::Stub(stub)
                 if matches!(stub.name(), "seed-binding" | "rotated-seed" | "drop-target") =>
             {
-                Some(EngineRetentionClaim { simple: None })
+                static NEXT_TEST_OWNER: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(1);
+                Some(EngineRetentionClaim {
+                    simple: None,
+                    owner_id: NEXT_TEST_OWNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                })
             }
             #[cfg(test)]
             Self::Stub(_) => None,
@@ -1489,15 +1502,21 @@ impl Engine {
         })?;
         match self {
             Self::Simple(engine) => {
-                engine.apply_capacity_cache_limits(
-                    retained_limit,
-                    prefix_limit,
-                    if pressure == crate::capacity::MemoryPressure::Critical {
-                        higgs_engine::simple::CachePressurePolicy::Critical
-                    } else {
-                        higgs_engine::simple::CachePressurePolicy::Normal
-                    },
-                );
+                engine
+                    .apply_capacity_cache_limits(
+                        retained_limit,
+                        prefix_limit,
+                        if pressure == crate::capacity::MemoryPressure::Critical {
+                            higgs_engine::simple::CachePressurePolicy::Critical
+                        } else {
+                            higgs_engine::simple::CachePressurePolicy::Normal
+                        },
+                    )
+                    .map_err(|floor| {
+                        EngineError::Generation(format!(
+                            "retained allocation {retained_limit} is below guaranteed floor {floor}"
+                        ))
+                    })?;
                 Ok(())
             }
             Self::Batch(engine) => {
@@ -1864,7 +1883,7 @@ pub struct AppState {
     /// Sole process-wide authority for local-model capacity and lifecycle state.
     pub capacity: Arc<CapacityRegistry>,
     retention_bindings:
-        std::sync::Mutex<std::collections::HashMap<(String, u64), (String, u64, bool)>>,
+        std::sync::Mutex<std::collections::HashMap<(String, u64), (String, u64, bool, u64)>>,
 }
 
 impl AppState {
@@ -1931,7 +1950,7 @@ impl AppState {
         {
             return false;
         }
-        bindings.insert(key, (revision.to_owned(), epoch, false));
+        bindings.insert(key, (revision.to_owned(), epoch, false, 0));
         true
     }
 
@@ -1950,12 +1969,21 @@ impl AppState {
         bindings.retain(|(bound_model, _), _| bound_model != model);
         bindings.insert(
             (model.to_owned(), session_id),
-            (revision.to_owned(), epoch, false),
+            (revision.to_owned(), epoch, false, _reservation.owner_id()),
         );
         true
     }
 
     pub fn publish_retention_seed(&self, model: &str, session_id: u64) -> bool {
+        self.publish_owned_retention_seed(model, session_id, 0)
+    }
+
+    pub fn publish_owned_retention_seed(
+        &self,
+        model: &str,
+        session_id: u64,
+        owner_id: u64,
+    ) -> bool {
         let mut bindings = self
             .retention_bindings
             .lock()
@@ -1963,15 +1991,29 @@ impl AppState {
         let Some(binding) = bindings.get_mut(&(model.to_owned(), session_id)) else {
             return false;
         };
+        if binding.3 != owner_id {
+            return false;
+        }
         binding.2 = true;
         true
     }
 
     pub fn abort_retention_seed(&self, model: &str, session_id: u64) {
-        self.retention_bindings
+        self.abort_owned_retention_seed(model, session_id, 0);
+    }
+
+    pub fn abort_owned_retention_seed(&self, model: &str, session_id: u64, owner_id: u64) {
+        let key = (model.to_owned(), session_id);
+        let mut bindings = self
+            .retention_bindings
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&(model.to_owned(), session_id));
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if bindings
+            .get(&key)
+            .is_some_and(|binding| binding.3 == owner_id)
+        {
+            bindings.remove(&key);
+        }
     }
 
     pub fn retention_binding_matches(
@@ -1985,7 +2027,7 @@ impl AppState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&(model.to_owned(), session_id))
-            .is_some_and(|(bound_revision, bound_epoch, published)| {
+            .is_some_and(|(bound_revision, bound_epoch, published, _)| {
                 *published && bound_revision == revision && *bound_epoch == epoch
             })
     }
@@ -2320,9 +2362,15 @@ mod tests {
         );
         assert!(state.claim_retention_seed("model", 7, "old", 1));
         assert!(state.publish_retention_seed("model", 7));
-        let claim = EngineRetentionClaim { simple: None };
+        let claim = EngineRetentionClaim {
+            simple: None,
+            owner_id: 7,
+        };
         assert!(state.claim_exclusively_reserved_seed("model", 8, "new", 2, &claim));
         assert!(!state.retention_binding_matches("model", 7, "old", 1));
         assert!(!state.retention_binding_matches("model", 8, "new", 2));
+        state.abort_owned_retention_seed("model", 8, 6);
+        assert!(state.publish_owned_retention_seed("model", 8, 7));
+        assert!(state.retention_binding_matches("model", 8, "new", 2));
     }
 }
