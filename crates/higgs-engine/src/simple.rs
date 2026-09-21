@@ -2285,6 +2285,39 @@ pub enum SessionContinuationPolicy {
 /// reserved its retained cache before the HTTP response is opened.
 pub type SessionStreamAcceptance = tokio::sync::oneshot::Sender<Result<(), u64>>;
 
+fn acknowledge_required_dspark_resumption(
+    continuation_policy: SessionContinuationPolicy,
+    resumed: bool,
+    session_id: u64,
+    acceptance: &mut Option<SessionStreamAcceptance>,
+) -> Result<(), EngineError> {
+    if continuation_policy != SessionContinuationPolicy::RequireContinuation {
+        return Ok(());
+    }
+
+    if resumed {
+        if let Some(acceptance) = acceptance.take() {
+            let _ = acceptance.send(Ok(()));
+        }
+        Ok(())
+    } else {
+        if let Some(acceptance) = acceptance.take() {
+            let _ = acceptance.send(Err(session_id));
+        }
+        Err(EngineError::RetainedSessionUnavailable(session_id))
+    }
+}
+
+fn dspark_cold_retry_allowed_for_policy(
+    continuation_policy: SessionContinuationPolicy,
+    continued: bool,
+    retried_cold: bool,
+    stream_output_emitted: bool,
+) -> bool {
+    continuation_policy == SessionContinuationPolicy::BestEffort
+        && continued_dspark_cold_retry_allowed(continued, retried_cold, stream_output_emitted)
+}
+
 #[cfg(test)]
 std::thread_local! {
     static PREFILL_SAMPLE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -7591,6 +7624,8 @@ impl SimpleEngine {
                     timing,
                     total_start,
                     sender,
+                    continuation_policy,
+                    acceptance,
                 )
                 .map_err(|error| {
                     let stop = crate::stop::generation_stop();
@@ -8462,6 +8497,8 @@ impl SimpleEngine {
         timing: bool,
         total_start: std::time::Instant,
         sender: Option<&tokio::sync::mpsc::Sender<StreamingOutput>>,
+        continuation_policy: SessionContinuationPolicy,
+        mut acceptance: Option<SessionStreamAcceptance>,
     ) -> Result<SessionGeneration, EngineError> {
         let dflash = self
             .dflash
@@ -8511,6 +8548,17 @@ impl SimpleEngine {
                 None
             }
         };
+        if let Err(error) = acknowledge_required_dspark_resumption(
+            continuation_policy,
+            resumed.is_some(),
+            session_id,
+            &mut acceptance,
+        ) {
+            self.cache_metrics
+                .required_continuation_misses
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(error);
+        }
 
         // Cache-state divergence must never fail the request outright: if the
         // resumed (continued) attempt errors, retry ONCE from a cold prefill
@@ -8851,7 +8899,8 @@ impl SimpleEngine {
                 }
                 Err(EngineError::Cancelled) => return Err(EngineError::Cancelled),
                 Err(error)
-                    if continued_dspark_cold_retry_allowed(
+                    if dspark_cold_retry_allowed_for_policy(
+                        continuation_policy,
                         continued,
                         retried_cold,
                         stream_output_emitted,
@@ -16710,6 +16759,68 @@ mod tests {
             EngineError::RetainedSessionUnavailable(0xACCE)
         ));
         assert_eq!(accept_rx.blocking_recv().unwrap(), Err(0xACCE));
+    }
+
+    #[test]
+    fn required_dspark_stream_accepts_only_a_forked_pair() {
+        let session_id = 0xD5A4;
+        let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
+        let mut acceptance = Some(accept_tx);
+
+        super::acknowledge_required_dspark_resumption(
+            SessionContinuationPolicy::RequireContinuation,
+            true,
+            session_id,
+            &mut acceptance,
+        )
+        .unwrap();
+
+        assert!(acceptance.is_none());
+        assert_eq!(accept_rx.blocking_recv().unwrap(), Ok(()));
+
+        let (reject_tx, reject_rx) = tokio::sync::oneshot::channel();
+        let mut rejection = Some(reject_tx);
+        let error = super::acknowledge_required_dspark_resumption(
+            SessionContinuationPolicy::RequireContinuation,
+            false,
+            session_id,
+            &mut rejection,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            EngineError::RetainedSessionUnavailable(id) if id == session_id
+        ));
+        assert!(rejection.is_none());
+        assert_eq!(reject_rx.blocking_recv().unwrap(), Err(session_id));
+
+        let (best_effort_tx, _best_effort_rx) = tokio::sync::oneshot::channel();
+        let mut best_effort = Some(best_effort_tx);
+        super::acknowledge_required_dspark_resumption(
+            SessionContinuationPolicy::BestEffort,
+            false,
+            session_id,
+            &mut best_effort,
+        )
+        .unwrap();
+        assert!(best_effort.is_some());
+    }
+
+    #[test]
+    fn required_dspark_stream_can_never_retry_cold() {
+        assert!(super::dspark_cold_retry_allowed_for_policy(
+            SessionContinuationPolicy::BestEffort,
+            true,
+            false,
+            false,
+        ));
+        assert!(!super::dspark_cold_retry_allowed_for_policy(
+            SessionContinuationPolicy::RequireContinuation,
+            true,
+            false,
+            false,
+        ));
     }
 
     #[test]
