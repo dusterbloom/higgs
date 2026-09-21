@@ -441,6 +441,7 @@ mod tests {
             model.to_owned(),
             None,
             crate::router::RoutingMethod::Direct,
+            Instant::now(),
         )
         .await;
         assert!(matches!(streaming, Err(ServerError::CapacityExceeded(_))));

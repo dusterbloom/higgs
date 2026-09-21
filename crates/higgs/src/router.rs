@@ -99,7 +99,7 @@ pub struct Router {
     /// Guarded by a `RwLock`: `resolve`/`list` take a read lock and clone the
     /// `Arc` out, so an in-flight request is never tied to map membership.
     local_engines: RwLock<HashMap<String, LocalEngineEntry>>,
-    loading_model_paths: Arc<Mutex<HashSet<PathBuf>>>,
+    loading_model_paths: Arc<Mutex<HashMap<PathBuf, usize>>>,
     cache_policy: tokio::sync::Mutex<()>,
     compiled_routes: Vec<CompiledRoute>,
     auto_routes: Vec<AutoRouteEntry>,
@@ -120,7 +120,7 @@ struct DisabledRouteGuard<'a> {
 }
 
 pub struct ModelPathReservation {
-    loading_model_paths: Arc<Mutex<HashSet<PathBuf>>>,
+    loading_model_paths: Arc<Mutex<HashMap<PathBuf, usize>>>,
     path: PathBuf,
 }
 
@@ -139,10 +139,16 @@ impl ModelPathReservation {
 
 impl Drop for ModelPathReservation {
     fn drop(&mut self) {
-        self.loading_model_paths
+        let mut owners = self
+            .loading_model_paths
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.path);
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = owners.get_mut(&self.path) {
+            *count -= 1;
+            if *count == 0 {
+                owners.remove(&self.path);
+            }
+        }
     }
 }
 
@@ -290,7 +296,7 @@ impl Router {
 
         Ok(Self {
             local_engines: RwLock::new(local_engines),
-            loading_model_paths: Arc::new(Mutex::new(HashSet::new())),
+            loading_model_paths: Arc::new(Mutex::new(HashMap::new())),
             cache_policy: tokio::sync::Mutex::new(()),
             compiled_routes,
             auto_routes,
@@ -385,9 +391,10 @@ impl Router {
         {
             return Err("model artifact is already loaded".to_owned());
         }
-        if !loading.insert(path.clone()) {
+        if loading.contains_key(&path) {
             return Err("model artifact is already loading".to_owned());
         }
+        loading.insert(path.clone(), 1);
         Ok(ModelPathReservation {
             loading_model_paths: Arc::clone(&self.loading_model_paths),
             path,
@@ -483,11 +490,12 @@ impl Router {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let entry = self.engines_write().remove(name)?;
-        let reservation = entry.model_path.and_then(|path| {
-            loading.insert(path.clone()).then(|| ModelPathReservation {
+        let reservation = entry.model_path.map(|path| {
+            *loading.entry(path.clone()).or_insert(0) += 1;
+            ModelPathReservation {
                 loading_model_paths: Arc::clone(&self.loading_model_paths),
                 path,
-            })
+            }
         });
         Some((entry.engine, reservation))
     }
@@ -1378,6 +1386,39 @@ mod tests {
         assert!(removed.is_some());
         assert!(!router.contains_engine("x"));
         assert!(router.remove_engine("x").is_none());
+    }
+
+    #[tokio::test]
+    async fn publishing_owner_hands_path_to_blocked_drain() {
+        let router =
+            Arc::new(Router::from_config(&HiggsConfig::default(), HashMap::new()).unwrap());
+        let path = PathBuf::from("/canonical/publishing-then-draining");
+        let publisher = router.reserve_model_path(path.clone()).unwrap();
+
+        router.engines_write().insert(
+            "overlap".to_owned(),
+            LocalEngineEntry {
+                engine: Arc::new(crate::state::Engine::test_stub("overlap")),
+                generation_defaults: GenerationDefaults::default(),
+                capacity_ready: true,
+                model_path: Some(path.clone()),
+            },
+        );
+
+        let (_engine, drain_owner) = router
+            .remove_engine_for_drain("overlap")
+            .expect("published route must be removable");
+        let drain_owner = drain_owner.expect("path-backed route must transfer ownership");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        drain_owner.hold_until(async move {
+            let _ = release_rx.await;
+        });
+
+        drop(publisher);
+        assert!(router.reserve_model_path(path.clone()).is_err());
+        release_tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(router.reserve_model_path(path).is_ok());
     }
 
     #[tokio::test]

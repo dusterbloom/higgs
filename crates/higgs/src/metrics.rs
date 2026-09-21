@@ -829,7 +829,13 @@ mod tests {
         let store = MetricsStore::new(Duration::from_secs(ONE_MINUTE_SECS));
         let id = store.record_pending(sample_record());
 
-        store.fail_stream(id, 7, Duration::from_secs(2), "decode failed".to_owned());
+        store.fail_stream(
+            id,
+            7,
+            Duration::from_secs(2),
+            RequestTiming::default(),
+            "decode failed".to_owned(),
+        );
 
         let record = store.snapshot().pop().unwrap();
         assert_eq!(record.status, 500);
@@ -1043,7 +1049,7 @@ mod tests {
         let mut guard = StreamMetricsGuard::new(Some(Arc::clone(&store)), Some(id), Instant::now());
         guard.update(25);
         guard.finish();
-        store.finalize_stream(id, 99, Duration::from_secs(1));
+        store.finalize_stream(id, 99, Duration::from_secs(1), RequestTiming::default());
 
         let content = std::fs::read_to_string(dir.path().join("metrics.jsonl")).unwrap();
         assert_eq!(content.lines().count(), 1);
@@ -1059,7 +1065,7 @@ mod tests {
         guard.update(8);
         guard.fail("capacity interrupted".to_owned());
         guard.finish();
-        store.finalize_stream(id, 100, Duration::from_secs(1));
+        store.finalize_stream(id, 100, Duration::from_secs(1), RequestTiming::default());
 
         let record = store.snapshot().pop().unwrap();
         assert_eq!(record.status, 500);
@@ -1072,8 +1078,19 @@ mod tests {
     #[test]
     fn unknown_stream_ids_are_ignored_by_both_terminal_paths() {
         let store = MetricsStore::new(Duration::from_secs(ONE_MINUTE_SECS));
-        store.finalize_stream(999_999, 100, Duration::from_secs(1));
-        store.fail_stream(999_999, 100, Duration::from_secs(1), "missing".to_owned());
+        store.finalize_stream(
+            999_999,
+            100,
+            Duration::from_secs(1),
+            RequestTiming::default(),
+        );
+        store.fail_stream(
+            999_999,
+            100,
+            Duration::from_secs(1),
+            RequestTiming::default(),
+            "missing".to_owned(),
+        );
         assert!(store.snapshot().is_empty());
     }
 
@@ -1097,8 +1114,8 @@ mod tests {
         old.timestamp = Instant::now() - Duration::from_millis(100);
         let id = store.record_pending(old);
         store.evict_expired();
-        store.finalize_stream(id, 42, Duration::from_secs(1));
-        store.finalize_stream(id, 99, Duration::from_secs(1));
+        store.finalize_stream(id, 42, Duration::from_secs(1), RequestTiming::default());
+        store.finalize_stream(id, 99, Duration::from_secs(1), RequestTiming::default());
 
         let content = std::fs::read_to_string(dir.path().join("metrics.jsonl")).unwrap();
         assert_eq!(content.lines().count(), 1);

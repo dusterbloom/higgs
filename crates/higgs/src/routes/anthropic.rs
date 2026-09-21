@@ -1176,6 +1176,7 @@ pub async fn count_tokens(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Instant;
 
     use super::{
         AnthropicToolChoice, CreateMessageRequest, ServerError, create_message_non_streaming,
@@ -1661,6 +1662,7 @@ mod tests {
             Arc::clone(&engine),
             None,
             crate::router::RoutingMethod::Direct,
+            Instant::now(),
         )
         .await;
         assert!(matches!(streaming, Err(ServerError::CapacityExceeded(_))));
