@@ -1288,8 +1288,7 @@ pub fn load_model_args<P: AsRef<Path>>(model_dir: P) -> Result<ModelArgs, ModelE
     let config_path = model_dir.as_ref().join("config.json");
     let file = std::fs::File::open(config_path)?;
     let config: serde_json::Value = serde_json::from_reader(file)?;
-    validate_nanbeige_config(&config)?;
-    Ok(serde_json::from_value(config)?)
+    model_args_from_value(&config)
 }
 
 fn reject_nanbeige_true_option(config: &serde_json::Value, key: &str) -> Result<(), ModelError> {
@@ -1411,6 +1410,7 @@ fn validate_nanbeige_config(config: &serde_json::Value) -> Result<(), ModelError
 }
 
 pub(crate) fn model_args_from_value(config: &serde_json::Value) -> Result<ModelArgs, ModelError> {
+    validate_nanbeige_config(config)?;
     Ok(serde_json::from_value(config.clone())?)
 }
 
@@ -1888,6 +1888,25 @@ mod tests {
 
         let err = load_model_args(dir.path()).unwrap_err();
         assert!(err.to_string().contains("loop_share_kv"));
+    }
+
+    #[test]
+    fn test_nanbeige_value_parser_rejects_unsupported_rope_scaling() {
+        let config = serde_json::json!({
+            "model_type": "nanbeige",
+            "hidden_size": 256,
+            "num_hidden_layers": 2,
+            "intermediate_size": 512,
+            "num_attention_heads": 4,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 1000,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 512,
+            "rope_scaling": {"type": "linear", "factor": 2.0}
+        });
+
+        let err = model_args_from_value(&config).unwrap_err();
+        assert!(err.to_string().contains("rope_scaling"));
     }
 
     #[test]

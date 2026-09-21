@@ -69,6 +69,30 @@ fn nanbeige_resolves_to_transformer_dense() {
 }
 
 #[test]
+fn nanbeige_with_unsupported_loop_sharing_is_rejected() {
+    let mut config = complete_config("nanbeige");
+    config["loop_share_kv"] = serde_json::json!(true);
+    let dir = write_config(&config);
+    let detected = adapter::detect(dir.path()).unwrap();
+
+    let error = match adapter::resolve(&detected) {
+        Ok(adapter) => panic!("unexpected adapter: {}", adapter.id()),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("loop_share_kv"));
+}
+
+#[test]
+fn nanbeige_loader_rejects_unsupported_rope_scaling() {
+    let mut config = complete_config("nanbeige");
+    config["rope_scaling"] = serde_json::json!({"type": "linear", "factor": 2.0});
+    let dir = write_config(&config);
+
+    let error = higgs_models::transformer::load_model_args(dir.path()).unwrap_err();
+    assert!(error.to_string().contains("rope_scaling"));
+}
+
+#[test]
 fn parses_family_versions_from_known_type_shapes() {
     for (model_type, family, version) in [
         (

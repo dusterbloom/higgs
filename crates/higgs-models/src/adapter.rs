@@ -476,6 +476,9 @@ impl BuiltinAdapter {
 
     fn validate_tolerant(&self, model: &DetectedModel) -> Result<(), ModelError> {
         if self.has_exact_resolved_config(model) {
+            if matches!(self.kind, LoadKind::Transformer) && model.model_type == "nanbeige" {
+                crate::transformer::model_args_from_value(model.resolved_config())?;
+            }
             return Ok(());
         }
         let config = model.resolved_config();

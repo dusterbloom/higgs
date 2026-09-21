@@ -34,7 +34,23 @@ fn catalog_accepts_nanbeige_metadata_identity_and_model_type() {
     let model = root.path().join("Nanbeige4.1-3B");
     write_valid_model(
         &model,
-        r#"{"model_type":"nanbeige","_name_or_path":"Nanbeige/Nanbeige4.1-3B"}"#,
+        r#"{
+            "model_type":"nanbeige",
+            "_name_or_path":"Nanbeige/Nanbeige4.1-3B",
+            "hidden_size":3072,
+            "num_hidden_layers":22,
+            "intermediate_size":10752,
+            "num_attention_heads":48,
+            "num_key_value_heads":8,
+            "vocab_size":166144,
+            "max_position_embeddings":262144,
+            "head_dim":128,
+            "rms_norm_eps":0.00001,
+            "hidden_act":"silu",
+            "num_loops":2,
+            "pretraining_tp":1,
+            "rope_scaling":null
+        }"#,
     );
 
     let available = scan_models(&[root.path().to_path_buf()]);
@@ -43,6 +59,30 @@ fn catalog_accepts_nanbeige_metadata_identity_and_model_type() {
     assert_eq!(available[0].id, "Nanbeige/Nanbeige4.1-3B");
     assert_eq!(available[0].model_type, "nanbeige");
     assert_eq!(available[0].adapter, "transformer-dense");
+}
+
+#[test]
+fn catalog_rejects_nanbeige_with_unsupported_hyper_connections() {
+    let root = tempfile::tempdir().unwrap();
+    let model = root.path().join("unsupported-nanbeige");
+    write_valid_model(
+        &model,
+        r#"{
+            "model_type":"nanbeige",
+            "hidden_size":3072,
+            "num_hidden_layers":22,
+            "intermediate_size":10752,
+            "num_attention_heads":48,
+            "num_key_value_heads":8,
+            "vocab_size":166144,
+            "max_position_embeddings":262144,
+            "head_dim":128,
+            "rms_norm_eps":0.00001,
+            "enable_hyper_connection":true
+        }"#,
+    );
+
+    assert!(scan_models(&[root.path().to_path_buf()]).is_empty());
 }
 
 #[test]
