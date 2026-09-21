@@ -61,6 +61,7 @@ const INFRASTRUCTURE_PATHS: &[&str] = &[
     "/health",
     "/metrics",
     "/v1/models",
+    "/v1/models/available",
     "/v1/system",
     "/v1/capacity",
 ];
@@ -94,6 +95,10 @@ pub fn build_router(
         .route(
             "/v1/models",
             get(routes::models::list_models).post(routes::models::load_model),
+        )
+        .route(
+            "/v1/models/available",
+            get(routes::models::list_available_models),
         )
         .route("/v1/capacity", get(routes::capacity::capacity))
         .route("/v1/models/{name}", delete(routes::models::unload_model))

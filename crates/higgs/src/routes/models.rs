@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,12 +15,28 @@ use crate::{
     config::{ModelConfig, validate_pflash_settings},
     error::ServerError,
     model_resolver,
+    retention_plan::scan_models,
     state::{
         Engine, SharedState, build_engine_with_capacity, measure_after_engine_drop,
         release_failed_engine,
     },
     types::openai::{ModelList, ModelObject, ModelRuntimeCapabilities},
 };
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AvailableModelRecord {
+    pub id: String,
+    pub path: PathBuf,
+    pub model_type: String,
+    pub adapter: String,
+    pub loaded: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AvailableModelList {
+    pub runtime_model_load: bool,
+    pub data: Vec<AvailableModelRecord>,
+}
 
 /// How long `DELETE /v1/models/{name}` waits for in-flight requests to release a
 /// model before detaching the final drop to a background task.
@@ -206,6 +224,59 @@ pub async fn list_models(State(state): State<SharedState>) -> Json<ModelList> {
     })
 }
 
+/// `GET /v1/models/available` -- list metadata-compatible local artifacts.
+pub async fn list_available_models(State(state): State<SharedState>) -> Json<AvailableModelList> {
+    Json(available_model_catalog(
+        &state.config,
+        &state.loaded_model_paths(),
+    ))
+}
+
+#[must_use]
+pub fn available_model_catalog(
+    config: &crate::config::HiggsConfig,
+    loaded_paths: &HashMap<PathBuf, String>,
+) -> AvailableModelList {
+    let mut roots = directories::BaseDirs::new().map_or_else(Vec::new, |dirs| {
+        vec![
+            dirs.home_dir().join(".cache/huggingface/hub"),
+            dirs.home_dir().join(".cache/lm-studio/models"),
+        ]
+    });
+    roots.extend(loaded_paths.keys().cloned());
+    let mut aliases = HashMap::new();
+    for model in &config.models {
+        let Ok(path) = model_resolver::resolve(&model.path) else {
+            continue;
+        };
+        roots.push(path.clone());
+        let Ok(canonical) = path.canonicalize() else {
+            continue;
+        };
+        if let Some(name) = &model.name {
+            aliases.insert(canonical.clone(), name.clone());
+        }
+    }
+    for (path, name) in loaded_paths {
+        aliases.insert(path.clone(), name.clone());
+    }
+
+    let data = scan_models(&roots)
+        .into_iter()
+        .map(|model| AvailableModelRecord {
+            id: aliases.get(&model.path).cloned().unwrap_or(model.id),
+            loaded: loaded_paths.contains_key(&model.path),
+            path: model.path,
+            model_type: model.model_type,
+            adapter: model.adapter,
+        })
+        .collect();
+    AvailableModelList {
+        runtime_model_load: config.local.allow_runtime_model_load,
+        data,
+    }
+}
+
 /// `POST /v1/models` -- load a model into GPU memory at runtime.
 ///
 /// Opt-in via `local.allow_runtime_model_load`. The body mirrors a `[[models]]`
@@ -257,6 +328,12 @@ pub async fn load_model(
             model_cfg.path, model_cfg.path
         ))
     })?;
+    let loaded_path = resolved.canonicalize().map_err(|error| {
+        ServerError::BadRequest(format!(
+            "model '{}' could not be canonicalized: {error}",
+            model_cfg.path
+        ))
+    })?;
     let exposed_name = crate::state::resolve_exposed_model_name(
         model_cfg.name.as_deref(),
         &model_cfg.path,
@@ -295,6 +372,7 @@ pub async fn load_model(
         facts,
     )
     .await?;
+    state.record_loaded_model_path(&name, &loaded_path);
 
     tracing::info!(model_name = %name, "Model loaded at runtime");
     Ok(Json(model_object(
@@ -433,6 +511,7 @@ pub async fn unload_model(
         .router
         .remove_engine(&name)
         .ok_or_else(|| ServerError::ModelNotFound(name.clone()))?;
+    state.forget_loaded_model_path(&name);
     let capacity_drain = CapacityDrain {
         state: Arc::clone(&state),
         registration: drain,
@@ -609,6 +688,88 @@ mod tests {
         // that boundary explicitly before entering lifecycle publication.
         state.capacity.refresh_memory(MlxMemorySnapshot::default());
         publish_loaded_engine(state, name, engine, generation_defaults, facts).await
+    }
+
+    fn write_catalog_model(path: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::write(
+            path.join("config.json"),
+            serde_json::json!({
+                "model_type": "llama",
+                "_name_or_path": name,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(path.join("tokenizer.json"), b"{}").unwrap();
+        std::fs::write(path.join("model.safetensors"), b"weights").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn available_models_uses_canonical_identity_for_names_and_loaded_state() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let resident = root.path().join("resident-artifact");
+        let same_display_name = root.path().join("other-artifact");
+        let resident_alias = root.path().join("resident-alias");
+        write_catalog_model(&resident, "Publisher/ResidentMetadata");
+        write_catalog_model(&same_display_name, "Publisher/Resident");
+        symlink(&resident, &resident_alias).unwrap();
+
+        let toml = format!(
+            r#"
+            [local]
+            allow_runtime_model_load = true
+
+            [[models]]
+            path = "{}"
+            name = "Publisher/Resident"
+
+            [[models]]
+            path = "{}"
+            name = "catalog-root"
+            "#,
+            resident_alias.display(),
+            root.path().display(),
+        );
+        let state = build_state(&toml, stub_engines(&["Publisher/Resident"]));
+        let app = crate::build_router(state, 30.0, None, 0, 1024, None);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models/available")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["runtime_model_load"], true);
+        let models = body["data"].as_array().unwrap();
+        let resident_path = resident.canonicalize().unwrap();
+        let other_path = same_display_name.canonicalize().unwrap();
+        let resident_records = models
+            .iter()
+            .filter(|model| model["path"] == resident_path.to_string_lossy().as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(resident_records.len(), 1);
+        assert_eq!(resident_records[0]["id"], "Publisher/Resident");
+        assert_eq!(resident_records[0]["model_type"], "llama");
+        assert_eq!(resident_records[0]["adapter"], "transformer-dense");
+        assert_eq!(resident_records[0]["loaded"], true);
+        let other = models
+            .iter()
+            .find(|model| model["path"] == other_path.to_string_lossy().as_ref())
+            .unwrap();
+        assert_eq!(other["id"], "Publisher/Resident");
+        assert_eq!(other["loaded"], false);
     }
 
     #[tokio::test]

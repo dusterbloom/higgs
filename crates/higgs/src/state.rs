@@ -1882,6 +1882,7 @@ pub struct AppState {
     pub metrics: Option<Arc<MetricsStore>>,
     /// Sole process-wide authority for local-model capacity and lifecycle state.
     pub capacity: Arc<CapacityRegistry>,
+    loaded_model_paths: std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
     retention_bindings:
         std::sync::Mutex<std::collections::HashMap<(String, u64), (String, u64, bool, u64)>>,
 }
@@ -1909,14 +1910,53 @@ impl AppState {
         metrics: Option<Arc<MetricsStore>>,
         capacity: Arc<CapacityRegistry>,
     ) -> Self {
+        let loaded_model_paths = config
+            .models
+            .iter()
+            .filter_map(|model| {
+                let resolved = crate::model_resolver::resolve(&model.path).ok()?;
+                let name =
+                    resolve_exposed_model_name(model.name.as_deref(), &model.path, &resolved);
+                router
+                    .contains_engine(&name)
+                    .then(|| resolved.canonicalize().ok().map(|path| (name, path)))?
+            })
+            .collect();
         Self {
             router,
             config,
             http_client,
             metrics,
             capacity,
+            loaded_model_paths: std::sync::Mutex::new(loaded_model_paths),
             retention_bindings: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    #[must_use]
+    pub fn loaded_model_paths(&self) -> std::collections::HashMap<PathBuf, String> {
+        self.loaded_model_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(name, path)| (path.clone(), name.clone()))
+            .collect()
+    }
+
+    pub fn record_loaded_model_path(&self, name: &str, path: &Path) {
+        if let Ok(path) = path.canonicalize() {
+            self.loaded_model_paths
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(name.to_owned(), path);
+        }
+    }
+
+    pub fn forget_loaded_model_path(&self, name: &str) {
+        self.loaded_model_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name);
     }
 
     pub fn claim_retention_seed(
