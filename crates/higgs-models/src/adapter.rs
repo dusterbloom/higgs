@@ -413,7 +413,7 @@ impl BuiltinAdapter {
         match self.kind {
             LoadKind::Transformer => {
                 matches!(text_alias.as_ref(), "qwen2" | "qwen3")
-                    || matches!(model_type, "llama" | "mistral")
+                    || matches!(model_type, "llama" | "mistral" | "nanbeige")
             }
             LoadKind::Bonsai => text_alias == "qwen3",
             LoadKind::Qwen3Next => text_alias == "qwen3_next",

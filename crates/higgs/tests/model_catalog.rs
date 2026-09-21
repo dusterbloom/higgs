@@ -34,14 +34,14 @@ fn catalog_accepts_nanbeige_metadata_identity_and_model_type() {
     let model = root.path().join("Nanbeige4.1-3B");
     write_valid_model(
         &model,
-        r#"{"model_type":"llama","_name_or_path":"Nanbeige/Nanbeige4.1-3B"}"#,
+        r#"{"model_type":"nanbeige","_name_or_path":"Nanbeige/Nanbeige4.1-3B"}"#,
     );
 
     let available = scan_models(&[root.path().to_path_buf()]);
 
     assert_eq!(available.len(), 1);
     assert_eq!(available[0].id, "Nanbeige/Nanbeige4.1-3B");
-    assert_eq!(available[0].model_type, "llama");
+    assert_eq!(available[0].model_type, "nanbeige");
     assert_eq!(available[0].adapter, "transformer-dense");
 }
 

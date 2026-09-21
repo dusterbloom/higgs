@@ -57,6 +57,18 @@ fn detects_plain_config() {
 }
 
 #[test]
+fn nanbeige_resolves_to_transformer_dense() {
+    let dir = write_config(&complete_config("nanbeige"));
+    let detected = adapter::detect(dir.path()).unwrap();
+
+    assert_eq!(detected.model_type, "nanbeige");
+    assert_eq!(
+        adapter::resolve(&detected).unwrap().id(),
+        "transformer-dense"
+    );
+}
+
+#[test]
 fn parses_family_versions_from_known_type_shapes() {
     for (model_type, family, version) in [
         (
