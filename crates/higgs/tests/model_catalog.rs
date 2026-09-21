@@ -28,6 +28,59 @@ fn catalog_accepts_valid_model() {
     assert_eq!(available[0].adapter, "transformer-dense");
 }
 
+#[test]
+fn catalog_accepts_nanbeige_metadata_identity_and_model_type() {
+    let root = tempfile::tempdir().unwrap();
+    let model = root.path().join("Nanbeige4.1-3B");
+    write_valid_model(
+        &model,
+        r#"{"model_type":"llama","_name_or_path":"Nanbeige/Nanbeige4.1-3B"}"#,
+    );
+
+    let available = scan_models(&[root.path().to_path_buf()]);
+
+    assert_eq!(available.len(), 1);
+    assert_eq!(available[0].id, "Nanbeige/Nanbeige4.1-3B");
+    assert_eq!(available[0].model_type, "llama");
+    assert_eq!(available[0].adapter, "transformer-dense");
+}
+
+#[test]
+fn catalog_rejects_unsupported_adapter() {
+    let root = tempfile::tempdir().unwrap();
+    let model = root.path().join("unsupported");
+    write_valid_model(&model, r#"{"model_type":"diffusion"}"#);
+
+    assert!(scan_models(&[root.path().to_path_buf()]).is_empty());
+}
+
+#[test]
+fn catalog_names_hugging_face_snapshot_from_repository_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let model = root
+        .path()
+        .join("models--LiquidAI--LFM2.5-2.6B-MLX/snapshots/deadbeef");
+    write_valid_model(&model, r#"{"model_type":"llama"}"#);
+
+    let available = scan_models(&[root.path().to_path_buf()]);
+
+    assert_eq!(available.len(), 1);
+    assert_eq!(available[0].id, "LiquidAI/LFM2.5-2.6B-MLX");
+}
+
+#[test]
+fn catalog_preserves_nested_lm_studio_variant_name() {
+    let root = tempfile::tempdir().unwrap();
+    let models_root = root.path().join(".cache/lm-studio/models");
+    let model = models_root.join("LiquidAI/LFM2.5-2.6B-MLX/8bit");
+    write_valid_model(&model, r#"{"model_type":"llama"}"#);
+
+    let available = scan_models(&[models_root]);
+
+    assert_eq!(available.len(), 1);
+    assert_eq!(available[0].id, "LiquidAI/LFM2.5-2.6B-MLX/8bit");
+}
+
 #[cfg(unix)]
 #[test]
 fn catalog_deduplicates_canonical_path() {
