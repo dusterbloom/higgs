@@ -12,7 +12,7 @@ use std::{
 
 use higgs::{
     config::HiggsConfig, model_resolver::load_after_model_path_preflight, router::Router,
-    state::ModelCatalogCache,
+    routes::models::run_reserved_blocking_load, state::ModelCatalogCache,
 };
 
 #[test]
@@ -89,19 +89,24 @@ async fn aborted_load_holds_path_until_detached_cleanup_finishes() {
         Arc::new(Router::from_config(&HiggsConfig::default(), Default::default()).unwrap());
     let path = PathBuf::from("/canonical/cancelled-runtime-model");
     let (loader_started_tx, loader_started_rx) = tokio::sync::oneshot::channel();
-    let (finish_loader_tx, finish_loader_rx) = tokio::sync::oneshot::channel();
+    let (finish_loader_tx, finish_loader_rx) = std::sync::mpsc::channel();
     let (cleanup_done_tx, cleanup_done_rx) = tokio::sync::oneshot::channel();
     let request_router = Arc::clone(&router);
     let request_path = path.clone();
 
     let request = tokio::spawn(async move {
         let reservation = request_router.reserve_model_path(request_path).unwrap();
-        reservation.hold_until(async move {
-            let _ = loader_started_tx.send(());
-            let _ = finish_loader_rx.await;
-            let _ = cleanup_done_tx.send(());
-        });
-        std::future::pending::<()>().await;
+        let _ = run_reserved_blocking_load(
+            reservation,
+            move || {
+                let _ = loader_started_tx.send(());
+                finish_loader_rx.recv().unwrap();
+            },
+            move |()| async move {
+                let _ = cleanup_done_tx.send(());
+            },
+        )
+        .await;
     });
     loader_started_rx.await.unwrap();
     request.abort();

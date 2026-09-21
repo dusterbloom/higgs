@@ -51,32 +51,32 @@ type LoadedEngine = Result<(String, Engine, ModelCapacityFacts), String>;
 /// Owns an in-progress blocking load. Dropping the awaiting HTTP future hands
 /// the still-running task to a detached cleanup task instead of detaching the
 /// model allocation itself.
-struct RuntimeLoadGuard {
-    task: Option<tokio::task::JoinHandle<LoadedEngine>>,
+type DetachedCleanup<T> =
+    Box<dyn FnOnce(T) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
+struct RuntimeLoadGuard<T: Send + 'static> {
+    task: Option<tokio::task::JoinHandle<T>>,
     reservation: Option<crate::router::ModelPathReservation>,
-    capacity: Arc<crate::capacity::CapacityRegistry>,
-    #[cfg(test)]
-    cleanup_ack: Option<tokio::sync::oneshot::Sender<()>>,
+    cleanup: Option<DetachedCleanup<T>>,
 }
 
-impl RuntimeLoadGuard {
-    fn spawn(
-        capacity: Arc<crate::capacity::CapacityRegistry>,
-        reservation: crate::router::ModelPathReservation,
-        load: impl FnOnce() -> LoadedEngine + Send + 'static,
-    ) -> Self {
+impl<T: Send + 'static> RuntimeLoadGuard<T> {
+    fn spawn<L, C, F>(reservation: crate::router::ModelPathReservation, load: L, cleanup: C) -> Self
+    where
+        L: FnOnce() -> T + Send + 'static,
+        C: FnOnce(T) -> F + Send + 'static,
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         Self {
             task: Some(tokio::task::spawn_blocking(load)),
             reservation: Some(reservation),
-            capacity,
-            #[cfg(test)]
-            cleanup_ack: None,
+            cleanup: Some(Box::new(move |value| Box::pin(cleanup(value)))),
         }
     }
 
     async fn finish(
         mut self,
-    ) -> Result<(LoadedEngine, crate::router::ModelPathReservation), tokio::task::JoinError> {
+    ) -> Result<(T, crate::router::ModelPathReservation), tokio::task::JoinError> {
         let result = self.task.as_mut().expect("runtime load task exists").await;
         self.task.take();
         result.map(|loaded| {
@@ -88,27 +88,39 @@ impl RuntimeLoadGuard {
     }
 }
 
-impl Drop for RuntimeLoadGuard {
+impl<T: Send + 'static> Drop for RuntimeLoadGuard<T> {
     fn drop(&mut self) {
         let Some(task) = self.task.take() else {
             return;
         };
         let reservation = self.reservation.take().expect("path reservation exists");
-        let capacity = Arc::clone(&self.capacity);
-        #[cfg(test)]
-        let cleanup_ack = self.cleanup_ack.take();
+        let cleanup = self.cleanup.take().expect("detached cleanup exists");
         reservation.hold_until(async move {
-            if let Ok(Ok((_name, engine, _facts))) = task.await {
-                let _ =
-                    tokio::task::spawn_blocking(move || release_failed_engine(engine, &capacity))
-                        .await;
-            }
-            #[cfg(test)]
-            if let Some(cleanup_ack) = cleanup_ack {
-                let _ = cleanup_ack.send(());
+            if let Ok(value) = task.await {
+                cleanup(value).await;
             }
         });
     }
+}
+
+/// Run the same reserved blocking lifecycle used by `POST /v1/models`.
+/// Cancelling the waiter detaches the loader and its cleanup while retaining
+/// the canonical-path reservation through both.
+#[doc(hidden)]
+pub async fn run_reserved_blocking_load<T, L, C, F>(
+    reservation: crate::router::ModelPathReservation,
+    load: L,
+    cleanup: C,
+) -> Result<(T, crate::router::ModelPathReservation), tokio::task::JoinError>
+where
+    T: Send + 'static,
+    L: FnOnce() -> T + Send + 'static,
+    C: FnOnce(T) -> F + Send + 'static,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    RuntimeLoadGuard::spawn(reservation, load, cleanup)
+        .finish()
+        .await
 }
 
 struct ProvisionalEngine {
@@ -402,14 +414,21 @@ pub async fn load_model(
     // Honor the HIGGS_KV_TURBO[BITS] env gate on runtime model loads too, so
     // a model loaded after boot matches the boot-time engines' KV storage.
     cfg.apply_kv_turbo_env_overrides(&|key| std::env::var(key).ok());
-    let load_capacity = Arc::clone(&capacity);
-    let (loaded, path_reservation) =
-        RuntimeLoadGuard::spawn(load_capacity, path_reservation, move || {
-            build_engine_with_capacity(&resolved, &cfg, &config, &capacity)
-        })
-        .finish()
-        .await
-        .map_err(|e| ServerError::InternalError(format!("model load task failed: {e}")))?;
+    let cleanup_capacity = Arc::clone(&capacity);
+    let (loaded, path_reservation) = run_reserved_blocking_load(
+        path_reservation,
+        move || build_engine_with_capacity(&resolved, &cfg, &config, &capacity),
+        move |loaded: LoadedEngine| async move {
+            if let Ok((_name, engine, _facts)) = loaded {
+                let _ = tokio::task::spawn_blocking(move || {
+                    release_failed_engine(engine, &cleanup_capacity);
+                })
+                .await;
+            }
+        },
+    )
+    .await
+    .map_err(|e| ServerError::InternalError(format!("model load task failed: {e}")))?;
     let (name, engine, facts) = loaded.map_err(ServerError::BadRequest)?;
     let vision = engine.is_vlm();
     let tool_mode = engine.tool_call_mode();
@@ -1281,17 +1300,28 @@ mod tests {
         let reservation = router
             .reserve_model_path(PathBuf::from("/test/cancelled"))
             .unwrap();
-        let mut guard = RuntimeLoadGuard::spawn(Arc::clone(&capacity), reservation, move || {
-            started.send(()).unwrap();
-            wait_release.recv().unwrap();
-            Ok((
-                "cancelled".to_owned(),
-                Engine::test_stub("cancelled"),
-                capacity_facts("cancelled"),
-            ))
-        });
-        guard.cleanup_ack = Some(cleanup_ack);
-        let waiter = tokio::spawn(async move { guard.finish().await });
+        let cleanup_capacity = Arc::clone(&capacity);
+        let waiter = tokio::spawn(run_reserved_blocking_load(
+            reservation,
+            move || {
+                started.send(()).unwrap();
+                wait_release.recv().unwrap();
+                Ok((
+                    "cancelled".to_owned(),
+                    Engine::test_stub("cancelled"),
+                    capacity_facts("cancelled"),
+                ))
+            },
+            move |loaded: LoadedEngine| async move {
+                if let Ok((_name, engine, _facts)) = loaded {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        release_failed_engine(engine, &cleanup_capacity);
+                    })
+                    .await;
+                }
+                let _ = cleanup_ack.send(());
+            },
+        ));
         wait_started.recv_timeout(Duration::from_secs(1)).unwrap();
         waiter.abort();
         release.send(()).unwrap();
