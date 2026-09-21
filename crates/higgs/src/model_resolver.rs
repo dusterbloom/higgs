@@ -92,6 +92,30 @@ fn default_hf_cache() -> Option<PathBuf> {
     })
 }
 
+/// Local model roots recognized by Higgs, including environment-selected and
+/// conventional Hugging Face caches plus the conventional LM Studio root.
+#[must_use]
+pub fn local_model_roots() -> Vec<PathBuf> {
+    let base_dirs = directories::BaseDirs::new();
+    local_model_roots_from(
+        default_hf_cache(),
+        base_dirs.as_ref().map(directories::BaseDirs::home_dir),
+    )
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn local_model_roots_from(hf_cache: Option<PathBuf>, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = hf_cache.into_iter().collect::<Vec<_>>();
+    if let Some(home) = home {
+        roots.push(home.join(".cache/huggingface/hub"));
+        roots.push(home.join(".cache/lm-studio/models"));
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 /// Testable env var resolution without reading actual environment.
 ///
 /// Resolution order matches the `HuggingFace` Python SDK:

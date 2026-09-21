@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -226,53 +226,57 @@ pub async fn list_models(State(state): State<SharedState>) -> Json<ModelList> {
 
 /// `GET /v1/models/available` -- list metadata-compatible local artifacts.
 pub async fn list_available_models(State(state): State<SharedState>) -> Json<AvailableModelList> {
+    let loaded_paths = state.router.local_model_paths();
+    let mut roots = model_resolver::local_model_roots();
+    roots.extend(loaded_paths.iter().cloned());
+    roots.extend(
+        state
+            .config
+            .models
+            .iter()
+            .filter_map(|model| model_resolver::resolve(&model.path).ok()),
+    );
+    roots.sort();
+    roots.dedup();
+    let mut cache = state.model_catalog_cache.lock().await;
+    if cache.1 != roots
+        || cache
+            .0
+            .is_none_or(|refreshed| refreshed.elapsed() >= Duration::from_secs(2))
+    {
+        let scan_roots = roots.clone();
+        cache.2 = tokio::task::spawn_blocking(move || scan_models(&scan_roots))
+            .await
+            .unwrap_or_default();
+        cache.0 = Some(std::time::Instant::now());
+        cache.1 = roots;
+    }
     Json(available_model_catalog(
-        &state.config,
-        &state.loaded_model_paths(),
+        state.config.local.allow_runtime_model_load,
+        &cache.2,
+        &loaded_paths,
     ))
 }
 
 #[must_use]
 pub fn available_model_catalog(
-    config: &crate::config::HiggsConfig,
-    loaded_paths: &HashMap<PathBuf, String>,
+    runtime_model_load: bool,
+    models: &[crate::retention_plan::AvailableModel],
+    loaded_paths: &HashSet<PathBuf>,
 ) -> AvailableModelList {
-    let mut roots = directories::BaseDirs::new().map_or_else(Vec::new, |dirs| {
-        vec![
-            dirs.home_dir().join(".cache/huggingface/hub"),
-            dirs.home_dir().join(".cache/lm-studio/models"),
-        ]
-    });
-    roots.extend(loaded_paths.keys().cloned());
-    let mut aliases = HashMap::new();
-    for model in &config.models {
-        let Ok(path) = model_resolver::resolve(&model.path) else {
-            continue;
-        };
-        roots.push(path.clone());
-        let Ok(canonical) = path.canonicalize() else {
-            continue;
-        };
-        if let Some(name) = &model.name {
-            aliases.insert(canonical.clone(), name.clone());
-        }
-    }
-    for (path, name) in loaded_paths {
-        aliases.insert(path.clone(), name.clone());
-    }
-
-    let data = scan_models(&roots)
-        .into_iter()
+    let data = models
+        .iter()
+        .cloned()
         .map(|model| AvailableModelRecord {
-            id: aliases.get(&model.path).cloned().unwrap_or(model.id),
-            loaded: loaded_paths.contains_key(&model.path),
+            id: model.id,
+            loaded: loaded_paths.contains(&model.path),
             path: model.path,
             model_type: model.model_type,
             adapter: model.adapter,
         })
         .collect();
     AvailableModelList {
-        runtime_model_load: config.local.allow_runtime_model_load,
+        runtime_model_load,
         data,
     }
 }
@@ -364,15 +368,15 @@ pub async fn load_model(
     let tool_mode = engine.tool_call_mode();
     let thinking = engine.thinking_mode();
 
-    publish_loaded_engine(
+    publish_loaded_engine_at_path(
         &state,
         name.clone(),
         engine,
         model_cfg.generation_defaults.clone(),
         facts,
+        loaded_path,
     )
     .await?;
-    state.record_loaded_model_path(&name, &loaded_path);
 
     tracing::info!(model_name = %name, "Model loaded at runtime");
     Ok(Json(model_object(
@@ -384,6 +388,7 @@ pub async fn load_model(
     )))
 }
 
+#[cfg(test)]
 async fn publish_loaded_engine(
     state: &SharedState,
     name: String,
@@ -397,6 +402,30 @@ async fn publish_loaded_engine(
         engine,
         generation_defaults,
         facts,
+        None,
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn publish_loaded_engine_at_path(
+    state: &SharedState,
+    name: String,
+    engine: Engine,
+    generation_defaults: crate::config::GenerationDefaults,
+    facts: ModelCapacityFacts,
+    model_path: PathBuf,
+) -> Result<(), ServerError> {
+    publish_loaded_engine_inner(
+        state,
+        name,
+        engine,
+        generation_defaults,
+        facts,
+        Some(model_path),
         #[cfg(test)]
         None,
         #[cfg(test)]
@@ -417,6 +446,7 @@ async fn publish_loaded_engine_inner(
     engine: Engine,
     generation_defaults: crate::config::GenerationDefaults,
     facts: ModelCapacityFacts,
+    model_path: Option<PathBuf>,
     #[cfg(test)] publication_gate: Option<PublicationTestGate>,
     #[cfg(test)] insertion_gate: Option<crate::router::RouteInsertionTestGate>,
 ) -> Result<(), ServerError> {
@@ -444,6 +474,7 @@ async fn publish_loaded_engine_inner(
             generation_defaults,
             &state.capacity,
             publication.registration(),
+            model_path,
             #[cfg(test)]
             insertion_gate,
         )
@@ -455,7 +486,9 @@ async fn publish_loaded_engine_inner(
             .router
             .apply_capacity_cache_allocations(&state.capacity)
             .await;
-        return if error == "model name is already loaded" {
+        return if error == "model name is already loaded"
+            || error == "model artifact is already loaded"
+        {
             Err(ServerError::Conflict(format!(
                 "model '{name}' is already loaded"
             )))
@@ -511,7 +544,6 @@ pub async fn unload_model(
         .router
         .remove_engine(&name)
         .ok_or_else(|| ServerError::ModelNotFound(name.clone()))?;
-    state.forget_loaded_model_path(&name);
     let capacity_drain = CapacityDrain {
         state: Arc::clone(&state),
         registration: drain,
@@ -760,7 +792,7 @@ mod tests {
             .filter(|model| model["path"] == resident_path.to_string_lossy().as_ref())
             .collect::<Vec<_>>();
         assert_eq!(resident_records.len(), 1);
-        assert_eq!(resident_records[0]["id"], "Publisher/Resident");
+        assert_eq!(resident_records[0]["id"], "Publisher/ResidentMetadata");
         assert_eq!(resident_records[0]["model_type"], "llama");
         assert_eq!(resident_records[0]["adapter"], "transformer-dense");
         assert_eq!(resident_records[0]["loaded"], true);
@@ -805,6 +837,8 @@ mod tests {
         let state = build_state("[local]\nallow_runtime_model_load = true\n", HashMap::new());
         let (arrived, wait_arrived) = tokio::sync::oneshot::channel();
         let (release, wait_release) = tokio::sync::oneshot::channel();
+        let second_path = PathBuf::from("/test/catalog/second");
+        let published_path = second_path.clone();
         let publish_state = Arc::clone(&state);
         let publication = tokio::spawn(async move {
             publish_state
@@ -816,6 +850,7 @@ mod tests {
                 Engine::test_stub("second"),
                 crate::config::GenerationDefaults::default(),
                 capacity_facts("second"),
+                Some(published_path),
                 Some(PublicationTestGate {
                     arrived,
                     release: wait_release,
@@ -828,6 +863,7 @@ mod tests {
             .await
             .expect("publication must pause after successful router insertion")
             .unwrap();
+        assert!(state.router.local_model_paths().contains(&second_path));
 
         let app = crate::build_router(Arc::clone(&state), 30.0, None, 0, 1024, None);
         let capacity_response = app
@@ -1051,6 +1087,7 @@ mod tests {
                 Engine::test_stub("second"),
                 crate::config::GenerationDefaults::default(),
                 facts,
+                None,
                 None,
                 Some(crate::router::RouteInsertionTestGate {
                     arrived,

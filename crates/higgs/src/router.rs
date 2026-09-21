@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use regex::Regex;
@@ -83,6 +84,7 @@ struct LocalEngineEntry {
     engine: Arc<Engine>,
     generation_defaults: GenerationDefaults,
     capacity_ready: bool,
+    model_path: Option<PathBuf>,
 }
 
 /// Routes model names to local engines or remote providers.
@@ -154,10 +156,21 @@ impl Router {
         let mut auto_candidates = Vec::new();
         let mut seen_names = HashSet::new();
         let mut local_generation_defaults = HashMap::new();
+        let mut local_model_paths = HashMap::new();
 
         for model in &config.models {
             if let Some(name) = &model.name {
                 local_generation_defaults.insert(name.clone(), model.generation_defaults.clone());
+            }
+            if let Ok(path) = crate::model_resolver::resolve(&model.path)
+                && let Ok(path) = path.canonicalize()
+            {
+                let name = crate::state::resolve_exposed_model_name(
+                    model.name.as_deref(),
+                    &model.path,
+                    &path,
+                );
+                local_model_paths.insert(name, path);
             }
         }
 
@@ -202,21 +215,30 @@ impl Router {
             }
         }
 
-        let local_engines = engines
-            .into_iter()
-            .map(|(name, engine)| {
-                let generation_defaults =
-                    local_generation_defaults.remove(&name).unwrap_or_default();
-                (
-                    name,
-                    LocalEngineEntry {
-                        engine,
-                        generation_defaults,
-                        capacity_ready: true,
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
+        let mut local_engines = HashMap::new();
+        let mut seen_model_paths = HashSet::new();
+        for (name, engine) in engines {
+            let generation_defaults =
+                local_generation_defaults.remove(&name).unwrap_or_default();
+            let model_path = local_model_paths.remove(&name);
+            if model_path
+                .as_ref()
+                .is_some_and(|path| !seen_model_paths.insert(path.clone()))
+            {
+                return Err(format!(
+                    "model artifact for '{name}' is already loaded under another name"
+                ));
+            }
+            local_engines.insert(
+                name,
+                LocalEngineEntry {
+                    engine,
+                    generation_defaults,
+                    capacity_ready: true,
+                    model_path,
+                },
+            );
+        }
 
         let (auto_router_engine, auto_router_model_name) = if config.auto_router.enabled {
             if config.auto_router.model.is_empty() {
@@ -312,6 +334,15 @@ impl Router {
         names
     }
 
+    /// Canonical artifacts in the same snapshot as route visibility.
+    pub fn local_model_paths(&self) -> HashSet<PathBuf> {
+        self.engines_read()
+            .values()
+            .filter(|entry| entry.capacity_ready)
+            .filter_map(|entry| entry.model_path.clone())
+            .collect()
+    }
+
     /// Sorted `(name, is_vlm)` for all loaded local engines (snapshot under a
     /// read lock). Used by `GET /v1/models` to advertise image-input support.
     pub fn local_models_with_vlm(&self) -> Vec<(String, bool)> {
@@ -378,6 +409,7 @@ impl Router {
                 engine,
                 generation_defaults,
                 capacity_ready: true,
+                model_path: None,
             },
         );
         Ok(())
@@ -428,6 +460,7 @@ impl Router {
         generation_defaults: GenerationDefaults,
         capacity: &CapacityRegistry,
         registration: &mut ActiveRegistration,
+        model_path: Option<PathBuf>,
         #[cfg(test)] mut insertion_gate: Option<RouteInsertionTestGate>,
     ) -> Result<(), (String, Arc<Engine>, String)> {
         let _serialized = self.cache_policy.lock().await;
@@ -462,6 +495,17 @@ impl Router {
                             "model name is already loaded".to_owned(),
                         ));
                     }
+                    if model_path.as_ref().is_some_and(|path| {
+                        engines
+                            .values()
+                            .any(|entry| entry.model_path.as_ref() == Some(path))
+                    }) {
+                        return Err((
+                            name,
+                            pending_engine.take().expect("provisional engine exists"),
+                            "model artifact is already loaded".to_owned(),
+                        ));
+                    }
                     engines.insert(
                         name.clone(),
                         LocalEngineEntry {
@@ -470,6 +514,7 @@ impl Router {
                                 .take()
                                 .expect("provisional defaults exist"),
                             capacity_ready: false,
+                            model_path: model_path.clone(),
                         },
                     );
                 }
@@ -1131,6 +1176,39 @@ mod tests {
         let router = Router::from_config(&config, HashMap::new()).unwrap();
         let result = router.resolve("nonexistent-model", None).await;
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_rejects_two_names_for_one_canonical_artifact() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("model");
+        let alias = root.path().join("alias");
+        std::fs::create_dir(&model).unwrap();
+        symlink(&model, &alias).unwrap();
+        let config = config_from_toml(&format!(
+            "[[models]]\npath = {:?}\nname = \"first\"\n[[models]]\npath = {:?}\nname = \"second\"\n",
+            model, alias
+        ));
+        let engines = HashMap::from([
+            (
+                "first".to_owned(),
+                Arc::new(crate::state::Engine::test_stub("first")),
+            ),
+            (
+                "second".to_owned(),
+                Arc::new(crate::state::Engine::test_stub("second")),
+            ),
+        ]);
+
+        let error = match Router::from_config(&config, engines) {
+            Ok(_) => panic!("duplicate canonical artifact must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("already loaded under another name"));
     }
 
     #[tokio::test]

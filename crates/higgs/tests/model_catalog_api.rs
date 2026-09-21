@@ -124,12 +124,11 @@ fn available_models_marks_only_the_exact_configured_artifact_loaded() {
     )
     .unwrap();
     let config = higgs::config::load_config_file(&config_path, None).unwrap();
+    let models = higgs::retention_plan::scan_models(&[root.path().to_path_buf()]);
     let catalog = higgs::routes::models::available_model_catalog(
-        &config,
-        &HashMap::from([(
-            resident.canonicalize().unwrap(),
-            "Publisher/Resident".to_owned(),
-        )]),
+        config.local.allow_runtime_model_load,
+        &models,
+        &std::collections::HashSet::from([resident.canonicalize().unwrap()]),
     );
     let resident_path = resident.canonicalize().unwrap();
     let resident_records = catalog
@@ -139,7 +138,7 @@ fn available_models_marks_only_the_exact_configured_artifact_loaded() {
         .collect::<Vec<_>>();
 
     assert_eq!(resident_records.len(), 1);
-    assert_eq!(resident_records[0].id, "Publisher/Resident");
+    assert_eq!(resident_records[0].id, "Publisher/MetadataName");
     assert!(resident_records[0].loaded);
     let decoy = catalog
         .data
@@ -176,16 +175,17 @@ async fn available_models_endpoint_uses_api_bearer_authentication() {
 }
 
 #[test]
-fn runtime_model_path_bookkeeping_controls_loaded_identity() {
+fn loaded_state_never_overrides_the_stable_scanner_name() {
     let root = tempfile::tempdir().unwrap();
     let model = root.path().join("runtime-model");
     write_model(&model, "Publisher/Metadata");
-    let state = state_with_catalog_root(root.path());
     let canonical = model.canonicalize().unwrap();
-
-    state.record_loaded_model_path("Publisher/Runtime", &canonical);
-    let loaded =
-        higgs::routes::models::available_model_catalog(&state.config, &state.loaded_model_paths());
+    let models = higgs::retention_plan::scan_models(&[root.path().to_path_buf()]);
+    let loaded = higgs::routes::models::available_model_catalog(
+        true,
+        &models,
+        &std::collections::HashSet::from([canonical.clone()]),
+    );
     assert!(
         loaded
             .data
@@ -201,18 +201,6 @@ fn runtime_model_path_bookkeeping_controls_loaded_identity() {
             .find(|record| record.path == canonical)
             .unwrap()
             .id,
-        "Publisher/Runtime"
-    );
-
-    state.forget_loaded_model_path("Publisher/Runtime");
-    let unloaded =
-        higgs::routes::models::available_model_catalog(&state.config, &state.loaded_model_paths());
-    assert!(
-        !unloaded
-            .data
-            .iter()
-            .find(|record| record.path == canonical)
-            .unwrap()
-            .loaded
+        "Publisher/Metadata"
     );
 }
