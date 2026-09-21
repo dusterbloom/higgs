@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use regex::Regex;
 use tracing::warn;
@@ -99,6 +99,7 @@ pub struct Router {
     /// Guarded by a `RwLock`: `resolve`/`list` take a read lock and clone the
     /// `Arc` out, so an in-flight request is never tied to map membership.
     local_engines: RwLock<HashMap<String, LocalEngineEntry>>,
+    loading_model_paths: Mutex<HashSet<PathBuf>>,
     cache_policy: tokio::sync::Mutex<()>,
     compiled_routes: Vec<CompiledRoute>,
     auto_routes: Vec<AutoRouteEntry>,
@@ -116,6 +117,21 @@ struct DisabledRouteGuard<'a> {
     router: &'a Router,
     name: String,
     armed: bool,
+}
+
+pub struct ModelPathReservation<'a> {
+    router: &'a Router,
+    path: PathBuf,
+}
+
+impl Drop for ModelPathReservation<'_> {
+    fn drop(&mut self) {
+        self.router
+            .loading_model_paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.path);
+    }
 }
 
 #[cfg(test)]
@@ -218,8 +234,7 @@ impl Router {
         let mut local_engines = HashMap::new();
         let mut seen_model_paths = HashSet::new();
         for (name, engine) in engines {
-            let generation_defaults =
-                local_generation_defaults.remove(&name).unwrap_or_default();
+            let generation_defaults = local_generation_defaults.remove(&name).unwrap_or_default();
             let model_path = local_model_paths.remove(&name);
             if model_path
                 .as_ref()
@@ -263,6 +278,7 @@ impl Router {
 
         Ok(Self {
             local_engines: RwLock::new(local_engines),
+            loading_model_paths: Mutex::new(HashSet::new()),
             cache_policy: tokio::sync::Mutex::new(()),
             compiled_routes,
             auto_routes,
@@ -334,13 +350,33 @@ impl Router {
         names
     }
 
-    /// Canonical artifacts in the same snapshot as route visibility.
-    pub fn local_model_paths(&self) -> HashSet<PathBuf> {
+    /// Canonical artifacts and their selectable route aliases in one snapshot.
+    pub fn local_model_routes(&self) -> HashMap<PathBuf, String> {
         self.engines_read()
-            .values()
-            .filter(|entry| entry.capacity_ready)
-            .filter_map(|entry| entry.model_path.clone())
+            .iter()
+            .filter(|(_, entry)| entry.capacity_ready)
+            .filter_map(|(name, entry)| entry.model_path.clone().map(|path| (path, name.clone())))
             .collect()
+    }
+
+    /// Reserve an artifact before expensive runtime loading. The insertion
+    /// path re-checks under the engine lock to close publication races.
+    pub fn reserve_model_path(&self, path: PathBuf) -> Result<ModelPathReservation<'_>, String> {
+        let mut loading = self
+            .loading_model_paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self
+            .engines_read()
+            .values()
+            .any(|entry| entry.model_path.as_ref() == Some(&path))
+        {
+            return Err("model artifact is already loaded".to_owned());
+        }
+        if !loading.insert(path.clone()) {
+            return Err("model artifact is already loading".to_owned());
+        }
+        Ok(ModelPathReservation { router: self, path })
     }
 
     /// Sorted `(name, is_vlm)` for all loaded local engines (snapshot under a

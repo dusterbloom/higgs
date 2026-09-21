@@ -128,7 +128,14 @@ fn available_models_marks_only_the_exact_configured_artifact_loaded() {
     let catalog = higgs::routes::models::available_model_catalog(
         config.local.allow_runtime_model_load,
         &models,
-        &std::collections::HashSet::from([resident.canonicalize().unwrap()]),
+        &HashMap::from([(
+            resident.canonicalize().unwrap(),
+            "Publisher/ActiveAlias".to_owned(),
+        )]),
+        &HashMap::from([(
+            resident.canonicalize().unwrap(),
+            "Publisher/ConfiguredAlias".to_owned(),
+        )]),
     );
     let resident_path = resident.canonicalize().unwrap();
     let resident_records = catalog
@@ -138,7 +145,8 @@ fn available_models_marks_only_the_exact_configured_artifact_loaded() {
         .collect::<Vec<_>>();
 
     assert_eq!(resident_records.len(), 1);
-    assert_eq!(resident_records[0].id, "Publisher/MetadataName");
+    assert_eq!(resident_records[0].id, "Publisher/ActiveAlias");
+    assert_eq!(resident_records[0].stable_id, "Publisher/MetadataName");
     assert!(resident_records[0].loaded);
     let decoy = catalog
         .data
@@ -175,7 +183,7 @@ async fn available_models_endpoint_uses_api_bearer_authentication() {
 }
 
 #[test]
-fn loaded_state_never_overrides_the_stable_scanner_name() {
+fn active_alias_is_selectable_while_stable_scanner_identity_is_preserved() {
     let root = tempfile::tempdir().unwrap();
     let model = root.path().join("runtime-model");
     write_model(&model, "Publisher/Metadata");
@@ -184,7 +192,8 @@ fn loaded_state_never_overrides_the_stable_scanner_name() {
     let loaded = higgs::routes::models::available_model_catalog(
         true,
         &models,
-        &std::collections::HashSet::from([canonical.clone()]),
+        &HashMap::from([(canonical.clone(), "local:active".to_owned())]),
+        &HashMap::new(),
     );
     assert!(
         loaded
@@ -201,6 +210,71 @@ fn loaded_state_never_overrides_the_stable_scanner_name() {
             .find(|record| record.path == canonical)
             .unwrap()
             .id,
+        "local:active"
+    );
+    assert_eq!(
+        loaded
+            .data
+            .iter()
+            .find(|record| record.path == canonical)
+            .unwrap()
+            .stable_id,
         "Publisher/Metadata"
     );
+}
+
+#[test]
+fn configured_alias_is_selectable_when_artifact_is_not_loaded() {
+    let root = tempfile::tempdir().unwrap();
+    let model = root.path().join("configured-model");
+    write_model(&model, "Publisher/Metadata");
+    let canonical = model.canonicalize().unwrap();
+    let models = higgs::retention_plan::scan_models(&[root.path().to_path_buf()]);
+
+    let catalog = higgs::routes::models::available_model_catalog(
+        true,
+        &models,
+        &HashMap::new(),
+        &HashMap::from([(canonical.clone(), "local:configured".to_owned())]),
+    );
+    let record = catalog
+        .data
+        .iter()
+        .find(|record| record.path == canonical)
+        .unwrap();
+
+    assert_eq!(record.id, "local:configured");
+    assert_eq!(record.stable_id, "Publisher/Metadata");
+    assert!(!record.loaded);
+}
+
+#[test]
+fn publication_and_unload_snapshots_change_selection_without_duplicates() {
+    let root = tempfile::tempdir().unwrap();
+    let model = root.path().join("lifecycle-model");
+    write_model(&model, "Publisher/Stable");
+    let canonical = model.canonicalize().unwrap();
+    let models = higgs::retention_plan::scan_models(&[root.path().to_path_buf()]);
+    let configured = HashMap::from([(canonical.clone(), "local:configured".to_owned())]);
+
+    let published = higgs::routes::models::available_model_catalog(
+        true,
+        &models,
+        &HashMap::from([(canonical.clone(), "local:active".to_owned())]),
+        &configured,
+    );
+    assert_eq!(published.data.len(), 1);
+    assert_eq!(published.data[0].id, "local:active");
+    assert!(published.data[0].loaded);
+
+    let unloaded = higgs::routes::models::available_model_catalog(
+        true,
+        &models,
+        &HashMap::new(),
+        &configured,
+    );
+    assert_eq!(unloaded.data.len(), 1);
+    assert_eq!(unloaded.data[0].id, "local:configured");
+    assert!(!unloaded.data[0].loaded);
+    assert_eq!(unloaded.data[0].stable_id, "Publisher/Stable");
 }

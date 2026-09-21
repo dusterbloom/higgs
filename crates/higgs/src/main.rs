@@ -697,6 +697,7 @@ async fn load_engines(
 ) -> Result<(HashMap<String, Arc<Engine>>, Vec<ActiveRegistration>), Box<dyn std::error::Error>> {
     let mut engines: HashMap<String, Arc<Engine>> = HashMap::new();
     let mut registrations = Vec::new();
+    let mut claimed_model_paths = std::collections::HashSet::new();
 
     for model_cfg in &config.models {
         let model_path = &model_cfg.path;
@@ -718,9 +719,13 @@ async fn load_engines(
             Err(err) => return Err(err.into()),
         };
 
-        tracing::info!(model = %model_path, resolved = %resolved.display(), "Loading model");
-        let (name, engine, facts) =
-            build_engine_with_capacity(&resolved, model_cfg, config, capacity)?;
+        let canonical = resolved.canonicalize()?;
+        tracing::info!(model = %model_path, resolved = %canonical.display(), "Loading model");
+        let (name, engine, facts) = model_resolver::load_after_model_path_preflight(
+            &mut claimed_model_paths,
+            canonical,
+            || build_engine_with_capacity(&resolved, model_cfg, config, capacity),
+        )?;
         if engines.contains_key(&name) {
             release_failed_engine(engine, capacity);
             return Err(format!(

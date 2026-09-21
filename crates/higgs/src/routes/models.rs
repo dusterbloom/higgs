@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +26,7 @@ use crate::{
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AvailableModelRecord {
     pub id: String,
+    pub stable_id: String,
     pub path: PathBuf,
     pub model_type: String,
     pub adapter: String,
@@ -226,9 +227,9 @@ pub async fn list_models(State(state): State<SharedState>) -> Json<ModelList> {
 
 /// `GET /v1/models/available` -- list metadata-compatible local artifacts.
 pub async fn list_available_models(State(state): State<SharedState>) -> Json<AvailableModelList> {
-    let loaded_paths = state.router.local_model_paths();
+    let loaded_routes = state.router.local_model_routes();
     let mut roots = model_resolver::local_model_roots();
-    roots.extend(loaded_paths.iter().cloned());
+    roots.extend(loaded_routes.keys().cloned());
     roots.extend(
         state
             .config
@@ -238,38 +239,53 @@ pub async fn list_available_models(State(state): State<SharedState>) -> Json<Ava
     );
     roots.sort();
     roots.dedup();
-    let mut cache = state.model_catalog_cache.lock().await;
-    if cache.1 != roots
-        || cache
-            .0
-            .is_none_or(|refreshed| refreshed.elapsed() >= Duration::from_secs(2))
-    {
-        let scan_roots = roots.clone();
-        cache.2 = tokio::task::spawn_blocking(move || scan_models(&scan_roots))
-            .await
-            .unwrap_or_default();
-        cache.0 = Some(std::time::Instant::now());
-        cache.1 = roots;
-    }
+    let models = state
+        .model_catalog_cache
+        .get_or_scan(roots, scan_models)
+        .await;
+    let configured_aliases = configured_model_aliases(&state.config.models);
     Json(available_model_catalog(
         state.config.local.allow_runtime_model_load,
-        &cache.2,
-        &loaded_paths,
+        &models,
+        &loaded_routes,
+        &configured_aliases,
     ))
+}
+
+fn configured_model_aliases(models: &[ModelConfig]) -> HashMap<PathBuf, String> {
+    let mut aliases = HashMap::new();
+    for model in models {
+        let Ok(path) = model_resolver::resolve(&model.path) else {
+            continue;
+        };
+        let Ok(path) = path.canonicalize() else {
+            continue;
+        };
+        aliases.entry(path.clone()).or_insert_with(|| {
+            crate::state::resolve_exposed_model_name(model.name.as_deref(), &model.path, &path)
+        });
+    }
+    aliases
 }
 
 #[must_use]
 pub fn available_model_catalog(
     runtime_model_load: bool,
     models: &[crate::retention_plan::AvailableModel],
-    loaded_paths: &HashSet<PathBuf>,
+    loaded_routes: &HashMap<PathBuf, String>,
+    configured_aliases: &HashMap<PathBuf, String>,
 ) -> AvailableModelList {
     let data = models
         .iter()
         .cloned()
         .map(|model| AvailableModelRecord {
-            id: model.id,
-            loaded: loaded_paths.contains(&model.path),
+            id: loaded_routes
+                .get(&model.path)
+                .or_else(|| configured_aliases.get(&model.path))
+                .cloned()
+                .unwrap_or_else(|| model.id.clone()),
+            stable_id: model.id,
+            loaded: loaded_routes.contains_key(&model.path),
             path: model.path,
             model_type: model.model_type,
             adapter: model.adapter,
@@ -338,6 +354,10 @@ pub async fn load_model(
             model_cfg.path
         ))
     })?;
+    let _path_reservation = state
+        .router
+        .reserve_model_path(loaded_path.clone())
+        .map_err(ServerError::Conflict)?;
     let exposed_name = crate::state::resolve_exposed_model_name(
         model_cfg.name.as_deref(),
         &model_cfg.path,
@@ -863,7 +883,10 @@ mod tests {
             .await
             .expect("publication must pause after successful router insertion")
             .unwrap();
-        assert!(state.router.local_model_paths().contains(&second_path));
+        assert_eq!(
+            state.router.local_model_routes().get(&second_path),
+            Some(&"second".to_owned())
+        );
 
         let app = crate::build_router(Arc::clone(&state), 30.0, None, 0, 1024, None);
         let capacity_response = app

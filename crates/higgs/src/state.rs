@@ -26,6 +26,51 @@ use crate::config::{
 use crate::metrics::MetricsStore;
 use crate::router::Router;
 
+#[derive(Clone, Default)]
+pub struct ModelCatalogCache {
+    inner: Arc<tokio::sync::Mutex<ModelCatalogSnapshot>>,
+}
+
+#[derive(Default)]
+struct ModelCatalogSnapshot {
+    refreshed: Option<std::time::Instant>,
+    roots: Vec<PathBuf>,
+    models: Vec<crate::retention_plan::AvailableModel>,
+}
+
+impl ModelCatalogCache {
+    /// The refresh task owns the lock independently of the awaiting request, so
+    /// cancellation cannot release serialization while `spawn_blocking` runs.
+    pub async fn get_or_scan<F>(
+        &self,
+        roots: Vec<PathBuf>,
+        scan: F,
+    ) -> Vec<crate::retention_plan::AvailableModel>
+    where
+        F: FnOnce(&[PathBuf]) -> Vec<crate::retention_plan::AvailableModel> + Send + 'static,
+    {
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            let mut snapshot = inner.lock().await;
+            if snapshot.roots != roots
+                || snapshot.refreshed.is_none_or(|refreshed| {
+                    refreshed.elapsed() >= std::time::Duration::from_secs(2)
+                })
+            {
+                let scan_roots = roots.clone();
+                snapshot.models = tokio::task::spawn_blocking(move || scan(&scan_roots))
+                    .await
+                    .unwrap_or_default();
+                snapshot.refreshed = Some(std::time::Instant::now());
+                snapshot.roots = roots;
+            }
+            snapshot.models.clone()
+        })
+        .await
+        .unwrap_or_default()
+    }
+}
+
 /// Process-wide GPU inference gate.
 ///
 /// MLX's Metal backend keeps shared, non-stream-local state — notably the
@@ -1882,11 +1927,7 @@ pub struct AppState {
     pub metrics: Option<Arc<MetricsStore>>,
     /// Sole process-wide authority for local-model capacity and lifecycle state.
     pub capacity: Arc<CapacityRegistry>,
-    pub model_catalog_cache: tokio::sync::Mutex<(
-        Option<std::time::Instant>,
-        Vec<PathBuf>,
-        Vec<crate::retention_plan::AvailableModel>,
-    )>,
+    pub model_catalog_cache: ModelCatalogCache,
     retention_bindings:
         std::sync::Mutex<std::collections::HashMap<(String, u64), (String, u64, bool, u64)>>,
 }
@@ -1920,7 +1961,7 @@ impl AppState {
             http_client,
             metrics,
             capacity,
-            model_catalog_cache: tokio::sync::Mutex::new((None, Vec::new(), Vec::new())),
+            model_catalog_cache: ModelCatalogCache::default(),
             retention_bindings: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }

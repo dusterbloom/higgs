@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Resolve a model specifier to a concrete directory path.
@@ -101,6 +102,26 @@ pub fn local_model_roots() -> Vec<PathBuf> {
         default_hf_cache(),
         base_dirs.as_ref().map(directories::BaseDirs::home_dir),
     )
+}
+
+/// Run a startup loader only after atomically claiming its canonical artifact
+/// in the caller-owned startup set. Startup loading is sequential; runtime
+/// loading uses `Router::reserve_model_path` for the same pre-load guarantee.
+pub fn load_after_model_path_preflight<T, E>(
+    claimed: &mut HashSet<PathBuf>,
+    canonical_path: PathBuf,
+    load: impl FnOnce() -> Result<T, E>,
+) -> Result<T, String>
+where
+    E: std::fmt::Display,
+{
+    if !claimed.insert(canonical_path.clone()) {
+        return Err(format!(
+            "model artifact '{}' is configured more than once",
+            canonical_path.display()
+        ));
+    }
+    load().map_err(|error| error.to_string())
 }
 
 #[doc(hidden)]
