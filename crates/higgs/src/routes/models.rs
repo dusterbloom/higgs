@@ -53,6 +53,7 @@ type LoadedEngine = Result<(String, Engine, ModelCapacityFacts), String>;
 /// model allocation itself.
 struct RuntimeLoadGuard {
     task: Option<tokio::task::JoinHandle<LoadedEngine>>,
+    reservation: Option<crate::router::ModelPathReservation>,
     capacity: Arc<crate::capacity::CapacityRegistry>,
     #[cfg(test)]
     cleanup_ack: Option<tokio::sync::oneshot::Sender<()>>,
@@ -61,20 +62,29 @@ struct RuntimeLoadGuard {
 impl RuntimeLoadGuard {
     fn spawn(
         capacity: Arc<crate::capacity::CapacityRegistry>,
+        reservation: crate::router::ModelPathReservation,
         load: impl FnOnce() -> LoadedEngine + Send + 'static,
     ) -> Self {
         Self {
             task: Some(tokio::task::spawn_blocking(load)),
+            reservation: Some(reservation),
             capacity,
             #[cfg(test)]
             cleanup_ack: None,
         }
     }
 
-    async fn finish(mut self) -> Result<LoadedEngine, tokio::task::JoinError> {
+    async fn finish(
+        mut self,
+    ) -> Result<(LoadedEngine, crate::router::ModelPathReservation), tokio::task::JoinError> {
         let result = self.task.as_mut().expect("runtime load task exists").await;
         self.task.take();
-        result
+        result.map(|loaded| {
+            (
+                loaded,
+                self.reservation.take().expect("path reservation exists"),
+            )
+        })
     }
 }
 
@@ -83,10 +93,11 @@ impl Drop for RuntimeLoadGuard {
         let Some(task) = self.task.take() else {
             return;
         };
+        let reservation = self.reservation.take().expect("path reservation exists");
         let capacity = Arc::clone(&self.capacity);
         #[cfg(test)]
         let cleanup_ack = self.cleanup_ack.take();
-        tokio::spawn(async move {
+        reservation.hold_until(async move {
             if let Ok(Ok((_name, engine, _facts))) = task.await {
                 let _ =
                     tokio::task::spawn_blocking(move || release_failed_engine(engine, &capacity))
@@ -102,6 +113,7 @@ impl Drop for RuntimeLoadGuard {
 
 struct ProvisionalEngine {
     engine: Option<Arc<Engine>>,
+    reservation: Option<crate::router::ModelPathReservation>,
     capacity: Arc<crate::capacity::CapacityRegistry>,
 }
 
@@ -147,9 +159,14 @@ impl Drop for PublicationRollback {
 }
 
 impl ProvisionalEngine {
-    fn new(engine: Engine, capacity: Arc<crate::capacity::CapacityRegistry>) -> Self {
+    fn new(
+        engine: Engine,
+        capacity: Arc<crate::capacity::CapacityRegistry>,
+        reservation: Option<crate::router::ModelPathReservation>,
+    ) -> Self {
         Self {
             engine: Some(Arc::new(engine)),
+            reservation,
             capacity,
         }
     }
@@ -160,12 +177,17 @@ impl ProvisionalEngine {
 
     fn publish(mut self) {
         self.engine.take();
+        self.reservation.take();
     }
 
     async fn cleanup(mut self) {
         if let Some(engine) = self.engine.take() {
             let capacity = Arc::clone(&self.capacity);
-            let cleanup = tokio::spawn(cleanup_shared_engine(engine, capacity));
+            let reservation = self.reservation.take();
+            let cleanup = tokio::spawn(async move {
+                cleanup_shared_engine(engine, capacity).await;
+                drop(reservation);
+            });
             let _ = cleanup.await;
         }
     }
@@ -197,8 +219,12 @@ impl Drop for ProvisionalEngine {
         let Some(engine) = self.engine.take() else {
             return;
         };
+        let reservation = self.reservation.take();
         let capacity = Arc::clone(&self.capacity);
-        tokio::spawn(cleanup_shared_engine(engine, capacity));
+        tokio::spawn(async move {
+            cleanup_shared_engine(engine, capacity).await;
+            drop(reservation);
+        });
     }
 }
 
@@ -354,7 +380,7 @@ pub async fn load_model(
             model_cfg.path
         ))
     })?;
-    let _path_reservation = state
+    let path_reservation = state
         .router
         .reserve_model_path(loaded_path.clone())
         .map_err(ServerError::Conflict)?;
@@ -377,13 +403,14 @@ pub async fn load_model(
     // a model loaded after boot matches the boot-time engines' KV storage.
     cfg.apply_kv_turbo_env_overrides(&|key| std::env::var(key).ok());
     let load_capacity = Arc::clone(&capacity);
-    let (name, engine, facts) = RuntimeLoadGuard::spawn(load_capacity, move || {
-        build_engine_with_capacity(&resolved, &cfg, &config, &capacity)
-    })
-    .finish()
-    .await
-    .map_err(|e| ServerError::InternalError(format!("model load task failed: {e}")))?
-    .map_err(ServerError::BadRequest)?;
+    let (loaded, path_reservation) =
+        RuntimeLoadGuard::spawn(load_capacity, path_reservation, move || {
+            build_engine_with_capacity(&resolved, &cfg, &config, &capacity)
+        })
+        .finish()
+        .await
+        .map_err(|e| ServerError::InternalError(format!("model load task failed: {e}")))?;
+    let (name, engine, facts) = loaded.map_err(ServerError::BadRequest)?;
     let vision = engine.is_vlm();
     let tool_mode = engine.tool_call_mode();
     let thinking = engine.thinking_mode();
@@ -395,6 +422,7 @@ pub async fn load_model(
         model_cfg.generation_defaults.clone(),
         facts,
         loaded_path,
+        path_reservation,
     )
     .await?;
 
@@ -423,6 +451,7 @@ async fn publish_loaded_engine(
         generation_defaults,
         facts,
         None,
+        None,
         #[cfg(test)]
         None,
         #[cfg(test)]
@@ -438,6 +467,7 @@ async fn publish_loaded_engine_at_path(
     generation_defaults: crate::config::GenerationDefaults,
     facts: ModelCapacityFacts,
     model_path: PathBuf,
+    path_reservation: crate::router::ModelPathReservation,
 ) -> Result<(), ServerError> {
     publish_loaded_engine_inner(
         state,
@@ -446,6 +476,7 @@ async fn publish_loaded_engine_at_path(
         generation_defaults,
         facts,
         Some(model_path),
+        Some(path_reservation),
         #[cfg(test)]
         None,
         #[cfg(test)]
@@ -467,10 +498,11 @@ async fn publish_loaded_engine_inner(
     generation_defaults: crate::config::GenerationDefaults,
     facts: ModelCapacityFacts,
     model_path: Option<PathBuf>,
+    path_reservation: Option<crate::router::ModelPathReservation>,
     #[cfg(test)] publication_gate: Option<PublicationTestGate>,
     #[cfg(test)] insertion_gate: Option<crate::router::RouteInsertionTestGate>,
 ) -> Result<(), ServerError> {
-    let provisional = ProvisionalEngine::new(engine, Arc::clone(&state.capacity));
+    let provisional = ProvisionalEngine::new(engine, Arc::clone(&state.capacity), path_reservation);
     let ticket = match state.capacity.begin_registration(name.clone()) {
         Ok(ticket) => ticket,
         Err(error) => {
@@ -871,6 +903,7 @@ mod tests {
                 crate::config::GenerationDefaults::default(),
                 capacity_facts("second"),
                 Some(published_path),
+                None,
                 Some(PublicationTestGate {
                     arrived,
                     release: wait_release,
@@ -1112,6 +1145,7 @@ mod tests {
                 facts,
                 None,
                 None,
+                None,
                 Some(crate::router::RouteInsertionTestGate {
                     arrived,
                     release: wait_release,
@@ -1242,7 +1276,12 @@ mod tests {
         let (started, wait_started) = std::sync::mpsc::channel();
         let (release, wait_release) = std::sync::mpsc::channel();
         let (cleanup_ack, wait_cleanup) = tokio::sync::oneshot::channel();
-        let mut guard = RuntimeLoadGuard::spawn(Arc::clone(&capacity), move || {
+        let router =
+            Router::from_config(&crate::config::HiggsConfig::default(), HashMap::new()).unwrap();
+        let reservation = router
+            .reserve_model_path(PathBuf::from("/test/cancelled"))
+            .unwrap();
+        let mut guard = RuntimeLoadGuard::spawn(Arc::clone(&capacity), reservation, move || {
             started.send(()).unwrap();
             wait_release.recv().unwrap();
             Ok((
@@ -1481,8 +1520,11 @@ mod tests {
     #[tokio::test]
     async fn cancelling_explicit_provisional_cleanup_does_not_drop_the_cleanup_owner() {
         let capacity = crate::capacity::CapacityRegistry::new(std::iter::empty());
-        let provisional =
-            ProvisionalEngine::new(Engine::test_stub("provisional"), Arc::clone(&capacity));
+        let provisional = ProvisionalEngine::new(
+            Engine::test_stub("provisional"),
+            Arc::clone(&capacity),
+            None,
+        );
         let leased = provisional.engine();
         let weak = Arc::downgrade(&leased);
         let cleanup = tokio::spawn(provisional.cleanup());

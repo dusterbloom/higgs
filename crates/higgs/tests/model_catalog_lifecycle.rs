@@ -82,3 +82,39 @@ async fn cancelled_catalog_request_does_not_start_a_second_scan() {
 
     assert_eq!(scans.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn aborted_load_holds_path_until_detached_cleanup_finishes() {
+    let router =
+        Arc::new(Router::from_config(&HiggsConfig::default(), Default::default()).unwrap());
+    let path = PathBuf::from("/canonical/cancelled-runtime-model");
+    let (loader_started_tx, loader_started_rx) = tokio::sync::oneshot::channel();
+    let (finish_loader_tx, finish_loader_rx) = tokio::sync::oneshot::channel();
+    let (cleanup_done_tx, cleanup_done_rx) = tokio::sync::oneshot::channel();
+    let request_router = Arc::clone(&router);
+    let request_path = path.clone();
+
+    let request = tokio::spawn(async move {
+        let reservation = request_router.reserve_model_path(request_path).unwrap();
+        reservation.hold_until(async move {
+            let _ = loader_started_tx.send(());
+            let _ = finish_loader_rx.await;
+            let _ = cleanup_done_tx.send(());
+        });
+        std::future::pending::<()>().await;
+    });
+    loader_started_rx.await.unwrap();
+    request.abort();
+
+    let second_loader_calls = AtomicUsize::new(0);
+    let duplicate = router.reserve_model_path(path.clone()).map(|_reservation| {
+        second_loader_calls.fetch_add(1, Ordering::SeqCst);
+    });
+    assert!(duplicate.is_err());
+    assert_eq!(second_loader_calls.load(Ordering::SeqCst), 0);
+
+    finish_loader_tx.send(()).unwrap();
+    cleanup_done_rx.await.unwrap();
+    tokio::task::yield_now().await;
+    assert!(router.reserve_model_path(path).is_ok());
+}

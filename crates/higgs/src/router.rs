@@ -99,7 +99,7 @@ pub struct Router {
     /// Guarded by a `RwLock`: `resolve`/`list` take a read lock and clone the
     /// `Arc` out, so an in-flight request is never tied to map membership.
     local_engines: RwLock<HashMap<String, LocalEngineEntry>>,
-    loading_model_paths: Mutex<HashSet<PathBuf>>,
+    loading_model_paths: Arc<Mutex<HashSet<PathBuf>>>,
     cache_policy: tokio::sync::Mutex<()>,
     compiled_routes: Vec<CompiledRoute>,
     auto_routes: Vec<AutoRouteEntry>,
@@ -119,15 +119,27 @@ struct DisabledRouteGuard<'a> {
     armed: bool,
 }
 
-pub struct ModelPathReservation<'a> {
-    router: &'a Router,
+pub struct ModelPathReservation {
+    loading_model_paths: Arc<Mutex<HashSet<PathBuf>>>,
     path: PathBuf,
 }
 
-impl Drop for ModelPathReservation<'_> {
+impl ModelPathReservation {
+    /// Detach work that owns this reservation until the work is fully done.
+    pub fn hold_until<F>(self, work: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        tokio::spawn(async move {
+            work.await;
+            drop(self);
+        });
+    }
+}
+
+impl Drop for ModelPathReservation {
     fn drop(&mut self) {
-        self.router
-            .loading_model_paths
+        self.loading_model_paths
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&self.path);
@@ -278,7 +290,7 @@ impl Router {
 
         Ok(Self {
             local_engines: RwLock::new(local_engines),
-            loading_model_paths: Mutex::new(HashSet::new()),
+            loading_model_paths: Arc::new(Mutex::new(HashSet::new())),
             cache_policy: tokio::sync::Mutex::new(()),
             compiled_routes,
             auto_routes,
@@ -361,7 +373,7 @@ impl Router {
 
     /// Reserve an artifact before expensive runtime loading. The insertion
     /// path re-checks under the engine lock to close publication races.
-    pub fn reserve_model_path(&self, path: PathBuf) -> Result<ModelPathReservation<'_>, String> {
+    pub fn reserve_model_path(&self, path: PathBuf) -> Result<ModelPathReservation, String> {
         let mut loading = self
             .loading_model_paths
             .lock()
@@ -376,7 +388,10 @@ impl Router {
         if !loading.insert(path.clone()) {
             return Err("model artifact is already loading".to_owned());
         }
-        Ok(ModelPathReservation { router: self, path })
+        Ok(ModelPathReservation {
+            loading_model_paths: Arc::clone(&self.loading_model_paths),
+            path,
+        })
     }
 
     /// Sorted `(name, is_vlm)` for all loaded local engines (snapshot under a
