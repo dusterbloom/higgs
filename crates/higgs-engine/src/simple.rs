@@ -1361,9 +1361,7 @@ impl RetainedReservations {
     fn floor_bytes(&self) -> usize {
         self.owners
             .values()
-            .map(|entry| entry.reserved_bytes)
-            .max()
-            .unwrap_or(0)
+            .fold(0usize, |sum, entry| sum.saturating_add(entry.reserved_bytes))
     }
 
     fn retain_sessions(&mut self, keep: &std::collections::HashSet<u64>) {
@@ -1378,6 +1376,55 @@ fn validate_retained_allocation_floor(requested: usize, floor: usize) -> Result<
     } else {
         Ok(())
     }
+}
+
+fn retained_capacity_floor_bytes(promised_bytes: usize, protected_actual_bytes: usize) -> usize {
+    promised_bytes.max(protected_actual_bytes)
+}
+
+fn swap_retained_capacity_above_floor(
+    capacity_retained_bytes: &AtomicUsize,
+    requested: usize,
+    promised_bytes: usize,
+    protected_actual_bytes: usize,
+) -> Result<usize, usize> {
+    let floor = retained_capacity_floor_bytes(promised_bytes, protected_actual_bytes);
+    validate_retained_allocation_floor(requested, floor)?;
+    Ok(capacity_retained_bytes.swap(requested, Ordering::AcqRel))
+}
+
+fn apply_retained_capacity_limit_atomic(
+    reservations: &std::sync::Mutex<RetainedReservations>,
+    retained: &std::sync::Mutex<std::collections::HashMap<u64, RetainedKv>>,
+    capacity_retained_bytes: &AtomicUsize,
+    retained_bytes: usize,
+    policy: CachePressurePolicy,
+) -> Result<RetentionMutation, usize> {
+    let reservations = lock_or_recover(reservations);
+    let mut retained = lock_or_recover(retained);
+    let reserved_ids = reservations.reserved_ids();
+    let protected_actual_bytes = reserved_ids.iter().fold(0usize, |sum, session_id| {
+        sum.saturating_add(
+            retained
+                .get(session_id)
+                .map_or(0, |entry| entry.state.estimated_bytes()),
+        )
+    });
+    let previous = swap_retained_capacity_above_floor(
+        capacity_retained_bytes,
+        retained_bytes,
+        reservations.floor_bytes(),
+        protected_actual_bytes,
+    )?;
+    if retained_bytes >= previous {
+        return Ok(RetentionMutation::default());
+    }
+    Ok(enforce_retained_byte_limit(
+        &mut retained,
+        &reserved_ids,
+        retained_bytes,
+        policy,
+    ))
 }
 
 /// Registry pressure intent for cache enforcement. Admission reclamation may
@@ -4515,22 +4562,14 @@ impl SimpleEngine {
         prefix_bytes: usize,
         policy: CachePressurePolicy,
     ) -> Result<(), usize> {
-        let floor = lock_or_recover(&self.retained_reservations).floor_bytes();
-        validate_retained_allocation_floor(retained_bytes, floor)?;
-        let previous = self
-            .capacity_retained_bytes
-            .swap(retained_bytes, Ordering::AcqRel);
-        if retained_bytes < previous {
-            let reservations = lock_or_recover(&self.retained_reservations);
-            let reserved_ids = reservations.reserved_ids();
-            let mutation = enforce_retained_byte_limit(
-                &mut lock_or_recover(&self.retained),
-                &reserved_ids,
-                retained_bytes,
-                policy,
-            );
-            self.record_retention_mutation(mutation);
-        }
+        let mutation = apply_retained_capacity_limit_atomic(
+            &self.retained_reservations,
+            &self.retained,
+            &self.capacity_retained_bytes,
+            retained_bytes,
+            policy,
+        )?;
+        self.record_retention_mutation(mutation);
         lock_or_recover(&self.prefix_cache).set_capacity_max_bytes(prefix_bytes);
         Ok(())
     }
@@ -18469,6 +18508,64 @@ mod tests {
             super::validate_retained_allocation_floor(4096, 4096),
             Ok(())
         );
+    }
+
+    #[test]
+    fn capacity_apply_serializes_reservation_with_validation_and_swap() {
+        use std::sync::{Arc, Mutex, atomic::AtomicUsize};
+
+        let reservations = Arc::new(Mutex::new(super::RetainedReservations::default()));
+        let retained = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let capacity = Arc::new(AtomicUsize::new(8192));
+        let retained_guard = retained.lock().unwrap();
+
+        let apply_reservations = Arc::clone(&reservations);
+        let apply_retained = Arc::clone(&retained);
+        let apply_capacity = Arc::clone(&capacity);
+        let apply = std::thread::spawn(move || {
+            super::apply_retained_capacity_limit_atomic(
+                &apply_reservations,
+                &apply_retained,
+                &apply_capacity,
+                4096,
+                super::CachePressurePolicy::Normal,
+            )
+        });
+
+        while reservations.try_lock().is_ok() {
+            std::thread::yield_now();
+        }
+        let claim_reservations = Arc::clone(&reservations);
+        let claim_capacity = Arc::clone(&capacity);
+        let claim = std::thread::spawn(move || {
+            claim_reservations
+                .lock()
+                .unwrap()
+                .claim_replacing(
+                    7,
+                    &[],
+                    claim_capacity.load(std::sync::atomic::Ordering::Acquire),
+                )
+                .unwrap();
+        });
+
+        drop(retained_guard);
+        assert!(apply.join().unwrap().is_ok());
+        claim.join().unwrap();
+        assert_eq!(capacity.load(std::sync::atomic::Ordering::Acquire), 4096);
+        assert_eq!(reservations.lock().unwrap().floor_bytes(), 4096);
+    }
+
+    #[test]
+    fn protected_growth_rejects_shrink_without_publishing_smaller_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let capacity = AtomicUsize::new(8192);
+        assert_eq!(
+            super::swap_retained_capacity_above_floor(&capacity, 4096, 4096, 6144),
+            Err(6144)
+        );
+        assert_eq!(capacity.load(Ordering::Acquire), 8192);
     }
 
     #[test]
