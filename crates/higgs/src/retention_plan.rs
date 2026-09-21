@@ -116,7 +116,10 @@ pub fn scan_models(roots: &[PathBuf]) -> Vec<AvailableModel> {
         .into_iter()
         .filter_map(|path| {
             let path = path.canonicalize().ok()?;
-            if !has_tokenizer(&path) || !has_safetensors(&path) {
+            if !path.join("tokenizer.json").is_file()
+                || !higgs_models::collect_safetensors_files(&path)
+                    .is_ok_and(|files| files.iter().all(|file| file.is_file()))
+            {
                 return None;
             }
             let detected = higgs_models::adapter::detect(&path).ok()?;
@@ -132,30 +135,6 @@ pub fn scan_models(roots: &[PathBuf]) -> Vec<AvailableModel> {
     found.sort_by(|left, right| left.path.cmp(&right.path));
     found.dedup_by(|left, right| left.path == right.path);
     found
-}
-
-fn has_tokenizer(path: &Path) -> bool {
-    [
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "tokenizer.model",
-        "vocab.json",
-        "vocab.txt",
-    ]
-    .iter()
-    .any(|name| path.join(name).is_file())
-}
-
-fn has_safetensors(path: &Path) -> bool {
-    std::fs::read_dir(path).is_ok_and(|entries| {
-        entries.flatten().any(|entry| {
-            entry.path().is_file()
-                && entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.ends_with(".safetensors"))
-        })
-    })
 }
 
 fn model_name(path: &Path, config: &serde_json::Value) -> String {
