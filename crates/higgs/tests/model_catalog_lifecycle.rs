@@ -110,6 +110,8 @@ async fn aborted_load_holds_path_until_detached_cleanup_finishes() {
     });
     loader_started_rx.await.unwrap();
     request.abort();
+    let cancellation = request.await.unwrap_err();
+    assert!(cancellation.is_cancelled());
 
     let second_loader_calls = AtomicUsize::new(0);
     let duplicate = router.reserve_model_path(path.clone()).map(|_reservation| {
