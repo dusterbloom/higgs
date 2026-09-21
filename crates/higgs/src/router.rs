@@ -472,6 +472,26 @@ impl Router {
         self.engines_write().remove(name).map(|entry| entry.engine)
     }
 
+    /// Atomically remove a published engine and reserve its canonical artifact
+    /// until the caller finishes draining the old allocation.
+    pub fn remove_engine_for_drain(
+        &self,
+        name: &str,
+    ) -> Option<(Arc<Engine>, Option<ModelPathReservation>)> {
+        let mut loading = self
+            .loading_model_paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let entry = self.engines_write().remove(name)?;
+        let reservation = entry.model_path.and_then(|path| {
+            loading.insert(path.clone()).then(|| ModelPathReservation {
+                loading_model_paths: Arc::clone(&self.loading_model_paths),
+                path,
+            })
+        });
+        Some((entry.engine, reservation))
+    }
+
     /// Map key bound to the auto-router model, if the auto-router is enabled.
     pub fn auto_router_model_name(&self) -> Option<&str> {
         self.auto_router_model_name.as_deref()

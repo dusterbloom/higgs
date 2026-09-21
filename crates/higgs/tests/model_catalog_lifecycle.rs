@@ -11,8 +11,11 @@ use std::{
 };
 
 use higgs::{
-    config::HiggsConfig, model_resolver::load_after_model_path_preflight, router::Router,
-    routes::models::run_reserved_blocking_load, state::ModelCatalogCache,
+    config::HiggsConfig,
+    model_resolver::load_after_model_path_preflight,
+    router::Router,
+    routes::models::{hold_unload_reservation_until, run_reserved_blocking_load},
+    state::ModelCatalogCache,
 };
 
 #[test]
@@ -33,6 +36,25 @@ fn duplicate_startup_path_is_rejected_before_loader_runs() {
 
     assert!(duplicate.is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn blocked_unload_keeps_artifact_unavailable_until_cleanup_finishes() {
+    let router =
+        Arc::new(Router::from_config(&HiggsConfig::default(), Default::default()).unwrap());
+    let path = PathBuf::from("/canonical/draining-model");
+    let reservation = router.reserve_model_path(path.clone()).unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let drain = tokio::spawn(hold_unload_reservation_until(reservation, async move {
+        let _ = started_tx.send(());
+        let _ = release_rx.await;
+    }));
+    started_rx.await.unwrap();
+    assert!(router.reserve_model_path(path.clone()).is_err());
+    release_tx.send(()).unwrap();
+    drain.await.unwrap();
+    assert!(router.reserve_model_path(path).is_ok());
 }
 
 #[test]

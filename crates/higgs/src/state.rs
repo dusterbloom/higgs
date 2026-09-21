@@ -2108,7 +2108,8 @@ pub fn resolve_exposed_model_name(
     {
         return configured_path.to_owned();
     }
-    higgs_engine::simple::exposed_model_name(resolved_path)
+    crate::retention_plan::stable_model_name(resolved_path)
+        .unwrap_or_else(|| higgs_engine::simple::exposed_model_name(resolved_path))
 }
 
 /// Type alias for the shared state used by Axum handlers.

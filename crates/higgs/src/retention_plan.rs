@@ -173,6 +173,13 @@ fn model_name(path: &Path, config: &serde_json::Value) -> String {
         .to_owned()
 }
 
+/// Scanner-authoritative stable name for a local artifact.
+pub fn stable_model_name(path: &Path) -> Option<String> {
+    let config = std::fs::read(path.join("config.json")).ok()?;
+    let config = serde_json::from_slice(&config).ok()?;
+    Some(model_name(path, &config))
+}
+
 pub fn plan_model(
     path: &Path,
     request: BudgetRequest,

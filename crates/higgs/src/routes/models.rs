@@ -293,15 +293,16 @@ pub async fn list_available_models(State(state): State<SharedState>) -> Json<Ava
 fn configured_model_aliases(models: &[ModelConfig]) -> HashMap<PathBuf, String> {
     let mut aliases = HashMap::new();
     for model in models {
+        let Some(name) = model.name.as_ref() else {
+            continue;
+        };
         let Ok(path) = model_resolver::resolve(&model.path) else {
             continue;
         };
         let Ok(path) = path.canonicalize() else {
             continue;
         };
-        aliases.entry(path.clone()).or_insert_with(|| {
-            crate::state::resolve_exposed_model_name(model.name.as_deref(), &model.path, &path)
-        });
+        aliases.entry(path).or_insert_with(|| name.clone());
     }
     aliases
 }
@@ -611,9 +612,9 @@ pub async fn unload_model(
         .capacity
         .begin_drain(&name)
         .map_err(registration_error)?;
-    let engine = state
+    let (engine, path_reservation) = state
         .router
-        .remove_engine(&name)
+        .remove_engine_for_drain(&name)
         .ok_or_else(|| ServerError::ModelNotFound(name.clone()))?;
     let capacity_drain = CapacityDrain {
         state: Arc::clone(&state),
@@ -624,7 +625,14 @@ pub async fn unload_model(
     // strong count only decreases. Free GPU memory once the last in-flight
     // request releases its clone; detach past the timeout so a long generation
     // can't block the response.
-    if drain_and_drop(engine, DRAIN_TIMEOUT, Some(capacity_drain)).await {
+    if drain_and_drop(
+        engine,
+        DRAIN_TIMEOUT,
+        Some(capacity_drain),
+        path_reservation,
+    )
+    .await
+    {
         tracing::info!(model_name = %name, "Model unloaded");
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -670,17 +678,23 @@ async fn drain_and_drop(
     engine: Arc<Engine>,
     timeout: Duration,
     capacity_drain: Option<CapacityDrain>,
+    path_reservation: Option<crate::router::ModelPathReservation>,
 ) -> bool {
     let (finished, wait_finished) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        drain_in_background(engine, capacity_drain).await;
+        drain_in_background(engine, capacity_drain, path_reservation).await;
         let _ = finished.send(());
     });
     tokio::time::timeout(timeout, wait_finished).await.is_ok()
 }
 
 /// Poll until the detached engine reference is sole-owned, then drop it.
-async fn drain_in_background(mut engine: Arc<Engine>, capacity_drain: Option<CapacityDrain>) {
+async fn drain_in_background(
+    mut engine: Arc<Engine>,
+    capacity_drain: Option<CapacityDrain>,
+    path_reservation: Option<crate::router::ModelPathReservation>,
+) {
+    hold_unload_reservation_until(path_reservation, async move {
     if let Some(drain) = capacity_drain.as_ref() {
         drain
             .state
@@ -705,6 +719,20 @@ async fn drain_in_background(mut engine: Arc<Engine>, capacity_drain: Option<Cap
             }
         }
     }
+    })
+    .await;
+}
+
+#[doc(hidden)]
+pub async fn hold_unload_reservation_until<F>(
+    reservation: impl Into<Option<crate::router::ModelPathReservation>>,
+    drain: F,
+) where
+    F: std::future::Future<Output = ()>,
+{
+    let reservation = reservation.into();
+    drain.await;
+    drop(reservation);
 }
 
 fn model_object(
@@ -1478,7 +1506,7 @@ mod tests {
     #[tokio::test]
     async fn drain_and_drop_drops_sole_owner_immediately() {
         let engine = Arc::new(Engine::test_stub("solo"));
-        assert!(drain_and_drop(engine, Duration::from_secs(1), None).await);
+        assert!(drain_and_drop(engine, Duration::from_secs(1), None, None).await);
     }
 
     #[tokio::test]
@@ -1491,7 +1519,7 @@ mod tests {
             drop(clone);
         });
         let start = Instant::now();
-        assert!(drain_and_drop(engine, Duration::from_secs(5), None).await);
+        assert!(drain_and_drop(engine, Duration::from_secs(5), None, None).await);
         assert!(
             start.elapsed() >= Duration::from_millis(100),
             "should have waited for the clone to drop"
@@ -1502,7 +1530,7 @@ mod tests {
     async fn drain_and_drop_times_out_and_detaches() {
         let engine = Arc::new(Engine::test_stub("stuck"));
         let clone = Arc::clone(&engine); // held past the timeout
-        let drained = drain_and_drop(engine, Duration::from_millis(80), None).await;
+        let drained = drain_and_drop(engine, Duration::from_millis(80), None, None).await;
         assert!(!drained, "should time out while a reference is held");
         drop(clone); // let the detached task finish
     }

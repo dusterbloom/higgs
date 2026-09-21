@@ -267,14 +267,55 @@ fn publication_and_unload_snapshots_change_selection_without_duplicates() {
     assert_eq!(published.data[0].id, "local:active");
     assert!(published.data[0].loaded);
 
-    let unloaded = higgs::routes::models::available_model_catalog(
-        true,
-        &models,
-        &HashMap::new(),
-        &configured,
-    );
+    let unloaded =
+        higgs::routes::models::available_model_catalog(true, &models, &HashMap::new(), &configured);
     assert_eq!(unloaded.data.len(), 1);
     assert_eq!(unloaded.data[0].id, "local:configured");
     assert!(!unloaded.data[0].loaded);
     assert_eq!(unloaded.data[0].stable_id, "Publisher/Stable");
+}
+
+#[tokio::test]
+async fn unnamed_nested_lm_studio_model_uses_full_stable_name() {
+    let root = tempfile::tempdir().unwrap();
+    let model = root
+        .path()
+        .join("lm-studio/models/Publisher/NestedModel/8bit");
+    write_model(&model, "Publisher/NestedModel/8bit");
+    let config_path = root.path().join("config.toml");
+    std::fs::write(&config_path, format!("[local]\nallow_runtime_model_load = true\n\n[[models]]\npath = \"{}\"\n\n[provider.mock]\nurl = \"http://127.0.0.1:1\"\n\n[default]\nprovider = \"mock\"\n", model.display())).unwrap();
+    let config = higgs::config::load_config_file(&config_path, None).unwrap();
+    assert_eq!(
+        higgs::state::resolve_exposed_model_name(None, model.to_str().unwrap(), &model),
+        "Publisher/NestedModel/8bit"
+    );
+    let router = Router::from_config(&config, HashMap::new()).unwrap();
+    let app = build_router(
+        Arc::new(AppState::new(router, config, reqwest::Client::new(), None)),
+        30.0,
+        None,
+        0,
+        1024,
+        None,
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/available")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let canonical = model.canonicalize().unwrap();
+    let record = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["path"] == canonical.to_string_lossy().as_ref())
+        .unwrap();
+    assert_eq!(record["id"], "Publisher/NestedModel/8bit");
+    assert_ne!(record["id"], "8bit");
 }
