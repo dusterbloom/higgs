@@ -183,11 +183,22 @@ every rotated module's `.signs` tensor is present with the shape its
 `.weight` tensor implies) from the safetensors header alone, before the
 server starts.
 
+Speculative verify (a DFlash 2 block or MTP draft plus its anchor, 2–8 rows)
+runs every rotated ternary projection, including the fused gate/up, through
+an FP32 `simdgroup_matrix` kernel that reads the packed weights once for all
+rows. MLX's stock 2-bit path re-reads them per row at these widths, so each
+projection cost 3–15× its one-row time. The kernel is on by default;
+`HIGGS_MMA_M8=0` restores stock. Verify rows match one-row decode to FP32
+rounding (`crates/higgs-models/tests/ternary_verify_parity.rs`). On a base M4
+(AC power) with a 4-bit DFlash 2 drafter at its trained block of 8, greedy
+decode against plain autoregressive decode measured 1.2× on code, 2.4× on
+JSON/tables, 1.7× on step-by-step math and 0.86× on prose, with byte-identical
+output; before this kernel, the same runs measured 0.71–1.05×.
+
 This adapter is covered by unit and property tests (config resolution,
 manifest validation, and a numerical round-trip proving the rotation is
-self-inverse) but has not yet been run end-to-end against the real
-downloaded checkpoint — that verification, including a parity check against
-the pack's bundled Python loader, is still open.
+self-inverse) and has run end-to-end against the real checkpoint. A parity
+check against the pack's bundled Python loader is still open.
 
 ## EschaLabs `eschamoe` Checkpoints
 

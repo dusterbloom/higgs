@@ -55,6 +55,33 @@ pub mod q2_tiled_qmm_bench {
         crate::metal_kernel::bonsai_q2_qmm_ternary(x, weight, scales, group_size)
     }
 }
+#[doc(hidden)]
+pub mod ternary_linear_probe {
+    //! Test seam: one Bonsai-2 (Hadamard ternary) packed projection through the
+    //! real `QLinear` dispatch, input rotation included; not model API.
+    use mlx_rs::{Array, error::Exception, module::Param};
+
+    pub fn forward(
+        x: &Array,
+        weight: &Array,
+        scales: &Array,
+        biases: &Array,
+        signs: &Array,
+        hadamard_block: i32,
+    ) -> Result<Array, Exception> {
+        let mut linear = crate::qwen3_next::QLinear::new_spec(crate::qwen3_next::QuantSpec {
+            group_size: 128,
+            bits: 2,
+            mode: crate::quant_mode::QuantMode::Affine,
+            hadamard_block,
+        })?;
+        linear.weight = Param::new(weight.clone());
+        linear.scales = Param::new(scales.clone());
+        linear.biases = Param::new(biases.clone());
+        linear.signs = Param::new(signs.clone());
+        linear.forward(x)
+    }
+}
 pub mod mlx_exec;
 pub mod phi3;
 pub mod progress;

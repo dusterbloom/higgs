@@ -3583,14 +3583,14 @@ pub fn bonsai_q2_qmm_tiled_ternary(
 // covers M <= 8 exactly: each 64-value weight group is dequantized once and
 // reused by every row, with K split across the 8 simdgroups of a threadgroup.
 // The product is computed transposed (out^T = W x^T), weights enter the MMA as
-// the exact bf16 of (2^bits + v) via a bit-insert, and the affine offset is
-// folded once per group: acc += s*C_g + (b - 2^bits*s)*sum(x_g).
+// the exact FP32 of (2^bits + v) via a bit-insert, and the affine offset is
+// folded once per group: acc += s*C_g + (b - 2^bits*s)*sum(x_g). Activations
+// stay FP32, like the one-row decode kernel, so verify rows reproduce decode.
 
 const Q2_MMA_M8_KERNEL_SOURCE: &str = r"
     const int K = KD, N = ND, M = MD;
     const int KPS = KD / SG;
-    const uint MAGIC = 129u << 7;          // (127 + 2) << 7
-    const uint MAGIC2 = MAGIC | (MAGIC << 16);
+    const uint MAGIC = 0x40800000u;         // 4.0f; v in mantissa bits 21-22 -> 4 + v
     const float POW = 4.0f;                 // 1 << 2
 
     uint tid  = thread_position_in_threadgroup.x;
@@ -3609,8 +3609,8 @@ const Q2_MMA_M8_KERNEL_SOURCE: &str = r"
     for (int t = 0; t < TILES; ++t) { acc0[t] = 0.0f; acc1[t] = 0.0f; }
 
     const bool xa_ok = fn < M, xb_ok = fn + 1 < M;
-    const device bfloat16_t* xa_p = x + (size_t)(xa_ok ? fn : 0) * K + fm * 8;
-    const device bfloat16_t* xb_p = x + (size_t)(xb_ok ? fn + 1 : 0) * K + fm * 8;
+    const device float* xa_p = x + (size_t)(xa_ok ? fn : 0) * K + fm * 8;
+    const device float* xb_p = x + (size_t)(xb_ok ? fn + 1 : 0) * K + fm * 8;
     const int hoff0 = (fn * 8) * 2, hoff1 = (fn * 8 + 8) * 2;
     const int hw0 = hoff0 >> 5, hs0 = hoff0 & 31;
     const int hw1 = hoff1 >> 5, hs1 = hoff1 & 31;
@@ -3618,18 +3618,21 @@ const Q2_MMA_M8_KERNEL_SOURCE: &str = r"
     const int gbeg = (int)sg * (KPS / 64);
     const int gend = gbeg + KPS / 64;
     for (int g = gbeg; g < gend; ++g) {
-        uint4 xa = xa_ok ? *((const device uint4*)(xa_p + g * 64)) : uint4(0u);
-        uint4 xb = xb_ok ? *((const device uint4*)(xb_p + g * 64)) : uint4(0u);
-        simdgroup_matrix<bfloat16_t, 8, 8> B[8];
+        const device float4* xa4 = (const device float4*)(xa_p + g * 64);
+        const device float4* xb4 = (const device float4*)(xb_p + g * 64);
+        float4 xa[2] = {xa_ok ? xa4[0] : float4(0.0f), xa_ok ? xa4[1] : float4(0.0f)};
+        float4 xb[2] = {xb_ok ? xb4[0] : float4(0.0f), xb_ok ? xb4[1] : float4(0.0f)};
+        simdgroup_matrix<float, 8, 8> B[8];
         float sa = 0.0f, sb = 0.0f;
         #pragma clang loop unroll(full)
         for (int kt = 0; kt < 8; ++kt) {
-            uint wa = (kt & 1) ? (xa[kt >> 1] & 0xFFFF0000u) : (xa[kt >> 1] << 16);
-            uint wb = (kt & 1) ? (xb[kt >> 1] & 0xFFFF0000u) : (xb[kt >> 1] << 16);
-            sa += as_type<float>(wa);
-            sb += as_type<float>(wb);
+            float va = xa[kt >> 2][kt & 3];
+            float vb = xb[kt >> 2][kt & 3];
+            sa += va;
+            sb += vb;
             thread auto& eb = B[kt].thread_elements();
-            reinterpret_cast<thread uint&>(eb) = (wa >> 16) | wb;
+            eb[0] = va;
+            eb[1] = vb;
         }
         sa += simd_shuffle_xor(sa, 2u);  sb += simd_shuffle_xor(sb, 2u);
         sa += simd_shuffle_xor(sa, 4u);  sb += simd_shuffle_xor(sb, 4u);
@@ -3646,13 +3649,14 @@ const Q2_MMA_M8_KERNEL_SOURCE: &str = r"
             ulong win0 = (ulong)(wr[hw0] >> hs0);
             ulong win1 = (ulong)(wr[hw1] >> hs1);
             simdgroup_matrix<float, 8, 8> Cg = simdgroup_matrix<float, 8, 8>(0);
-            simdgroup_matrix<bfloat16_t, 8, 8> A;
+            simdgroup_matrix<float, 8, 8> A;
             thread auto& ea = A.thread_elements();
             #pragma clang loop unroll(full)
             for (int kt = 0; kt < 8; ++kt) {
                 uint v0 = (uint)(win0 >> (kt * 2)) & 3u;
                 uint v1 = (uint)(win1 >> (kt * 2)) & 3u;
-                reinterpret_cast<thread uint&>(ea) = MAGIC2 | (v0 << 5) | (v1 << 21);
+                ea[0] = as_type<float>(MAGIC | (v0 << 21));
+                ea[1] = as_type<float>(MAGIC | (v1 << 21));
                 simdgroup_multiply_accumulate(Cg, A, B[kt], Cg);
             }
             thread auto& cg = Cg.thread_elements();
@@ -3676,7 +3680,7 @@ const Q2_MMA_M8_KERNEL_SOURCE: &str = r"
         if (m < M && n < N) {
             float v = 0.0f;
             for (int q = 0; q < SG; ++q) v += red[(q * TILES + t) * 64 + nl * 8 + m];
-            out[(size_t)m * N + n] = (bfloat16_t)v;
+            out[(size_t)m * N + n] = v;
         }
     }
 ";
@@ -3692,7 +3696,7 @@ fn create_q2_mma_m8_kernel() -> mlx_sys::mlx_fast_metal_kernel {
         .unwrap_or_default();
     unsafe {
         let kernel = mlx_sys::mlx_fast_metal_kernel_new(
-            c"higgs_bonsai_q2_mma_m8_v1".as_ptr(),
+            c"higgs_bonsai_q2_mma_m8_f32".as_ptr(),
             in_vec,
             out_vec,
             source.as_ptr(),
@@ -3741,9 +3745,9 @@ fn configure_q2_mma_m8_kernel(
 }
 
 /// Ternary (bits=2, group_size=128) M<=8 MMA matmul for the speculative-verify
-/// tile. `x` is `[M, K]` bf16 (M <= 8), `weight` `[N, K/16]` u32, `scales`/`biases`
-/// `[N, K/128]` bf16. Returns `[M, N]` bf16.
-#[allow(dead_code, unsafe_code)]
+/// tile. `x` is `[..., K]` f32 with at most 8 rows, `weight` `[N, K/16]` u32,
+/// `scales`/`biases` `[N, K/128]` (f16 or bf16). Returns `[..., N]` f32.
+#[allow(unsafe_code)]
 pub fn bonsai_q2_mma_m8(
     x: &Array,
     weight: &Array,
@@ -3752,6 +3756,12 @@ pub fn bonsai_q2_mma_m8(
 ) -> Result<Array, Exception> {
     ensure_ffi_error_handler();
 
+    if x.dtype() != mlx_rs::Dtype::Float32 {
+        return Err(Exception::custom(format!(
+            "bonsai_q2_mma_m8: x must be Float32, got {:?}",
+            x.dtype()
+        )));
+    }
     let x_shape = x.shape();
     let m_rows: i32 = x_shape
         .iter()

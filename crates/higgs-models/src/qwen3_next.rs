@@ -1022,9 +1022,9 @@ impl QLinear {
     }
 
     fn q2_row2_m5_ternary_forward(&self, x: &Array) -> Result<Option<Array>, Exception> {
-        // The row2 M=5 kernels are an unvalidated probe (they fail at eval);
-        // when the MMA verify kernel is enabled it supersedes them for M<=8.
-        if mma_m8_enabled() {
+        // On Hadamard ternary packs the MMA verify kernel supersedes the row2
+        // M=5 kernels for M<=8; other Q2 packs keep row2.
+        if self.hadamard_block > 0 && mma_m8_enabled() {
             return Ok(None);
         }
         let row2_enabled = std::env::var("HIGGS_DSPARK_Q2_ROW2_MLP").map_or(true, |v| v != "0");
@@ -1287,7 +1287,7 @@ impl QLinear {
                             self.group_size,
                         );
                     }
-                    if row_count > 1 && row_count <= 8 && mma_m8_enabled() {
+                    if ternary_q2_verify_eligible(self.group_size, row_count) {
                         if std::env::var("HIGGS_MMA_M8_TRACE").is_ok_and(|v| v == "1") {
                             tracing::info!(
                                 row_count,
@@ -1296,17 +1296,8 @@ impl QLinear {
                                 "MMA verify gate"
                             );
                         }
-                        // The hadamard rotation emits fp32; chad's runtime keeps
-                        // the rotation in the model's native dtype, so the MMA
-                        // kernel sees bf16 x. Cast to match (the kernel is only
-                        // ~1-2 bf16 ulps off stock anyway, greedy-correct).
-                        let x_bf16 = if x.dtype() == mlx_rs::Dtype::Bfloat16 {
-                            x.clone()
-                        } else {
-                            x.as_dtype(mlx_rs::Dtype::Bfloat16)?
-                        };
-                        return crate::metal_kernel::bonsai_q2_mma_m8(
-                            &x_bf16,
+                        return ternary_q2_verify_forward(
+                            x,
                             &self.weight,
                             &self.scales,
                             &self.biases,
@@ -1912,10 +1903,34 @@ fn dense_fused_ternary_qmv_eligible(
 
 /// Whether the M<=8 MMA verify kernel (simdgroup_matrix<8,8>, affine-offset)
 /// replaces stock quantized_matmul for the ternary pack's batched projections.
-/// Default off; opt in with HIGGS_MMA_M8=1.
+/// Default on; opt out with `HIGGS_MMA_M8=0`.
 fn mma_m8_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("HIGGS_MMA_M8").is_ok_and(|v| v == "1"))
+    *ENABLED.get_or_init(|| std::env::var("HIGGS_MMA_M8").map_or(true, |v| v != "0"))
+}
+
+/// Whether a ternary-pack product of `rows` rows takes the verify kernel: the
+/// speculative-verify width (a `DFlash` block or MTP draft plus its anchor).
+fn ternary_q2_verify_eligible(group_size: i32, rows: i32) -> bool {
+    group_size == 128 && (2..=8).contains(&rows) && mma_m8_enabled()
+}
+
+/// The ternary pack's product on an already rotated input at the verify width:
+/// one launch reads the packed weights once for every row, in FP32 like the
+/// one-row decode kernel, so verify rows reproduce decode rows.
+fn ternary_q2_verify_forward(
+    x: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+) -> Result<Array, Exception> {
+    let y = crate::metal_kernel::bonsai_q2_mma_m8(
+        &x.as_dtype(Dtype::Float32)?,
+        weight,
+        scales,
+        biases,
+    )?;
+    y.as_dtype(x.dtype())
 }
 
 /// Whether the reduced-precision state store applies stochastic rounding
@@ -7931,6 +7946,13 @@ impl FfnBlock {
                     // no bias read. Decode only: batched prefill must use QMM.
                     // `x` is already hadamard-rotated above.
                     crate::metal_kernel::bonsai_q2_qmv_ternary(x, fw, fs, gp.group_size)?
+                } else if gp.bits == 2
+                    && fused_hadamard.is_some()
+                    && ternary_qmv_enabled()
+                    && ternary_q2_verify_eligible(gp.group_size, row_count)
+                {
+                    // Speculative verify width: gate|up read once for all rows.
+                    ternary_q2_verify_forward(x, fw, fs, fb)?
                 } else if use_fused_gemv {
                     qgemv_4bit(x, fw, fs, fb, gp.group_size)?
                 } else {
