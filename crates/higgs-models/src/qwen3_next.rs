@@ -4754,7 +4754,7 @@ pub(crate) fn yarn_rope_params(args: &Qwen3NextModelArgs) -> Option<YarnRopePara
 /// Precomputed `YaRN` state for one attention module. `None` on default-rope
 /// checkpoints, whose rope path stays bit-identical to the pre-`YaRN` code.
 #[derive(Debug, Clone)]
-struct YarnRope {
+pub(crate) struct YarnRope {
     /// Per-dimension rope periods (yarn-interpolated `base^(2i/dims)`), f32
     /// `[rope_dim/2]`. Passed as the `freqs` argument of `mlx_fast_rope` on
     /// the decode path; the manual prefill path uses `reciprocal(freqs)` —
@@ -4862,6 +4862,15 @@ pub enum DFlashRowSchedule {
     NativeBatch,
     /// Fold the exact one-token stateful primitives across a short block.
     CanonicalS1,
+}
+
+/// How an attention forward rotates a multi-row input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowRope {
+    /// Prefill: absolute 1,024-row blocks, so cold and retained prefills match.
+    PrefillStable,
+    /// Speculative verify: decode's fused kernel, identical per row to decode.
+    Decode,
 }
 
 /// Bound attention scratch without shrinking the expert/recurrent prefill batch.
@@ -5002,7 +5011,29 @@ impl Qwen3NextAttention {
         mask: Option<&AttentionMask>,
         cache: &mut SteppingKeyValueCache,
     ) -> Result<Array, Exception> {
-        self.forward_scheduled(x, mask, cache, DFlashRowSchedule::NativeBatch)
+        self.forward_scheduled(
+            x,
+            mask,
+            cache,
+            DFlashRowSchedule::NativeBatch,
+            RowRope::PrefillStable,
+        )
+    }
+
+    /// Forward the rows of a speculative verify with decode's `RoPE`.
+    fn forward_verify(
+        &mut self,
+        x: &Array,
+        mask: Option<&AttentionMask>,
+        cache: &mut SteppingKeyValueCache,
+    ) -> Result<Array, Exception> {
+        self.forward_scheduled(
+            x,
+            mask,
+            cache,
+            DFlashRowSchedule::NativeBatch,
+            RowRope::Decode,
+        )
     }
 
     /// Forward a speculative short block with the exact one-row numerical
@@ -5022,7 +5053,13 @@ impl Qwen3NextAttention {
                 "canonical short-block attention requires 1..=8 rows, got {seq_len}"
             )));
         }
-        self.forward_scheduled(x, mask, cache, DFlashRowSchedule::CanonicalS1)
+        self.forward_scheduled(
+            x,
+            mask,
+            cache,
+            DFlashRowSchedule::CanonicalS1,
+            RowRope::PrefillStable,
+        )
     }
 
     /// Attend one query against the cache view produced by one cache append.
@@ -5070,6 +5107,7 @@ impl Qwen3NextAttention {
         mask: Option<&AttentionMask>,
         cache: &mut SteppingKeyValueCache,
         row_schedule: DFlashRowSchedule,
+        row_rope: RowRope,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
         let B = *shape
@@ -5129,20 +5167,20 @@ impl Qwen3NextAttention {
         // the per-token hot path).
         let offset = cache.offset();
         let rope_offset = cache.position_offset();
-        queries = apply_qwen3_next_rope_scheduled(
-            queries,
-            &self.rope,
-            rope_offset,
-            self.yarn.as_ref(),
-            row_schedule,
-        )?;
-        keys = apply_qwen3_next_rope_scheduled(
-            keys,
-            &self.rope,
-            rope_offset,
-            self.yarn.as_ref(),
-            row_schedule,
-        )?;
+        let rotate = |rows: Array| match row_rope {
+            RowRope::Decode => {
+                apply_qwen3_next_rope_verify(&rows, &self.rope, rope_offset, self.yarn.as_ref())
+            }
+            RowRope::PrefillStable => apply_qwen3_next_rope_scheduled(
+                rows,
+                &self.rope,
+                rope_offset,
+                self.yarn.as_ref(),
+                row_schedule,
+            ),
+        };
+        queries = rotate(queries)?;
+        keys = rotate(keys)?;
 
         // DIAGNOSTIC: probe-driven capture of this FA layer's keys (first FA
         // layer of a forward: offset==0, L>1). Captures pre-write (post-rope)
@@ -8486,10 +8524,32 @@ pub struct Qwen3NextCausalLM {
     moe_mtp: Option<MoeMtpHead>,
 }
 
+/// `RoPE` for the rows of a speculative verify forward: decode's fused kernel
+/// over every row at once, bit-identical per row to one-token decode (checked
+/// at 2-16 rows, FP32 and BF16, across 1,024-row block boundaries). The
+/// prefill path would pad the rows to a 1,024-row block (~2-4 ms per query
+/// tensor at 8 rows on base M4).
+pub(crate) fn apply_qwen3_next_rope_verify(
+    x: &Array,
+    rope: &nn::Rope,
+    offset: i32,
+    yarn: Option<&YarnRope>,
+) -> Result<Array, Exception> {
+    match yarn {
+        Some(yarn_rope) => apply_fast_rope_with_freqs(
+            &yarn_rope.prescale_rotary(x)?,
+            rope,
+            offset,
+            Some(&yarn_rope.freqs),
+        ),
+        None => apply_fast_rope_with_freqs(x, rope, offset, None),
+    }
+}
+
 // `shadow_reuse` covers the YaRN prescale rebind of `x`; `indexing_slicing`
 // covers the fixed 4-D attention tensor shape.
 #[allow(clippy::shadow_reuse, clippy::indexing_slicing)]
-fn apply_qwen3_next_rope(
+pub(crate) fn apply_qwen3_next_rope(
     x: Array,
     rope: &nn::Rope,
     offset: i32,
@@ -10904,7 +10964,9 @@ impl Qwen3NextCausalLM {
                     DFlashRowSchedule::CanonicalS1 => {
                         attn.forward_canonical_rows(&normed, mask_ref, layer_kv)?
                     }
-                    DFlashRowSchedule::NativeBatch => attn.forward(&normed, mask_ref, layer_kv)?,
+                    DFlashRowSchedule::NativeBatch => {
+                        attn.forward_verify(&normed, mask_ref, layer_kv)?
+                    }
                 };
                 (output, None)
             };

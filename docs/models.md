@@ -193,7 +193,17 @@ rounding (`crates/higgs-models/tests/ternary_verify_parity.rs`). On a base M4
 (AC power) with a 4-bit DFlash 2 drafter at its trained block of 8, greedy
 decode against plain autoregressive decode measured 1.2× on code, 2.4× on
 JSON/tables, 1.7× on step-by-step math and 0.86× on prose, with byte-identical
-output; before this kernel, the same runs measured 0.71–1.05×.
+output; before this kernel, the same runs measured 0.71–1.05×. Verify rows
+also take decode's fused RoPE (bit-identical per row) instead of the prefill
+path's 1,024-row padding, which cut full-attention verify time by about 70%
+and made every speculative round 16% faster across 24 prompts.
+
+`HIGGS_DFLASH_ADAPTIVE` has no effect with DFlash 2 drafters: they always
+propose their full trained block, and on this kernel a smaller block would not
+verify faster anyway. The realized-speedup gate keeps prose near plain-decode
+speed. A smoother gate (EMA weight 0.2 instead of 0.4) was measured on 24
+prompts and traded +13% on step-by-step math for −4% on prose and −3% on
+JSON/tables, with code unchanged, so the default stays at 0.4.
 
 This adapter is covered by unit and property tests (config resolution,
 manifest validation, and a numerical round-trip proving the rotation is

@@ -82,6 +82,31 @@ pub mod ternary_linear_probe {
         linear.forward(x)
     }
 }
+#[doc(hidden)]
+pub mod verify_rope_probe {
+    //! Test seam: the full-attention RoPE of Qwen3.5/3.8-style layers (64
+    //! rotary dims, theta 1e7) for verify rows and for one decode row.
+    use mlx_rs::{Array, builder::Builder, error::Exception, nn};
+
+    fn rope() -> Result<nn::Rope, Exception> {
+        nn::RopeBuilder::new(64)
+            .traditional(false)
+            .base(10_000_000.0)
+            .scale(1.0)
+            .build()
+            .map_err(|e| Exception::custom(format!("{e}")))
+    }
+
+    /// `x` is `[B, H, rows, D]` starting at absolute position `offset`.
+    pub fn verify(x: &Array, offset: i32) -> Result<Array, Exception> {
+        crate::qwen3_next::apply_qwen3_next_rope_verify(x, &rope()?, offset, None)
+    }
+
+    /// `x` is one decode row `[B, H, 1, D]` at absolute position `offset`.
+    pub fn decode(x: &Array, offset: i32) -> Result<Array, Exception> {
+        crate::qwen3_next::apply_qwen3_next_rope(x.clone(), &rope()?, offset, None)
+    }
+}
 pub mod mlx_exec;
 pub mod phi3;
 pub mod progress;
