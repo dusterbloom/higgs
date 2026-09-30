@@ -210,7 +210,7 @@ fn resolved_runtime_identity_with_selection(
         "chunkedLoadEvaluation": nonzero("HIGGS_LOAD_EVAL_CHUNKED", true),
         "compiledGating": flag("HIGGS_COMPILED_GATING", true),
         "compiledGdnDecode": truthy("HIGGS_COMPILED_GDN_DECODE"),
-        "asyncLayerStateEvaluation": flag("HIGGS_ASYNC_LAYER_STATE_EVAL", true),
+        "asyncLayerStateEvaluation": flag("HIGGS_ASYNC_LAYER_STATE_EVAL", false),
         "bonsaiSymmetricQ1": flag("HIGGS_BONSAI_SYMMETRIC_Q1", true),
         "bonsaiTgLut4": nonzero("HIGGS_BONSAI_TG_LUT4", true),
         "bonsaiTgLut4FusedMlp": env("HIGGS_BONSAI_TG_LUT4_FUSED_MLP").as_deref() == Some("1"),

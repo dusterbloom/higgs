@@ -42,7 +42,7 @@ fn every_runtime_or_layout_mutation_changes_the_capacity_identity() {
         ("HIGGS_TURBOQUANT_MIN_TOKENS", "0"),
         ("HIGGS_COMPILED_GATING", "0"),
         ("HIGGS_COMPILED_GDN_DECODE", "1"),
-        ("HIGGS_ASYNC_LAYER_STATE_EVAL", "0"),
+        ("HIGGS_ASYNC_LAYER_STATE_EVAL", "1"),
         ("HIGGS_BONSAI_SYMMETRIC_Q1", "0"),
         ("HIGGS_BONSAI_TG_LUT4", "0"),
         ("HIGGS_BONSAI_TG_LUT4_FUSED_MLP", "1"),

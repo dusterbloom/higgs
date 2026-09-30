@@ -782,8 +782,12 @@ const fn default_min_tokens_to_persist() -> usize {
     DEFAULT_MIN_TOKENS_TO_PERSIST
 }
 
+// 3, not 1-2: nanobot interleaves the main chat, subagents and compaction on
+// one server; fewer slots evicts the main session (32 s cold vs 0.9 s warm,
+// 2026-09-25 session measurements). Memory stays bounded by
+// kv_max_retained_bytes.
 const fn default_kv_max_sessions() -> usize {
-    2
+    3
 }
 
 const fn default_kv_retained_idle_secs() -> u64 {
@@ -2376,13 +2380,13 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        assert_eq!(model.kv_max_sessions, 2);
+        assert_eq!(model.kv_max_sessions, 3);
         assert_eq!(model.kv_max_session_tokens, 32_768);
         assert_eq!(model.kv_retained_idle_secs, 300);
         assert_eq!(model.kv_max_suffix_prefill_tokens, 24_576);
         assert_eq!(model.kv_max_retained_bytes, 2_147_483_648);
         let kv = model.kv_cache_config();
-        assert_eq!(kv.max_retained_sessions, 2);
+        assert_eq!(kv.max_retained_sessions, 3);
         assert_eq!(kv.max_session_tokens, 32_768);
         assert_eq!(kv.retained_idle_secs, 300);
         assert_eq!(kv.max_retained_bytes, 2_147_483_648);

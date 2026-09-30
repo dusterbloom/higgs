@@ -94,7 +94,7 @@ path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # kv_adaptive_dense_layers = 0
 # kv_seed = 0
 # # Cache-resident multi-turn KV retention limits (bound resident KV memory):
-# kv_max_sessions = 2                    # max retained conversations, LRU-evicted (>= 1)
+# kv_max_sessions = 3                    # max retained conversations, LRU-evicted (>= 1)
 # kv_max_session_tokens = 32768          # drop a conversation's KV past N tokens (0 = unlimited)
 # kv_retained_idle_secs = 300            # evict KV idle longer than N seconds (0 = never)
 # kv_max_suffix_prefill_tokens = 24576   # maximum exact suffix before degraded bootstrap

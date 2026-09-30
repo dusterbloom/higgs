@@ -1956,14 +1956,19 @@ fn gdn_state_stochastic() -> i32 {
     })
 }
 
+/// Per-layer `async_eval` of decode state. Default OFF: with a retained
+/// session resident it throttles Escha decode 18.8 → 12.0 tok/s (Metal queue
+/// submit contention), and off is neutral-to-faster everywhere measured
+/// (docs/superpowers/results/2026-09-25-escha-session-measurements.md).
+/// Opt in: HIGGS_ASYNC_LAYER_STATE_EVAL=1.
 fn async_layer_state_eval_enabled() -> bool {
     *ASYNC_LAYER_STATE_EVAL_ENABLED.get_or_init(|| {
-        !matches!(
+        matches!(
             std::env::var("HIGGS_ASYNC_LAYER_STATE_EVAL")
                 .ok()
                 .map(|s| s.trim().to_ascii_lowercase())
                 .as_deref(),
-            Some("0" | "false" | "off" | "no")
+            Some("1" | "true" | "on" | "yes")
         )
     })
 }
