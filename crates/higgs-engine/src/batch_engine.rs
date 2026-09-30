@@ -249,6 +249,12 @@ impl BatchEngine {
         // marker rendering but can never lock the model afterwards.
         let (is_vlm, image_marker_text, vision_capabilities) =
             capture_vision_capabilities(model.as_vision());
+        let template = template.with_special_literals(
+            crate::special_literals::SpecialLiterals::from_tokenizer(
+                &tokenizer,
+                image_marker_text,
+            )?,
+        );
 
         crate::simple::set_wired_limit_to_max(raise_wired_limit);
 
@@ -404,11 +410,7 @@ impl BatchEngine {
         let prompt = self
             .template
             .apply(messages, tools, mode.add_generation_prompt())?;
-        let encoding = self
-            .tokenizer
-            .encode(prompt.as_str(), false)
-            .map_err(|e| EngineError::Tokenization(e.to_string()))?;
-        Ok(encoding.get_ids().to_vec())
+        self.template.encode_prompt(&self.tokenizer, &prompt)
     }
 
     /// Generate a complete (non-streaming) response.

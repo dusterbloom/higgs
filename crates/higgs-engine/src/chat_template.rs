@@ -1,8 +1,11 @@
+use std::borrow::Cow;
+
 use minijinja::value::Kwargs;
 use minijinja::{Environment, Value};
 use serde::Serialize;
 
 use crate::error::EngineError;
+use crate::special_literals::SpecialLiterals;
 
 /// Whether a rendered chat prompt opens the next assistant generation turn or
 /// stops at the exact boundary of the completed messages.
@@ -41,6 +44,8 @@ pub struct ChatTemplateRenderer {
     eos_token: String,
     supports_tools: bool,
     supports_thinking: bool,
+    /// Escapes special-token literals in content; see [`SpecialLiterals`].
+    literals: Option<SpecialLiterals>,
 }
 
 impl ChatTemplateRenderer {
@@ -68,7 +73,47 @@ impl ChatTemplateRenderer {
             eos_token: String::new(),
             supports_tools,
             supports_thinking,
+            literals: None,
         })
+    }
+
+    /// Keep special-token literals in message content out of the structure
+    /// channel. Every render escapes them; tokenize renders with
+    /// [`Self::encode_prompt`] and read retained ids back with
+    /// [`Self::decode_prompt`].
+    #[must_use]
+    pub fn with_special_literals(mut self, literals: SpecialLiterals) -> Self {
+        self.literals = Some(literals);
+        self
+    }
+
+    /// Tokenize a rendered prompt.
+    pub fn encode_prompt(
+        &self,
+        tokenizer: &tokenizers::Tokenizer,
+        rendered: &str,
+    ) -> Result<Vec<u32>, EngineError> {
+        match &self.literals {
+            Some(literals) => literals.encode(tokenizer, rendered),
+            None => tokenizer
+                .encode(rendered, false)
+                .map(|encoding| encoding.get_ids().to_vec())
+                .map_err(|e| EngineError::Tokenization(e.to_string())),
+        }
+    }
+
+    /// Detokenize prompt ids into the same text space renders use.
+    pub fn decode_prompt(
+        &self,
+        tokenizer: &tokenizers::Tokenizer,
+        ids: &[u32],
+    ) -> Result<String, EngineError> {
+        match &self.literals {
+            Some(literals) => literals.decode(tokenizer, ids),
+            None => tokenizer
+                .decode(ids, false)
+                .map_err(|e| EngineError::Tokenization(e.to_string())),
+        }
     }
 
     /// Whether this template has an explicit native tool representation.
@@ -187,6 +232,8 @@ impl ChatTemplateRenderer {
             .get_template("chat")
             .map_err(|e| EngineError::Template(e.to_string()))?;
 
+        let escaped = self.escape_messages(messages);
+        let messages = escaped.as_deref().unwrap_or(messages);
         let bos = &self.bos_token;
         let eos = &self.eos_token;
         let context = tools.map_or_else(
@@ -213,6 +260,29 @@ impl ChatTemplateRenderer {
 
         tmpl.render(context)
             .map_err(|e| EngineError::Template(e.to_string()))
+    }
+
+    /// `None` when no content quotes a special token (the common case).
+    // ponytail: content only; tool-call arguments are rendered through
+    // `tojson` and can still carry a raw literal. Escape them here too if a
+    // tool payload ever needs to quote chat markers.
+    fn escape_messages(&self, messages: &[ChatMessage]) -> Option<Vec<ChatMessage>> {
+        let literals = self.literals.as_ref()?;
+        let escaped: Vec<_> = messages.iter().map(|m| literals.escape(&m.content)).collect();
+        if escaped.iter().all(|c| matches!(c, Cow::Borrowed(_))) {
+            return None;
+        }
+        Some(
+            messages
+                .iter()
+                .zip(escaped)
+                .map(|(m, content)| ChatMessage {
+                    role: m.role.clone(),
+                    content: content.into_owned(),
+                    tool_calls: m.tool_calls.clone(),
+                })
+                .collect(),
+        )
     }
 }
 

@@ -3779,7 +3779,13 @@ impl SimpleEngine {
             .make_cache_with_config(kv_cache_config)
             .map_err(EngineError::Mlx)?;
         let tokenizer = model_loader::load_tokenizer(model_dir)?;
-        let template = ChatTemplateRenderer::try_from_model_dir(model_dir)?;
+        let image_marker = model.as_vision().map(VisionModel::image_marker_text);
+        let template = ChatTemplateRenderer::try_from_model_dir(model_dir)?
+            .map(|t| {
+                crate::special_literals::SpecialLiterals::from_tokenizer(&tokenizer, image_marker)
+                    .map(|literals| t.with_special_literals(literals))
+            })
+            .transpose()?;
         if template.is_none() {
             tracing::warn!("No chat template found; /v1/chat/completions will be unavailable");
         }
@@ -5308,11 +5314,7 @@ impl SimpleEngine {
             add_generation_prompt,
             enable_thinking,
         )?;
-        let encoding = self
-            .tokenizer
-            .encode(prompt.as_str(), false)
-            .map_err(|e| EngineError::Tokenization(e.to_string()))?;
-        let prompt_tokens = encoding.get_ids().to_vec();
+        let prompt_tokens = renderer.encode_prompt(&self.tokenizer, &prompt)?;
         let mut hard_keep_ranges = Vec::new();
         let without_generation_prompt =
             renderer.apply_with_thinking(messages, tools, false, enable_thinking)?;
@@ -5375,11 +5377,18 @@ impl SimpleEngine {
         enable_thinking: bool,
     ) -> Result<Vec<u32>, EngineError> {
         let prompt = self.render_chat_prompt_with_thinking(messages, tools, enable_thinking)?;
-        let encoding = self
-            .tokenizer
-            .encode(prompt.as_str(), false)
-            .map_err(|e| EngineError::Tokenization(e.to_string()))?;
-        Ok(encoding.get_ids().to_vec())
+        self.encode_rendered_prompt(&prompt)
+    }
+
+    fn encode_rendered_prompt(&self, rendered: &str) -> Result<Vec<u32>, EngineError> {
+        match &self.template {
+            Some(renderer) => renderer.encode_prompt(&self.tokenizer, rendered),
+            None => self
+                .tokenizer
+                .encode(rendered, false)
+                .map(|encoding| encoding.get_ids().to_vec())
+                .map_err(|e| EngineError::Tokenization(e.to_string())),
+        }
     }
 
     /// Apply chat template and tokenize messages.
@@ -7239,7 +7248,16 @@ impl SimpleEngine {
             }
             return canonical.to_vec();
         }
-        let retained_text = match self.tokenizer.decode(retained, false) {
+        // Same escaped text space as the fresh render below, so quoted chat
+        // markers in content cannot be mistaken for message boundaries.
+        let decoded = match &self.template {
+            Some(renderer) => renderer.decode_prompt(&self.tokenizer, retained),
+            None => self
+                .tokenizer
+                .decode(retained, false)
+                .map_err(|e| EngineError::Tokenization(e.to_string())),
+        };
+        let retained_text = match decoded {
             Ok(text) => text,
             Err(error) => {
                 if diag {
@@ -7286,7 +7304,7 @@ impl SimpleEngine {
             }
             return prompt_tokens.to_vec();
         };
-        let Ok(delta_enc) = self.tokenizer.encode(delta_text, false) else {
+        let Ok(delta_ids) = self.encode_rendered_prompt(delta_text) else {
             if diag {
                 eprintln!(
                     "DIAG session-continue-fallback: reason=encode_delta_failed session_id={session_id} delta_bytes={}",
@@ -7299,12 +7317,12 @@ impl SimpleEngine {
             eprintln!(
                 "DIAG session-continue: matched session_id={session_id} retained_tokens={} delta_tokens={} full_prompt_tokens={}",
                 retained.len(),
-                delta_enc.get_ids().len(),
+                delta_ids.len(),
                 prompt_tokens.len()
             );
         }
         let mut combined = retained.to_vec();
-        combined.extend_from_slice(delta_enc.get_ids());
+        combined.extend_from_slice(&delta_ids);
         combined
     }
 
@@ -15670,6 +15688,56 @@ mod tests {
             delta,
             "<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>"
         );
+    }
+
+    // 2026-09-25 "1 in 3 continuations rejected": user content quoting chat
+    // markers (higgs's own source) became real control tokens and broke the
+    // text splice, forcing a cold re-prefill. Qwen-shaped template: the
+    // generation prompt opens an empty think block that history drops, so
+    // the continuation must go through the splice.
+    #[test]
+    fn continuation_splices_when_content_quotes_chat_markers() {
+        let tokenizer = crate::special_literals::chatml_test_tokenizer();
+        let literals =
+            crate::special_literals::SpecialLiterals::from_tokenizer(&tokenizer, None).unwrap();
+        let mut engine = session_cache_test_engine();
+        engine.template = Some(
+            ChatTemplateRenderer::new(
+                "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}\
+                 {% if add_generation_prompt %}<|im_start|>assistant\n<think>\n\n</think>\n\n{% endif %}",
+            )
+            .unwrap()
+            .with_special_literals(literals),
+        );
+        engine.tokenizer = tokenizer;
+        let im_start = engine.tokenizer.token_to_id("<|im_start|>").unwrap();
+        let im_end = engine.tokenizer.token_to_id("<|im_end|>").unwrap();
+        let msg = |role: &str, content: &str| ChatMessage {
+            role: role.to_owned(),
+            content: content.to_owned(),
+            tool_calls: None,
+        };
+        let quoted = r#"const IM_START: &str = "<|im_start|>"; const IM_END: &str = "<|im_end|>";"#;
+
+        let turn1 = vec![msg("user", quoted)];
+        let mut retained = engine
+            .prepare_chat_prompt_with_thinking(&turn1, None, false)
+            .unwrap();
+        // Quoted markers are text: only the two structural <|im_start|>.
+        assert_eq!(retained.iter().filter(|&&id| id == im_start).count(), 2);
+        retained.extend(engine.tokenizer.encode("answer1", false).unwrap().get_ids());
+        retained.push(im_end);
+
+        let turn2 = vec![msg("user", quoted), msg("assistant", "answer1"), msg("user", "q2")];
+        let prompt = engine
+            .prepare_chat_prompt_with_thinking(&turn2, None, false)
+            .unwrap();
+        let continued =
+            engine.continued_prompt_tokens_from_retained(7, Some(&retained), &prompt, &turn2, None, false);
+
+        assert!(continued.starts_with(&retained), "fell back to a cold prompt");
+        let delta = engine.tokenizer.decode(&continued[retained.len()..], false).unwrap();
+        assert_eq!(delta, "\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
     }
 
     #[test]
