@@ -4276,15 +4276,6 @@ impl SimpleEngine {
         lock_or_recover(&self.retained).len()
     }
 
-    /// Diagnostic-only read of current retained state. Admission must use the
-    /// locked streaming acceptance handshake; this snapshot is inherently racy.
-    pub fn retained_session_can_continue(&self, session_id: u64, prompt_tokens: &[u32]) -> bool {
-        lock_or_recover(&self.retained)
-            .get(&session_id)
-            .is_some_and(|entry| {
-                continuation_prior_len(entry.state.tokens(), prompt_tokens).is_some()
-            })
-    }
 
     pub fn record_required_continuation_miss(&self) {
         self.cache_metrics

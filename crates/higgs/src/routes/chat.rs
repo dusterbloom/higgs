@@ -351,13 +351,18 @@ fn validate_required_retention(
     })?;
     match retention.mode {
         crate::types::openai::RetentionMode::Required => {
+            // Only the binding is checked here. The prefix proof belongs to
+            // the worker: after a generated assistant turn the route's
+            // re-rendered prompt is never a raw token extension of the
+            // retained cache (think block, tool-call rendering) — only the
+            // worker's message-boundary splice reconciles it, and it rejects
+            // with this same error when it cannot.
             if !state.retention_binding_matches(
                 model,
                 retention.session_id,
                 &retention.contract_revision,
                 retention.epoch,
-            ) || !engine.retained_session_can_continue(retention.session_id, prompt_tokens)
-            {
+            ) {
                 return Err(ServerError::RequiredRetentionUnavailable(error_context));
             }
             if !engine.lease_retained_session(retention.session_id, 300) {
@@ -4339,6 +4344,22 @@ mod tests {
                 &engine,
                 model,
                 &[1, 2, 3],
+                1,
+                Some(&required),
+                &[]
+            )
+            .is_ok()
+        );
+        // After a generated tool call the re-rendered prompt is not a raw
+        // token extension of the retained cache; the route must still admit
+        // it and leave the prefix proof to the worker's splice (2026-09-30
+        // "retained session … epoch 0 is unavailable" on every tool call).
+        assert!(
+            validate_required_retention(
+                &state,
+                &engine,
+                model,
+                &[1, 9, 3],
                 1,
                 Some(&required),
                 &[]

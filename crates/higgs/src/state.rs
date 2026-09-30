@@ -787,14 +787,6 @@ impl Engine {
         }
     }
 
-    pub fn retained_session_can_continue(&self, session_id: u64, prompt_tokens: &[u32]) -> bool {
-        match self {
-            Self::Simple(e) => e.retained_session_can_continue(session_id, prompt_tokens),
-            Self::Batch(_) => false,
-            #[cfg(test)]
-            Self::Stub(stub) => matches!(stub.name(), "raw-accept-worker-reject" | "seed-binding"),
-        }
-    }
 
     pub fn record_required_continuation_miss(&self) {
         if let Self::Simple(engine) = self {
