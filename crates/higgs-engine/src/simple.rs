@@ -4666,6 +4666,30 @@ impl SimpleEngine {
             .map(|kept| kept.state.tokens().to_vec())
     }
 
+    /// Count and explain a required continuation that cannot run as an exact
+    /// retained-prefix continuation. Logged because the client only sees
+    /// "unavailable": 2026-10-01's 38K-token LargeSuffix miss was invisible.
+    fn required_continuation_miss(
+        &self,
+        session_id: u64,
+        strategy: SessionPrefillStrategy,
+        retained_tokens: Option<&[u32]>,
+        candidate_tokens: usize,
+    ) -> EngineError {
+        self.cache_metrics
+            .required_continuation_misses
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            session_id,
+            ?strategy,
+            retained_tokens = retained_tokens.map(<[u32]>::len),
+            candidate_tokens,
+            max_suffix_prefill_tokens = self.session_max_suffix_prefill_tokens,
+            "required continuation cannot continue the retained session"
+        );
+        EngineError::RetainedSessionUnavailable(session_id)
+    }
+
     /// Reject and forget a retained entry whose exact token identity cannot
     /// continue the canonical request. A present-but-diverged cache is not a
     /// cold-cache miss: silently bootstrapping it can turn a cheap suffix turn
@@ -6940,10 +6964,12 @@ impl SimpleEngine {
             && (!matches!(strategy, SessionPrefillStrategy::Continue { .. })
                 || !exact_retained_prefix)
         {
-            self.cache_metrics
-                .required_continuation_misses
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(EngineError::RetainedSessionUnavailable(session_id));
+            return Err(self.required_continuation_miss(
+                session_id,
+                strategy,
+                retained_tokens.as_deref(),
+                continued_prompt.len(),
+            ));
         }
 
         #[cfg(test)]
@@ -7116,10 +7142,12 @@ impl SimpleEngine {
             if let Some(acceptance) = acceptance.take() {
                 let _ = acceptance.send(Err(session_id));
             }
-            self.cache_metrics
-                .required_continuation_misses
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(EngineError::RetainedSessionUnavailable(session_id));
+            return Err(self.required_continuation_miss(
+                session_id,
+                strategy,
+                retained_tokens.as_deref(),
+                continued_prompt.len(),
+            ));
         }
 
         match strategy {
