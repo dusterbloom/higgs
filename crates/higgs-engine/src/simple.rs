@@ -2226,6 +2226,7 @@ struct CacheMetrics {
     broken_leases: AtomicU64,
     prefill_only_requests: AtomicU64,
     required_continuation_misses: AtomicU64,
+    stateless_large_prefills: AtomicU64,
 }
 
 struct PendingContinuationMetrics {
@@ -2456,6 +2457,9 @@ pub struct CacheStats {
     pub prefill_only_requests: u64,
     /// Required-continuation requests rejected before a cold prefill.
     pub required_continuation_misses: u64,
+    /// Stateless (no session routing) requests whose prompt was large enough
+    /// to warrant a warning before the cold prefill ran.
+    pub stateless_large_prefills: u64,
     /// Currently retained sessions that own an inseparable target/dSpark pair.
     pub retained_paired_sessions: usize,
     /// Conservative target bytes retained by paired sessions.
@@ -4283,6 +4287,14 @@ impl SimpleEngine {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count a stateless (no session routing) request whose prompt was large
+    /// enough that its cold prefill cost deserved a warning.
+    pub fn record_stateless_large_prefill(&self) {
+        self.cache_metrics
+            .stateless_large_prefills
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Lease an existing retained session against idle eviction. Count and byte
     /// limits remain hard and may still evict it.
     pub fn lease_retained_session(&self, session_id: u64, ttl: std::time::Duration) -> bool {
@@ -4491,6 +4503,10 @@ impl SimpleEngine {
             required_continuation_misses: self
                 .cache_metrics
                 .required_continuation_misses
+                .load(Ordering::Relaxed),
+            stateless_large_prefills: self
+                .cache_metrics
+                .stateless_large_prefills
                 .load(Ordering::Relaxed),
             retained_paired_sessions: retained_paired.entries,
             retained_paired_target_bytes: retained_paired.target_bytes,
@@ -16736,6 +16752,16 @@ mod tests {
         ));
         assert!(engine.retained_session_tokens(0xCAFE).is_none());
         assert_eq!(engine.cache_stats().required_continuation_misses, 1);
+    }
+
+    #[test]
+    fn stateless_large_prefill_is_counted() {
+        let engine = session_cache_test_engine();
+        assert_eq!(engine.cache_stats().stateless_large_prefills, 0);
+
+        engine.record_stateless_large_prefill();
+
+        assert_eq!(engine.cache_stats().stateless_large_prefills, 1);
     }
 
     #[test]

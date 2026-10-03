@@ -806,6 +806,17 @@ impl Engine {
         }
     }
 
+    /// Count a stateless (no session routing) request whose prompt was large
+    /// enough that its cold prefill cost deserved a warning.
+    pub fn record_stateless_large_prefill(&self) {
+        match self {
+            Self::Simple(engine) => engine.record_stateless_large_prefill(),
+            Self::Batch(_) => {}
+            #[cfg(test)]
+            Self::Stub(stub) => stub.record_named_mutation("stateless_large_prefill".to_owned()),
+        }
+    }
+
     /// Cache-effectiveness snapshot for observability. Only the Simple engine
     /// has a cache-resident path; other variants report `None`.
     pub fn cache_stats(&self) -> Option<CacheStats> {

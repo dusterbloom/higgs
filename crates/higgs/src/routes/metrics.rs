@@ -124,6 +124,9 @@ pub struct CacheMetricsView {
     pub prefill_only_requests: u64,
     /// Required-continuation requests rejected before a cold prefill.
     pub required_continuation_misses: u64,
+    /// Stateless (no session routing) requests whose prompt was large enough
+    /// to warrant a warning before the cold prefill ran.
+    pub stateless_large_prefills: u64,
     /// Currently retained sessions that own an inseparable target/dSpark pair.
     pub retained_paired_sessions: u64,
     /// Conservative target bytes retained by paired sessions.
@@ -261,6 +264,9 @@ impl CacheMetricsView {
         self.required_continuation_misses = self
             .required_continuation_misses
             .saturating_add(stats.required_continuation_misses);
+        self.stateless_large_prefills = self
+            .stateless_large_prefills
+            .saturating_add(stats.stateless_large_prefills);
         self.retained_paired_sessions = self
             .retained_paired_sessions
             .saturating_add(u64::try_from(stats.retained_paired_sessions).unwrap_or(u64::MAX));
@@ -541,6 +547,7 @@ mod tests {
             broken_leases: 41,
             prefill_only_requests: 42,
             required_continuation_misses: 43,
+            stateless_large_prefills: 53,
             retained_paired_sessions: 44,
             retained_paired_target_bytes: 45,
             retained_paired_dflash_bytes: 46,
@@ -676,6 +683,7 @@ mod tests {
         assert_eq!(view.broken_leases, 82);
         assert_eq!(view.prefill_only_requests, 84);
         assert_eq!(view.required_continuation_misses, 86);
+        assert_eq!(view.stateless_large_prefills, 106);
         assert_eq!(view.retained_paired_sessions, 88);
         assert_eq!(view.retained_paired_target_bytes, 90);
         assert_eq!(view.retained_paired_dflash_bytes, 92);
@@ -731,6 +739,7 @@ mod tests {
             ("broken_leases", 41),
             ("prefill_only_requests", 42),
             ("required_continuation_misses", 43),
+            ("stateless_large_prefills", 53),
             ("retained_paired_sessions", 44),
             ("retained_paired_target_bytes", 45),
             ("retained_paired_dflash_bytes", 46),

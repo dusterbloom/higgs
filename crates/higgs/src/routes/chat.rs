@@ -36,6 +36,14 @@ use higgs_models::SamplingParams;
 
 const TOOL_RESULT_PROMPT_WARN_BYTES: usize = 16 * 1024;
 
+/// Prompt-token threshold above which a stateless (no session routing)
+/// prefill gets a warning before it runs. Deliberately independent of
+/// `MlxRuntimeTuning::chunked_prefill_threshold` — that knob sizes per-model
+/// prefill chunking inside `higgs-engine` and isn't reachable (or meaningful)
+/// as a request-level "this is expensive" signal here.
+// ponytail: hardcoded; revisit if this needs to be configurable per-deployment.
+const STATELESS_LARGE_PREFILL_WARN_TOKENS: usize = 8192;
+
 struct ToolChoicePlan<'a> {
     prompt_tools: Option<&'a [serde_json::Value]>,
     constraint_schema: Option<serde_json::Value>,
@@ -844,6 +852,17 @@ async fn chat_completions_non_streaming(
         want_logprobs,
         !stop_sequences.is_empty(),
     );
+    warn_stateless_prefill(
+        &engine,
+        req.session_id,
+        session_id,
+        image_inputs.is_some(),
+        constraint.is_some(),
+        checkpoint_id.as_deref(),
+        want_logprobs,
+        !stop_sequences.is_empty(),
+        prompt_tokens.len(),
+    );
     if required_retention.as_ref().is_some_and(|retention| {
         retention.mode == crate::types::openai::RetentionMode::Seed
             && session_id != Some(retention.session_id)
@@ -1426,6 +1445,17 @@ async fn chat_completions_stream(
         checkpoint_id.as_deref(),
         want_logprobs,
         !stop_sequences.is_empty(),
+    );
+    warn_stateless_prefill(
+        &engine,
+        request_session_id,
+        stream_session_id,
+        image_inputs.is_some(),
+        constraint.is_some(),
+        checkpoint_id.as_deref(),
+        want_logprobs,
+        !stop_sequences.is_empty(),
+        prompt_tokens.len(),
     );
     if required_retention.as_ref().is_some_and(|retention| {
         retention.mode == crate::types::openai::RetentionMode::Seed
@@ -2300,6 +2330,80 @@ fn session_continuation_id(
         .filter(|_| checkpoint_id.is_none())
         .filter(|_| !want_logprobs)
         .filter(|_| !has_stop_sequences)
+}
+
+/// Names the request features that make [`session_continuation_id`] discard
+/// an otherwise-present `session_id`, in the same order it checks them.
+fn session_routing_disabled_reasons(
+    has_image_inputs: bool,
+    has_constraint: bool,
+    checkpoint_id: Option<&str>,
+    want_logprobs: bool,
+    has_stop_sequences: bool,
+) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if has_image_inputs {
+        reasons.push("image_inputs");
+    }
+    if has_constraint {
+        reasons.push("response_format_or_tool_choice_constraint");
+    }
+    if checkpoint_id.is_some() {
+        reasons.push("checkpoint_id");
+    }
+    if want_logprobs {
+        reasons.push("logprobs");
+    }
+    if has_stop_sequences {
+        reasons.push("stop_sequences");
+    }
+    reasons
+}
+
+/// Warn when a request is about to cold-prefill with no session-routed KV
+/// reuse: either because the client asked for session continuation but a
+/// request feature disabled it, or because the stateless prefill itself is
+/// large enough that a silent multi-minute prefill would otherwise go
+/// unexplained in the logs. Shared by the streaming and non-streaming routes.
+#[allow(clippy::too_many_arguments)]
+fn warn_stateless_prefill(
+    engine: &Engine,
+    requested_session_id: Option<u64>,
+    session_id: Option<u64>,
+    has_image_inputs: bool,
+    has_constraint: bool,
+    checkpoint_id: Option<&str>,
+    want_logprobs: bool,
+    has_stop_sequences: bool,
+    prompt_tokens: usize,
+) {
+    if session_id.is_some() {
+        return;
+    }
+    if let Some(sid) = requested_session_id {
+        let reasons = session_routing_disabled_reasons(
+            has_image_inputs,
+            has_constraint,
+            checkpoint_id,
+            want_logprobs,
+            has_stop_sequences,
+        );
+        if !reasons.is_empty() {
+            tracing::warn!(
+                session_id = sid,
+                ?reasons,
+                "session_id present but session routing disabled by request feature(s); prefilling statelessly"
+            );
+        }
+    }
+    if prompt_tokens >= STATELESS_LARGE_PREFILL_WARN_TOKENS {
+        engine.record_stateless_large_prefill();
+        tracing::warn!(
+            prompt_tokens,
+            warn_threshold_tokens = STATELESS_LARGE_PREFILL_WARN_TOKENS,
+            "large stateless prefill: no session controls"
+        );
+    }
 }
 
 fn validate_prompt_limit(
@@ -3299,6 +3403,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn large_stateless_prefill_without_session_id_is_counted() {
+        let engine = Arc::new(Engine::test_stub("zero-prefix-large-stateless-prefill"));
+        engine.test_set_chat_prompt_tokens(vec![7; STATELESS_LARGE_PREFILL_WARN_TOKENS]);
+        let request = chat_request(serde_json::json!({}));
+
+        // The generic test stub has no real generation backend, so the
+        // stateless path errors past the warn/count call site this test
+        // exercises; that's the point reached before the error, not the
+        // error itself.
+        let error = chat_completions_non_streaming(
+            streaming_test_state(),
+            request,
+            Arc::clone(&engine),
+            GenerationDefaults::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, ServerError::Engine(higgs_engine::error::EngineError::Generation(_))),
+            "must reach the stateless generation dispatch: {error:?}"
+        );
+
+        assert!(
+            engine
+                .route_test_mutation_sequence()
+                .contains(&"stateless_large_prefill".to_owned()),
+            "large session-less prefill must be counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_id_disabled_by_stop_sequences_falls_back_to_stateless_prefill() {
+        let engine = Arc::new(Engine::test_stub("zero-prefix-session-disabled-by-stop"));
+        // Large enough to also trip the size warning, so the mutation hook
+        // confirms this request actually reached the stateless prefill path
+        // instead of session-routed generation.
+        engine.test_set_chat_prompt_tokens(vec![7; STATELESS_LARGE_PREFILL_WARN_TOKENS]);
+        let request = chat_request(serde_json::json!({
+            "session_id": 42,
+            "stop": ["END"]
+        }));
+
+        // Same reasoning as above: the generic stub errors on the stateless
+        // generation call, but only after this request's session_id was
+        // disabled and it fell through to that stateless dispatch.
+        let error = chat_completions_non_streaming(
+            streaming_test_state(),
+            request,
+            Arc::clone(&engine),
+            GenerationDefaults::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, ServerError::Engine(higgs_engine::error::EngineError::Generation(_))),
+            "must reach the stateless generation dispatch, not session-routed generation: {error:?}"
+        );
+
+        let mutations = engine.route_test_mutation_sequence();
+        assert!(
+            mutations.contains(&"stateless_large_prefill".to_owned()),
+            "stop_sequences must disable session routing and fall back to stateless prefill"
+        );
+        assert!(
+            !mutations.iter().any(|m| m.starts_with("continue:42") || m.starts_with("retain:42")),
+            "session 42 must never be routed to, since stop_sequences disables continuation"
+        );
+    }
+
+    #[tokio::test]
     async fn streaming_required_materialization_failure_errors_before_sse() {
         let request = chat_request(serde_json::json!({
             "stream": true,
@@ -3725,6 +3899,44 @@ mod tests {
         assert_eq!(
             session_continuation_id(Some(42), false, false, Some("checkpoint-a"), false, false),
             None
+        );
+    }
+
+    #[test]
+    fn session_routing_disabled_reasons_names_every_disabling_feature() {
+        assert_eq!(
+            session_routing_disabled_reasons(false, false, None, false, false),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            session_routing_disabled_reasons(true, false, None, false, false),
+            vec!["image_inputs"]
+        );
+        assert_eq!(
+            session_routing_disabled_reasons(false, true, None, false, false),
+            vec!["response_format_or_tool_choice_constraint"]
+        );
+        assert_eq!(
+            session_routing_disabled_reasons(false, false, Some("checkpoint-a"), false, false),
+            vec!["checkpoint_id"]
+        );
+        assert_eq!(
+            session_routing_disabled_reasons(false, false, None, true, false),
+            vec!["logprobs"]
+        );
+        assert_eq!(
+            session_routing_disabled_reasons(false, false, None, false, true),
+            vec!["stop_sequences"]
+        );
+        assert_eq!(
+            session_routing_disabled_reasons(true, true, Some("checkpoint-a"), true, true),
+            vec![
+                "image_inputs",
+                "response_format_or_tool_choice_constraint",
+                "checkpoint_id",
+                "logprobs",
+                "stop_sequences"
+            ]
         );
     }
 
