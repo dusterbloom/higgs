@@ -1756,11 +1756,19 @@ async fn chat_completions_stream(
                         }
                     }
                 }
+                let raw_on_error = output.raw;
                 if adapter_error.is_none() {
                     adapter_error = output.error.map(|error| error.to_string());
                 }
                 if let Some(error) = adapter_error {
                     metrics_guard.fail(error.clone());
+                    tracing::error!(
+                        error = %error,
+                        raw = ?raw_on_error,
+                        request_id = %request_id,
+                        session_id = ?stream_session_id,
+                        "tool-call stream parser rejected model output",
+                    );
                     yield Ok(Event::default().data(streaming_error_json(&error)));
                     return;
                 }

@@ -42,9 +42,33 @@ pub enum ToolParseError {
 pub struct IncrementalToolCallOutput {
     pub events: Vec<ToolStreamEvent>,
     pub error: Option<ToolParseError>,
+    /// The buffered model text that produced `error`, captured just before
+    /// the buffer is cleared and trimmed to the trailing
+    /// [`MAX_RAW_ERROR_BYTES`] bytes on a character boundary. Only ever set
+    /// alongside `error`; lets callers log the exact bytes that caused a
+    /// terminal parse failure instead of losing them to the clear.
+    pub raw: Option<String>,
 }
 
 const MAX_JSON_NESTING: usize = 256;
+
+/// Cap on the raw buffer text captured in [`IncrementalToolCallOutput::raw`]
+/// so a pathological model output can't flood logs.
+const MAX_RAW_ERROR_BYTES: usize = 2048;
+
+/// Returns the trailing `MAX_RAW_ERROR_BYTES` bytes of `text`, snapped
+/// forward to the nearest character boundary so the slice is always valid
+/// UTF-8.
+fn error_raw_tail(text: &str) -> String {
+    if text.len() <= MAX_RAW_ERROR_BYTES {
+        return text.to_owned();
+    }
+    let mut start = text.len() - MAX_RAW_ERROR_BYTES;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_owned()
+}
 
 /// Incrementally recognizes all tool syntaxes supported by the batch parser.
 ///
@@ -255,6 +279,7 @@ impl IncrementalToolCallTracker {
                     .into_iter()
                     .collect(),
                 error: None,
+                raw: None,
             };
         }
         if matches!(self.state, State::Failed) {
@@ -274,6 +299,7 @@ impl IncrementalToolCallTracker {
                 }
                 Err(error) => {
                     self.state = State::Failed;
+                    output.raw = Some(error_raw_tail(&self.buffer));
                     self.buffer.clear();
                     self.cursor = 0;
                     output.error = Some(error);
@@ -297,6 +323,7 @@ impl IncrementalToolCallTracker {
             self.compact();
         } else {
             self.state = State::Failed;
+            output.raw = Some(error_raw_tail(&self.buffer));
             self.buffer.clear();
             self.cursor = 0;
             output.error = Some(ToolParseError::IncompleteToolCall);
@@ -2210,6 +2237,24 @@ mod tests {
             }) if name == "count"
         ));
         assert!(!output.events.contains(&ToolEnd { index: 0 }));
+    }
+
+    #[test]
+    fn malformed_call_preserves_raw_offending_text_for_logging() {
+        let typed = schema("set", &serde_json::json!({"count": {"type": "integer"}}));
+        let mut tracker = IncrementalToolCallTracker::new(true, Some(typed));
+        let output = tracker.process(
+            "<tool_call><function=set><parameter=count>42,</parameter></function></tool_call>",
+        );
+        assert!(matches!(
+            output.error,
+            Some(ToolParseError::Malformed { .. })
+        ));
+        assert!(
+            output.raw.as_deref().is_some_and(|raw| raw.contains("42,")),
+            "expected raw buffer to retain the offending text, got {:?}",
+            output.raw
+        );
     }
 
     #[test]
