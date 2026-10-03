@@ -355,8 +355,6 @@ impl CapacityRegistry {
             legacy_token_upper_bound: active.facts.retained_session_tokens,
             fixed_bytes_per_session: active.facts.retained_fixed_bytes_per_session,
             conservative_bytes_per_token: active.facts.retained_bytes_per_token,
-            worst_case_turn_tokens: output,
-            target_after_compaction_tokens: output,
         })
     }
     pub fn cache_allocations(&self) -> Vec<(String, u64, u64)> {

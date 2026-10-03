@@ -63,8 +63,6 @@ fn v2_contract_and_malformed_request_complete_the_wire_matrix() {
         legacy_token_upper_bound: 96_576,
         fixed_bytes_per_session: 0,
         conservative_bytes_per_token: 128 * 1024,
-        worst_case_turn_tokens: 4_096,
-        target_after_compaction_tokens: 4_096,
     })
     .unwrap();
     let expected: serde_json::Value =

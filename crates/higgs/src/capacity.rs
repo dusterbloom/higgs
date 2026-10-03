@@ -347,6 +347,29 @@ fn capacity_server_error(error: CapacityAdmissionError) -> crate::error::ServerE
 pub const CAPACITY_SCHEMA_VERSION: u32 = 1;
 pub const CAPACITY_RETRY_AFTER_MS: u64 = 5_000;
 
+/// Headroom between the soft-compaction boundary and the fast wall, as a
+/// divisor of the guaranteed fast window (`guaranteed / 4`), floored at one
+/// `max_output_tokens`.
+///
+/// A tool-looping client crosses the soft boundary mid-turn and keeps growing
+/// the prompt by one assistant output plus one tool result per round until the
+/// turn ends and compaction lands. One full output is the physical floor: the
+/// round right after crossing must still be admissible under the wall. A
+/// quarter of the window covers the several rounds one turn actually takes
+/// (measured 2026-10-02: nine rounds, ~8k tokens, inside one user turn on a
+/// 45k window — twice the single `max_output` the old derivation left).
+pub const SOFT_HEADROOM_WINDOW_DIVISOR: u64 = 4;
+
+/// Post-compaction target as a divisor of the soft boundary (`soft / 2`):
+/// compaction halves the prompt.
+///
+/// Half the soft boundary always holds the client's immutable prefix (system
+/// prompt plus tool definitions, a few thousand tokens) and a working tail,
+/// and with quarter-window headroom the seeded session regrows at least one
+/// headroom before it re-crosses the soft boundary, so one cold seed buys more
+/// than one in-flight turn of growth.
+pub const COMPACTION_TARGET_DIVISOR: u64 = 2;
+
 /// Immutable inputs used to derive the retained-byte safety envelope.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FastSessionContractInputs {
@@ -359,8 +382,6 @@ pub struct FastSessionContractInputs {
     pub legacy_token_upper_bound: u64,
     pub fixed_bytes_per_session: u64,
     pub conservative_bytes_per_token: u64,
-    pub worst_case_turn_tokens: u64,
-    pub target_after_compaction_tokens: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -407,8 +428,6 @@ impl FastSessionContractV2 {
             || input.retained_budget_bytes == 0
             || input.guaranteed_sessions == 0
             || input.conservative_bytes_per_token == 0
-            || input.worst_case_turn_tokens == 0
-            || input.target_after_compaction_tokens == 0
         {
             return Err(FastSessionContractError::NonPositive);
         }
@@ -430,12 +449,11 @@ impl FastSessionContractV2 {
         if input.legacy_token_upper_bound != 0 {
             guaranteed = guaranteed.min(input.legacy_token_upper_bound);
         }
+        let headroom = (guaranteed / SOFT_HEADROOM_WINDOW_DIVISOR).max(input.max_output_tokens);
         let soft = guaranteed
-            .checked_sub(input.worst_case_turn_tokens)
+            .checked_sub(headroom)
             .ok_or(FastSessionContractError::InsufficientRetainedBudget)?;
-        let target = input
-            .target_after_compaction_tokens
-            .min(soft.saturating_sub(1));
+        let target = soft / COMPACTION_TARGET_DIVISOR;
         if target == 0 || target >= soft || soft >= guaranteed {
             return Err(FastSessionContractError::InsufficientRetainedBudget);
         }
@@ -871,7 +889,7 @@ mod output_default_tests {
 
 #[cfg(test)]
 mod fast_session_contract_tests {
-    use super::{FastSessionContractInputs, FastSessionContractV2};
+    use super::{FastSessionContractInputs, FastSessionContractV2, SOFT_HEADROOM_WINDOW_DIVISOR};
 
     fn inputs(bytes_per_token: u64) -> FastSessionContractInputs {
         FastSessionContractInputs {
@@ -884,8 +902,6 @@ mod fast_session_contract_tests {
             legacy_token_upper_bound: 96_576,
             fixed_bytes_per_session: 0,
             conservative_bytes_per_token: bytes_per_token,
-            worst_case_turn_tokens: 4_096,
-            target_after_compaction_tokens: 4_096,
         }
     }
 
@@ -911,6 +927,43 @@ mod fast_session_contract_tests {
         );
         assert!(
             contract.soft_compaction_prompt_tokens() < contract.guaranteed_fast_prompt_tokens()
+        );
+    }
+
+    #[test]
+    fn soft_boundary_leaves_tool_loop_headroom_and_compaction_halves_the_prompt() {
+        // Live 2026-10-02 geometry: 49152-token session cap minus 4096 output.
+        let mut live = inputs(64 * 1024);
+        live.legacy_token_upper_bound = 45_056;
+        for input in [inputs(64 * 1024), inputs(128 * 1024), live] {
+            let contract = FastSessionContractV2::new(input).unwrap();
+            let guaranteed = contract.guaranteed_fast_prompt_tokens();
+            let soft = contract.soft_compaction_prompt_tokens();
+            let target = contract.target_after_compaction_tokens();
+            let headroom = guaranteed - soft;
+            // The round right after crossing the soft boundary is still admissible.
+            assert!(headroom >= contract.max_output_tokens());
+            // Headroom scales with the window, not with one output.
+            assert!(headroom * SOFT_HEADROOM_WINDOW_DIVISOR >= guaranteed);
+            // A seeded session regrows at least one headroom before the next soft boundary.
+            assert!(soft - target >= headroom);
+            // A fresh seed absorbs one full output without re-crossing the soft boundary.
+            assert!(target + contract.max_output_tokens() <= soft);
+        }
+    }
+
+    #[test]
+    fn headroom_floors_at_one_full_output_on_small_windows() {
+        let mut input = inputs(64 * 1024);
+        input.legacy_token_upper_bound = 12_288;
+        let contract = FastSessionContractV2::new(input).unwrap();
+
+        assert_eq!(
+            contract.guaranteed_fast_prompt_tokens() - contract.soft_compaction_prompt_tokens(),
+            contract.max_output_tokens()
+        );
+        assert!(
+            contract.target_after_compaction_tokens() < contract.soft_compaction_prompt_tokens()
         );
     }
 

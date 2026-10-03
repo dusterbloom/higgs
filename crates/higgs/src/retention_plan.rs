@@ -46,8 +46,6 @@ pub fn plan_from_geometry(
             legacy_token_upper_bound: 0,
             fixed_bytes_per_session: fixed,
             conservative_bytes_per_token: per_token,
-            worst_case_turn_tokens: output,
-            target_after_compaction_tokens: output,
         })
     };
     let bytes = match request {

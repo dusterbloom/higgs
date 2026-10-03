@@ -15,8 +15,6 @@ fn inputs(bytes_per_token: u64) -> FastSessionContractInputs {
         legacy_token_upper_bound: 96_576,
         fixed_bytes_per_session: 0,
         conservative_bytes_per_token: bytes_per_token,
-        worst_case_turn_tokens: 4_096,
-        target_after_compaction_tokens: 4_096,
     }
 }
 

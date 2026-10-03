@@ -81,8 +81,8 @@ It is keyed by `boot_id`, `generation`, and `model_fingerprint`.
   "maxOutputTokens": 4096,
   "retainedBudgetBytes": 4294967296,
   "guaranteedFastPromptTokens": 24576,
-  "softCompactionPromptTokens": 16384,
-  "targetAfterCompactionTokens": 4096,
+  "softCompactionPromptTokens": 18432,
+  "targetAfterCompactionTokens": 9216,
   "guaranteedSessions": 1
 }
 ```
@@ -175,10 +175,16 @@ conservative observed upper bound. Observations may tighten safety, never
 optimistically enlarge it. The estimate includes fixed and marginal costs and
 must cover paired target/DFlash state.
 
-The soft boundary is derived from the hard guarantee minus at least one
-worst-case turn and maximum output growth. It is not a universal percentage.
-The target-after-compaction is small enough that an unavoidable cold seed is a
-bounded operation.
+The soft boundary is the hard guarantee minus tool-loop headroom: a quarter of
+the guaranteed fast window, floored at one `max_output_tokens`. One full output
+is the physical floor (the round right after crossing the boundary must still
+be admissible under the wall); a quarter of the window covers the several tool
+rounds one turn takes before compaction can land (measured 2026-10-02: nine
+rounds, ~8k tokens, inside one user turn on a 45k window).
+The target-after-compaction is half the soft boundary: it always holds the
+immutable prefix (system prompt plus tool definitions) and a working tail, and
+the seeded session regrows at least one headroom before the next soft boundary,
+so the cold seed stays a bounded operation paid once per compaction cycle.
 
 For more than one guaranteed retained session, Higgs reserves a per-session
 share. Aggregate LRU without reservation cannot be advertised as a guarantee.
