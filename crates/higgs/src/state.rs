@@ -766,6 +766,18 @@ impl Engine {
         }
     }
 
+    /// Evict retained sessions idle past the configured TTL, freeing their
+    /// reservation slot. Returns the number evicted (0 on engines without
+    /// retained-session support, or a test stub).
+    pub fn evict_configured_idle_retained(&self) -> usize {
+        match self {
+            Self::Simple(engine) => engine.evict_configured_idle_retained(),
+            Self::Batch(_) => 0,
+            #[cfg(test)]
+            Self::Stub(_) => 0,
+        }
+    }
+
     /// Confirm an idle-eviction lease only when the requested retained session exists.
     pub fn lease_retained_session(&self, session_id: u64, ttl_seconds: u32) -> bool {
         match self {

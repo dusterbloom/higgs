@@ -371,18 +371,37 @@ fn validate_required_retention(
             Ok(None)
         }
         crate::types::openai::RetentionMode::Seed => {
+            // An idle published session (past its configured TTL with no live
+            // lease) otherwise wedges every new seed forever: it holds the one
+            // guaranteed reservation slot but is never evicted outside engine
+            // generation. Evict before the receipt/reserve checks below. No
+            // session lock is held at this point (called from the route
+            // handler before any `session_lock_for` acquisition), and
+            // `evict_idle_retained` itself only ever `try_lock`s per-session
+            // locks, so this cannot deadlock against an in-flight request.
+            engine.evict_configured_idle_retained();
             if engine
                 .retained_session_receipt(retention.session_id)
                 .is_some()
             {
-                return Err(ServerError::Conflict(
+                tracing::warn!(
+                    session_id = retention.session_id,
+                    condition = "receipt_exists",
+                    "retention seed conflict"
+                );
+                return Err(ServerError::RetentionSeedConflict(
                     "retention seed conflicts with an existing session identity".to_owned(),
                 ));
             }
             let Some(reservation) = engine
                 .reserve_retained_session_replacing(retention.session_id, retired_session_ids)
             else {
-                return Err(ServerError::Conflict(
+                tracing::warn!(
+                    session_id = retention.session_id,
+                    condition = "reservation_held",
+                    "retention seed conflict"
+                );
+                return Err(ServerError::RetentionSeedConflict(
                     "retention seed conflicts with an existing session identity".to_owned(),
                 ));
             };
@@ -394,7 +413,12 @@ fn validate_required_retention(
                 &reservation,
             ) {
                 engine.release_retained_reservation(reservation);
-                return Err(ServerError::Conflict(
+                tracing::warn!(
+                    session_id = retention.session_id,
+                    condition = "exclusive_claim_failed",
+                    "retention seed conflict"
+                );
+                return Err(ServerError::RetentionSeedConflict(
                     "retention seed conflicts with an existing session identity".to_owned(),
                 ));
             }
@@ -4391,6 +4415,36 @@ mod tests {
         seed.drop_session_id = Some(42);
         assert!(apply_required_retention(&mut seed).is_err());
         assert_eq!(engine.route_test_retained_sessions(), [42]);
+    }
+
+    #[test]
+    fn seed_conflict_returns_structured_retention_seed_conflict_error() {
+        let model = "retention-seed-conflict";
+        let (state, engine) = crate::capacity::retained_contract_route_test_state(
+            model,
+            4 * 1024 * 1024 * 1024,
+            128 * 1024,
+        );
+        let revision = state
+            .capacity
+            .fast_session_contract(model)
+            .unwrap()
+            .contract_revision()
+            .to_owned();
+        let retention = crate::types::openai::RetentionRequest {
+            mode: crate::types::openai::RetentionMode::Seed,
+            session_id: 42,
+            epoch: 7,
+            contract_revision: revision,
+        };
+        // The stub engine's reservation only admits a fixed allowlist of test
+        // model names, so this model's reservation attempt fails closed
+        // (`reservation_held`), the same outward shape as a real engine whose
+        // one guaranteed slot is still claimed by another session.
+        assert!(matches!(
+            validate_required_retention(&state, &engine, model, &[1, 2], 1, Some(&retention), &[]),
+            Err(ServerError::RetentionSeedConflict(_))
+        ));
     }
 
     #[test]

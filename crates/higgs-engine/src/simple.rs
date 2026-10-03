@@ -17349,6 +17349,84 @@ mod tests {
         assert_eq!(engine.retained_session_tokens(SESSION_ID), None);
     }
 
+    /// An idle *published* retained reservation (past TTL, lease expired)
+    /// held the one guaranteed slot and wedged every new seed forever,
+    /// because nothing outside engine generation ever called
+    /// `evict_configured_idle_retained`. A seed route now calls it before
+    /// admitting a new session id.
+    #[test]
+    fn evict_configured_idle_retained_frees_a_wedged_seed_slot_but_not_a_live_lease() {
+        const OLD_ID: u64 = 0xBEEF_0001;
+        const NEW_ID: u64 = 0xBEEF_0002;
+        const LEASED_ID: u64 = 0xBEEF_0003;
+        const NEWER_ID: u64 = 0xBEEF_0004;
+        let mut engine = session_cache_test_engine();
+        engine.kv_cache_config.retained_idle_secs = 1;
+
+        // Publish OLD_ID's retained cache and reservation, mirroring a
+        // completed seed generation.
+        engine.stash_retained(
+            OLD_ID,
+            crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+                AnyCache::KV(Vec::new()),
+                vec![1, 2, 3],
+            ),
+            false,
+        );
+        let old_claim = engine
+            .reserve_retained_session_replacing(OLD_ID, &[])
+            .expect("reserve old id");
+        lock_or_recover(&engine.retained_reservations).mark_published(OLD_ID);
+        drop(old_claim);
+        lock_or_recover(&engine.retained)
+            .get_mut(&OLD_ID)
+            .unwrap()
+            .last_used = std::time::Instant::now() - std::time::Duration::from_secs(60);
+
+        // A brand-new seed is blocked while the idle reservation is held.
+        assert!(engine.reserve_retained_session_replacing(NEW_ID, &[]).is_none());
+
+        // The fix: evicting configured-idle retained frees the slot.
+        assert_eq!(engine.evict_configured_idle_retained(), 1);
+        let new_claim = engine
+            .reserve_retained_session_replacing(NEW_ID, &[])
+            .expect("new seed must be admitted once idle eviction frees the slot");
+        engine.release_retained_reservation(new_claim);
+
+        // A session with a LIVE lease still blocks a new seed: idle eviction
+        // must not evict it.
+        engine.stash_retained(
+            LEASED_ID,
+            crate::cache::paired::RetainedState::target_only_unchecked_for_test(
+                AnyCache::KV(Vec::new()),
+                vec![4, 5, 6],
+            ),
+            false,
+        );
+        let leased_claim = engine
+            .reserve_retained_session_replacing(LEASED_ID, &[])
+            .expect("reserve leased id");
+        lock_or_recover(&engine.retained_reservations).mark_published(LEASED_ID);
+        drop(leased_claim);
+        assert!(engine.lease_retained_session(LEASED_ID, std::time::Duration::from_secs(300)));
+        lock_or_recover(&engine.retained)
+            .get_mut(&LEASED_ID)
+            .unwrap()
+            .last_used = std::time::Instant::now() - std::time::Duration::from_secs(60);
+
+        assert_eq!(
+            engine.evict_configured_idle_retained(),
+            0,
+            "a live lease must survive idle eviction"
+        );
+        assert!(
+            engine
+                .reserve_retained_session_replacing(NEWER_ID, &[])
+                .is_none(),
+            "a live-leased session must still block a new seed"
+        );
+    }
+
     #[test]
     fn simple_engine_fork_target_continuable_preserves_retained_session() {
         const SESSION_ID: u64 = 0xCACE_11ED;

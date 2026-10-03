@@ -67,6 +67,9 @@ pub enum ServerError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    #[error("Conflict: {0}")]
+    RetentionSeedConflict(String),
+
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
@@ -168,6 +171,12 @@ impl ServerError {
                 None,
             ),
             Self::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg.clone(), None),
+            Self::RetentionSeedConflict(msg) => (
+                StatusCode::CONFLICT,
+                "conflict",
+                msg.clone(),
+                Some("retention_seed_conflict"),
+            ),
             Self::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.clone(), None),
             Self::InternalError(msg) => {
                 tracing::error!(error = %msg, "Internal error");
@@ -308,6 +317,19 @@ mod tests {
                 .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"]["code"], "retained_session_unavailable");
+    }
+
+    #[tokio::test]
+    async fn retention_seed_conflict_has_stable_code_and_message() {
+        let msg = "retention seed conflicts with an existing session identity";
+        let (status, body) = response_status_and_body(
+            ServerError::RetentionSeedConflict(msg.to_owned()).into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "retention_seed_conflict");
+        assert_eq!(body["error"]["type"], "conflict");
+        assert_eq!(body["error"]["message"], msg);
     }
 
     #[tokio::test]
