@@ -133,16 +133,20 @@ impl ShortConv {
         cache.conv_pos = k - 2;
         cache.offset += len;
 
+        // Accumulate in f32 like mlx `Conv1d`: per-step bf16 rounding doubled
+        // the logit error against an f32 oracle (scripts/lfm2_parity.py).
         let w = self
             .conv
             .weight
             .reshape(&[dim, k])?
-            .transpose_axes(&[1, 0])?;
-        let mut y = xp.index((.., 0..len, ..)).multiply(w.index(0))?;
+            .transpose_axes(&[1, 0])?
+            .as_dtype(Dtype::Float32)?;
+        let xp32 = xp.as_dtype(Dtype::Float32)?;
+        let mut y = xp32.index((.., 0..len, ..)).multiply(w.index(0))?;
         for i in 1..k {
-            y = y.add(xp.index((.., i..i + len, ..)).multiply(w.index(i))?)?;
+            y = y.add(xp32.index((.., i..i + len, ..)).multiply(w.index(i))?)?;
         }
-        self.out_proj.forward(&c.multiply(y)?)
+        self.out_proj.forward(&c.multiply(y.as_dtype(c.dtype())?)?)
     }
 }
 
