@@ -125,6 +125,7 @@ fn prune_sweep() {
         let (mut correct, mut sum_peak, mut sum_tps) = (0_u32, 0.0_f32, 0.0_f32);
         for (i, problem) in problems.iter().enumerate() {
             let msg = ChatMessage {
+                reasoning_content: None,
                 role: "user".to_owned(),
                 content: prompt_for(problem),
                 tool_calls: None,

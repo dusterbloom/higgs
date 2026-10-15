@@ -87,6 +87,7 @@ fn run(
     enable_thinking: bool,
 ) -> PrunedGeneration {
     let msg = ChatMessage {
+        reasoning_content: None,
         role: "user".to_owned(),
         content: prompt,
         tool_calls: None,

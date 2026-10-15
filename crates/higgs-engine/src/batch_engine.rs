@@ -347,6 +347,11 @@ impl BatchEngine {
         &self.eos_token_ids
     }
 
+    /// The chat template opens `<think>` regardless of the thinking toggle.
+    pub const fn forces_thinking(&self) -> bool {
+        self.template.forces_thinking()
+    }
+
     pub fn hidden_size(&self) -> i32 {
         self.hidden_size.load(Ordering::Relaxed)
     }
@@ -366,9 +371,14 @@ impl BatchEngine {
     }
 
     /// Batch generation currently does not expose a per-request thinking
-    /// toggle, so report it as disabled even when the template mentions one.
+    /// toggle, so report it as disabled even when the template mentions one —
+    /// unless the template always opens `<think>`.
     pub const fn thinking_mode(&self) -> &'static str {
-        "disabled"
+        if self.forces_thinking() {
+            "always"
+        } else {
+            "disabled"
+        }
     }
 
     /// The marker text injected at each image position before tokenization,
@@ -2093,11 +2103,13 @@ mod tests {
         let engine = batch_prompt_test_engine();
         let messages = vec![
             ChatMessage {
+                reasoning_content: None,
                 role: "user".to_owned(),
                 content: "question".to_owned(),
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: "assistant".to_owned(),
                 content: "answer".to_owned(),
                 tool_calls: None,

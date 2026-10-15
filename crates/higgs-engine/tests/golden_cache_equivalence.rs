@@ -53,6 +53,7 @@ use higgs_models::turboquant::KvCacheConfig;
 
 fn user(content: &str) -> ChatMessage {
     ChatMessage {
+        reasoning_content: None,
         role: "user".to_owned(),
         content: content.to_owned(),
         tool_calls: None,
@@ -61,6 +62,7 @@ fn user(content: &str) -> ChatMessage {
 
 fn assistant(content: String) -> ChatMessage {
     ChatMessage {
+        reasoning_content: None,
         role: "assistant".to_owned(),
         content,
         tool_calls: None,

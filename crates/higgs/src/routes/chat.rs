@@ -779,18 +779,20 @@ async fn chat_completions_non_streaming(
     let tools = tool_choice.prompt_tools;
     let required_call = tool_choice.requires_call();
     let required_name = tool_choice.required_name.clone();
-    let thinking_enabled = crate::reasoning::effective_thinking_enabled(
-        engine.enable_thinking(),
-        &[engine.model_name(), req.model.as_str()],
-        req.reasoning.as_ref(),
-        req.chat_template_kwargs
-            .as_ref()
-            .and_then(|k| k.enable_thinking)
-            .or(req.enable_thinking)
-            .or(generation_defaults.enable_thinking),
-        // A required-call grammar starts with visible `<tool_call>` text. Leaving
-        // the template inside `<think>` would classify the entire call as reasoning.
-    ) && !tool_choice.requires_call();
+    let thinking_enabled = (engine.forces_thinking()
+        || crate::reasoning::effective_thinking_enabled(
+            engine.enable_thinking(),
+            &[engine.model_name(), req.model.as_str()],
+            req.reasoning.as_ref(),
+            req.chat_template_kwargs
+                .as_ref()
+                .and_then(|k| k.enable_thinking)
+                .or(req.enable_thinking)
+                .or(generation_defaults.enable_thinking),
+            // A required-call grammar starts with visible `<tool_call>` text. Leaving
+            // the template inside `<think>` would classify the entire call as reasoning.
+        ))
+        && !tool_choice.requires_call();
 
     let (prompt_tokens, pflash_policy) = engine
         .prepare_chat_prompt_with_pflash_policy(&messages, tools, thinking_enabled, prompt_mode)
@@ -1359,17 +1361,19 @@ async fn chat_completions_stream(
     };
 
     let messages = convert_messages(&effective_messages);
-    let thinking_enabled_stream = crate::reasoning::effective_thinking_enabled(
-        engine.enable_thinking(),
-        &[engine.model_name(), req.model.as_str()],
-        req.reasoning.as_ref(),
-        req.chat_template_kwargs
-            .as_ref()
-            .and_then(|k| k.enable_thinking)
-            .or(req.enable_thinking)
-            .or(generation_defaults.enable_thinking),
-        // Keep the forced envelope in visible output for the streaming parser too.
-    ) && !tool_choice.requires_call();
+    let thinking_enabled_stream = (engine.forces_thinking()
+        || crate::reasoning::effective_thinking_enabled(
+            engine.enable_thinking(),
+            &[engine.model_name(), req.model.as_str()],
+            req.reasoning.as_ref(),
+            req.chat_template_kwargs
+                .as_ref()
+                .and_then(|k| k.enable_thinking)
+                .or(req.enable_thinking)
+                .or(generation_defaults.enable_thinking),
+            // Keep the forced envelope in visible output for the streaming parser too.
+        ))
+        && !tool_choice.requires_call();
 
     // Pass tools into prompt rendering so the chat template emits the
     // tool spec the model recognises. The on-the-fly
@@ -2087,6 +2091,7 @@ fn convert_messages(
             higgs_engine::chat_template::ChatMessage {
                 role: m.role.clone(),
                 content,
+                reasoning_content: m.reasoning_content.clone(),
                 tool_calls: tool_calls_json,
             }
         })

@@ -17,6 +17,12 @@ Each step loads the 13.6 GB model, so run them one after another:
     cargo run -p higgs-models --example lfm2_logits -- <model_dir> <work>/ids.json <work>/higgs
     cargo run -p higgs-models --example lfm2_logits -- <model_dir> <work>/ids.json <work>/higgs_f32 f32
     python scripts/lfm2_parity.py compare <work>      # exit 1 if a gate fails
+
+`ref` also writes conversations.json + prompts.json (HF-rendered prompts) for the
+higgs template golden test:
+
+    HIGGS_LFM2_DIR=<model_dir> HIGGS_LFM2_PARITY=<work> \
+        cargo test -p higgs-engine --test lfm2_template -- --ignored
 """
 
 import json
@@ -53,6 +59,19 @@ CONVERSATIONS = {
             {"role": "user", "content": "Now write a haiku that uses that number."},
         ]
     },
+    "agent": {
+        "messages": [
+            {"role": "user", "content": "What's the weather in Rome?"},
+            {
+                "role": "assistant",
+                "reasoning_content": "The user wants Rome's weather, so call get_weather.",
+                "content": "",
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": {"city": "Rome"}}}],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": '{"temp_c": 21, "sky": "clear"}'},
+        ],
+        "tools": TOOLS,
+    },
     "code": {"messages": [{"role": "user", "content": "Write a Python function that merges overlapping intervals, with a short docstring."}]},
     "math": {"messages": [{"role": "user", "content": "A train leaves at 9:40 and arrives at 13:05. It stops twice for 7 minutes. What is its moving time?"}]},
     "multilingual": {"messages": [{"role": "user", "content": "Spiega in italiano, in tre frasi, cos'è la fotosintesi."}]},
@@ -84,6 +103,7 @@ def ref(model_dir: str, work: Path) -> None:
         mx.save_safetensors(str(work / f"f32_{name}.safetensors"), {"logits": model(mx.array(seq)[None])[0]})
     (work / "ids.json").write_text(json.dumps(ids))
     (work / "prompts.json").write_text(json.dumps(prompts, ensure_ascii=False, indent=1))
+    (work / "conversations.json").write_text(json.dumps(CONVERSATIONS, ensure_ascii=False, indent=1))
 
 
 def kl_top1(oracle: mx.array, logits: mx.array) -> tuple[mx.array, mx.array]:

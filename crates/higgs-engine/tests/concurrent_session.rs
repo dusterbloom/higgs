@@ -68,6 +68,7 @@ fn concurrent_same_session_is_serialized_and_correct() {
 
     let render = |content: &str| -> Vec<u32> {
         let msg = ChatMessage {
+            reasoning_content: None,
             role: "user".to_owned(),
             content: content.to_owned(),
             tool_calls: None,

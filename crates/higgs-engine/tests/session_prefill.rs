@@ -87,6 +87,7 @@ fn session_continuation_saves_prefill() {
 
     // ---- Turn 1: full prefill, retains live cache + the tokens it now holds.
     let turn1_msg = ChatMessage {
+        reasoning_content: None,
         role: "user".to_owned(),
         content: "Explain photosynthesis in one sentence.".to_owned(),
         tool_calls: None,
@@ -225,6 +226,7 @@ fn decode_throughput_probe() {
     while engine
         .prepare_chat_prompt_with_thinking(
             &[ChatMessage {
+                reasoning_content: None,
                 role: "user".to_owned(),
                 content: content.clone(),
                 tool_calls: None,
@@ -246,6 +248,7 @@ fn decode_throughput_probe() {
     let toks = engine
         .prepare_chat_prompt_with_thinking(
             &[ChatMessage {
+                reasoning_content: None,
                 role: "user".to_owned(),
                 content,
                 tool_calls: None,
@@ -293,6 +296,7 @@ fn long_context_session_continuation_beats_cold_prefill() {
     while engine
         .prepare_chat_prompt_with_thinking(
             &[ChatMessage {
+                reasoning_content: None,
                 role: "user".to_owned(),
                 content: content.clone(),
                 tool_calls: None,
@@ -310,6 +314,7 @@ fn long_context_session_continuation_beats_cold_prefill() {
     }
 
     let turn1 = ChatMessage {
+        reasoning_content: None,
         role: "user".to_owned(),
         content,
         tool_calls: None,

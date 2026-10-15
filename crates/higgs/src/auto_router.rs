@@ -112,6 +112,7 @@ pub fn classify_local(
     );
 
     let chat_messages = vec![higgs_engine::chat_template::ChatMessage {
+        reasoning_content: None,
         role: "user".to_owned(),
         content: prompt,
         tool_calls: None,

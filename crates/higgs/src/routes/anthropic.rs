@@ -477,12 +477,13 @@ async fn create_message_non_streaming(
         ));
     }
     let tools = tool_choice.prompt_tools.as_deref();
-    let thinking_enabled = crate::reasoning::effective_thinking_enabled(
-        engine.enable_thinking(),
-        &[engine.model_name(), req.model.as_str()],
-        None,
-        None,
-    );
+    let thinking_enabled = engine.forces_thinking()
+        || crate::reasoning::effective_thinking_enabled(
+            engine.enable_thinking(),
+            &[engine.model_name(), req.model.as_str()],
+            None,
+            None,
+        );
 
     let prompt_tokens = engine
         .prepare_chat_prompt_with_thinking(&engine_messages, tools, thinking_enabled)
@@ -641,12 +642,14 @@ async fn create_message_stream(
     let tools = tool_choice.prompt_tools.as_deref();
     let stream_includes_tools = tools.is_some_and(|items| !items.is_empty());
     let tool_schema = anthropic_tool_schema(tools);
-    let thinking_enabled = crate::reasoning::effective_thinking_enabled(
-        engine.enable_thinking(),
-        &[engine.model_name(), req.model.as_str()],
-        None,
-        None,
-    ) && !required_call;
+    let thinking_enabled = (engine.forces_thinking()
+        || crate::reasoning::effective_thinking_enabled(
+            engine.enable_thinking(),
+            &[engine.model_name(), req.model.as_str()],
+            None,
+            None,
+        ))
+        && !required_call;
     let constraint =
         build_anthropic_tool_constraint(tool_choice.constraint_schema.as_ref(), &engine)?;
 
@@ -1121,12 +1124,13 @@ pub async fn count_tokens(
         } => {
             let engine_messages = anthropic_messages_to_engine(&req.messages, req.system.as_ref());
             let tools = req.tools.as_deref();
-            let thinking_enabled = crate::reasoning::effective_thinking_enabled(
-                engine.enable_thinking(),
-                &[engine.model_name(), model_name.as_str()],
-                None,
-                None,
-            );
+            let thinking_enabled = engine.forces_thinking()
+                || crate::reasoning::effective_thinking_enabled(
+                    engine.enable_thinking(),
+                    &[engine.model_name(), model_name.as_str()],
+                    None,
+                    None,
+                );
 
             let tokens = engine
                 .prepare_chat_prompt_with_thinking(&engine_messages, tools, thinking_enabled)

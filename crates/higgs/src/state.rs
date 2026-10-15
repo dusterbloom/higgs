@@ -519,6 +519,17 @@ impl Engine {
         }
     }
 
+    /// The loaded chat template always opens `<think>` (e.g. LFM2.5), so the
+    /// output starts inside reasoning whatever the request asked for.
+    pub fn forces_thinking(&self) -> bool {
+        match self {
+            Self::Simple(e) => e.forces_thinking(),
+            Self::Batch(e) => e.forces_thinking(),
+            #[cfg(test)]
+            Self::Stub(_) => false,
+        }
+    }
+
     /// Client-facing tool protocol for the loaded model. The engine keeps the
     /// actual parser private; clients only need to choose native schemas or
     /// the textual fallback.

@@ -84,6 +84,7 @@ fn prune_smoke() {
     .expect("load model");
 
     let msg = ChatMessage {
+        reasoning_content: None,
         role: "user".to_owned(),
         content: "Natalia sold clips to 48 of her friends in April, then sold half as many \
                   clips in May. How many clips did she sell altogether in April and May? \

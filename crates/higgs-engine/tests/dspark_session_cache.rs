@@ -102,6 +102,7 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically_impl(target_bi
     let prompt = engine
         .prepare_chat_prompt_with_thinking(
             &[ChatMessage {
+                reasoning_content: None,
                 role: "user".to_owned(),
                 content: "Print the integers from 1 upward as comma-separated values. \
                           Output only the sequence and continue for many terms."
@@ -449,6 +450,7 @@ fn bonsai_session_pair_resumes_suffix_only_and_demotes_atomically_impl(target_bi
     let divergent_prompt = engine
         .prepare_chat_prompt_with_thinking(
             &[ChatMessage {
+                reasoning_content: None,
                 role: "user".to_owned(),
                 content: "Reply with only the word seven.".to_owned(),
                 tool_calls: None,

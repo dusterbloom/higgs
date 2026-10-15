@@ -151,6 +151,7 @@ fn run_one(
     max_tokens: u32,
 ) -> (String, u32, u32) {
     let msg = ChatMessage {
+        reasoning_content: None,
         role: "user".to_owned(),
         content: prompt,
         tool_calls: None,

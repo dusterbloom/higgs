@@ -47,6 +47,7 @@ fn retained_count_cap_bounds_live_sessions() {
     // Four distinct conversations, each retained then LRU-evicted past the cap.
     for sid in 1u64..=4 {
         let msg = ChatMessage {
+            reasoning_content: None,
             role: "user".to_owned(),
             content: format!("Reply with just the word ok (request {sid})."),
             tool_calls: None,

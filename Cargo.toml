@@ -93,12 +93,12 @@ governor = "0.10"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 json5 = "1"
 
 # Tokenization + Templates
 tokenizers = { version = "0.23", features = ["http"] }
-minijinja = { version = "2", features = ["loader", "fuel"] }
+minijinja = { version = "2", features = ["loader", "fuel", "preserve_order"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 # CLI + Configuration

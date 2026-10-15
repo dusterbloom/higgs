@@ -137,6 +137,7 @@ fn generation_prompt_suffix(
     enable_thinking: bool,
 ) -> Option<Box<[u32]>> {
     let test_msg = [ChatMessage {
+        reasoning_content: None,
         role: "user".to_owned(),
         content: "x".to_owned(),
         tool_calls: None,
@@ -642,6 +643,7 @@ fn pflash_current_user_start_token(
     const SENTINEL: &str = "__HIGGS_PFLASH_CURRENT_USER_START__";
     let mut probe_messages = before_tail_messages.to_vec();
     probe_messages.push(ChatMessage {
+        reasoning_content: None,
         role: "user".to_owned(),
         content: SENTINEL.to_owned(),
         tool_calls: None,
@@ -5212,6 +5214,13 @@ impl SimpleEngine {
         self.enable_thinking
     }
 
+    /// The chat template opens `<think>` regardless of the thinking toggle.
+    pub fn forces_thinking(&self) -> bool {
+        self.template
+            .as_ref()
+            .is_some_and(ChatTemplateRenderer::forces_thinking)
+    }
+
     /// Runtime tool protocol derived from the loaded chat template. Higgs owns
     /// the model-specific parser, so clients only need the native/textual
     /// presentation decision.
@@ -5225,7 +5234,9 @@ impl SimpleEngine {
 
     /// Runtime thinking mode derived from the loaded template/engine.
     pub fn thinking_mode(&self) -> &'static str {
-        if self.enable_thinking
+        if self.forces_thinking() {
+            "always"
+        } else if self.enable_thinking
             || self
                 .template
                 .as_ref()
@@ -9106,6 +9117,7 @@ impl SimpleEngine {
     /// Render a single user message to prompt tokens.
     fn render_user(&self, content: String, enable_thinking: bool) -> Result<Vec<u32>, EngineError> {
         let msg = ChatMessage {
+            reasoning_content: None,
             role: "user".to_owned(),
             content,
             tool_calls: None,
@@ -15473,16 +15485,19 @@ mod tests {
     #[test]
     fn pflash_real_user_query_ignores_wrapped_tool_responses() {
         let no_query = [ChatMessage {
+            reasoning_content: None,
             role: "user".to_owned(),
             content: "<tool_response>{\"ok\":true}</tool_response>".to_owned(),
             tool_calls: None,
         }];
         let system_only = [ChatMessage {
+            reasoning_content: None,
             role: "system".to_owned(),
             content: "policy".to_owned(),
             tool_calls: None,
         }];
         let real_query = [ChatMessage {
+            reasoning_content: None,
             role: "user".to_owned(),
             content: "what next?".to_owned(),
             tool_calls: None,
@@ -15596,11 +15611,13 @@ mod tests {
         let engine = session_prompt_template_test_engine();
         let messages = vec![
             ChatMessage {
+                reasoning_content: None,
                 role: "user".into(),
                 content: "question".into(),
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: "assistant".into(),
                 content: "call".into(),
                 tool_calls: None,
@@ -15636,11 +15653,13 @@ mod tests {
         let session_id = 0xC011;
         let original_messages = vec![
             ChatMessage {
+                reasoning_content: None,
                 role: "user".into(),
                 content: "question".into(),
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: "assistant".into(),
                 content: "call".into(),
                 tool_calls: None,
@@ -15648,6 +15667,7 @@ mod tests {
         ];
         let mut expanded_messages = original_messages.clone();
         expanded_messages.push(ChatMessage {
+            reasoning_content: None,
             role: "user".into(),
             content: "question".into(),
             tool_calls: None,
@@ -15751,6 +15771,7 @@ mod tests {
         let im_start = engine.tokenizer.token_to_id("<|im_start|>").unwrap();
         let im_end = engine.tokenizer.token_to_id("<|im_end|>").unwrap();
         let msg = |role: &str, content: &str| ChatMessage {
+            reasoning_content: None,
             role: role.to_owned(),
             content: content.to_owned(),
             tool_calls: None,
@@ -15784,16 +15805,19 @@ mod tests {
 
         let messages = vec![
             ChatMessage {
+                reasoning_content: None,
                 role: "user".to_owned(),
                 content: "question".to_owned(),
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: "assistant".to_owned(),
                 content: "call".to_owned(),
                 tool_calls: None,
             },
             ChatMessage {
+                reasoning_content: None,
                 role: "tool".to_owned(),
                 content: "Tokyo 27C".to_owned(),
                 tool_calls: None,
@@ -15877,22 +15901,26 @@ mod tests {
             " the".repeat(15_000)
         );
         let system = ChatMessage {
+            reasoning_content: None,
             role: "system".to_owned(),
             content: "Retain the document exactly. Follow the latest instruction exactly."
                 .to_owned(),
             tool_calls: None,
         };
         let user = ChatMessage {
+            reasoning_content: None,
             role: "user".to_owned(),
             content: long_document,
             tool_calls: None,
         };
         let acknowledgement = ChatMessage {
+            reasoning_content: None,
             role: "assistant".to_owned(),
             content: "Document retained.".to_owned(),
             tool_calls: None,
         };
         let recall = ChatMessage {
+            reasoning_content: None,
             role: "user".to_owned(),
             content: "Reply with exactly the four-word verification fact from the retained document and no other text. Do not call tools."
                 .to_owned(),
@@ -18979,6 +19007,7 @@ mod tests {
         .expect("load DFlash engine");
 
         let messages = [ChatMessage {
+            reasoning_content: None,
             role: "user".to_owned(),
             content: "Count from 1 to 40. Print only the numbers separated by commas.".to_owned(),
             tool_calls: None,
@@ -19244,6 +19273,7 @@ mod tests {
         );
 
         let messages = [ChatMessage {
+            reasoning_content: None,
             role: "user".to_owned(),
             content: user_prompt.to_owned(),
             tool_calls: None,
@@ -19618,6 +19648,7 @@ mod tests {
 
     fn dflash_chat_tokens(engine: &SimpleEngine, prompt: &str) -> Vec<u32> {
         let messages = [ChatMessage {
+            reasoning_content: None,
             role: "user".to_owned(),
             content: prompt.to_owned(),
             tool_calls: None,

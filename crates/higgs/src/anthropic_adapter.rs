@@ -71,6 +71,7 @@ pub fn anthropic_messages_to_engine(
 
     if let Some(sys) = system {
         result.push(higgs_engine::chat_template::ChatMessage {
+            reasoning_content: None,
             role: "system".to_owned(),
             content: sys.to_text(),
             tool_calls: None,
@@ -100,6 +101,7 @@ pub fn anthropic_messages_to_engine(
         };
 
         result.push(higgs_engine::chat_template::ChatMessage {
+            reasoning_content: None,
             role: msg.role.clone(),
             content,
             tool_calls: None,

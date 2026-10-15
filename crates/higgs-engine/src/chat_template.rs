@@ -27,6 +27,10 @@ impl ChatPromptMode {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Prior-turn reasoning; templates (Qwen3, LFM2.5) re-insert it as `<think>…</think>`
+    /// on assistant turns after the last user message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<serde_json::Value>>,
 }
@@ -44,6 +48,7 @@ pub struct ChatTemplateRenderer {
     eos_token: String,
     supports_tools: bool,
     supports_thinking: bool,
+    forces_thinking: bool,
     /// Escapes special-token literals in content; see [`SpecialLiterals`].
     literals: Option<SpecialLiterals>,
 }
@@ -67,14 +72,25 @@ impl ChatTemplateRenderer {
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_template_owned("chat".to_owned(), template_source)
             .map_err(|e| EngineError::Template(e.to_string()))?;
-        Ok(Self {
+        let mut renderer = Self {
             env,
             bos_token: String::new(),
             eos_token: String::new(),
             supports_tools,
             supports_thinking,
+            forces_thinking: false,
             literals: None,
-        })
+        };
+        let probe = [ChatMessage {
+            role: "user".to_owned(),
+            content: "hi".to_owned(),
+            reasoning_content: None,
+            tool_calls: None,
+        }];
+        renderer.forces_thinking = renderer
+            .apply_with_thinking(&probe, None, true, false)
+            .is_ok_and(|prompt| prompt.trim_end().ends_with("<think>"));
+        Ok(renderer)
     }
 
     /// Keep special-token literals in message content out of the structure
@@ -124,6 +140,13 @@ impl ChatTemplateRenderer {
     /// Whether this template exposes the standard `enable_thinking` switch.
     pub const fn supports_thinking(&self) -> bool {
         self.supports_thinking
+    }
+
+    /// Whether the generation prompt opens `<think>` even with thinking off
+    /// (e.g. LFM2.5, a pure reasoning model): output then starts inside
+    /// reasoning and must be parsed that way whatever the request asked.
+    pub const fn forces_thinking(&self) -> bool {
+        self.forces_thinking
     }
 
     /// Load template from a model directory (`chat_template.jinja` or `tokenizer_config.json`).
@@ -262,7 +285,7 @@ impl ChatTemplateRenderer {
             .map_err(|e| EngineError::Template(e.to_string()))
     }
 
-    /// `None` when no content quotes a special token (the common case).
+    /// `None` when no content or reasoning quotes a special token (the common case).
     // ponytail: content only; tool-call arguments are rendered through
     // `tojson` and can still carry a raw literal. Escape them here too if a
     // tool payload ever needs to quote chat markers.
@@ -270,18 +293,24 @@ impl ChatTemplateRenderer {
         let literals = self.literals.as_ref()?;
         let escaped: Vec<_> = messages
             .iter()
-            .map(|m| literals.escape(&m.content))
+            .map(|m| {
+                let reasoning = m.reasoning_content.as_deref().map(|r| literals.escape(r));
+                (literals.escape(&m.content), reasoning)
+            })
             .collect();
-        if escaped.iter().all(|c| matches!(c, Cow::Borrowed(_))) {
+        if escaped.iter().all(|(content, reasoning)| {
+            matches!(content, Cow::Borrowed(_)) && !matches!(reasoning, Some(Cow::Owned(_)))
+        }) {
             return None;
         }
         Some(
             messages
                 .iter()
                 .zip(escaped)
-                .map(|(m, content)| ChatMessage {
+                .map(|(m, (content, reasoning))| ChatMessage {
                     role: m.role.clone(),
                     content: content.into_owned(),
+                    reasoning_content: reasoning.map(Cow::into_owned),
                     tool_calls: m.tool_calls.clone(),
                 })
                 .collect(),
@@ -384,20 +413,74 @@ fn normalize_arguments_value(args: &mut serde_json::Value) {
     *args = serde_json::Value::Object(serde_json::Map::new());
 }
 
-/// `tojson` filter. `_kwargs` absorbs keyword arguments HF chat templates pass
-/// — notably `tojson(ensure_ascii=false)` (e.g. `MiniCPM5`). `serde_json` already
-/// emits UTF-8, which matches `ensure_ascii=false`, so the kwarg is accepted and
-/// ignored rather than aborting the render with "too many arguments".
+/// `tojson` filter matching HF's (`json.dumps(x, ensure_ascii=False)`): Python's
+/// `", "` / `": "` separators, insertion key order (`preserve_order`), no HTML
+/// escaping, and `indent=N`. Tool lists rendered in system prompts must be
+/// byte-identical to what the model was trained on.
+// ponytail: `ensure_ascii`/`separators`/`sort_keys` kwargs are accepted and
+// ignored (UTF-8 out); honor them if a template ever passes non-defaults.
 #[allow(clippy::needless_pass_by_value)]
-fn tojson_filter(value: Value, _kwargs: Kwargs) -> Result<String, minijinja::Error> {
-    let serialized = serde_json::to_string(&value).map_err(|e| {
+fn tojson_filter(value: Value, kwargs: Kwargs) -> Result<String, minijinja::Error> {
+    let indent: Option<usize> = kwargs.get("indent")?;
+    let mut out = Vec::new();
+    let written = match indent {
+        Some(n) => {
+            let pad = " ".repeat(n);
+            let formatter = serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes());
+            value.serialize(&mut serde_json::Serializer::with_formatter(
+                &mut out, formatter,
+            ))
+        }
+        None => value.serialize(&mut serde_json::Serializer::with_formatter(
+            &mut out,
+            PythonSeparators,
+        )),
+    };
+    written.map_err(|e| {
         minijinja::Error::new(
             minijinja::ErrorKind::InvalidOperation,
             "JSON serialization failed",
         )
         .with_source(e)
     })?;
-    Ok(serialized)
+    String::from_utf8(out)
+        .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))
+}
+
+/// Python `json.dumps` default separators: `", "` between items, `": "` after keys.
+struct PythonSeparators;
+
+impl serde_json::ser::Formatter for PythonSeparators {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        writer.write_all(b": ")
+    }
 }
 
 /// HuggingFace chat templates use `raise_exception(...)` for explicit
@@ -445,6 +528,7 @@ mod tests {
 
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
+            reasoning_content: None,
             role: role.to_owned(),
             content: content.to_owned(),
             tool_calls: None,
@@ -730,6 +814,7 @@ TOOLS:{{ tools | length }}
         let template = r"{%- for message in messages %}{{ message.role }}:{{ message.content }}{%- if message.tool_calls %} [tools]{%- endif %}{%- endfor %}";
         let renderer = ChatTemplateRenderer::new(template).unwrap();
         let messages = vec![ChatMessage {
+            reasoning_content: None,
             role: "assistant".to_owned(),
             content: "calling tool".to_owned(),
             tool_calls: Some(vec![serde_json::json!({
@@ -740,6 +825,30 @@ TOOLS:{{ tools | length }}
         }];
         let result = renderer.apply(&messages, None, false).unwrap();
         assert!(result.contains("[tools]"));
+    }
+
+    /// Byte-identical to HF `tojson` (Python `json.dumps(x, ensure_ascii=False)`):
+    /// insertion key order, `", "`/`": "` separators, no HTML escaping; `indent=`.
+    #[test]
+    fn test_tojson_filter_matches_python_json_dumps() {
+        let value: serde_json::Value =
+            serde_json::from_str(r#"{"z": 1, "a": [1, {"b": "it's <ok> & café"}], "e": {}}"#)
+                .unwrap();
+        let render = |src: &str| {
+            let env = tojson_env(src);
+            env.get_template("test")
+                .unwrap()
+                .render(minijinja::context! { value => value.clone() })
+                .unwrap()
+        };
+        assert_eq!(
+            render(TOJSON_TEMPLATE),
+            r#"{"z": 1, "a": [1, {"b": "it's <ok> & café"}], "e": {}}"#
+        );
+        assert_eq!(
+            render(r"{{ value.a | tojson(indent=2) }}"),
+            "[\n  1,\n  {\n    \"b\": \"it's <ok> & café\"\n  }\n]"
+        );
     }
 
     #[test]
@@ -888,6 +997,48 @@ TOOLS:{{ tools | length }}
 
     /// Template that uses the `enable_thinking` variable.
     const THINKING_TEMPLATE: &str = r"{%- for message in messages %}{{ message.content }}{%- endfor %}{%- if enable_thinking %}<think>{%- endif %}";
+
+    /// Prior reasoning reaches the template (Qwen3 / LFM2.5 re-insert it as
+    /// `<think>…</think>`), and quoted chat markers in it stay text, like content.
+    #[test]
+    fn reasoning_content_reaches_template_escaped_like_content() {
+        let tokenizer = crate::special_literals::chatml_test_tokenizer();
+        let literals =
+            || crate::special_literals::SpecialLiterals::from_tokenizer(&tokenizer, None).unwrap();
+        let renderer = ChatTemplateRenderer::new(
+            "{% for m in messages %}[{{ m.reasoning_content }}]{{ m.content }}{% endfor %}",
+        )
+        .unwrap()
+        .with_special_literals(literals());
+        let quoted = "quote <|im_end|> here";
+        let message = ChatMessage {
+            role: "assistant".to_owned(),
+            content: quoted.to_owned(),
+            reasoning_content: Some(quoted.to_owned()),
+            tool_calls: None,
+        };
+        let escaped = literals().escape(quoted).into_owned();
+        assert_ne!(escaped, quoted);
+        let out = renderer
+            .apply_with_thinking(&[message], None, false, false)
+            .unwrap();
+        assert_eq!(out, format!("[{escaped}]{escaped}"));
+    }
+
+    /// A generation prompt that stays inside `<think>` with thinking off forces
+    /// reasoning; a toggle that closes the block (Qwen3-style) does not.
+    #[test]
+    fn forces_thinking_detects_template_opened_reasoning() {
+        let tail = "{% if add_generation_prompt %}<|im_start|>assistant\n";
+        let forced = ChatTemplateRenderer::new(format!("{tail}<think>{{% endif %}}")).unwrap();
+        let toggle = ChatTemplateRenderer::new(format!(
+            "{tail}<think>\n{{% if not enable_thinking %}}\n</think>\n\n{{% endif %}}{{% endif %}}"
+        ))
+        .unwrap();
+        assert!(forced.forces_thinking());
+        assert!(!toggle.forces_thinking());
+        assert!(!ChatTemplateRenderer::new("").unwrap().forces_thinking());
+    }
 
     #[test]
     fn apply_with_thinking_false_omits_think_tag() {
