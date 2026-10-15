@@ -5221,6 +5221,17 @@ impl SimpleEngine {
             .is_some_and(ChatTemplateRenderer::forces_thinking)
     }
 
+    /// `<think>` budget when a request omits `reasoning_budget`. A model whose
+    /// template always opens `<think>` (LFM2.5) reasons by design: capping it
+    /// forced `</think>` mid-thought on 99/100 IFEval prompts, so it is uncapped.
+    fn default_thinking_budget(&self) -> u32 {
+        if self.forces_thinking() {
+            u32::MAX
+        } else {
+            DEFAULT_THINKING_BUDGET
+        }
+    }
+
     /// Runtime tool protocol derived from the loaded chat template. Higgs owns
     /// the model-specific parser, so clients only need the native/textual
     /// presentation decision.
@@ -10109,7 +10120,9 @@ impl SimpleEngine {
         pflash_policy: &PFlashPromptPolicy,
         allow_prefix_cache: bool,
     ) -> Result<GenerationOutput, EngineError> {
-        let thinking_budget = params.thinking_budget.unwrap_or(DEFAULT_THINKING_BUDGET);
+        let thinking_budget = params
+            .thinking_budget
+            .unwrap_or_else(|| self.default_thinking_budget());
         let generation_suffix = self.gen_prompt_suffixes.for_request(enable_thinking);
         let compressed = self.pflash_compress_if_eligible(
             prompt_tokens,
@@ -13645,7 +13658,9 @@ impl SimpleEngine {
         pflash_policy: &PFlashPromptPolicy,
         allow_prefix_cache: bool,
     ) -> Result<(), EngineError> {
-        let thinking_budget = params.thinking_budget.unwrap_or(DEFAULT_THINKING_BUDGET);
+        let thinking_budget = params
+            .thinking_budget
+            .unwrap_or_else(|| self.default_thinking_budget());
         let generation_suffix = self.gen_prompt_suffixes.for_request(enable_thinking);
         let compressed = self.pflash_compress_if_eligible(
             prompt_tokens,
