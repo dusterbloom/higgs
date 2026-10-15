@@ -7,7 +7,7 @@
 //! [`QuantizationSettings::resolve`], so per-tensor overrides (e.g. the 6-bit
 //! `model.embed_tokens` in the 4-bit release) load without special cases.
 
-use std::path::Path;
+use std::{cell::RefCell, path::Path};
 
 use mlx_rs::{
     Array, Dtype,
@@ -18,6 +18,7 @@ use mlx_rs::{
     module::{Module, Param},
     nn,
     ops::{self, indexing::IndexOp},
+    transforms::compile::compile,
 };
 use serde::Deserialize;
 
@@ -87,6 +88,25 @@ fn empty() -> Param<Array> {
     Param::new(Array::from_slice::<f32>(&[], &[0]))
 }
 
+// Decode is bound by MLX's per-op CPU encode cost (~1.4k ops/token keeps the
+// GPU ~65% busy), so the per-token elementwise chains run as compiled graphs.
+// Only at L=1: prefill shapes vary per request and are compute-bound anyway.
+type CompiledFn = dyn for<'a> FnMut(&'a [Array]) -> Result<Vec<Array>, Exception>;
+type RouterKey = (i32, bool, Dtype);
+
+thread_local! {
+    static CONV_STEP: RefCell<Option<Box<CompiledFn>>> = const { RefCell::new(None) };
+    static ROUTERS: RefCell<Vec<(RouterKey, Box<CompiledFn>)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn two(outputs: Vec<Array>) -> Result<(Array, Array), Exception> {
+    let mut it = outputs.into_iter();
+    match (it.next(), it.next()) {
+        (Some(a), Some(b)) => Ok((a, b)),
+        _ => Err(Exception::custom("compiled graph must return two arrays")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Gated short convolution
 // ---------------------------------------------------------------------------
@@ -107,47 +127,87 @@ struct ShortConv {
     #[param]
     out_proj: QLinear,
     kernel: i32,
+    /// `[K, D]` f32 taps, derived once from `conv.weight`.
+    taps: Option<Array>,
 }
 
 impl ShortConv {
+    fn taps(&mut self) -> Result<Array, Exception> {
+        if let Some(taps) = &self.taps {
+            return Ok(taps.clone());
+        }
+        let taps = self
+            .conv
+            .weight
+            .reshape(&[-1, self.kernel])?
+            .transpose_axes(&[1, 0])?
+            .as_dtype(Dtype::Float32)?;
+        self.taps = Some(taps.clone());
+        Ok(taps)
+    }
+
     /// `out_proj(C * conv(B * x))`, causal over the cached last `K-1` rows of `B*x`.
     ///
-    /// One code path for prefill and decode: the state is kept chronologically
-    /// (`conv_pos = K-2` keeps it ring-compatible with `ArraysCache` consumers).
+    /// The state is kept chronologically (`conv_pos = K-2` keeps it
+    /// ring-compatible with `ArraysCache` consumers). Taps accumulate in f32
+    /// like mlx `Conv1d`: per-step bf16 rounding doubled the logit error
+    /// against an f32 oracle (`scripts/lfm2_parity.py`).
     // ponytail: K shifted multiply-adds instead of nn::Conv1d; the Metal conv
     // kernel only handles K=4 (qwen3_next.rs) and K=3 here is negligible work.
-    fn forward(&self, x: &Array, cache: &mut ArraysCache) -> Result<Array, Exception> {
+    fn forward(&mut self, x: &Array, cache: &mut ArraysCache) -> Result<Array, Exception> {
         let parts = self.in_proj.forward(x)?.split(3, Some(-1))?;
         let [b, c, xs] = parts.as_slice() else {
             return Err(Exception::custom("in_proj must split into B, C, x"));
         };
-        let bx = b.multiply(xs)?;
-        let (k, len, dim) = (self.kernel, x.dim(1), x.dim(2));
-
-        let state = match cache.conv_state.take() {
-            Some(state) => state,
-            None => ops::zeros_dtype(&[x.dim(0), k - 1, dim], bx.dtype())?,
-        };
-        let xp = ops::concatenate_axis(&[state, bx], 1)?;
-        cache.conv_state = Some(xp.index((.., -(k - 1).., ..)));
+        let (k, len) = (self.kernel, x.dim(1));
+        let taps = self.taps()?;
+        let prior = cache.conv_state.take();
         cache.conv_pos = k - 2;
         cache.offset += len;
 
-        // Accumulate in f32 like mlx `Conv1d`: per-step bf16 rounding doubled
-        // the logit error against an f32 oracle (scripts/lfm2_parity.py).
-        let w = self
-            .conv
-            .weight
-            .reshape(&[dim, k])?
-            .transpose_axes(&[1, 0])?
-            .as_dtype(Dtype::Float32)?;
+        if let (1, Some(state)) = (len, &prior) {
+            let args = [b.clone(), xs.clone(), c.clone(), state.clone(), taps];
+            let (y, next_state) = two(CONV_STEP.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                let step = slot.get_or_insert_with(|| Box::new(compile(conv_step, None)));
+                step(&args)
+            })?)?;
+            cache.conv_state = Some(next_state);
+            return self.out_proj.forward(&y);
+        }
+
+        let bx = b.multiply(xs)?;
+        let state = match prior {
+            Some(state) => state,
+            None => ops::zeros_dtype(&[x.dim(0), k - 1, x.dim(2)], bx.dtype())?,
+        };
+        let xp = ops::concatenate_axis(&[state, bx], 1)?;
+        cache.conv_state = Some(xp.index((.., -(k - 1).., ..)));
         let xp32 = xp.as_dtype(Dtype::Float32)?;
-        let mut y = xp32.index((.., 0..len, ..)).multiply(w.index(0))?;
+        let mut y = xp32.index((.., 0..len, ..)).multiply(taps.index(0))?;
         for i in 1..k {
-            y = y.add(xp32.index((.., i..i + len, ..)).multiply(w.index(i))?)?;
+            y = y.add(xp32.index((.., i..i + len, ..)).multiply(taps.index(i))?)?;
         }
         self.out_proj.forward(&c.multiply(y.as_dtype(c.dtype())?)?)
     }
+}
+
+/// One decode token of [`ShortConv::forward`] (same f32 tap order), plus the
+/// shifted state: `[b, x, c, state, taps]` -> `[C * conv, next_state]`.
+fn conv_step(args: &[Array]) -> Result<Vec<Array>, Exception> {
+    let [b, xs, c, state, taps] = args else {
+        return Err(Exception::custom("conv_step takes b, x, c, state, taps"));
+    };
+    let bx = b.multiply(xs)?;
+    let k = taps.dim(0);
+    let tap = |row: &Array, i: i32| row.as_dtype(Dtype::Float32)?.multiply(taps.index(i));
+    let mut y = tap(&state.index((.., 0..1, ..)), 0)?;
+    for i in 1..k - 1 {
+        y = y.add(tap(&state.index((.., i..i + 1, ..)), i)?)?;
+    }
+    y = y.add(tap(&bx, k - 1)?)?;
+    let next_state = ops::concatenate_axis(&[state.index((.., 1.., ..)), bx], 1)?;
+    Ok(vec![c.multiply(y.as_dtype(c.dtype())?)?, next_state])
 }
 
 // ---------------------------------------------------------------------------
@@ -308,9 +368,24 @@ impl FeedForward {
         })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array, Exception> {
-        if let (Some(gate), Some(experts)) = (&self.gate, &self.switch_mlp) {
-            return self.forward_sparse(x, gate, experts);
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        if let Some(gate) = &self.gate {
+            let (inds, weights) = self.route(x, gate)?;
+            let experts = self
+                .switch_mlp
+                .as_mut()
+                .ok_or_else(|| Exception::custom("MoE layer without experts"))?;
+            // Decode (one token): gather directly. The global-sort path pads the
+            // routed rows to `4 × num_experts` for prefill/decode rounding parity,
+            // which at L=1 multiplies expert work ~64× for LFM2's 64 experts.
+            let routed = if x.dim(1) == 1 {
+                experts.forward_gather_fused_decode(x, &inds)?
+            } else {
+                experts.forward_gather_fused(x, &inds)?
+            };
+            return routed
+                .multiply(weights.expand_dims(-1)?)?
+                .sum_axes(&[-2], false);
         }
         let (Some(g), Some(u), Some(d)) = (&self.gate_proj, &self.up_proj, &self.down_proj) else {
             return Err(Exception::custom(
@@ -321,40 +396,57 @@ impl FeedForward {
     }
 
     /// Experts are *selected* on `sigmoid(gate) + expert_bias` but *weighted* by
-    /// the unbiased sigmoid scores (HF `Lfm2Moe` reference).
-    fn forward_sparse(
-        &self,
-        x: &Array,
-        gate: &QLinear,
-        experts: &SwitchMlpWeights,
-    ) -> Result<Array, Exception> {
-        let probs = nn::sigmoid(&gate.forward(x)?.as_dtype(Dtype::Float32)?)?;
-        let selection = if self.expert_bias.size() > 0 {
-            probs.add(&*self.expert_bias)?
+    /// the unbiased sigmoid scores (HF `Lfm2Moe` reference). Returns `(inds, weights)`.
+    fn route(&self, x: &Array, gate: &QLinear) -> Result<(Array, Array), Exception> {
+        let key = (self.top_k, self.norm_topk_prob, x.dtype());
+        let args = [
+            gate.forward(x)?.as_dtype(Dtype::Float32)?,
+            (*self.expert_bias).clone(),
+            Array::from_f32(self.routed_scaling_factor),
+        ];
+        two(if x.dim(1) == 1 {
+            ROUTERS.with(|cell| {
+                let mut routers = cell.borrow_mut();
+                let slot = routers
+                    .iter()
+                    .position(|(k, _)| *k == key)
+                    .unwrap_or_else(|| {
+                        routers.push((key, Box::new(compile(router(key), None))));
+                        routers.len() - 1
+                    });
+                let (_, route) = routers
+                    .get_mut(slot)
+                    .ok_or_else(|| Exception::custom("router cache slot"))?;
+                route(&args)
+            })?
+        } else {
+            router(key)(&args)?
+        })
+    }
+}
+
+/// Sigmoid top-k routing: `[logits_f32, expert_bias, scale]` -> `[inds, weights]`.
+/// An empty `expert_bias` means no selection bias.
+fn router(
+    (top_k, norm_topk_prob, dtype): RouterKey,
+) -> impl for<'a> FnMut(&'a [Array]) -> Result<Vec<Array>, Exception> + Copy + 'static {
+    move |args: &[Array]| {
+        let [logits, bias, scale] = args else {
+            return Err(Exception::custom("router takes logits, bias, scale"));
+        };
+        let probs = nn::sigmoid(logits)?;
+        let selection = if bias.size() > 0 {
+            probs.add(bias)?
         } else {
             probs.clone()
         };
-        let k = self.top_k;
-        let inds = ops::argpartition_axis(&selection, -k, -1)?.index((.., .., -k..));
+        let inds = ops::argpartition_axis(&selection, -top_k, -1)?.index((.., .., -top_k..));
         let mut scores = probs.take_along_axis(&inds, -1)?;
-        if self.norm_topk_prob {
+        if norm_topk_prob {
             let denom = scores.sum_axes(&[-1], true)?.add(Array::from_f32(1e-6))?;
             scores = scores.divide(denom)?;
         }
-        let weights = scores
-            .multiply(Array::from_f32(self.routed_scaling_factor))?
-            .as_dtype(x.dtype())?;
-        // Decode (one token): gather directly. The global-sort path pads the
-        // routed rows to `4 × num_experts` for prefill/decode rounding parity,
-        // which at L=1 multiplies expert work ~64× for LFM2's 64 experts.
-        let routed = if x.dim(1) == 1 {
-            experts.forward_gather(x, &inds, false)?
-        } else {
-            experts.forward_gather_global_sort(x, &inds)?
-        };
-        routed
-            .multiply(weights.expand_dims(-1)?)?
-            .sum_axes(&[-2], false)
+        Ok(vec![inds, scores.multiply(scale)?.as_dtype(dtype)?])
     }
 }
 
@@ -390,6 +482,7 @@ impl DecoderLayer {
                 in_proj: linear(q, &format!("{p}.conv.in_proj"))?,
                 out_proj: linear(q, &format!("{p}.conv.out_proj"))?,
                 kernel: args.conv_l_cache,
+                taps: None,
             };
             (None, Some(conv))
         };
@@ -424,7 +517,7 @@ impl DecoderLayer {
                 .forward(&normed, mask, c)?,
             LayerCache::Arrays(c) => self
                 .conv
-                .as_ref()
+                .as_mut()
                 .ok_or_else(mismatch)?
                 .forward(&normed, c)?,
         };
@@ -571,5 +664,11 @@ pub fn load_lfm2_moe_model<P: AsRef<Path>>(model_dir: P) -> Result<Lfm2MoeCausal
         false,
         quant.as_ref(),
     )?;
+    // One gate+up gather per MoE layer instead of two (fewer decode ops).
+    for layer in &mut model.model.layers {
+        if let Some(experts) = layer.feed_forward.switch_mlp.as_mut() {
+            experts.fuse_gate_up_in_place()?;
+        }
+    }
     Ok(model)
 }

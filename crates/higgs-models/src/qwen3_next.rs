@@ -6290,6 +6290,76 @@ impl SwitchMlpWeights {
         // Reshape back to [B, L, top_k, D]
         out_unsorted.reshape(&[b, l, top_k, d])
     }
+
+    /// Fuse gate+up for [`Self::forward_gather_fused`] /
+    /// [`Self::forward_gather_fused_decode`] and release the separate copies, so
+    /// fusing costs no resident memory (the lazy init keeps both).
+    pub(crate) fn fuse_gate_up_in_place(&mut self) -> Result<(), Exception> {
+        let intermediate = *self
+            .gate_proj
+            .weight
+            .shape()
+            .get(1)
+            .ok_or_else(|| Exception::custom("gate_proj weight missing dim 1"))?;
+        let cat = |a: &Array, b: &Array| ops::concatenate_axis(&[a, b], 1);
+        let fw = cat(&self.gate_proj.weight, &self.up_proj.weight)?;
+        let fs = cat(&self.gate_proj.scales, &self.up_proj.scales)?;
+        let fb = cat(&self.gate_proj.biases, &self.up_proj.biases)?;
+        mlx_rs::transforms::eval([&fw, &fs, &fb])?;
+        self.fused_gate_up = Some((fw, fs, fb, intermediate));
+        for proj in [&mut self.gate_proj, &mut self.up_proj] {
+            for param in [&mut proj.weight, &mut proj.scales, &mut proj.biases] {
+                **param = Array::from_slice::<f32>(&[], &[0]);
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::forward_gather`] over the fused gate+up weights (2 `gather_qmm`
+    /// instead of 3, compiled `SiLU`-gate); requires [`Self::fuse_gate_up_in_place`].
+    pub(crate) fn forward_gather_fused_decode(
+        &self,
+        x: &Array,
+        indices: &Array,
+    ) -> Result<Array, Exception> {
+        let (fw, fs, fb, intermediate) = self
+            .fused_gate_up
+            .as_ref()
+            .ok_or_else(|| Exception::custom("fuse_gate_up_in_place not called"))?;
+        let shape = x.shape();
+        let [b, l, d] = shape else {
+            return Err(Exception::custom(
+                "forward_gather_fused_decode input must be [B, L, D]",
+            ));
+        };
+        let fused = gather_qmm(
+            &x.reshape(&[*b, *l, 1, 1, *d])?,
+            fw,
+            fs,
+            fb,
+            indices,
+            true,
+            self.gate_proj.group_size,
+            self.gate_proj.bits,
+            false,
+        )?;
+        let parts = fused.split_axis(&[*intermediate], Some(-1))?;
+        let [gate_out, up_out] = parts.as_slice() else {
+            return Err(Exception::custom("fused split failed"));
+        };
+        let down_out = gather_qmm(
+            &silu_mul(gate_out, up_out)?,
+            &self.down_proj.weight,
+            &self.down_proj.scales,
+            &self.down_proj.biases,
+            indices,
+            true,
+            self.down_proj.group_size,
+            self.down_proj.bits,
+            false,
+        )?;
+        down_out.squeeze_axes(&[-2])
+    }
 }
 
 // ---------------------------------------------------------------------------
