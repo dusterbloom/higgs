@@ -105,6 +105,141 @@ fn cstr_vec(names: &[&CStr]) -> mlx_sys::mlx_vector_string {
 }
 
 // ---------------------------------------------------------------------------
+// Generic custom kernel: name the inputs/outputs, write the body, launch.
+// ---------------------------------------------------------------------------
+
+/// Template argument for [`FastKernel::apply`].
+pub(crate) enum TemplateArg<'a> {
+    Int(&'a CStr, i32),
+    Bool(&'a CStr, bool),
+    Dtype(&'a CStr, Dtype),
+}
+
+/// A runtime-compiled Metal kernel (`mlx_fast_metal_kernel`). The `source` is
+/// the kernel body: inputs and outputs are visible by name, alongside Metal's
+/// `thread_position_in_grid` etc. Inputs are made row-contiguous by MLX.
+pub(crate) struct FastKernel(CachedMetalKernel);
+
+impl FastKernel {
+    #[allow(unsafe_code)]
+    pub(crate) fn new(
+        name: &CStr,
+        inputs: &[&CStr],
+        outputs: &[&CStr],
+        source: &CStr,
+        header: &CStr,
+    ) -> Self {
+        let (input_names, output_names) = (cstr_vec(inputs), cstr_vec(outputs));
+        // SAFETY: all pointers are valid C strings / vectors for the call; the
+        // name vectors are copied by MLX and freed right after.
+        unsafe {
+            let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+                name.as_ptr(),
+                input_names,
+                output_names,
+                source.as_ptr(),
+                header.as_ptr(),
+                true,
+                false,
+            );
+            mlx_sys::mlx_vector_string_free(input_names);
+            mlx_sys::mlx_vector_string_free(output_names);
+            Self(CachedMetalKernel(kernel))
+        }
+    }
+
+    /// Enqueue one launch on the current stream; returns one array per
+    /// `(shape, dtype)` in `outputs`.
+    #[allow(unsafe_code)]
+    pub(crate) fn apply(
+        &self,
+        inputs: &[&Array],
+        template: &[TemplateArg<'_>],
+        grid: [i32; 3],
+        threadgroup: [i32; 3],
+        outputs: &[(&[i32], Dtype)],
+    ) -> Result<Vec<Array>, Exception> {
+        ensure_ffi_error_handler();
+        let stream = Stream::task_local_or_default();
+        let ([gx, gy, gz], [tx, ty, tz]) = (grid, threadgroup);
+        // SAFETY: the config, input/output vectors and arrays are created and
+        // freed here; output arrays are handed to `Array::from_ptr` exactly once.
+        unsafe {
+            let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+            let mut status = mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, gx, gy, gz)
+                | mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, tx, ty, tz);
+            for arg in template {
+                status |= match *arg {
+                    TemplateArg::Int(name, value) => {
+                        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+                            config,
+                            name.as_ptr(),
+                            value,
+                        )
+                    }
+                    TemplateArg::Bool(name, value) => {
+                        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_bool(
+                            config,
+                            name.as_ptr(),
+                            value,
+                        )
+                    }
+                    TemplateArg::Dtype(name, dtype) => {
+                        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+                            config,
+                            name.as_ptr(),
+                            u32::from(dtype),
+                        )
+                    }
+                };
+            }
+            for (shape, dtype) in outputs {
+                status |= mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+                    config,
+                    shape.as_ptr(),
+                    shape.len(),
+                    u32::from(*dtype),
+                );
+            }
+            let input_ptrs: Vec<_> = inputs.iter().map(|a| a.as_ptr()).collect();
+            let inputs_vec = mlx_sys::mlx_vector_array_new_data(input_ptrs.as_ptr(), input_ptrs.len());
+            let mut outputs_vec = mlx_sys::mlx_vector_array_new();
+            if status == 0 {
+                status = mlx_sys::mlx_fast_metal_kernel_apply(
+                    &raw mut outputs_vec,
+                    (self.0).0,
+                    inputs_vec,
+                    config,
+                    stream.as_ptr(),
+                );
+            }
+            let result = if status == 0 {
+                (0..mlx_sys::mlx_vector_array_size(outputs_vec))
+                    .map(|i| {
+                        let mut out = mlx_sys::mlx_array_new();
+                        if mlx_sys::mlx_vector_array_get(&raw mut out, outputs_vec, i) == 0 {
+                            Ok(Array::from_ptr(out))
+                        } else {
+                            mlx_sys::mlx_array_free(out);
+                            Err(Exception::custom(take_last_error()))
+                        }
+                    })
+                    .collect()
+            } else {
+                Err(Exception::custom(format!(
+                    "custom Metal kernel failed: {}",
+                    take_last_error()
+                )))
+            };
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            mlx_sys::mlx_vector_array_free(inputs_vec);
+            mlx_sys::mlx_vector_array_free(outputs_vec);
+            result
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Materializing device copy.
 //
 // MLX 0.30.6's `mlx_copy` is a copy-on-write alias: evaluation calls

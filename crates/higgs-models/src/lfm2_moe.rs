@@ -7,7 +7,7 @@
 //! [`QuantizationSettings::resolve`], so per-tensor overrides (e.g. the 6-bit
 //! `model.embed_tokens` in the 4-bit release) load without special cases.
 
-use std::{cell::RefCell, path::Path};
+use std::{path::Path, sync::OnceLock};
 
 use mlx_rs::{
     Array, Dtype,
@@ -18,13 +18,13 @@ use mlx_rs::{
     module::{Module, Param},
     nn,
     ops::{self, indexing::IndexOp},
-    transforms::compile::compile,
 };
 use serde::Deserialize;
 
 use crate::{
     cache::{KeyValueCache, SteppingKeyValueCache},
     error::ModelError,
+    metal_kernel::{FastKernel, TemplateArg},
     quant_config::QuantizationSettings,
     qwen3_next::{ArraysCache, LayerCache, QEmbedding, QLinear, SwitchMlpWeights, swiglu},
     utils::{AttentionMask, apply_rope, create_causal_mask},
@@ -88,22 +88,88 @@ fn empty() -> Param<Array> {
     Param::new(Array::from_slice::<f32>(&[], &[0]))
 }
 
-// Decode is bound by MLX's per-op CPU encode cost (~1.4k ops/token keeps the
-// GPU ~65% busy), so the per-token elementwise chains run as compiled graphs.
-// Only at L=1: prefill shapes vary per request and are compute-bound anyway.
-type CompiledFn = dyn for<'a> FnMut(&'a [Array]) -> Result<Vec<Array>, Exception>;
-type RouterKey = (i32, bool, Dtype);
+// Decode dispatches ~1.4k dependent kernels per token and every one costs a few
+// microseconds of GPU latency, so the per-token chains around the matmuls run
+// as single custom kernels (L=1 only: prefill is compute-bound). Each kernel
+// reproduces the op-by-op MLX arithmetic (no FMA contraction).
+const NO_FMA: &std::ffi::CStr = c"#pragma METAL fp contract(off)\n";
 
-thread_local! {
-    static CONV_STEP: RefCell<Option<Box<CompiledFn>>> = const { RefCell::new(None) };
-    static ROUTERS: RefCell<Vec<(RouterKey, Box<CompiledFn>)>> = const { RefCell::new(Vec::new()) };
+/// One decode token of the short conv: `in_proj` output `[B | C | x]`, state
+/// rows oldest..newest, f32 taps `[K, D]` -> `C * conv(B*x)` and the next state.
+const CONV_STEP: &std::ffi::CStr = cr"
+uint d = thread_position_in_grid.x;
+if (d >= D) return;
+T bx = static_cast<T>(static_cast<float>(bcx[d]) * static_cast<float>(bcx[2 * D + d]));
+float acc = static_cast<float>(state[d]) * taps[d];
+for (uint i = 1; i < K - 1; ++i) {
+  acc = acc + static_cast<float>(state[i * D + d]) * taps[i * D + d];
+}
+acc = acc + static_cast<float>(bx) * taps[(K - 1) * D + d];
+out[d] = static_cast<T>(static_cast<float>(bcx[D + d]) * static_cast<float>(static_cast<T>(acc)));
+for (uint i = 0; i + 2 < K; ++i) {
+  next_state[i * D + d] = state[(i + 1) * D + d];
+}
+next_state[(K - 2) * D + d] = bx;
+";
+
+/// Router logits, one simdgroup per expert: `x . w[e]` (f32 weights).
+const ROUTER_LOGITS: &std::ffi::CStr = cr"
+uint e = threadgroup_position_in_grid.x;
+uint lane = thread_index_in_simdgroup;
+float acc = 0.0f;
+for (uint j = lane; j < D; j += 32) {
+  acc = acc + static_cast<float>(x[j]) * w[e * D + j];
+}
+float logit = simd_sum(acc);
+if (lane == 0) logits[e] = logit;
+";
+
+/// Sigmoid top-k over <= 64 experts in one simdgroup: selected on
+/// `sigmoid + bias`, weighted by the unbiased sigmoid (HF `Lfm2Moe`).
+const ROUTER_SELECT: &std::ffi::CStr = cr"
+uint lane = thread_index_in_simdgroup;
+auto sigmoid = [](float l) { float y = 1.0f / (1.0f + metal::exp(metal::abs(l))); return l < 0.0f ? y : 1.0f - y; };
+float pa = lane < E ? sigmoid(logits[lane]) : 0.0f;
+float pb = lane + 32 < E ? sigmoid(logits[lane + 32]) : 0.0f;
+float a = lane < E ? (HAS_BIAS ? pa + bias[lane] : pa) : -INFINITY;
+float b = lane + 32 < E ? (HAS_BIAS ? pb + bias[lane + 32] : pb) : -INFINITY;
+float picked[TOPK];
+uint ids[TOPK];
+float total = 0.0f;
+for (uint k = 0; k < TOPK; ++k) {
+  bool use_b = b > a;
+  float best = use_b ? b : a;
+  float top = simd_max(best);
+  uint winner = simd_min(best == top ? (use_b ? lane + 32 : lane) : 0xffffffffu);
+  float p = simd_shuffle(winner < 32 ? pa : pb, winner % 32);
+  ids[k] = winner;
+  picked[k] = p;
+  total = total + p;
+  if (winner == lane) a = -INFINITY;
+  if (winner == lane + 32) b = -INFINITY;
+}
+if (lane < TOPK) {
+  float s = NORM ? picked[lane] / (total + 1e-6f) : picked[lane];
+  inds[lane] = ids[lane];
+  weights[lane] = static_cast<T>(s * scale);
+}
+";
+
+fn kernel(
+    cell: &'static OnceLock<FastKernel>,
+    name: &std::ffi::CStr,
+    inputs: &[&std::ffi::CStr],
+    outputs: &[&std::ffi::CStr],
+    source: &std::ffi::CStr,
+) -> &'static FastKernel {
+    cell.get_or_init(|| FastKernel::new(name, inputs, outputs, source, NO_FMA))
 }
 
-fn two(outputs: Vec<Array>) -> Result<(Array, Array), Exception> {
+fn pair(outputs: Vec<Array>) -> Result<(Array, Array), Exception> {
     let mut it = outputs.into_iter();
     match (it.next(), it.next()) {
         (Some(a), Some(b)) => Ok((a, b)),
-        _ => Err(Exception::custom("compiled graph must return two arrays")),
+        _ => Err(Exception::custom("kernel must return two arrays")),
     }
 }
 
@@ -155,27 +221,42 @@ impl ShortConv {
     // ponytail: K shifted multiply-adds instead of nn::Conv1d; the Metal conv
     // kernel only handles K=4 (qwen3_next.rs) and K=3 here is negligible work.
     fn forward(&mut self, x: &Array, cache: &mut ArraysCache) -> Result<Array, Exception> {
-        let parts = self.in_proj.forward(x)?.split(3, Some(-1))?;
-        let [b, c, xs] = parts.as_slice() else {
-            return Err(Exception::custom("in_proj must split into B, C, x"));
-        };
+        let bcx = self.in_proj.forward(x)?;
         let (k, len) = (self.kernel, x.dim(1));
         let taps = self.taps()?;
         let prior = cache.conv_state.take();
         cache.conv_pos = k - 2;
         cache.offset += len;
 
-        if let (1, Some(state)) = (len, &prior) {
-            let args = [b.clone(), xs.clone(), c.clone(), state.clone(), taps];
-            let (y, next_state) = two(CONV_STEP.with(|cell| {
-                let mut slot = cell.borrow_mut();
-                let step = slot.get_or_insert_with(|| Box::new(compile(conv_step, None)));
-                step(&args)
-            })?)?;
+        if let (1, 1, Some(state)) = (x.dim(0), len, &prior) {
+            static STEP: OnceLock<FastKernel> = OnceLock::new();
+            let step = kernel(
+                &STEP,
+                c"lfm2_conv_step",
+                &[c"bcx", c"state", c"taps"],
+                &[c"out", c"next_state"],
+                CONV_STEP,
+            );
+            let (dim, dtype) = (x.dim(2), bcx.dtype());
+            let (y, next_state) = pair(step.apply(
+                &[&bcx, state, &taps],
+                &[
+                    TemplateArg::Dtype(c"T", dtype),
+                    TemplateArg::Int(c"D", dim),
+                    TemplateArg::Int(c"K", k),
+                ],
+                [dim, 1, 1],
+                [256, 1, 1],
+                &[(&[1, 1, dim], dtype), (&[1, k - 1, dim], dtype)],
+            )?)?;
             cache.conv_state = Some(next_state);
             return self.out_proj.forward(&y);
         }
 
+        let parts = bcx.split(3, Some(-1))?;
+        let [b, c, xs] = parts.as_slice() else {
+            return Err(Exception::custom("in_proj must split into B, C, x"));
+        };
         let bx = b.multiply(xs)?;
         let state = match prior {
             Some(state) => state,
@@ -190,24 +271,6 @@ impl ShortConv {
         }
         self.out_proj.forward(&c.multiply(y.as_dtype(c.dtype())?)?)
     }
-}
-
-/// One decode token of [`ShortConv::forward`] (same f32 tap order), plus the
-/// shifted state: `[b, x, c, state, taps]` -> `[C * conv, next_state]`.
-fn conv_step(args: &[Array]) -> Result<Vec<Array>, Exception> {
-    let [b, xs, c, state, taps] = args else {
-        return Err(Exception::custom("conv_step takes b, x, c, state, taps"));
-    };
-    let bx = b.multiply(xs)?;
-    let k = taps.dim(0);
-    let tap = |row: &Array, i: i32| row.as_dtype(Dtype::Float32)?.multiply(taps.index(i));
-    let mut y = tap(&state.index((.., 0..1, ..)), 0)?;
-    for i in 1..k - 1 {
-        y = y.add(tap(&state.index((.., i..i + 1, ..)), i)?)?;
-    }
-    y = y.add(tap(&bx, k - 1)?)?;
-    let next_state = ops::concatenate_axis(&[state.index((.., 1.., ..)), bx], 1)?;
-    Ok(vec![c.multiply(y.as_dtype(c.dtype())?)?, next_state])
 }
 
 // ---------------------------------------------------------------------------
@@ -398,55 +461,79 @@ impl FeedForward {
     /// Experts are *selected* on `sigmoid(gate) + expert_bias` but *weighted* by
     /// the unbiased sigmoid scores (HF `Lfm2Moe` reference). Returns `(inds, weights)`.
     fn route(&self, x: &Array, gate: &QLinear) -> Result<(Array, Array), Exception> {
-        let key = (self.top_k, self.norm_topk_prob, x.dtype());
-        let args = [
-            gate.forward(x)?.as_dtype(Dtype::Float32)?,
-            (*self.expert_bias).clone(),
-            Array::from_f32(self.routed_scaling_factor),
-        ];
-        two(if x.dim(1) == 1 {
-            ROUTERS.with(|cell| {
-                let mut routers = cell.borrow_mut();
-                let slot = routers
-                    .iter()
-                    .position(|(k, _)| *k == key)
-                    .unwrap_or_else(|| {
-                        routers.push((key, Box::new(compile(router(key), None))));
-                        routers.len() - 1
-                    });
-                let (_, route) = routers
-                    .get_mut(slot)
-                    .ok_or_else(|| Exception::custom("router cache slot"))?;
-                route(&args)
-            })?
-        } else {
-            router(key)(&args)?
-        })
-    }
-}
-
-/// Sigmoid top-k routing: `[logits_f32, expert_bias, scale]` -> `[inds, weights]`.
-/// An empty `expert_bias` means no selection bias.
-fn router(
-    (top_k, norm_topk_prob, dtype): RouterKey,
-) -> impl for<'a> FnMut(&'a [Array]) -> Result<Vec<Array>, Exception> + Copy + 'static {
-    move |args: &[Array]| {
-        let [logits, bias, scale] = args else {
-            return Err(Exception::custom("router takes logits, bias, scale"));
-        };
-        let probs = nn::sigmoid(logits)?;
-        let selection = if bias.size() > 0 {
-            probs.add(bias)?
+        let experts = gate.weight.dim(0);
+        let has_bias = self.expert_bias.size() > 0;
+        let fused = x.dim(0) == 1
+            && x.dim(1) == 1
+            && gate.bits == 0
+            && gate.weight.dtype() == Dtype::Float32
+            && experts <= 64
+            && (1..=32).contains(&self.top_k);
+        if fused {
+            static LOGITS: OnceLock<FastKernel> = OnceLock::new();
+            static SELECT: OnceLock<FastKernel> = OnceLock::new();
+            let logits_k = kernel(
+                &LOGITS,
+                c"lfm2_router_logits",
+                &[c"x", c"w"],
+                &[c"logits"],
+                ROUTER_LOGITS,
+            );
+            let select_k = kernel(
+                &SELECT,
+                c"lfm2_router_select",
+                &[c"logits", c"bias", c"scale"],
+                &[c"inds", c"weights"],
+                ROUTER_SELECT,
+            );
+            let logits = logits_k
+                .apply(
+                    &[x, &gate.weight],
+                    &[TemplateArg::Int(c"D", x.dim(2))],
+                    [experts * 32, 1, 1],
+                    [32, 1, 1],
+                    &[(&[experts], Dtype::Float32)],
+                )?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Exception::custom("router logits kernel returned nothing"))?;
+            let bias = if has_bias {
+                &*self.expert_bias
+            } else {
+                &logits
+            };
+            let k = self.top_k;
+            return pair(select_k.apply(
+                &[&logits, bias, &Array::from_f32(self.routed_scaling_factor)],
+                &[
+                    TemplateArg::Dtype(c"T", x.dtype()),
+                    TemplateArg::Int(c"E", experts),
+                    TemplateArg::Int(c"TOPK", k),
+                    TemplateArg::Bool(c"HAS_BIAS", has_bias),
+                    TemplateArg::Bool(c"NORM", self.norm_topk_prob),
+                ],
+                [32, 1, 1],
+                [32, 1, 1],
+                &[(&[1, 1, k], Dtype::Uint32), (&[1, 1, k], x.dtype())],
+            )?);
+        }
+        let probs = nn::sigmoid(&gate.forward(x)?.as_dtype(Dtype::Float32)?)?;
+        let selection = if has_bias {
+            probs.add(&*self.expert_bias)?
         } else {
             probs.clone()
         };
-        let inds = ops::argpartition_axis(&selection, -top_k, -1)?.index((.., .., -top_k..));
+        let k = self.top_k;
+        let inds = ops::argpartition_axis(&selection, -k, -1)?.index((.., .., -k..));
         let mut scores = probs.take_along_axis(&inds, -1)?;
-        if norm_topk_prob {
+        if self.norm_topk_prob {
             let denom = scores.sum_axes(&[-1], true)?.add(Array::from_f32(1e-6))?;
             scores = scores.divide(denom)?;
         }
-        Ok(vec![inds, scores.multiply(scale)?.as_dtype(dtype)?])
+        let weights = scores
+            .multiply(Array::from_f32(self.routed_scaling_factor))?
+            .as_dtype(x.dtype())?;
+        Ok((inds, weights))
     }
 }
 
