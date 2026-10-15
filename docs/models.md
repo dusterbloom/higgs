@@ -75,7 +75,7 @@ generation_defaults = { max_tokens = 16384, temperature = 0.1, top_k = 50, repet
 ```
 
 IFEval (first 100, prompt-level strict, greedy, 16K budget): 98% vs 96.75%
-on the bf16 model card. M4 10-core / 32 GB, AC power: decode 59.6 tok/s
+on the bf16 model card. M4 10-core / 32 GB, AC power: decode 60.9 tok/s
 (≤1.5K ctx), 46 tok/s at 21K ctx; prefill ~500 tok/s at 2K-8K. Decode is
 ~97% weight-reading qmv/gather kernels (16.3 of 17.1 ms/token).
 
