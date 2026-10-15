@@ -117,6 +117,11 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::DeepSeekV2(model))
         }
+        "lfm2_moe" => {
+            let model = higgs_models::lfm2_moe::load_lfm2_moe_model(&config.model_dir)
+                .map_err(EngineError::Model)?;
+            Ok(AnyModel::Lfm2Moe(model))
+        }
         other => Err(EngineError::Model(
             higgs_models::error::ModelError::UnsupportedModel(other.to_owned()),
         )),

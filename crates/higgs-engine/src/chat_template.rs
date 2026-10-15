@@ -268,7 +268,10 @@ impl ChatTemplateRenderer {
     // tool payload ever needs to quote chat markers.
     fn escape_messages(&self, messages: &[ChatMessage]) -> Option<Vec<ChatMessage>> {
         let literals = self.literals.as_ref()?;
-        let escaped: Vec<_> = messages.iter().map(|m| literals.escape(&m.content)).collect();
+        let escaped: Vec<_> = messages
+            .iter()
+            .map(|m| literals.escape(&m.content))
+            .collect();
         if escaped.iter().all(|c| matches!(c, Cow::Borrowed(_))) {
             return None;
         }
@@ -411,7 +414,22 @@ fn normalize_hf_chat_template(template_source: String) -> String {
     // messages backwards. MiniJinja accepts `messages[::-1]` but does not
     // iterate it like Python/Jinja2, which trips templates that validate the
     // presence of a real user query. Use MiniJinja's reverse filter instead.
-    template_source.replace("messages[::-1]", "messages|reverse")
+    let mut source = template_source.replace("messages[::-1]", "messages|reverse");
+    // HF `{% generation %}…{% endgeneration %}` (e.g. LFM2) only marks
+    // assistant tokens for training masks; render it as an always-true block,
+    // keeping the whitespace-control markers.
+    for (open, close) in [("{%", "%}"), ("{%-", "%}"), ("{%", "-%}"), ("{%-", "-%}")] {
+        source = source
+            .replace(
+                &format!("{open} generation {close}"),
+                &format!("{open} if true {close}"),
+            )
+            .replace(
+                &format!("{open} endgeneration {close}"),
+                &format!("{open} endif {close}"),
+            );
+    }
+    source
 }
 
 #[allow(
@@ -1093,5 +1111,16 @@ TOOLS:{{ tools | length }}
         let mut tc = parsed(r#"{ "name": "f", "arguments": "[1,2,3]" }"#);
         normalize_tool_call_for_template(&mut tc);
         assert_eq!(tc.get("arguments"), Some(&parsed("{}")));
+    }
+
+    #[test]
+    fn hf_generation_blocks_render_as_plain_content() {
+        let src = normalize_hf_chat_template(
+            "a{%- generation -%} b {%- endgeneration -%}c{% generation %}d{% endgeneration %}"
+                .into(),
+        );
+        let mut env = Environment::new();
+        env.add_template("t", &src).unwrap();
+        assert_eq!(env.get_template("t").unwrap().render(()).unwrap(), "abcd");
     }
 }

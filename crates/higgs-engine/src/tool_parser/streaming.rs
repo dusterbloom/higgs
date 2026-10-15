@@ -3,7 +3,8 @@ use std::collections::{HashSet, VecDeque};
 use super::{
     CDATA_CLOSE, CDATA_OPEN, FUNCTION_CLOSE, FUNCTION_OPEN, MAX_INSIDE_TOOL_CALL_BYTES,
     MINICPM_FUNCTION_OPEN, MINICPM_PARAM_CLOSE, MINICPM_PARAM_OPEN, PARAM_CLOSE, PARAM_OPEN,
-    ParamType, TOOL_CALL_CLOSE, TOOL_CALL_OPEN, ToolSchema,
+    PYTHONIC_CLOSE, PYTHONIC_OPEN, ParamType, TOOL_CALL_CLOSE, TOOL_CALL_OPEN, ToolSchema,
+    parse_pythonic_block,
 };
 
 /// An ordered semantic event produced while model text is decoded.
@@ -89,9 +90,16 @@ enum State {
     Scan,
     WrappedDetect,
     Legacy(Legacy),
-    XmlName { dialect: XmlDialect, name: String },
+    XmlName {
+        dialect: XmlDialect,
+        name: String,
+    },
     Xml(XmlCall),
-    WrappedClose { index: usize },
+    WrappedClose {
+        index: usize,
+    },
+    /// Inside an LFM2 `<|tool_call_start|>[…]` list; buffered to its closer.
+    Pythonic,
     Failed,
     Poison,
 }
@@ -367,6 +375,7 @@ impl IncrementalToolCallTracker {
             State::XmlName { dialect, name } => self.step_xml_name(dialect, name, events),
             State::Xml(call) => self.step_xml(call, events),
             State::WrappedClose { index } => self.step_wrapped_close(index, events),
+            State::Pythonic => self.step_pythonic(events),
             State::Failed => Ok((State::Failed, false)),
             State::Poison => Err(ToolParseError::Malformed {
                 message: "parser entered an invalid internal state",
@@ -382,34 +391,23 @@ impl IncrementalToolCallTracker {
         if available.is_empty() {
             return Ok((State::Scan, false));
         }
-        let wrapped = available
-            .find(TOOL_CALL_OPEN)
-            .map(|position| (position, true));
-        let mini = available
-            .find(MINICPM_FUNCTION_OPEN)
-            .map(|position| (position, false));
-        let opener = match (wrapped, mini) {
-            (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
-            (Some(found), None) | (None, Some(found)) => Some(found),
-            (None, None) => None,
-        };
-        if let Some((position, is_wrapped)) = opener {
+        // Earliest opener wins; `<tool_call>` wins ties.
+        let opener = [TOOL_CALL_OPEN, MINICPM_FUNCTION_OPEN, PYTHONIC_OPEN]
+            .into_iter()
+            .filter_map(|opener| Some((available.find(opener)?, opener)))
+            .min_by_key(|&(position, _)| position);
+        if let Some((position, opener)) = opener {
             push_text(events, available[..position].to_owned());
             self.consume(position, false)?;
-            let opener_len = if is_wrapped {
-                TOOL_CALL_OPEN.len()
-            } else {
-                MINICPM_FUNCTION_OPEN.len()
-            };
-            self.consume(opener_len, false)?;
-            self.call_bytes = opener_len;
-            let next = if is_wrapped {
-                State::WrappedDetect
-            } else {
-                State::XmlName {
+            self.consume(opener.len(), false)?;
+            self.call_bytes = opener.len();
+            let next = match opener {
+                TOOL_CALL_OPEN => State::WrappedDetect,
+                PYTHONIC_OPEN => State::Pythonic,
+                _ => State::XmlName {
                     dialect: XmlDialect::MiniCpm,
                     name: String::new(),
-                }
+                },
             };
             return Ok((next, true));
         }
@@ -421,6 +419,41 @@ impl IncrementalToolCallTracker {
         }
         push_text(events, available[..emit_len].to_owned());
         self.consume(emit_len, false)?;
+        Ok((State::Scan, true))
+    }
+
+    /// Pythonic calls are Python literals, not JSON, so they cannot stream
+    /// append-only; buffer to the closer, then emit each call whole.
+    fn step_pythonic(
+        &mut self,
+        events: &mut Vec<ToolStreamEvent>,
+    ) -> Result<(State, bool), ToolParseError> {
+        let available = self.available();
+        let Some(end) = available.find(PYTHONIC_CLOSE) else {
+            if self.call_bytes + available.len() > MAX_INSIDE_TOOL_CALL_BYTES {
+                return Err(ToolParseError::CallTooLarge {
+                    limit: MAX_INSIDE_TOOL_CALL_BYTES,
+                });
+            }
+            return Ok((State::Pythonic, false));
+        };
+        let block = format!("{PYTHONIC_OPEN}{}", &available[..end]);
+        let calls = parse_pythonic_block(&block, self.schema.as_ref()).ok_or(
+            ToolParseError::Malformed {
+                message: "malformed Pythonic tool-call list",
+            },
+        )?;
+        self.consume(end + PYTHONIC_CLOSE.len(), true)?;
+        for call in calls {
+            let index = self.next_index;
+            self.next_index += 1;
+            events.push(ToolStreamEvent::ToolStart {
+                index,
+                name: call.name,
+            });
+            push_arguments(events, index, call.arguments.to_string());
+            self.complete_call(index, events);
+        }
         Ok((State::Scan, true))
     }
 
@@ -1873,7 +1906,10 @@ fn opener_suffix_len(input: &str) -> usize {
     let mut best = 0;
     for (index, _) in input.char_indices() {
         let suffix = &input[index..];
-        if TOOL_CALL_OPEN.starts_with(suffix) || MINICPM_FUNCTION_OPEN.starts_with(suffix) {
+        if [TOOL_CALL_OPEN, MINICPM_FUNCTION_OPEN, PYTHONIC_OPEN]
+            .iter()
+            .any(|opener| opener.starts_with(suffix))
+        {
             best = best.max(suffix.len());
         }
     }
@@ -2568,5 +2604,40 @@ mod tests {
                 .all(|event| !matches!(event, Text(_)))
         );
         assert!(!overflow.events.contains(&ToolEnd { index: 0 }));
+    }
+
+    #[test]
+    fn pythonic_stream_matches_batch_parse_for_any_chunking() {
+        let input = concat!(
+            "Checking. <|tool_call_start|>[read_file(path='a, b.rs', n=3), ",
+            "ls()]<|tool_call_end|> then <|tool_call_start|>[x(q=\"]\")]<|tool_call_end|>"
+        );
+        let batch = parse_tool_calls(input, None);
+        for seed in 0..32 {
+            let mut tracker = IncrementalToolCallTracker::new(true, None);
+            let (events, error) = collect(&mut tracker, &random_chunks(input, seed));
+            assert!(error.is_none(), "seed {seed}: {error:?}");
+            let text: String = events
+                .iter()
+                .filter_map(|e| {
+                    if let Text(t) = e {
+                        Some(t.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(text, "Checking.  then ", "seed {seed}");
+            assert_eq!(tracker.completed_call_count(), batch.tool_calls.len());
+            for (index, call) in batch.tool_calls.iter().enumerate() {
+                assert!(events.contains(&ToolStart {
+                    index,
+                    name: call.name.clone()
+                }));
+                let streamed: serde_json::Value =
+                    serde_json::from_str(&arguments(&events, index)).unwrap();
+                assert_eq!(streamed, call.arguments, "seed {seed} call {index}");
+            }
+        }
     }
 }

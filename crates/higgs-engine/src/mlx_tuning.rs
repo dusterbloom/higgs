@@ -392,7 +392,9 @@ pub fn model_load_estimate(
             "qwen3_5_vl" | "qwen3_vl" | "qwen2_5_vl" | "llava-qwen2" | "gemma3" | "gemma3_text"
             | "gemma4" | "gemma4_text" | "gemma4_unified" => LoaderWorkspaceKind::FullArtifact,
             "qwen2" | "qwen3" | "llama" | "mistral" | "nanbeige" | "qwen3_moe" | "gemma2"
-            | "phi3" | "starcoder2" | "deepseek_v2" => LoaderWorkspaceKind::StandardStream,
+            | "phi3" | "starcoder2" | "deepseek_v2" | "lfm2_moe" => {
+                LoaderWorkspaceKind::StandardStream
+            }
             _ => LoaderWorkspaceKind::Unknown,
         }
     };
@@ -844,7 +846,7 @@ impl ModelMetadata {
     fn is_moe(&self) -> bool {
         matches!(
             self.model_type.as_deref(),
-            Some("qwen3_moe" | "qwen3_5_moe" | "deepseek_v2")
+            Some("qwen3_moe" | "qwen3_5_moe" | "deepseek_v2" | "lfm2_moe")
         )
     }
 

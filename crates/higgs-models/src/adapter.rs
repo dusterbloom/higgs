@@ -190,6 +190,7 @@ enum LoadKind {
     LlavaQwen2,
     DeepSeekV2,
     QwenVl,
+    Lfm2Moe,
 }
 
 #[cfg(test)]
@@ -227,7 +228,8 @@ impl BuiltinAdapter {
             | LoadKind::Gemma2
             | LoadKind::Phi3
             | LoadKind::Starcoder2
-            | LoadKind::DeepSeekV2 => LoaderBoundaryClass::StandardStream,
+            | LoadKind::DeepSeekV2
+            | LoadKind::Lfm2Moe => LoaderBoundaryClass::StandardStream,
         }
     }
 }
@@ -263,6 +265,9 @@ const fn starcoder() -> ModelFamily {
 }
 const fn deepseek() -> ModelFamily {
     ModelFamily::DeepSeek
+}
+fn liquid() -> ModelFamily {
+    ModelFamily::Other("lfm2".to_owned())
 }
 const fn llava() -> ModelFamily {
     ModelFamily::Llava
@@ -378,6 +383,14 @@ static DEEPSEEK_V2: BuiltinAdapter = BuiltinAdapter {
     notes: "DeepSeek-V2 MLA/MoE",
     kind: LoadKind::DeepSeekV2,
 };
+static LFM2_MOE: BuiltinAdapter = BuiltinAdapter {
+    id: "lfm2-moe",
+    family: liquid,
+    version_range: "LFM2 / LFM2.5 MoE",
+    capabilities: caps(false, false, true, false, false),
+    notes: "LiquidAI short-conv/attention hybrid with sparse MoE",
+    kind: LoadKind::Lfm2Moe,
+};
 static QWEN_VL: BuiltinAdapter = BuiltinAdapter {
     id: "qwen_vl",
     family: qwen_vl,
@@ -387,7 +400,7 @@ static QWEN_VL: BuiltinAdapter = BuiltinAdapter {
     kind: LoadKind::QwenVl,
 };
 
-static BUILTINS: [&BuiltinAdapter; 14] = [
+static BUILTINS: [&BuiltinAdapter; 15] = [
     &BONSAI_Q1,
     // Qwen-VL must precede the qwen3_5 adapters: a `qwen3_5_vl` wrapper is an
     // exact match for QWEN_VL and for the nested `qwen3_5` backbone, so equal
@@ -404,6 +417,7 @@ static BUILTINS: [&BuiltinAdapter; 14] = [
     &STARCODER2,
     &LLAVA_QWEN2,
     &DEEPSEEK_V2,
+    &LFM2_MOE,
     &TRANSFORMER_DENSE,
 ];
 
@@ -429,6 +443,7 @@ impl BuiltinAdapter {
             LoadKind::Starcoder2 => model_type == "starcoder2",
             LoadKind::LlavaQwen2 => model_type == "llava-qwen2",
             LoadKind::DeepSeekV2 => model_type == "deepseek_v2",
+            LoadKind::Lfm2Moe => model_type == "lfm2_moe",
             LoadKind::QwenVl => {
                 matches!(
                     text_alias.as_ref(),
@@ -460,7 +475,8 @@ impl BuiltinAdapter {
             | LoadKind::Phi3
             | LoadKind::Starcoder2
             | LoadKind::LlavaQwen2
-            | LoadKind::DeepSeekV2 => false,
+            | LoadKind::DeepSeekV2
+            | LoadKind::Lfm2Moe => false,
         }
     }
 
@@ -649,6 +665,7 @@ impl ModelAdapter for BuiltinAdapter {
                 .map_err(ModelError::Json)
                 .and_then(|args| crate::deepseek_v2::load_deepseek_v2_model_with_args(dir, args))
                 .map(AnyModel::DeepSeekV2),
+            LoadKind::Lfm2Moe => crate::lfm2_moe::load_lfm2_moe_model(dir).map(AnyModel::Lfm2Moe),
             LoadKind::QwenVl => {
                 crate::qwen_vl::load_qwen_vl_model_from_value(dir, &model.raw, disable_vision)
             }
@@ -920,7 +937,7 @@ mod tests {
             .iter()
             .map(|adapter| (adapter.id, adapter.loader_boundary_class()))
             .collect::<Vec<_>>();
-        assert_eq!(inventory.len(), 14);
+        assert_eq!(inventory.len(), 15);
         assert!(inventory.contains(&("qwen3-next", LoaderBoundaryClass::QwenSpecial)));
         assert!(inventory.contains(&("qwen3.5-moe", LoaderBoundaryClass::QwenSpecial)));
         assert!(inventory.contains(&("qwen_vl", LoaderBoundaryClass::FullArtifact)));

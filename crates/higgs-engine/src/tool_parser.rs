@@ -27,6 +27,10 @@
 //! emits every value as a raw string, so values are coerced to JSON types
 //! using the request's declared tool schema ([`ToolSchema`]) when available,
 //! falling back to best-effort parsing otherwise.
+//!
+//! Two unwrapped dialects are also recognised: `MiniCPM` bare
+//! `<function name="…">` blocks, and LFM2's Pythonic list
+//! `<|tool_call_start|>[name(a='x', b=1)]<|tool_call_end|>`.
 
 mod streaming;
 
@@ -74,8 +78,10 @@ pub fn parse_tool_calls(text: &str, schema: Option<&ToolSchema>) -> ToolParseRes
     // wrapper. When there's no wrapper but a function opener is present, take
     // that path; otherwise fall through to the `<tool_call>` scanner (which
     // covers both the JSON and Qwen `<function=` XML inner forms).
-    if !text.contains(TOOL_CALL_OPEN) && text.contains(MINICPM_FUNCTION_OPEN) {
-        return parse_minicpm_tool_calls(text, schema);
+    if !text.contains(TOOL_CALL_OPEN) {
+        if let Some(dialect) = Bare::ALL.into_iter().find(|d| text.contains(d.opener())) {
+            return parse_bare_tool_calls(text, dialect, schema);
+        }
     }
 
     let mut result_text = String::new();
@@ -148,6 +154,10 @@ const MINICPM_FUNCTION_OPEN: &str = "<function ";
 const MINICPM_PARAM_OPEN: &str = "<param name=\"";
 const MINICPM_PARAM_CLOSE: &str = "</param>";
 const NAME_ATTR: &str = "name=\"";
+
+// LFM2-style Pythonic tool calls: `<|tool_call_start|>[f(a='x', b=1), g()]<|tool_call_end|>`.
+const PYTHONIC_OPEN: &str = "<|tool_call_start|>";
+const PYTHONIC_CLOSE: &str = "<|tool_call_end|>";
 const CDATA_OPEN: &str = "<![CDATA[";
 const CDATA_CLOSE: &str = "]]>";
 
@@ -459,36 +469,177 @@ fn parse_minicpm_function(block: &str, schema: Option<&ToolSchema>) -> Option<Pa
     })
 }
 
-/// Scan text for one or more bare `MiniCPM` `<function …>…</function>` blocks
-/// (no `<tool_call>` wrapper). Text outside the blocks is preserved as visible
-/// content; unparseable or unterminated blocks are preserved verbatim.
-fn parse_minicpm_tool_calls(text: &str, schema: Option<&ToolSchema>) -> ToolParseResult {
+/// Split `s` on `sep` at bracket depth 0, outside quoted strings.
+fn split_top_level(s: &str, sep: char) -> Vec<&str> {
+    let (mut parts, mut start, mut depth) = (Vec::new(), 0, 0_i32);
+    let (mut quote, mut escaped) = (None, false);
+    for (i, ch) in s.char_indices() {
+        match (quote, ch) {
+            (Some(_), _) if escaped => escaped = false,
+            (Some(_), '\\') => escaped = true,
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, '(' | '[' | '{') => depth += 1,
+            (None, ')' | ']' | '}') => depth -= 1,
+            (None, c) if c == sep && depth == 0 => {
+                parts.push(s.get(start..i).unwrap_or_default());
+                start = i + c.len_utf8();
+            }
+            (None, _) => {}
+        }
+    }
+    parts.push(s.get(start..).unwrap_or_default());
+    parts
+}
+
+/// Unquote a Python string literal, reversing the template's escapes.
+fn unquote_python(raw: &str) -> Option<String> {
+    let quote = raw.chars().next().filter(|c| matches!(c, '\'' | '"'))?;
+    let inner = raw.get(1..)?.strip_suffix(quote)?;
+    let (mut out, mut chars) = (String::with_capacity(inner.len()), inner.chars());
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            other => out.push(other),
+        }
+    }
+    Some(out)
+}
+
+/// Convert one Pythonic argument value to JSON, honouring the declared type.
+fn pythonic_value(raw: &str, declared: Option<ParamType>) -> serde_json::Value {
+    if let Some(s) = unquote_python(raw) {
+        return coerce_param_value(&s, Some(declared.unwrap_or(ParamType::Str)));
+    }
+    match raw {
+        "True" => serde_json::Value::Bool(true),
+        "False" => serde_json::Value::Bool(false),
+        "None" => serde_json::Value::Null,
+        _ => coerce_param_value(raw, declared),
+    }
+}
+
+/// Parse one `name(key=value, …)` call.
+fn parse_pythonic_call(call: &str, schema: Option<&ToolSchema>) -> Option<ParsedToolCall> {
+    let open = call.find('(')?;
+    let name = call.get(..open)?.trim();
+    let valid = |c: char| c.is_alphanumeric() || matches!(c, '_' | '.' | '-');
+    if name.is_empty() || !name.chars().all(valid) {
+        return None;
+    }
+    let mut arguments = serde_json::Map::new();
+    for arg in split_top_level(call.get(open + 1..)?.strip_suffix(')')?, ',') {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            continue;
+        }
+        let (key, raw) = arg.split_once('=')?;
+        let key = key.trim();
+        let declared = schema.and_then(|s| s.param_type(name, key));
+        arguments.insert(key.to_owned(), pythonic_value(raw.trim(), declared));
+    }
+    Some(ParsedToolCall {
+        name: name.to_owned(),
+        arguments: serde_json::Value::Object(arguments),
+    })
+}
+
+/// Parse a Pythonic block (`<|tool_call_start|>[f(…), g(…)` without its closer).
+/// All-or-nothing: one malformed call keeps the whole block visible.
+fn parse_pythonic_block(block: &str, schema: Option<&ToolSchema>) -> Option<Vec<ParsedToolCall>> {
+    let body = block.strip_prefix(PYTHONIC_OPEN)?.trim();
+    let body = body.strip_prefix('[')?.strip_suffix(']')?;
+    split_top_level(body, ',')
+        .into_iter()
+        .filter(|call| !call.trim().is_empty())
+        .map(|call| parse_pythonic_call(call.trim(), schema))
+        .collect()
+}
+
+/// Tool-call dialects without a `<tool_call>` wrapper. The opener stays part
+/// of the block handed to [`Bare::parse`]; the closer is consumed separately.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bare {
+    /// `MiniCPM` `<function name="…">…</function>` (one call per block).
+    MiniCpm,
+    /// LFM2 `<|tool_call_start|>[…]<|tool_call_end|>` (a list of calls).
+    Pythonic,
+}
+
+impl Bare {
+    const ALL: [Self; 2] = [Self::MiniCpm, Self::Pythonic];
+
+    const fn opener(self) -> &'static str {
+        match self {
+            Self::MiniCpm => MINICPM_FUNCTION_OPEN,
+            Self::Pythonic => PYTHONIC_OPEN,
+        }
+    }
+
+    const fn closer(self) -> &'static str {
+        match self {
+            Self::MiniCpm => FUNCTION_CLOSE,
+            Self::Pythonic => PYTHONIC_CLOSE,
+        }
+    }
+
+    /// Byte offset of the block's closer, or `None` while it is incomplete.
+    fn block_end(self, s: &str) -> Option<usize> {
+        match self {
+            Self::MiniCpm => minicpm_function_end(s),
+            Self::Pythonic => s.find(PYTHONIC_CLOSE),
+        }
+    }
+
+    fn parse(self, block: &str, schema: Option<&ToolSchema>) -> Option<Vec<ParsedToolCall>> {
+        match self {
+            Self::MiniCpm => parse_minicpm_function(block, schema).map(|call| vec![call]),
+            Self::Pythonic => parse_pythonic_block(block, schema),
+        }
+    }
+}
+
+/// Scan text for one or more unwrapped tool-call blocks of `dialect`. Text
+/// outside the blocks is preserved as visible content; unparseable or
+/// unterminated blocks are preserved verbatim.
+fn parse_bare_tool_calls(
+    text: &str,
+    dialect: Bare,
+    schema: Option<&ToolSchema>,
+) -> ToolParseResult {
     let mut result_text = String::new();
     let mut tool_calls = Vec::new();
     let mut remaining = text;
 
     loop {
-        let Some(start) = remaining.find(MINICPM_FUNCTION_OPEN) else {
+        let Some(start) = remaining.find(dialect.opener()) else {
             result_text.push_str(remaining);
             break;
         };
         result_text.push_str(remaining.get(..start).unwrap_or_default());
         let block_region = remaining.get(start..).unwrap_or_default();
 
-        let Some(end) = minicpm_function_end(block_region) else {
+        let Some(end) = dialect.block_end(block_region) else {
             result_text.push_str(block_region);
             break;
         };
 
         let block = block_region.get(..end).unwrap_or_default();
-        if let Some(parsed) = parse_minicpm_function(block, schema) {
-            tool_calls.push(parsed);
+        if let Some(parsed) = dialect.parse(block, schema) {
+            tool_calls.extend(parsed);
         } else {
             result_text.push_str(block);
-            result_text.push_str(FUNCTION_CLOSE);
+            result_text.push_str(dialect.closer());
         }
         remaining = block_region
-            .get(end + FUNCTION_CLOSE.len()..)
+            .get(end + dialect.closer().len()..)
             .unwrap_or_default();
     }
 
@@ -515,12 +666,19 @@ pub struct StreamingToolOutput {
 }
 
 /// Longest opener token. In the scanning state the tracker keeps this many
-/// bytes at the buffer tail so a `<tool_call>` or `<function ` opener split
-/// across a chunk boundary is still detected next chunk.
-const MAX_OPENER_LEN: usize = if TOOL_CALL_OPEN.len() > MINICPM_FUNCTION_OPEN.len() {
-    TOOL_CALL_OPEN.len()
-} else {
-    MINICPM_FUNCTION_OPEN.len()
+/// bytes at the buffer tail so an opener split across a chunk boundary is
+/// still detected next chunk.
+const MAX_OPENER_LEN: usize = {
+    let mut max = TOOL_CALL_OPEN.len();
+    let mut i = 0;
+    while i < Bare::ALL.len() {
+        let len = Bare::ALL[i].opener().len();
+        if len > max {
+            max = len;
+        }
+        i += 1;
+    }
+    max
 };
 
 /// Which kind of tool-call block the tracker is currently inside.
@@ -530,8 +688,8 @@ enum Inside {
     None,
     /// Inside a `<tool_call>…</tool_call>` block (JSON or Qwen `<function=` XML).
     ToolCall,
-    /// Inside a bare `MiniCPM` `<function …>…</function>` block.
-    Function,
+    /// Inside an unwrapped block whose opener is kept in the buffer.
+    Bare(Bare),
 }
 
 /// State machine that buffers streaming text chunks and extracts tool-call
@@ -592,16 +750,12 @@ impl StreamingToolCallTracker {
     /// `ToolCall`/`Function` — or flush all-but-tail and signal "wait".
     /// Returns `true` to keep looping, `false` to break (need more input).
     fn scan_for_opener(&mut self, out: &mut StreamingToolOutput) -> bool {
-        let tc = self.buffer.find(TOOL_CALL_OPEN);
-        let fc = self.buffer.find(MINICPM_FUNCTION_OPEN);
-        // Enter whichever opener appears first; `(pos, is_tool_call)`.
-        let pick = match (tc, fc) {
-            (Some(t), Some(f)) => Some(if f < t { (f, false) } else { (t, true) }),
-            (Some(t), None) => Some((t, true)),
-            (None, Some(f)) => Some((f, false)),
-            (None, None) => None,
-        };
-        let Some((pos, is_tool_call)) = pick else {
+        // Enter whichever opener appears first (`<tool_call>` wins ties).
+        let pick = std::iter::once((TOOL_CALL_OPEN, Inside::ToolCall))
+            .chain(Bare::ALL.map(|d| (d.opener(), Inside::Bare(d))))
+            .filter_map(|(opener, inside)| Some((self.buffer.find(opener)?, inside)))
+            .min_by_key(|&(pos, _)| pos);
+        let Some((pos, inside)) = pick else {
             // No opener yet — flush all but a tail large enough to hold a
             // split opener, walking back to a UTF-8 char boundary.
             if self.buffer.len() > MAX_OPENER_LEN {
@@ -618,19 +772,15 @@ impl StreamingToolCallTracker {
         };
         out.visible
             .push_str(self.buffer.get(..pos).unwrap_or_default());
-        if is_tool_call {
-            // Strip the `<tool_call>` opener; the inner body is parsed at the closer.
-            self.buffer = self
-                .buffer
-                .get(pos + TOOL_CALL_OPEN.len()..)
-                .unwrap_or_default()
-                .to_owned();
-            self.inside = Inside::ToolCall;
+        // Strip the `<tool_call>` opener (its inner body is parsed at the
+        // closer); bare dialects keep theirs for the block parser.
+        let skip = if inside == Inside::ToolCall {
+            TOOL_CALL_OPEN.len()
         } else {
-            // Keep the `<function …` opener for the block parser.
-            self.buffer = self.buffer.get(pos..).unwrap_or_default().to_owned();
-            self.inside = Inside::Function;
-        }
+            0
+        };
+        self.buffer = self.buffer.get(pos + skip..).unwrap_or_default().to_owned();
+        self.inside = inside;
         true
     }
 
@@ -684,27 +834,26 @@ impl StreamingToolCallTracker {
                         break;
                     }
                 }
-                Inside::Function => {
-                    // The `<function …` opener is kept in the buffer so the
-                    // block parser can read the `name="…"` attribute. Seek a
-                    // CDATA-aware `</function>`.
-                    if let Some(end) = minicpm_function_end(&self.buffer) {
+                Inside::Bare(dialect) => {
+                    // The opener is kept in the buffer so the block parser can
+                    // read it (e.g. `MiniCPM`'s `name="…"` attribute).
+                    if let Some(end) = dialect.block_end(&self.buffer) {
                         let block = self.buffer.get(..end).unwrap_or_default();
-                        if let Some(parsed) = parse_minicpm_function(block, self.schema.as_ref()) {
-                            out.new_tool_calls.push(parsed);
-                            self.completed_count += 1;
+                        if let Some(parsed) = dialect.parse(block, self.schema.as_ref()) {
+                            self.completed_count += parsed.len();
+                            out.new_tool_calls.extend(parsed);
                         } else {
                             out.visible.push_str(block);
-                            out.visible.push_str(FUNCTION_CLOSE);
+                            out.visible.push_str(dialect.closer());
                         }
                         self.buffer = self
                             .buffer
-                            .get(end + FUNCTION_CLOSE.len()..)
+                            .get(end + dialect.closer().len()..)
                             .unwrap_or_default()
                             .to_owned();
                         self.inside = Inside::None;
                     } else if self.buffer.len() > MAX_INSIDE_TOOL_CALL_BYTES {
-                        // Overflow guard: `<function …` opened, never closed.
+                        // Overflow guard: opened, never closed.
                         let leftover = std::mem::take(&mut self.buffer);
                         out.visible.push_str(&leftover);
                         self.inside = Inside::None;
@@ -740,9 +889,9 @@ impl StreamingToolCallTracker {
                 v.push_str(&leftover);
                 v
             }
-            // `Function` keeps its `<function …` opener in the buffer, and
-            // `None` is plain text — both emit the leftover verbatim.
-            Inside::Function | Inside::None => leftover,
+            // Bare dialects keep their opener in the buffer, and `None` is
+            // plain text — both emit the leftover verbatim.
+            Inside::Bare(_) | Inside::None => leftover,
         };
 
         StreamingToolOutput {
@@ -1532,5 +1681,79 @@ After last."#;
         assert_eq!(calls[0].name, "run");
         assert_eq!(calls[0].arguments, serde_json::json!({ "cmd": "echo hi" }));
         assert_eq!(t.completed_count(), 1);
+    }
+
+    #[test]
+    fn pythonic_calls_parse_to_json_arguments() {
+        let text = concat!(
+            "Let me check. <|tool_call_start|>[read_file(path='src/a b.rs', limit=20), ",
+            r#"run(cmd='echo \'hi\'\nls', opts={"cwd": "/tmp", "env": [1, 2]}, dry=True, t=None), "#,
+            "now()]<|tool_call_end|> Done."
+        );
+        let r = parse_tool_calls(text, None);
+        assert_eq!(r.text, "Let me check.  Done.");
+        let got: Vec<_> = r
+            .tool_calls
+            .iter()
+            .map(|c| (c.name.as_str(), c.arguments.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "read_file",
+                    serde_json::json!({"path": "src/a b.rs", "limit": 20})
+                ),
+                (
+                    "run",
+                    serde_json::json!({"cmd": "echo 'hi'\nls", "opts": {"cwd": "/tmp", "env": [1, 2]},
+                                       "dry": true, "t": null})
+                ),
+                ("now", serde_json::json!({})),
+            ]
+        );
+    }
+
+    #[test]
+    fn pythonic_schema_coercion_and_malformed_passthrough() {
+        let tools = [
+            serde_json::json!({"type": "function", "function": {"name": "f",
+            "parameters": {"properties": {"n": {"type": "integer"}, "s": {"type": "string"}}}}}),
+        ];
+        let schema = ToolSchema::from_tools(Some(&tools));
+        let r = parse_tool_calls(
+            "<|tool_call_start|>[f(n='7', s=42)]<|tool_call_end|>",
+            schema.as_ref(),
+        );
+        assert_eq!(
+            r.tool_calls[0].arguments,
+            serde_json::json!({"n": 7, "s": "42"})
+        );
+
+        let bad = "<|tool_call_start|>[f(n=1), not a call]<|tool_call_end|>";
+        let r = parse_tool_calls(bad, None);
+        assert!(r.tool_calls.is_empty());
+        assert_eq!(r.text, bad, "malformed block must stay visible verbatim");
+    }
+
+    #[test]
+    fn streaming_pythonic_split_across_chunks() {
+        let mut t = StreamingToolCallTracker::new(true, None);
+        let (vis, calls) = drain_visible_and_calls(
+            &mut t,
+            &[
+                "ok <|tool_",
+                "call_start|>[a(x='1,2'",
+                "), b()]<|tool_call",
+                "_end|> bye",
+            ],
+        );
+        assert_eq!(vis, "ok  bye");
+        assert_eq!(
+            calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(calls[0].arguments, serde_json::json!({"x": "1,2"}));
+        assert_eq!(t.completed_count(), 2);
     }
 }

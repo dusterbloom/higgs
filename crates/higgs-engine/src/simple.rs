@@ -537,6 +537,7 @@ fn any_model_variant_name(model: &AnyModel) -> &'static str {
         AnyModel::QwenVl(_) => "QwenVl",
         AnyModel::DeepSeekV2(_) => "DeepSeekV2",
         AnyModel::BonsaiQ1(_) => "BonsaiQ1",
+        AnyModel::Lfm2Moe(_) => "Lfm2Moe",
     }
 }
 
@@ -14110,7 +14111,9 @@ const MAX_DETOK_WINDOW: usize = 64;
 /// the `<|…|>` chat-control delimiters and the classic `<s>`/`</s>`/`<pad>`/
 /// `<unk>`/`<mask>` sentinels. Content-bearing special tokens (`<think>`,
 /// `<tool_call>`, `MiniCPM`'s `<function>`/`<param>`) deliberately do NOT match,
-/// so they survive decoding and reach the tool-call / reasoning parsers. Shared
+/// nor do `<|…|>` tokens the tokenizer marks non-special (LFM2's
+/// `<|tool_call_start|>`/`<|tool_call_end|>`), so they survive decoding and
+/// reach the tool-call / reasoning parsers. Shared
 /// by the non-streaming decode path ([`SimpleEngine::decode_tokens`]) and the
 /// streaming detokenizer ([`IncrementalDetok`]) so the two strip identically.
 pub(crate) fn content_preserving_skip_ids(
@@ -14120,7 +14123,7 @@ pub(crate) fn content_preserving_skip_ids(
     let mut ids: std::collections::HashSet<u32> = eos_token_ids.iter().copied().collect();
     for (id, added) in tokenizer.get_added_tokens_decoder() {
         let content = added.content.as_str();
-        let is_control = (content.starts_with("<|") && content.ends_with("|>"))
+        let is_control = (added.special && content.starts_with("<|") && content.ends_with("|>"))
             || matches!(content, "<s>" | "</s>" | "<pad>" | "<unk>" | "<mask>");
         if is_control {
             ids.insert(id);
@@ -20567,6 +20570,7 @@ mod tests {
             tokenizers::AddedToken::from("<function>", true),
             tokenizers::AddedToken::from("<tool_call>", true),
         ]);
+        let _ = tok.add_tokens([tokenizers::AddedToken::from("<|tool_call_start|>", false)]);
         let im_end = tok.token_to_id("<|im_end|>").unwrap();
         let skip = super::content_preserving_skip_ids(&tok, &[im_end, 7]);
 
@@ -20585,6 +20589,10 @@ mod tests {
         assert!(
             !skip.contains(&tok.token_to_id("<tool_call>").unwrap()),
             "<tool_call> preserved"
+        );
+        assert!(
+            !skip.contains(&tok.token_to_id("<|tool_call_start|>").unwrap()),
+            "non-special <|…|> markup (LFM2 tool calls) preserved"
         );
     }
 
