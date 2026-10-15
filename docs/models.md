@@ -22,6 +22,7 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 | Phi-3 | `phi3` | Phi-3 Mini, Small, and Medium |
 | Starcoder2 | `starcoder2` | Starcoder2 3B, 7B, and 15B |
 | DeepSeek-V2 | `deepseek_v2` | DeepSeek-V2-Lite |
+| LFM2-MoE | `lfm2_moe` | LiquidAI LFM2.5-24B-A2B |
 | LLaVA-Qwen2 | `llava-qwen2` | nanoLLaVA-1.5 |
 | Architecture | `model_type` | Examples | Vision |
 |---|---|---|---|
@@ -41,6 +42,7 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 | Phi-3 | `phi3` | Phi-3 Mini, Small, and Medium | none |
 | Starcoder2 | `starcoder2` | Starcoder2 3B, 7B, and 15B | none |
 | DeepSeek-V2 | `deepseek_v2` | DeepSeek-V2-Lite | none |
+| LFM2-MoE | `lfm2_moe` | LiquidAI LFM2.5-24B-A2B | none |
 | LLaVA-Qwen2 | `llava-qwen2` | nanoLLaVA-1.5 | supported |
 
 † `higgs doctor` reports vision at the adapter level. A multimodal `gemma3` /
@@ -53,6 +55,29 @@ pan-and-scan image input; `gemma3_text` / `gemma4_text` checkpoints show
 describes a text-only backbone; the vision tower bundled with the base
 Qwen3.8-27B model is not part of this Q2 pack, so there is nothing for Higgs
 to skip. See [Bonsai-2 Hadamard Q2 notes](#bonsai-2-hadamard-q2-notes) below.
+
+### LFM2-MoE notes
+
+`lfm2_moe` (LiquidAI LFM2.5-24B-A2B: gated short-conv + GQA hybrid, 64
+sigmoid-routed experts, top-4) matches mlx-lm >= 0.32 on the shipped 4-bit
+weights: with f32 activations the logits agree to KL ~5e-8 (100% top-1), and
+in bf16 higgs sits within mlx-lm's own rounding noise. Re-check with
+`scripts/lfm2_parity.py` (reference, `examples/lfm2_logits.rs`, compare) and
+`tests/lfm2_template.rs` (byte-exact chat template vs HF).
+
+It is a pure reasoning model: the template always opens `<think>`, so higgs
+reports `thinking: always`, parses reasoning into `reasoning_content`, and does
+not cap reasoning unless a request sets `reasoning_budget`. Give it room —
+4096 `max_tokens` truncated ~8% of IFEval prompts. Model-card sampling:
+
+```toml
+generation_defaults = { max_tokens = 16384, temperature = 0.1, top_k = 50, repetition_penalty = 1.05 }
+```
+
+IFEval (first 100, prompt-level strict, greedy, 16K budget): 98% vs 96.75%
+on the bf16 model card. M4 10-core / 32 GB, AC power: decode 59.6 tok/s
+(≤1.5K ctx), 46 tok/s at 21K ctx; prefill ~500 tok/s at 2K-8K. Decode is
+~97% weight-reading qmv/gather kernels (16.3 of 17.1 ms/token).
 
 ### Gemma 3 / Gemma 4 notes
 

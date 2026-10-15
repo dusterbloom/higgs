@@ -62,3 +62,12 @@ quantization = "8bit"
 approx_size_gb = 27.0
 context = 32768
 tags = ["large", "dense", "mtp", "qwen3next"]
+
+[[models]]
+key = "lfm2.5-24b-a2b-4bit"
+label = "LFM2.5-24B-A2B 4-bit (hybrid conv/attn MoE)"
+path = "LiquidAI/LFM2.5-24B-A2B-MLX-4bit"
+quantization = "4bit"
+approx_size_gb = 13.6
+context = 131072
+tags = ["medium", "moe", "hybrid", "reasoning"]
