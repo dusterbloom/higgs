@@ -1781,6 +1781,22 @@ pub(crate) fn try_eval_deep_clone(a: &Array) -> Result<Array, Exception> {
     crate::metal_kernel::materialized_device_copy(a)
 }
 
+/// Compact, independently owned device copies of `arrays`, evaluated in one
+/// batch.
+///
+/// Long-lived stores must hold these instead of slices: an MLX slice is a view
+/// that keeps its whole parent allocation alive, so a cached 32-token block
+/// cut from a 20K-token KV would pin all 20K tokens while reporting 32.
+pub fn compact_copies(arrays: &[&Array]) -> Result<Vec<Array>, Exception> {
+    let copies = arrays
+        .iter()
+        .map(|a| crate::metal_kernel::materialized_device_copy_lazy(a))
+        .collect::<Result<Vec<_>, _>>()?;
+    let _token = (!crate::mlx_exec::held()).then(crate::mlx_exec::acquire);
+    crate::mlx_exec::eval(&copies)?;
+    Ok(copies)
+}
+
 /// Write `update` into `target` at `[..., start:start+n, ...]` on axis 2.
 #[allow(unsafe_code, clippy::indexing_slicing)]
 fn slice_update_axis2(

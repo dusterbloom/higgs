@@ -1197,6 +1197,7 @@ fn edge_blocks_from(
 ) -> EdgeData {
     blocks.map_or(EdgeData::None, |layers| {
         let tokens = layer_run_tokens(&layers);
+        let layers = compact_layers(layers);
         EdgeData::Paged(EdgeBlocks {
             layers,
             tokens,
@@ -1204,6 +1205,79 @@ fn edge_blocks_from(
             hybrid,
         })
     })
+}
+
+/// Replace incoming blocks with compact copies as they become trie storage.
+///
+/// Incoming blocks are slices of the stored cache, and an MLX slice keeps its
+/// whole parent allocation alive: a turn's 32-token tail block would pin that
+/// turn's entire KV while the ledger counts 32 tokens, so a growing chat
+/// leaked ~one full KV per turn past the byte budget. Copying here, after
+/// dedup dropped the shared span, copies only the blocks the trie keeps.
+/// On copy failure the views are kept: correct data, just over-retained.
+fn compact_layers(layers: Vec<CachedLayerData>) -> Vec<CachedLayerData> {
+    let mut sources: Vec<&Array> = Vec::new();
+    for layer in &layers {
+        match layer {
+            CachedLayerData::Kv(blocks) => {
+                for b in blocks {
+                    sources.extend([&b.keys, &b.values]);
+                }
+            }
+            CachedLayerData::TurboQuantKv(blocks) => {
+                for b in blocks {
+                    sources.extend([
+                        &b.key_codes,
+                        &b.key_norms,
+                        &b.key_gammas,
+                        &b.value_codes,
+                        &b.value_norms,
+                    ]);
+                }
+            }
+            CachedLayerData::Empty => {}
+        }
+    }
+    let copies = match higgs_models::cache::compact_copies(&sources) {
+        Ok(copies) => copies,
+        Err(error) => {
+            tracing::warn!(%error, "prefix cache block compaction failed; keeping slice views");
+            return layers;
+        }
+    };
+    let mut copies = copies.into_iter();
+    let mut next = || copies.next().expect("one copy per source array");
+    layers
+        .into_iter()
+        .map(|layer| match layer {
+            CachedLayerData::Kv(blocks) => CachedLayerData::Kv(
+                blocks
+                    .iter()
+                    .map(|_| {
+                        Arc::new(KvBlock {
+                            keys: next(),
+                            values: next(),
+                        })
+                    })
+                    .collect(),
+            ),
+            CachedLayerData::TurboQuantKv(blocks) => CachedLayerData::TurboQuantKv(
+                blocks
+                    .iter()
+                    .map(|_| {
+                        Arc::new(TqBlock {
+                            key_codes: next(),
+                            key_norms: next(),
+                            key_gammas: next(),
+                            value_codes: next(),
+                            value_norms: next(),
+                        })
+                    })
+                    .collect(),
+            ),
+            CachedLayerData::Empty => CachedLayerData::Empty,
+        })
+        .collect()
 }
 
 /// Number of tokens a per-layer block run covers (block count x block size,
@@ -2996,6 +3070,62 @@ mod tests {
         assert_eq!(cache.max_cached, 0);
         cache.set_capacity_max_bytes(4096);
         assert_eq!(cache.max_cached, 7);
+    }
+
+    /// The cache may keep alive only what its byte ledger accounts for. A
+    /// growing conversation stores a fresh full-length KV each turn; radix dedup
+    /// keeps just the new tail blocks, so if those blocks are views into the
+    /// source buffer they pin the whole turn's KV while the ledger counts one
+    /// block (LFM2: 13 GB → 26 GB over 50 turns under a 1 GiB budget).
+    #[test]
+    #[allow(unsafe_code)]
+    fn stored_blocks_retain_no_more_memory_than_accounted() {
+        let active_bytes = || {
+            let mut bytes = 0usize;
+            assert_eq!(unsafe { mlx_sys::mlx_get_active_memory(&raw mut bytes) }, 0);
+            bytes as i64
+        };
+        // Real (non-broadcast) data so every array owns a full-size buffer.
+        let kv = |seq_len: i32| {
+            let make = || {
+                let n = 8 * seq_len * 128;
+                let a = mlx_rs::ops::arange::<_, f32>(0, n, None)
+                    .unwrap()
+                    .reshape(&[1, 8, seq_len, 128])
+                    .unwrap();
+                a.eval().unwrap();
+                a
+            };
+            AnyCache::KV(vec![Some(
+                SteppingKeyValueCache::from_arrays(make(), make()).unwrap(),
+            )])
+        };
+        // Keep two endpoints, like a long chat evicting its older turns.
+        let mut cache = PagedPrefixCache::new(2, 32);
+        let before = active_bytes();
+        for turn in 0..8 {
+            let len = 1024 + 32 * turn;
+            let tokens: Vec<u32> = (0..len as u32).collect();
+            cache.store(&tokens, &kv(len)); // source cache dropped here
+        }
+        let resident = cache.radix_byte_stats().resident_bytes as i64;
+        assert!(resident > 0);
+        // Metal releases a dropped source's buffer from its completion handler,
+        // shortly after eval returns; wait for it rather than racing it.
+        let slack = 1 << 20;
+        let mut retained = active_bytes() - before;
+        for _ in 0..200 {
+            if retained <= resident + slack {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            retained = active_bytes() - before;
+        }
+        assert!(
+            retained <= resident + slack,
+            "cache retains {retained} B but holds {resident} B of blocks: stored blocks \
+             pin their source buffers"
+        );
     }
 
     #[test]
