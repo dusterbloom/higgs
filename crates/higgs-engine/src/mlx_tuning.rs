@@ -594,6 +594,8 @@ impl EngineCostDescription {
                 return None;
             }
             layers / interval
+        } else if let Some(full) = metadata.full_attention_layers {
+            u64::try_from(full).ok()?
         } else {
             layers
         };
@@ -609,6 +611,15 @@ impl EngineCostDescription {
         let recurrent_layers = layers.checked_sub(dense_layers)?;
         let recurrent_fixed_bytes = if recurrent_layers == 0 {
             0
+        } else if metadata.linear_num_key_heads.is_none() {
+            // LFM2 short-conv layers: `conv_L_cache - 1` rows of `hidden_size`,
+            // charged at f32 like the GDN state below.
+            let hidden = u64::try_from(metadata.hidden_size?).ok()?;
+            let rows = u64::try_from(metadata.conv_l_cache?).ok()?.checked_sub(1)?;
+            recurrent_layers
+                .checked_mul(rows)?
+                .checked_mul(hidden)?
+                .checked_mul(4)?
         } else {
             let key_heads = u64::try_from(metadata.linear_num_key_heads?).ok()?;
             let value_heads = u64::try_from(metadata.linear_num_value_heads?).ok()?;
@@ -770,6 +781,11 @@ struct ModelMetadata {
     linear_key_head_dim: Option<usize>,
     linear_value_head_dim: Option<usize>,
     linear_conv_kernel_dim: Option<usize>,
+    /// Count of `"full_attention"` entries in `layer_types` (LFM2-style hybrids
+    /// list their layout instead of a `full_attention_interval`).
+    full_attention_layers: Option<usize>,
+    /// LFM2 short-conv window; its recurrent state keeps `conv_L_cache - 1` rows.
+    conv_l_cache: Option<usize>,
     max_position_embeddings: Option<usize>,
     weight_bytes: Option<u64>,
 }
@@ -795,7 +811,13 @@ impl ModelMetadata {
                 .and_then(|v| usize::try_from(v).ok()),
             num_key_value_heads: config_lookup_u64(&config, "num_key_value_heads")
                 .and_then(|v| usize::try_from(v).ok()),
-            head_dim: config_lookup_u64(&config, "head_dim").and_then(|v| usize::try_from(v).ok()),
+            // HF default when absent: hidden_size / num_attention_heads.
+            head_dim: config_lookup_u64(&config, "head_dim")
+                .or_else(|| {
+                    config_lookup_u64(&config, "hidden_size")?
+                        .checked_div(config_lookup_u64(&config, "num_attention_heads")?)
+                })
+                .and_then(|v| usize::try_from(v).ok()),
             full_attention_interval: config_lookup_u64(&config, "full_attention_interval")
                 .and_then(|v| usize::try_from(v).ok()),
             linear_num_value_heads: config_lookup_u64(&config, "linear_num_value_heads")
@@ -807,6 +829,28 @@ impl ModelMetadata {
             linear_value_head_dim: config_lookup_u64(&config, "linear_value_head_dim")
                 .and_then(|v| usize::try_from(v).ok()),
             linear_conv_kernel_dim: config_lookup_u64(&config, "linear_conv_kernel_dim")
+                .and_then(|v| usize::try_from(v).ok()),
+            // Only a recurrent layout (attention + conv/linear layers) counts:
+            // sliding-window attention (Gemma) still keeps per-token KV.
+            full_attention_layers: config
+                .get("layer_types")
+                .or_else(|| config.get("text_config")?.get("layer_types"))
+                .and_then(serde_json::Value::as_array)
+                .filter(|types| {
+                    types.iter().all(|t| {
+                        matches!(
+                            t.as_str(),
+                            Some("full_attention" | "conv" | "linear_attention")
+                        )
+                    })
+                })
+                .map(|types| {
+                    types
+                        .iter()
+                        .filter(|t| t.as_str() == Some("full_attention"))
+                        .count()
+                }),
+            conv_l_cache: config_lookup_u64(&config, "conv_L_cache")
                 .and_then(|v| usize::try_from(v).ok()),
             max_position_embeddings: config_lookup_u64(&config, "max_position_embeddings")
                 .and_then(|v| usize::try_from(v).ok()),
@@ -2246,6 +2290,60 @@ mod tests {
         assert_eq!(cost.persistent_bytes_per_token, 20_480);
         assert!(cost.fixed_live_session_bytes > 0);
         assert_eq!(cost.persistent_bytes(49_152), Some(960 * 1024 * 1024));
+        Ok(())
+    }
+
+    /// A `layer_types` layout charges per-token KV only to its attention
+    /// layers when the rest are recurrent (LFM2 conv), but to every layer when
+    /// the rest are sliding-window attention; a missing `head_dim` is
+    /// `hidden_size / num_attention_heads`.
+    #[test]
+    fn layer_types_geometry_charges_only_kv_keeping_layers() -> std::io::Result<()> {
+        let geometry = |layer_kind: &str| -> std::io::Result<EngineCostDescription> {
+            let temp = TempDir::new().map_err(std::io::Error::other)?;
+            let layer_types: Vec<&str> = (0..40)
+                .map(|i| {
+                    if i % 4 == 2 {
+                        "full_attention"
+                    } else {
+                        layer_kind
+                    }
+                })
+                .collect();
+            write_json(
+                &temp.path().join("config.json"),
+                &serde_json::json!({
+                    "model_type": "lfm2_moe",
+                    "num_hidden_layers": 40,
+                    "hidden_size": 2048,
+                    "num_attention_heads": 32,
+                    "num_key_value_heads": 8,
+                    "conv_L_cache": 3,
+                    "layer_types": layer_types,
+                }),
+            )?;
+            let transient = TransientPrefillEstimate {
+                base_bytes: 0,
+                bytes_per_prompt_token: 0,
+                bytes_per_chunk_token: 0,
+                max_prompt_tokens: 131_072,
+                max_chunk_tokens: 4_096,
+            };
+            Ok(
+                EngineCostDescription::fp16_from_model_dir(temp.path(), 0, 0, transient)
+                    .expect("complete layer_types geometry"),
+            )
+        };
+
+        // 10 attention layers x K+V x 8 heads x 64 dims x 2 bytes.
+        let conv = geometry("conv")?;
+        assert_eq!(conv.persistent_bytes_per_token, 20_480);
+        // 30 conv layers x 2 rows x 2048 hidden x 4 bytes.
+        assert_eq!(conv.fixed_live_session_bytes, 491_520);
+
+        let sliding = geometry("sliding_attention")?;
+        assert_eq!(sliding.persistent_bytes_per_token, 81_920);
+        assert_eq!(sliding.fixed_live_session_bytes, 0);
         Ok(())
     }
 
