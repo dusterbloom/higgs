@@ -347,40 +347,6 @@ impl AnyCache {
         targets
     }
 
-    /// Approximate resident byte size of the KV state (keys + values + any
-    /// TurboQuant storage). Conservative: counts every layer's full K/V
-    /// buffers, so shared/overlapping prefixes are over-counted across
-    /// entries — a safe upper bound for a size budget that must never
-    /// under-evict.
-    #[must_use]
-    pub fn approx_bytes(&self) -> usize {
-        let mut total = 0usize;
-        match self {
-            Self::KV(layers) => {
-                for layer in layers.iter().flatten() {
-                    total = total.saturating_add(layer.keys().map(|a| a.nbytes()).unwrap_or(0));
-                    total = total.saturating_add(layer.values().map(|a| a.nbytes()).unwrap_or(0));
-                    if let Some((_, kc, kn, kg, vc, vn)) = layer.turbo_arrays() {
-                        total = total.saturating_add(kc.nbytes());
-                        total = total.saturating_add(kn.nbytes());
-                        total = total.saturating_add(kg.nbytes());
-                        total = total.saturating_add(vc.nbytes());
-                        total = total.saturating_add(vn.nbytes());
-                    }
-                }
-            }
-            Self::Hybrid(layers) => {
-                for layer in layers.iter().flatten() {
-                    if let LayerCache::KV(kv) = layer {
-                        total = total.saturating_add(kv.keys().map(|a| a.nbytes()).unwrap_or(0));
-                        total = total.saturating_add(kv.values().map(|a| a.nbytes()).unwrap_or(0));
-                    }
-                }
-            }
-        }
-        total
-    }
-
     /// Resident token count (the dense KV offset) of the first KV layer, or 0.
     /// All KV layers advance in lockstep, so layer 0 is representative.
     #[must_use]
@@ -618,6 +584,37 @@ impl AnyCache {
                 })
             }),
         }
+    }
+
+    /// Give recurrent (conv/SSM) state its own compact storage, so a cache can
+    /// be kept across requests without pinning more than `estimated_bytes`.
+    ///
+    /// That state is routinely a slice of a prompt-sized buffer (a prefill's
+    /// conv rows are the tail of `concat(state, chunk)`; replayed SSM states
+    /// slice one all-layer output), and an MLX slice keeps its whole parent
+    /// alive. KV buffers need no copy: `SteppingKeyValueCache` builds them by
+    /// `slice_update`/concat, so they already own exactly what they count.
+    /// Every long-lived store must call this when it takes ownership.
+    pub fn compact_state(&mut self) -> Result<(), Exception> {
+        let Self::Hybrid(layers) = self else {
+            return Ok(());
+        };
+        let mut slots: Vec<&mut Array> = layers
+            .iter_mut()
+            .flatten()
+            .filter_map(|layer| match layer {
+                LayerCache::Arrays(arrays) => Some(arrays),
+                LayerCache::KV(_) => None,
+            })
+            .flat_map(|arrays| [arrays.conv_state.as_mut(), arrays.ssm_state.as_mut()])
+            .flatten()
+            .collect();
+        let sources: Vec<&Array> = slots.iter().map(|slot| &**slot).collect();
+        let copies = cache::compact_copies(&sources)?;
+        for (slot, copy) in slots.iter_mut().zip(copies) {
+            **slot = copy;
+        }
+        Ok(())
     }
 
     /// Borrow the inner hybrid (KV+SSM) cache slice; errors on a KV-only cache.

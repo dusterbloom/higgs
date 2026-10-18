@@ -235,12 +235,17 @@ impl PrefixCache {
     }
 
     /// Store a prefix and its cache state.
-    pub fn store(&mut self, prefix_tokens: &[u32], cache: AnyCache) {
+    pub fn store(&mut self, prefix_tokens: &[u32], mut cache: AnyCache) {
         if self.max_cached == 0 {
             return;
         }
+        // Kept across requests: must not pin prefill-sized state buffers.
+        if let Err(error) = cache.compact_state() {
+            tracing::warn!(%error, "prefix cache state compaction failed; not storing");
+            return;
+        }
 
-        let bytes = cache.approx_bytes();
+        let bytes = cache.estimated_bytes();
         let outcome = Self::insert(&mut self.root, prefix_tokens, 0, cache);
 
         if outcome.added {
@@ -275,7 +280,7 @@ impl PrefixCache {
             });
             return InsertOutcome {
                 added: is_new,
-                replaced_bytes: previous.map_or(0, |state| state.cache.approx_bytes()),
+                replaced_bytes: previous.map_or(0, |state| state.cache.estimated_bytes()),
             };
         }
 
@@ -368,7 +373,7 @@ impl PrefixCache {
         };
         if let Some(evicted) = self.root.remove_cached_with_time(oldest) {
             self.num_cached -= 1;
-            self.total_bytes = self.total_bytes.saturating_sub(evicted.approx_bytes());
+            self.total_bytes = self.total_bytes.saturating_sub(evicted.estimated_bytes());
             self.root.prune();
             true
         } else {
@@ -425,7 +430,7 @@ mod tests {
     fn test_size_aware_eviction_drops_lru_over_budget() {
         // Each entry is ~2048 bytes; a 3000-byte budget holds only one entry.
         let entry = make_sized_cache(2048);
-        let per_entry = entry.approx_bytes();
+        let per_entry = entry.estimated_bytes();
         assert!(per_entry > 0, "sized cache must report non-zero bytes");
 
         let mut cache = PrefixCache::new(100).with_max_bytes(3000);
@@ -471,7 +476,7 @@ mod tests {
     fn test_overwrite_and_clear_keep_byte_ledger_coherent() {
         let small = make_sized_cache(1024);
         let large = make_sized_cache(4096);
-        let large_bytes = large.approx_bytes();
+        let large_bytes = large.estimated_bytes();
         let mut cache = PrefixCache::new(100);
 
         cache.store(&[1, 2, 3], small);

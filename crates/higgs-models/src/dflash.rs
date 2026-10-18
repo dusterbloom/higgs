@@ -1337,8 +1337,8 @@ impl DFlashSnapshot {
             .map(|layer| {
                 layer.as_ref().map_or(Ok(None), |(keys, values)| {
                     Ok(Some((
-                        try_eval_device_copy(keys)?,
-                        try_eval_device_copy(values)?,
+                        crate::cache::try_eval_deep_clone(keys)?,
+                        crate::cache::try_eval_deep_clone(values)?,
                     )))
                 })
             })
@@ -1346,7 +1346,7 @@ impl DFlashSnapshot {
         let pending_taps = self
             .pending_taps
             .as_ref()
-            .map(try_eval_device_copy)
+            .map(crate::cache::try_eval_deep_clone)
             .transpose()?;
         Ok(DFlashCache {
             layers,
@@ -1356,27 +1356,6 @@ impl DFlashSnapshot {
             revision: 0,
         })
     }
-}
-
-#[allow(unsafe_code)]
-fn try_eval_device_copy(array: &Array) -> Result<Array, Exception> {
-    let mut result = unsafe { mlx_sys::mlx_array_new() };
-    let status = unsafe {
-        mlx_sys::mlx_copy(
-            &raw mut result,
-            array.as_ptr(),
-            mlx_rs::Stream::task_local_or_default().as_ptr(),
-        )
-    };
-    if status != 0 {
-        unsafe { mlx_sys::mlx_array_free(result) };
-        return Err(Exception::custom(format!(
-            "failed to copy drafter snapshot array: MLX status {status}"
-        )));
-    }
-    let copy = unsafe { Array::from_ptr(result) };
-    copy.eval()?;
-    Ok(copy)
 }
 
 /// A lazy drafter forward whose cache update has not been published yet.
@@ -1740,7 +1719,11 @@ impl DFlashDrafter {
             offset = end;
         }
         if processed < rows {
-            Ok(Some(raw_taps.index((.., processed.., ..))))
+            // A slice would pin the whole primed tap block (every row of this
+            // prime) for as long as the snapshot lives; keep only the remainder.
+            Ok(Some(crate::metal_kernel::materialized_device_copy_lazy(
+                &raw_taps.index((.., processed.., ..)),
+            )?))
         } else {
             Ok(None)
         }

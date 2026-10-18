@@ -383,10 +383,16 @@ impl SealedPair {
     }
 
     fn from_stamp(
-        target: AnyCache,
+        mut target: AnyCache,
         dflash: DFlashSnapshot,
         stamp: PrefixStamp,
     ) -> Result<Self, PairedCacheError> {
+        // Retained across requests: must not pin prefill-sized state buffers.
+        target
+            .compact_state()
+            .map_err(|error| PairedCacheError::TargetMaterialization {
+                details: error.to_string(),
+            })?;
         let expected = stamp.boundary()?;
         Self::validate_boundaries(&target, dflash.position(), expected)?;
         let metadata = Arc::new(PairMetadata {
@@ -1608,7 +1614,16 @@ pub(crate) struct RetainedTarget {
 }
 
 impl RetainedTarget {
-    fn from_evaluated_tokens(cache: AnyCache, tokens: Vec<u32>) -> Result<Self, PairedCacheError> {
+    fn from_evaluated_tokens(
+        mut cache: AnyCache,
+        tokens: Vec<u32>,
+    ) -> Result<Self, PairedCacheError> {
+        // Retained across requests: must not pin prefill-sized state buffers.
+        cache
+            .compact_state()
+            .map_err(|error| PairedCacheError::TargetMaterialization {
+                details: error.to_string(),
+            })?;
         let stamp = PrefixStamp::from_tokens(tokens);
         let expected = stamp.boundary()?;
         cache

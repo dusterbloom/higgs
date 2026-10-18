@@ -728,13 +728,20 @@ impl SteppingKeyValueCache {
             value_parts.push(slice_axis2(values, b, off)?);
         }
 
+        // A lone surviving part is a slice that would keep the whole old
+        // buffer alive (the rope-shifted key tail is already a fresh array).
         let new_keys = if key_parts.len() == 1 {
-            key_parts.remove(0)
+            let part = key_parts.remove(0);
+            if a > 0 {
+                crate::metal_kernel::materialized_device_copy_lazy(&part)?
+            } else {
+                part
+            }
         } else {
             concatenate_axis(&key_parts, 2)?
         };
         let new_values = if value_parts.len() == 1 {
-            value_parts.remove(0)
+            crate::metal_kernel::materialized_device_copy_lazy(&value_parts.remove(0))?
         } else {
             concatenate_axis(&value_parts, 2)?
         };
@@ -798,7 +805,13 @@ impl SteppingKeyValueCache {
             .keys
             .as_ref()
             .map_or(0, Array::nbytes)
-            .saturating_add(self.values.as_ref().map_or(0, Array::nbytes));
+            .saturating_add(self.values.as_ref().map_or(0, Array::nbytes))
+            .saturating_add(
+                self.mla
+                    .as_ref()
+                    .and_then(|m| m.latent.as_ref())
+                    .map_or(0, Array::nbytes),
+            );
         self.turbo
             .as_ref()
             .map_or(dense, |turbo| dense.saturating_add(turbo.estimated_bytes()))
