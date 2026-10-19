@@ -12513,6 +12513,18 @@ fn qwen3_5_quantization_config(value: &serde_json::Value) -> Option<Quantization
 /// Without this, mixed-precision checkpoints (e.g. AEON mxfp4 + bf16 GDN
 /// dynamics) fail to load because the weight loader can't find `.scales`
 /// for the dense projections.
+/// Projections that may ship dense (weight-only) in mixed-precision packs:
+/// GDN projections, plus the embedding and LM head.
+const DENSE_CANDIDATE_SUFFIXES: [&str; 7] = [
+    ".linear_attn.in_proj_a",
+    ".linear_attn.in_proj_b",
+    ".linear_attn.in_proj_qkv",
+    ".linear_attn.in_proj_z",
+    ".linear_attn.out_proj",
+    "embed_tokens",
+    "lm_head",
+];
+
 fn detect_dense_gdn_projections(
     model_dir: &Path,
     overrides: &mut BTreeMap<String, QuantizationConfig>,
@@ -12545,11 +12557,14 @@ fn detect_dense_gdn_projections(
 
     let mut added = 0usize;
     for weight_key in keys.iter() {
-        // Look for GDN projection weights: ...linear_attn.in_proj_{a,b}.weight
+        // Look for candidate weights: GDN projections, embedding, LM head.
         let Some(base) = strip_prefix(weight_key).strip_suffix(".weight") else {
             continue;
         };
-        if !(base.ends_with(".linear_attn.in_proj_a") || base.ends_with(".linear_attn.in_proj_b")) {
+        if !DENSE_CANDIDATE_SUFFIXES
+            .iter()
+            .any(|suffix| base.ends_with(suffix))
+        {
             continue;
         }
         // If this path is NOT quantized (no .scales key) and not already overridden
@@ -12559,16 +12574,27 @@ fn detect_dense_gdn_projections(
         }
     }
 
-    // Fused construction resolves the concatenated `in_proj_ba` path, so
-    // mirror the split-part overrides onto the fused key when both halves
-    // are dense (the fused loader concatenates weight-only pairs directly).
-    let fused_ba: Vec<String> = overrides
-        .keys()
-        .filter_map(|k| k.strip_suffix(".in_proj_a"))
-        .filter(|prefix| overrides.contains_key(&format!("{prefix}.in_proj_b")))
-        .map(|prefix| format!("{prefix}.in_proj_ba"))
-        .collect();
-    for key in fused_ba {
+    // Fused construction resolves the concatenated `in_proj_ba` / `in_proj_qkvz`
+    // paths, so mirror the split-part overrides onto the fused key when both
+    // halves are dense (the fused loader concatenates weight-only pairs directly).
+    let is_dense = |key: &str| overrides.get(key).is_some_and(|spec| spec.mode.is_dense());
+    let fused: Vec<String> = [
+        ("in_proj_a", "in_proj_b", "in_proj_ba"),
+        ("in_proj_qkv", "in_proj_z", "in_proj_qkvz"),
+    ]
+    .iter()
+    .flat_map(|(first, second, joined)| {
+        overrides
+            .keys()
+            .filter_map(|k| k.strip_suffix(&format!(".{first}")))
+            .filter(|prefix| {
+                is_dense(&format!("{prefix}.{first}")) && is_dense(&format!("{prefix}.{second}"))
+            })
+            .map(|prefix| format!("{prefix}.{joined}"))
+            .collect::<Vec<_>>()
+    })
+    .collect();
+    for key in fused {
         if !overrides.contains_key(&key) {
             overrides.insert(key, dense_spec.clone());
             added += 1;
@@ -27898,9 +27924,24 @@ mod tests {
                 "language_model.model.layers.0.linear_attn.in_proj_a.scales",
                 "language_model.model.layers.0.linear_attn.in_proj_b.weight",
                 "language_model.model.layers.0.linear_attn.in_proj_b.scales",
+                "language_model.model.layers.0.linear_attn.in_proj_qkv.weight",
+                "language_model.model.layers.0.linear_attn.in_proj_qkv.scales",
+                "language_model.model.layers.0.linear_attn.in_proj_z.weight",
+                "language_model.model.layers.0.linear_attn.in_proj_z.scales",
+                "language_model.model.layers.0.linear_attn.out_proj.weight",
+                "language_model.model.layers.0.linear_attn.out_proj.scales",
                 // Layer 1: dense GDN dynamics (bf16: weight only, AEON-style)
                 "language_model.model.layers.1.linear_attn.in_proj_a.weight",
                 "language_model.model.layers.1.linear_attn.in_proj_b.weight",
+                // ...and dense GDN projections (mlx-community MiniCPM-V-4.7
+                // quantizes only MLP/attention, leaving linear_attn in bf16).
+                "language_model.model.layers.1.linear_attn.in_proj_qkv.weight",
+                "language_model.model.layers.1.linear_attn.in_proj_z.weight",
+                "language_model.model.layers.1.linear_attn.out_proj.weight",
+                // Quantized embedding, dense LM head.
+                "language_model.model.embed_tokens.weight",
+                "language_model.model.embed_tokens.scales",
+                "language_model.lm_head.weight",
             ],
         );
 
@@ -27918,8 +27959,13 @@ mod tests {
         for key in [
             "model.layers.1.linear_attn.in_proj_a",
             "model.layers.1.linear_attn.in_proj_b",
+            "model.layers.1.linear_attn.in_proj_qkv",
+            "model.layers.1.linear_attn.in_proj_z",
+            "model.layers.1.linear_attn.out_proj",
             // Synthesized for the fused-projection construction path.
             "model.layers.1.linear_attn.in_proj_ba",
+            "model.layers.1.linear_attn.in_proj_qkvz",
+            "lm_head",
         ] {
             let qc = overrides
                 .get(key)
@@ -27930,7 +27976,11 @@ mod tests {
             !overrides.contains_key("model.layers.0.linear_attn.in_proj_ba"),
             "no fused override synthesized for the quantized layer"
         );
-        assert_eq!(overrides.len(), 3);
+        assert_eq!(
+            overrides.len(),
+            8,
+            "only layer 1 and lm_head are dense: {overrides:?}"
+        );
     }
 
     /// mxfp4 embeddings ship `.weight` + `.scales` only; `biases` stays an
