@@ -72,7 +72,10 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
         // `qwen3_5` VLM wrapper) plus a `modules` manifest that `load_qwen3_5_model`
         // already folds into per-path `QuantSpec.hadamard_block` overrides — no
         // separate loader needed.
-        "prism_hadamard_qwen35" => {
+        // openbmb MiniCPM-V 4.7: a `text_config`-wrapped qwen3_5 backbone
+        // (GDN + full attention) with its own top-level `model_type`. Text-only
+        // serving runs the backbone through the qwen3_5 loader; vision is unused.
+        "prism_hadamard_qwen35" | "minicpmv4_7" => {
             let model = higgs_models::qwen3_next::load_qwen3_5_model(&config.model_dir)
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::Qwen3Next(model))

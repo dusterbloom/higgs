@@ -37,6 +37,7 @@ pub fn is_supported(model_type: &str) -> bool {
             | "qwen3_5"
             | "qwen3_5_moe"
             | "prism_hadamard_qwen35"
+            | "minicpmv4_7"
             | "qwen3_5_vl"
             | "qwen3_vl"
             | "qwen2_5_vl"
@@ -191,6 +192,11 @@ mod tests {
     #[test]
     fn test_is_supported_prism_hadamard_qwen35() {
         assert!(is_supported("prism_hadamard_qwen35"));
+    }
+
+    #[test]
+    fn test_is_supported_minicpmv4_7() {
+        assert!(is_supported("minicpmv4_7"));
     }
 
     #[test]

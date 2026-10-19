@@ -13,6 +13,7 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 | Qwen3.5 (dense) | `qwen3_5` | Qwen3.5 dense MLX checkpoints |
 | Qwen3.5 / Qwen3.6 MoE | `qwen3_5_moe` | Qwen3.5-35B-A3B, Qwen3.6-35B-A3B |
 | Bonsai-2 Hadamard Q2 | `prism_hadamard_qwen35` | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` |
+| MiniCPM-V 4.7 (text) | `minicpmv4_7` | `mlx-community/MiniCPM-V-4.7-1B-4bit` |
 | Qwen3-Next | `qwen3_next` | Qwen3-Coder hybrid checkpoints |
 | Qwen3-MoE | `qwen3_moe` | Qwen3-30B-A3B |
 | Nanbeige | `nanbeige` | Nanbeige4.2 |
@@ -33,6 +34,7 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 | Qwen3.5+ (dense) | `qwen3_5`, `qwen3_5_text` | Qwen3.5 dense checkpoints; Qwen3.8-27B | none |
 | Qwen3.5+ (MoE) | `qwen3_5_moe`, `qwen3_5_text_moe` | Qwen3.5-35B-A3B, Qwen3.6-35B-A3B | none |
 | Bonsai-2 Hadamard Q2 | `prism_hadamard_qwen35` | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` | none‡ |
+| MiniCPM-V 4.7 (text) | `minicpmv4_7` | `mlx-community/MiniCPM-V-4.7-1B-4bit` | tower-ignored |
 | Qwen3-Next | `qwen3_next` | Qwen3-Coder hybrid checkpoints | none |
 | Qwen3-MoE | `qwen3_moe` | Qwen3-30B-A3B | none |
 | Qwen-VL | `qwen3_5_vl`, `qwen3_vl`, `qwen2_5_vl` | Qwen2.5-VL / Qwen3-VL / Qwen3.5-VL | supported |
