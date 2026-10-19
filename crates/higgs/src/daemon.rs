@@ -180,6 +180,8 @@ port = 8000
 # mlx_profile = "auto"
 # Allow loading/unloading models at runtime via POST/DELETE /v1/models.
 # Off by default; protect with server.api_key before enabling.
+# A runtime load whose path matches a [[models]] entry inherits that entry's
+# settings (generation_defaults, kv_*, ...) for any key the request omits.
 # allow_runtime_model_load = false
 
 # --- Local models ---

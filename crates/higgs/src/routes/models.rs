@@ -336,6 +336,42 @@ pub fn available_model_catalog(
     }
 }
 
+/// Fill a runtime load request from the `[[models]]` entry for the same weights.
+///
+/// Keys the request sets win; every other field (`generation_defaults`, `kv_*`,
+/// `mlx_profile`, ...) comes from config.toml. Clients such as nanobot send only
+/// `{path, name}`, so without this a hot-swapped model lost its tuned sampling.
+/// Entries match by resolved path, not name: the path identifies the weights.
+fn merge_configured_model(
+    models: &[ModelConfig],
+    request: serde_json::Value,
+) -> Result<ModelConfig, serde_json::Error> {
+    let serde_json::Value::Object(overrides) = request else {
+        return serde_json::from_value(request);
+    };
+    let request_dir = overrides
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .and_then(canonical_model_dir);
+    let configured = request_dir.and_then(|dir| {
+        models
+            .iter()
+            .find(|model| canonical_model_dir(&model.path).as_ref() == Some(&dir))
+    });
+    let mut merged = match configured {
+        Some(model) => serde_json::to_value(model)?,
+        None => serde_json::Value::Object(serde_json::Map::new()),
+    };
+    if let Some(base) = merged.as_object_mut() {
+        base.extend(overrides);
+    }
+    serde_json::from_value(merged)
+}
+
+fn canonical_model_dir(path: &str) -> Option<PathBuf> {
+    model_resolver::resolve(path).ok()?.canonicalize().ok()
+}
+
 /// `POST /v1/models` -- load a model into GPU memory at runtime.
 ///
 /// Opt-in via `local.allow_runtime_model_load`. The body mirrors a `[[models]]`
@@ -353,7 +389,8 @@ pub async fn load_model(
         ));
     }
 
-    let model_cfg: ModelConfig = serde_json::from_slice(&body)
+    let model_cfg = serde_json::from_slice(&body)
+        .and_then(|request| merge_configured_model(&state.config.models, request))
         .map_err(|e| ServerError::BadRequest(format!("invalid model config: {e}")))?;
 
     // Validate the KV-cache config up front, mirroring `doctor::check_models`.
@@ -1597,5 +1634,51 @@ mod tests {
         })
         .await
         .expect("detached provisional cleanup must retain ownership through cancellation");
+    }
+
+    #[test]
+    fn runtime_load_inherits_configured_entry_for_same_weights() {
+        let configured_dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let configured: ModelConfig = serde_json::from_value(serde_json::json!({
+            "path": configured_dir.path(),
+            "name": "configured-name",
+            "generation_defaults": { "temperature": 0.7, "top_k": 100 },
+        }))
+        .unwrap();
+        let models = [configured];
+
+        // Same weights spelled differently: config fills what the request omits.
+        let merged = merge_configured_model(
+            &models,
+            serde_json::json!({
+                "path": format!("{}/.", configured_dir.path().display()),
+                "name": "client-name",
+            }),
+        )
+        .unwrap();
+        assert_eq!(merged.name.as_deref(), Some("client-name"));
+        assert_eq!(merged.generation_defaults.temperature, Some(0.7));
+        assert_eq!(merged.generation_defaults.top_k, Some(100));
+
+        // A key the request sets wins over the configured one.
+        let merged = merge_configured_model(
+            &models,
+            serde_json::json!({
+                "path": configured_dir.path(),
+                "generation_defaults": { "temperature": 0.1 },
+            }),
+        )
+        .unwrap();
+        assert_eq!(merged.generation_defaults.temperature, Some(0.1));
+
+        // Different weights inherit nothing.
+        let merged =
+            merge_configured_model(&models, serde_json::json!({ "path": other_dir.path() }))
+                .unwrap();
+        assert_eq!(
+            merged.generation_defaults,
+            crate::config::GenerationDefaults::default()
+        );
     }
 }
