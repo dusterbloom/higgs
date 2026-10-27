@@ -1740,7 +1740,13 @@ impl DFlashDrafter {
             offset = end;
         }
         if processed < rows {
-            Ok(Some(raw_taps.index((.., processed.., ..))))
+            // Owned copy: a view of the remainder would keep the whole
+            // combined chunk alive in the cache and in radix snapshots, which
+            // count only the remainder's bytes.
+            let remainder = raw_taps.index((.., processed.., ..));
+            Ok(Some(crate::metal_kernel::materialized_device_copy_lazy(
+                &remainder,
+            )?))
         } else {
             Ok(None)
         }

@@ -284,13 +284,19 @@ static MATERIALIZED_COPY_KERNEL: OnceLock<CachedMetalKernel> = OnceLock::new();
 /// Unlike `mlx_copy` under the pinned MLX 0.30.6 backend, FastMetal custom
 /// outputs cannot alias or donate an input buffer: the backend allocates
 /// exactly `out.nbytes()` before running this bit-preserving identity kernel.
-#[allow(unsafe_code)]
 pub(crate) fn materialized_device_copy(src: &Array) -> Result<Array, Exception> {
+    let result = materialized_device_copy_lazy(src)?;
+    let _token = (!crate::mlx_exec::held()).then(crate::mlx_exec::acquire);
+    crate::mlx_exec::eval([&result])?;
+    Ok(result)
+}
+
+/// [`materialized_device_copy`] without the evaluation, so many copies can
+/// share one evaluation. The fresh allocation happens when it is evaluated.
+#[allow(unsafe_code)]
+pub(crate) fn materialized_device_copy_lazy(src: &Array) -> Result<Array, Exception> {
     if src.size() == 0 {
-        let empty = mlx_rs::ops::zeros_dtype(src.shape(), src.dtype())?;
-        let _token = (!crate::mlx_exec::held()).then(crate::mlx_exec::acquire);
-        crate::mlx_exec::eval([&empty])?;
-        return Ok(empty);
+        return mlx_rs::ops::zeros_dtype(src.shape(), src.dtype());
     }
 
     let element_count = i32::try_from(src.size()).map_err(|_| {
@@ -299,7 +305,7 @@ pub(crate) fn materialized_device_copy(src: &Array) -> Result<Array, Exception> 
     ensure_ffi_error_handler();
 
     let stream = Stream::task_local_or_default();
-    let result = unsafe {
+    unsafe {
         let dtype = mlx_sys::mlx_array_dtype(src.as_ptr());
         let config = mlx_sys::mlx_fast_metal_kernel_config_new();
         let thread_count = element_count.min(256);
@@ -366,12 +372,7 @@ pub(crate) fn materialized_device_copy(src: &Array) -> Result<Array, Exception> 
         mlx_sys::mlx_vector_array_free(inputs_vec);
         mlx_sys::mlx_vector_array_free(outputs_vec);
         result
-    };
-
-    let result = result?;
-    let _token = (!crate::mlx_exec::held()).then(crate::mlx_exec::acquire);
-    crate::mlx_exec::eval([&result])?;
-    Ok(result)
+    }
 }
 
 // ---------------------------------------------------------------------------

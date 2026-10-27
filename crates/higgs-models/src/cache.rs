@@ -1781,6 +1781,23 @@ pub(crate) fn try_eval_deep_clone(a: &Array) -> Result<Array, Exception> {
     crate::metal_kernel::materialized_device_copy(a)
 }
 
+/// Copy each array into its own exact-size device allocation, evaluated in
+/// one batch.
+///
+/// An evaluated MLX slice shares its source allocation, so a long-lived view
+/// keeps the whole source alive; these copies keep only themselves. The caller
+/// must hold the MLX execution gate: this evaluates, and never takes the gate
+/// itself, so it is safe under locks ordered after the gate.
+#[allow(clippy::disallowed_methods)] // caller holds the gate; see doc
+pub fn owned_device_copies(arrays: &[Array]) -> Result<Vec<Array>, Exception> {
+    let copies = arrays
+        .iter()
+        .map(crate::metal_kernel::materialized_device_copy_lazy)
+        .collect::<Result<Vec<_>, _>>()?;
+    mlx_rs::transforms::eval(&copies)?;
+    Ok(copies)
+}
+
 /// Write `update` into `target` at `[..., start:start+n, ...]` on axis 2.
 #[allow(unsafe_code, clippy::indexing_slicing)]
 fn slice_update_axis2(

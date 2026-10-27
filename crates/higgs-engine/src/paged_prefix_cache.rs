@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use higgs_models::cache::{KeyValueCache, SteppingKeyValueCache, slice_axis1, slice_axis2};
+use higgs_models::cache::{
+    KeyValueCache, SteppingKeyValueCache, owned_device_copies, slice_axis1, slice_axis2,
+};
 #[cfg(test)]
 use higgs_models::dflash::{DFlashCache, DFlashSnapshot};
 use higgs_models::qwen3_next::ArraysCache;
@@ -42,6 +44,9 @@ std::thread_local! {
 struct KvBlock {
     keys: Array,
     values: Array,
+    /// Own device allocation (see [`owned_block_views`]); only owned blocks
+    /// may enter the trie.
+    owned: bool,
 }
 
 impl KvBlock {
@@ -52,13 +57,17 @@ impl KvBlock {
     /// below relies on; it costs nothing net (the slice would materialize on
     /// first use anyway) and removes the cross-thread data race on shared graphs.
     #[allow(clippy::disallowed_methods)] // eval-before-share soundness; on-gate in prod, off-gate only in single-threaded radix tests
-    fn new(keys: Array, values: Array) -> Result<Arc<Self>, Exception> {
+    fn new(keys: Array, values: Array, owned: bool) -> Result<Arc<Self>, Exception> {
         // Construction-time soundness eval (eval-before-share). Always reached
         // via `store()` → `run_prefill` under the MLX gate in production; uses
         // the raw transform directly so the radix unit tests (single-threaded,
         // no gate) can construct blocks without tripping the gate's debug_assert.
         mlx_rs::transforms::eval([&keys, &values])?;
-        Ok(Arc::new(Self { keys, values }))
+        Ok(Arc::new(Self {
+            keys,
+            values,
+            owned,
+        }))
     }
 }
 
@@ -89,6 +98,8 @@ struct TqBlock {
     key_gammas: Array,
     value_codes: Array,
     value_norms: Array,
+    /// Own device allocation; see [`KvBlock::owned`].
+    owned: bool,
 }
 
 impl TqBlock {
@@ -101,6 +112,7 @@ impl TqBlock {
         key_gammas: Array,
         value_codes: Array,
         value_norms: Array,
+        owned: bool,
     ) -> Result<Arc<Self>, Exception> {
         // Construction-time soundness eval; see KvBlock::new for why this uses
         // the raw transform rather than the gated wrapper.
@@ -117,6 +129,7 @@ impl TqBlock {
             key_gammas,
             value_codes,
             value_norms,
+            owned,
         }))
     }
 }
@@ -1155,6 +1168,14 @@ impl CachedLayerData {
     }
 
     /// Keep only the last `n` blocks of this layer's run.
+    fn all_owned(&self) -> bool {
+        match self {
+            Self::Kv(blocks) => blocks.iter().all(|b| b.owned),
+            Self::TurboQuantKv(blocks) => blocks.iter().all(|b| b.owned),
+            Self::Empty => true,
+        }
+    }
+
     fn take_last_blocks(&self, n: usize) -> Self {
         match self {
             Self::Kv(blocks) => {
@@ -1196,6 +1217,10 @@ fn edge_blocks_from(
     hybrid: bool,
 ) -> EdgeData {
     blocks.map_or(EdgeData::None, |layers| {
+        debug_assert!(
+            layers.iter().all(CachedLayerData::all_owned),
+            "radix edge would cache view blocks that pin their prefill buffer"
+        );
         let tokens = layer_run_tokens(&layers);
         EdgeData::Paged(EdgeBlocks {
             layers,
@@ -1593,7 +1618,7 @@ impl PagedPrefixCache {
         cache: &AnyCache,
     ) -> Result<PreparedPairTarget, PairedCacheError> {
         let mut prepared =
-            Self::prepare_store_with_block_size(ticket.block_size, prefix_tokens, cache)
+            Self::prepare_store_with_block_size(ticket.block_size, prefix_tokens, cache, 0)
                 .ok_or_else(|| PairedCacheError::TargetMaterialization {
                     details: "target cache cannot be represented at this radix key".to_owned(),
                 })?;
@@ -1701,21 +1726,71 @@ impl PagedPrefixCache {
     }
 
     fn prepare_store(&self, prefix_tokens: &[u32], cache: &AnyCache) -> Option<PreparedStore> {
-        Self::prepare_store_with_block_size(self.block_size, prefix_tokens, cache)
+        // The paged key insert walks: complete blocks of the cached prefix.
+        let cached = prefix_tokens.len().min(
+            kv_offset(cache)
+                .and_then(|o| usize::try_from(o).ok())
+                .unwrap_or(0),
+        );
+        let stored = cached / self.block_size * self.block_size;
+        let shared = self.shared_prefix_blocks(prefix_tokens.get(..stored).unwrap_or_default());
+        Self::prepare_store_with_block_size(self.block_size, prefix_tokens, cache, shared)
+    }
+
+    /// Leading blocks of `tokens` that [`Self::insert`] will drop as already
+    /// cached: per trie level, `floor(common / block_size)` blocks, excluding
+    /// an exactly matched final edge (an exact re-store refreshes that edge
+    /// from the incoming run). Store skips copying exactly these blocks.
+    fn shared_prefix_blocks(&self, tokens: &[u32]) -> usize {
+        let (mut node, mut pos, mut blocks) = (&self.root, 0, 0);
+        loop {
+            let Some(child) = tokens.get(pos).and_then(|t| node.children.get(t)) else {
+                return blocks;
+            };
+            let rest = tokens.get(pos..).unwrap_or_default();
+            let common = child
+                .edge
+                .iter()
+                .zip(rest)
+                .take_while(|(a, b)| a == b)
+                .count();
+            if common < child.edge.len() {
+                return blocks + common / self.block_size;
+            }
+            if pos + common >= tokens.len() {
+                return blocks;
+            }
+            blocks += common / self.block_size;
+            pos += common;
+            node = child;
+        }
     }
 
     fn prepare_store_with_block_size(
         block_size: usize,
         prefix_tokens: &[u32],
         cache: &AnyCache,
+        shared_blocks: usize,
     ) -> Option<PreparedStore> {
         // Dense KV may legitimately extend beyond a stripped key: paging slices
         // only the key's complete blocks. Whole-clone fallbacks cannot be
         // truncated and therefore require an exact cache/key boundary.
-        let prepared = match slice_into_blocks(cache, block_size, prefix_tokens.len()) {
+        let prepared = match slice_into_blocks(
+            cache,
+            block_size,
+            prefix_tokens.len(),
+            shared_blocks,
+        ) {
             Ok(prepared) => prepared,
-            Err(error) => {
-                tracing::warn!(error = %error, "Failed to page cache, using clone fallback");
+            Err(error) if prefix_tokens.len() >= block_size => {
+                // A pageable prefix fails when owning the block copies fails,
+                // i.e. under memory pressure. A shallow clone would keep the
+                // live prefill buffers alive outside the byte ledger.
+                tracing::warn!(error = %error, "Failed to page cache; skipping prefix cache store");
+                return None;
+            }
+            Err(_) => {
+                // Shorter than one block: kept whole, as before.
                 let offset = kv_offset(cache).and_then(|value| usize::try_from(value).ok());
                 if offset.is_some_and(|value| value != prefix_tokens.len()) {
                     tracing::debug!(
@@ -2406,11 +2481,12 @@ fn slice_into_blocks(
     cache: &AnyCache,
     block_size: usize,
     max_tokens: usize,
+    shared_blocks: usize,
 ) -> Result<PreparedStore, Exception> {
     let kv_layers = match cache {
         AnyCache::KV(kv_layers) => kv_layers,
         AnyCache::Hybrid(layers) => {
-            return slice_hybrid_into_blocks(cache, layers, block_size, max_tokens);
+            return slice_hybrid_into_blocks(cache, layers, block_size, max_tokens, shared_blocks);
         }
     };
 
@@ -2436,9 +2512,9 @@ fn slice_into_blocks(
                 if tq_context.is_none() {
                     tq_context = kv.turbo_arrays().map(|(c, ..)| Arc::clone(c));
                 }
-                slice_tq_layer(kv, num_blocks, block_size_i32)
+                slice_tq_layer(kv, num_blocks, block_size_i32, shared_blocks)
             } else {
-                slice_kv_layer(Some(kv), num_blocks, block_size_i32)
+                slice_kv_layer(Some(kv), num_blocks, block_size_i32, shared_blocks)
             }
         })
         .collect::<Result<_, _>>()?;
@@ -2474,6 +2550,7 @@ fn slice_hybrid_into_blocks(
     layers: &[Option<LayerCache>],
     block_size: usize,
     max_tokens: usize,
+    shared_blocks: usize,
 ) -> Result<PreparedStore, Exception> {
     let cloned = || PreparedStore {
         blocks: None,
@@ -2520,9 +2597,9 @@ fn slice_hybrid_into_blocks(
                     if tq_context.is_none() {
                         tq_context = kv.turbo_arrays().map(|(c, ..)| Arc::clone(c));
                     }
-                    slice_tq_layer(kv, num_blocks, block_size_i32)
+                    slice_tq_layer(kv, num_blocks, block_size_i32, shared_blocks)
                 } else {
-                    slice_kv_layer(Some(kv), num_blocks, block_size_i32)
+                    slice_kv_layer(Some(kv), num_blocks, block_size_i32, shared_blocks)
                 }
             }
             Some(LayerCache::Arrays(arrays)) => {
@@ -2566,6 +2643,7 @@ fn slice_tq_layer(
     kv: &SteppingKeyValueCache,
     num_blocks: usize,
     block_size: i32,
+    shared_blocks: usize,
 ) -> Result<CachedLayerData, Exception> {
     let Some((_ctx, key_codes, key_norms, key_gammas, value_codes, value_norms)) =
         kv.turbo_arrays()
@@ -2573,23 +2651,16 @@ fn slice_tq_layer(
         return Ok(CachedLayerData::Empty);
     };
 
-    let mut blocks = Vec::with_capacity(num_blocks);
-    for i in 0..num_blocks {
-        let start = i32::try_from(i)
-            .map_err(|_| Exception::custom("block index overflow"))?
-            .checked_mul(block_size)
-            .ok_or_else(|| Exception::custom("block start overflow"))?;
-        let end = start
-            .checked_add(block_size)
-            .ok_or_else(|| Exception::custom("block end overflow"))?;
-        blocks.push(TqBlock::new(
-            slice_axis1(key_codes, start, end)?,
-            slice_axis1(key_norms, start, end)?,
-            slice_axis1(key_gammas, start, end)?,
-            slice_axis1(value_codes, start, end)?,
-            slice_axis1(value_norms, start, end)?,
-        )?);
-    }
+    let views = |arr| owned_block_views(arr, num_blocks, block_size, slice_axis1, shared_blocks);
+    let blocks = views(key_codes)?
+        .into_iter()
+        .zip(views(key_norms)?)
+        .zip(views(key_gammas)?)
+        .zip(views(value_codes)?)
+        .zip(views(value_norms)?)
+        .enumerate()
+        .map(|(i, ((((kc, kn), kg), vc), vn))| TqBlock::new(kc, kn, kg, vc, vn, i >= shared_blocks))
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(CachedLayerData::TurboQuantKv(blocks))
 }
@@ -2599,6 +2670,7 @@ fn slice_kv_layer(
     kv_opt: Option<&SteppingKeyValueCache>,
     num_blocks: usize,
     block_size: i32,
+    shared_blocks: usize,
 ) -> Result<CachedLayerData, Exception> {
     let Some(kv) = kv_opt else {
         return Ok(CachedLayerData::Empty);
@@ -2607,21 +2679,50 @@ fn slice_kv_layer(
         return Ok(CachedLayerData::Empty);
     };
 
-    let mut blocks = Vec::with_capacity(num_blocks);
-    for i in 0..num_blocks {
-        let start = i32::try_from(i)
-            .map_err(|_| Exception::custom("block index overflow"))?
-            .checked_mul(block_size)
-            .ok_or_else(|| Exception::custom("block start overflow"))?;
-        let end = start
-            .checked_add(block_size)
-            .ok_or_else(|| Exception::custom("block end overflow"))?;
-        let k = slice_axis2(keys, start, end)?;
-        let v = slice_axis2(values, start, end)?;
-        blocks.push(KvBlock::new(k, v)?);
-    }
+    let views = |arr| owned_block_views(arr, num_blocks, block_size, slice_axis2, shared_blocks);
+    let blocks = views(keys)?
+        .into_iter()
+        .zip(views(values)?)
+        .enumerate()
+        .map(|(i, (k, v))| KvBlock::new(k, v, i >= shared_blocks))
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(CachedLayerData::Kv(blocks))
+}
+
+/// Slice `num_blocks` blocks off `arr`; every block from `shared_blocks` on
+/// gets its own device allocation.
+///
+/// Blocks sliced straight from a prefill cache are views that keep the whole
+/// prefill buffer alive, outside the radix byte ledger, for as long as any of
+/// them is cached: a long conversation then leaks one buffer per turn. Owned
+/// copies make every cached block cost exactly what the ledger charges. The
+/// leading `shared_blocks` are already cached and dropped on insert, so they
+/// stay uncopied views.
+fn owned_block_views(
+    arr: &Array,
+    num_blocks: usize,
+    block_size: i32,
+    slice: fn(&Array, i32, i32) -> Result<Array, Exception>,
+    shared_blocks: usize,
+) -> Result<Vec<Array>, Exception> {
+    let views = (0..num_blocks)
+        .map(|i| {
+            let start = i32::try_from(i)
+                .ok()
+                .and_then(|i| i.checked_mul(block_size))
+                .ok_or_else(|| Exception::custom("block start overflow"))?;
+            slice(arr, start, start + block_size)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let split = shared_blocks.min(views.len());
+    let (mut shared, new) = (views[..split].to_vec(), &views[split..]);
+    // One batch: evaluating thousands of views one block at a time (as
+    // `KvBlock::new` would) dominates the store.
+    #[allow(clippy::disallowed_methods)] // under the caller's gate, as KvBlock::new
+    mlx_rs::transforms::eval(&shared)?;
+    shared.extend(owned_device_copies(new)?);
+    Ok(shared)
 }
 
 /// Flatten the per-edge block runs along a root -> node path (plus an optional
@@ -3450,7 +3551,7 @@ mod tests {
         let seq: i32 = 64; // exact multiple of DEFAULT_BLOCK_SIZE
         let (hybrid, conv, ssm, keys, values) = make_content_hybrid_cache(seq);
 
-        let prepared = slice_into_blocks(&hybrid, DEFAULT_BLOCK_SIZE, seq as usize).unwrap();
+        let prepared = slice_into_blocks(&hybrid, DEFAULT_BLOCK_SIZE, seq as usize, 0).unwrap();
         assert!(
             prepared.blocks.is_some(),
             "a block-aligned hybrid store must be sliced into blocks"
@@ -3509,7 +3610,7 @@ mod tests {
         };
         arrays.offset -= 1;
 
-        let prepared = slice_into_blocks(&hybrid, DEFAULT_BLOCK_SIZE, seq as usize).unwrap();
+        let prepared = slice_into_blocks(&hybrid, DEFAULT_BLOCK_SIZE, seq as usize, 0).unwrap();
         assert!(
             prepared.blocks.is_none(),
             "a GDN snapshot at the wrong offset must not be paged"
@@ -3529,7 +3630,7 @@ mod tests {
         let seq: i32 = 65; // intentionally NOT a multiple of DEFAULT_BLOCK_SIZE
         let (hybrid, conv, ssm, keys, values) = make_content_hybrid_cache(seq);
 
-        let prepared = slice_into_blocks(&hybrid, DEFAULT_BLOCK_SIZE, seq as usize).unwrap();
+        let prepared = slice_into_blocks(&hybrid, DEFAULT_BLOCK_SIZE, seq as usize, 0).unwrap();
         assert!(
             prepared.blocks.is_none(),
             "a misaligned hybrid store must NOT be sliced into blocks"
@@ -5337,7 +5438,7 @@ mod tests {
             panic!("expected KV cache");
         };
         let kv = layers[0].as_ref().expect("layer 0 present");
-        let CachedLayerData::Kv(blocks) = slice_kv_layer(Some(kv), 4, 32).unwrap() else {
+        let CachedLayerData::Kv(blocks) = slice_kv_layer(Some(kv), 4, 32, 0).unwrap() else {
             panic!("expected Kv blocks");
         };
         let shared = Arc::new(blocks);

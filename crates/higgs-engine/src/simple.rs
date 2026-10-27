@@ -272,6 +272,24 @@ pub fn resolve_pflash_min_free_memory_mb(raw: Option<&str>) -> usize {
         .unwrap_or(2048)
 }
 
+/// Trace MLX allocator counters at a prefill stage (`RUST_LOG=higgs_mem=debug`).
+/// Read-only: `peak_mb` is the process high-water mark, so this never disturbs
+/// the request memory sampler's own peak window.
+#[allow(unsafe_code)]
+fn trace_mlx_memory(stage: &str, tokens: usize) {
+    if !tracing::enabled!(target: "higgs_mem", tracing::Level::DEBUG) {
+        return;
+    }
+    let (mut active, mut peak, mut cache) = (0usize, 0usize, 0usize);
+    unsafe {
+        mlx_sys::mlx_get_active_memory(&raw mut active);
+        mlx_sys::mlx_get_peak_memory(&raw mut peak);
+        mlx_sys::mlx_get_cache_memory(&raw mut cache);
+    }
+    let mb = |b: usize| b / (1024 * 1024);
+    tracing::debug!(target: "higgs_mem", stage, tokens, active_mb = mb(active), peak_mb = mb(peak), cache_mb = mb(cache));
+}
+
 fn prefill_min_free_memory_mb() -> usize {
     let raw = std::env::var("HIGGS_PREFLASH_MIN_FREE_MB").ok();
     resolve_pflash_min_free_memory_mb(raw.as_deref())
@@ -5820,6 +5838,8 @@ impl SimpleEngine {
             } else {
                 0
             };
+            tracing::debug!(target: "higgs_mem", seq_len, split_at, capture_hidden, chunked_threshold, chunked_size, "prefill plan");
+            trace_mlx_memory("prefill_start", usize::try_from(seq_len).unwrap_or(0));
 
             if split_at > 0 {
                 // Phase 1: advance the cache over the conversation body. When the
@@ -5868,6 +5888,7 @@ impl SimpleEngine {
                 // (GDN/SSM layers are functional and stay cheap-shallow), freezing
                 // the snapshot independent of Phase 2.
                 prepared.stored_clone = Some(prepared.cache.deep_clone());
+                trace_mlx_memory("hybrid_body_snapshot", split_at);
                 // DIAGNOSTIC (env HIGGS_DIAG_STORE_DRIFT=1): throwaway cold
                 // forward over the FULL prompt on a second fresh cache, compare
                 // its [..split_at] KV to the two-phase stored_clone. If they
@@ -5969,6 +5990,7 @@ impl SimpleEngine {
             }
             eval(eval_targets).map_err(EngineError::Mlx)?;
         }
+        trace_mlx_memory("prefill_logits", prompt_tokens.len());
 
         // Skip prefix cache for multimodal (image-specific KV states)
         if store_prefix_cache && prepared.image_batch.is_none() {
@@ -6024,6 +6046,7 @@ impl SimpleEngine {
                 );
             }
         }
+        trace_mlx_memory("prefix_store", prompt_tokens.len());
         maybe_clear_mlx_cache(
             self.tuning.clear_cache_after_prefill(),
             "simple_post_prefill",
