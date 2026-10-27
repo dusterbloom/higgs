@@ -1900,6 +1900,13 @@ impl PagedPrefixCache {
             self.evict_lru();
         }
         if self.max_bytes > 0 {
+            // An entry larger than the whole budget can never fit. Evicting
+            // LRU first would drain every older entry (including the shorter
+            // prefix this one extends, which still serves the next turn)
+            // before finally dropping the new entry too. Drop only it.
+            if endpoint_path_bytes(&self.root, entry_id).is_some_and(|b| b > self.max_bytes) {
+                self.remove_entry(entry_id);
+            }
             while self.total_bytes > self.max_bytes {
                 if !self.evict_lru() {
                     break;
@@ -2107,6 +2114,10 @@ impl PagedPrefixCache {
         let Some((_, entry_id)) = self.root.oldest_cached() else {
             return false;
         };
+        self.remove_entry(entry_id)
+    }
+
+    fn remove_entry(&mut self, entry_id: u64) -> bool {
         if let Some(was_paired) = self.root.remove_cached_by_id(entry_id) {
             self.num_cached -= 1;
             if was_paired {
@@ -2474,6 +2485,21 @@ fn total_endpoint_path_bytes(node: &RadixNode) -> usize {
     }
 
     visit(node, 0)
+}
+
+/// Root-to-endpoint path bytes of the single endpoint `entry_id`, if stored.
+fn endpoint_path_bytes(node: &RadixNode, entry_id: u64) -> Option<usize> {
+    fn visit(node: &RadixNode, parent_bytes: usize, entry_id: u64) -> Option<usize> {
+        let path_bytes = parent_bytes.saturating_add(node.edge_blocks.total_bytes());
+        if let Some(cached) = node.cached.as_ref().filter(|c| c.entry_id == entry_id) {
+            return Some(path_bytes.saturating_add(cached.endpoint.owned_bytes()));
+        }
+        node.children
+            .values()
+            .find_map(|child| visit(child, path_bytes, entry_id))
+    }
+
+    visit(node, 0, entry_id)
 }
 
 /// Slice a cache into block-aligned paged data.
@@ -3088,6 +3114,32 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert!(cache.total_bytes() <= 1500 + one_entry);
         assert!(cache.total_bytes() >= one_entry);
+    }
+
+    #[test]
+    fn oversized_extension_is_dropped_without_evicting_its_cached_prefix() {
+        // A growing conversation: turn N's prefix fits the budget, turn N+1
+        // extends it past the budget on its own. The cache must keep turn N's
+        // entry (the next request still reuses it) instead of draining to empty.
+        let short: Vec<u32> = (0..8).collect();
+        let long: Vec<u32> = (0..16).collect();
+        let short_bytes = {
+            let mut probe = PagedPrefixCache::new(10, 4);
+            probe.store(&short, &make_kv_cache(1, 8));
+            probe.total_bytes()
+        };
+        let mut cache = PagedPrefixCache::new(10, 4).with_max_bytes(short_bytes);
+        cache.store(&short, &make_kv_cache(1, 8));
+        cache.store(&long, &make_kv_cache(1, 16));
+
+        assert_eq!(cache.len(), 1, "only the oversized extension is dropped");
+        assert_eq!(cache.total_bytes(), short_bytes);
+        let mut next_turn = long.clone();
+        next_turn.push(99);
+        let hit = cache
+            .find_longest_prefix(&next_turn)
+            .expect("the fitting prefix still serves the next turn");
+        assert_eq!(hit.prefix_len, short.len());
     }
 
     #[test]
