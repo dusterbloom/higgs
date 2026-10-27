@@ -37,7 +37,7 @@ use higgs_models::SamplingParams;
 const TOOL_RESULT_PROMPT_WARN_BYTES: usize = 16 * 1024;
 
 /// Prompt-token threshold above which a stateless (no session routing)
-/// prefill gets a warning before it runs. Deliberately independent of
+/// prefill's uncached suffix gets a warning. Deliberately independent of
 /// `MlxRuntimeTuning::chunked_prefill_threshold` — that knob sizes per-model
 /// prefill chunking inside `higgs-engine` and isn't reachable (or meaningful)
 /// as a request-level "this is expensive" signal here.
@@ -854,8 +854,7 @@ async fn chat_completions_non_streaming(
         want_logprobs,
         !stop_sequences.is_empty(),
     );
-    warn_stateless_prefill(
-        &engine,
+    warn_session_routing_disabled(
         req.session_id,
         session_id,
         image_inputs.is_some(),
@@ -863,7 +862,6 @@ async fn chat_completions_non_streaming(
         checkpoint_id.as_deref(),
         want_logprobs,
         !stop_sequences.is_empty(),
-        prompt_tokens.len(),
     );
     if required_retention.as_ref().is_some_and(|retention| {
         retention.mode == crate::types::openai::RetentionMode::Seed
@@ -912,6 +910,7 @@ async fn chat_completions_non_streaming(
     let tool_payload = tool_payload_stats(&effective_messages);
     warn_large_tool_payload(tool_payload);
 
+    let prompt_tokens_len = prompt_tokens.len();
     let output = if let Some(sid) = session_id {
         let engine_c = Arc::clone(&engine);
         let prompt_tokens_c = prompt_tokens.clone();
@@ -997,9 +996,10 @@ async fn chat_completions_non_streaming(
             retention_receipt,
         );
     } else {
+        let engine_c = Arc::clone(&engine);
         tokio::task::spawn_blocking(move || {
             crate::capacity::run_reserved_generation(reservation, watchdog, || {
-                engine.generate_with_thinking_and_pflash_policy_with_cache(
+                engine_c.generate_with_thinking_and_pflash_policy_with_cache(
                     &prompt_tokens,
                     max_tokens,
                     &sampling,
@@ -1019,6 +1019,7 @@ async fn chat_completions_non_streaming(
         .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
         .map_err(map_engine_error)?
     };
+    warn_large_stateless_prefill(&engine, prompt_tokens_len, output.cached_prompt_tokens);
 
     let logprobs_response = output
         .token_logprobs
@@ -1438,6 +1439,7 @@ async fn chat_completions_stream(
     let model = req.model;
     let checkpoint_id = req.checkpoint_id;
     let prompt_token_count = u32::try_from(prompt_tokens.len()).unwrap_or(0);
+    let prompt_token_len = prompt_tokens.len();
     let tool_payload = tool_payload_stats(&effective_messages);
     warn_large_tool_payload(tool_payload);
 
@@ -1450,8 +1452,7 @@ async fn chat_completions_stream(
         want_logprobs,
         !stop_sequences.is_empty(),
     );
-    warn_stateless_prefill(
-        &engine,
+    warn_session_routing_disabled(
         request_session_id,
         stream_session_id,
         image_inputs.is_some(),
@@ -1459,7 +1460,6 @@ async fn chat_completions_stream(
         checkpoint_id.as_deref(),
         want_logprobs,
         !stop_sequences.is_empty(),
-        prompt_tokens.len(),
     );
     if required_retention.as_ref().is_some_and(|retention| {
         retention.mode == crate::types::openai::RetentionMode::Seed
@@ -1837,6 +1837,9 @@ async fn chat_completions_stream(
         // Radix prefix-cache tokens reused this turn, taken from the prefill
         // progress events (`p.cached`). Reported as `prompt_tokens_details`.
         let mut cached_prompt_tokens: u32 = 0;
+        // Session-routed streams never warn; stateless ones warn once prefill
+        // ends and the radix hit is known.
+        let mut prefill_warned = stream_session_id.is_some();
         let mut pending_finish_reason: Option<String> = None;
         let mut pending_finish_logprobs: Option<ChoiceLogprobs> = None;
         while let Some(output) = rx.recv().await {
@@ -1852,6 +1855,10 @@ async fn chat_completions_stream(
                     yield Ok(Event::default().data(json));
                 }
                 continue;
+            }
+            if !prefill_warned {
+                prefill_warned = true;
+                warn_large_stateless_prefill(&engine, prompt_token_len, cached_prompt_tokens);
             }
             output_token_count = output.completion_tokens;
             metrics_guard.update(u64::from(output_token_count));
@@ -2365,14 +2372,10 @@ fn session_routing_disabled_reasons(
     reasons
 }
 
-/// Warn when a request is about to cold-prefill with no session-routed KV
-/// reuse: either because the client asked for session continuation but a
-/// request feature disabled it, or because the stateless prefill itself is
-/// large enough that a silent multi-minute prefill would otherwise go
-/// unexplained in the logs. Shared by the streaming and non-streaming routes.
-#[allow(clippy::too_many_arguments)]
-fn warn_stateless_prefill(
-    engine: &Engine,
+/// Warn when the client asked for session continuation but a request
+/// feature disabled it, so the turn falls back to stateless prefill. Runs
+/// before prefill. Shared by the streaming and non-streaming routes.
+fn warn_session_routing_disabled(
     requested_session_id: Option<u64>,
     session_id: Option<u64>,
     has_image_inputs: bool,
@@ -2380,33 +2383,50 @@ fn warn_stateless_prefill(
     checkpoint_id: Option<&str>,
     want_logprobs: bool,
     has_stop_sequences: bool,
-    prompt_tokens: usize,
 ) {
-    if session_id.is_some() {
+    let (Some(sid), None) = (requested_session_id, session_id) else {
         return;
-    }
-    if let Some(sid) = requested_session_id {
-        let reasons = session_routing_disabled_reasons(
-            has_image_inputs,
-            has_constraint,
-            checkpoint_id,
-            want_logprobs,
-            has_stop_sequences,
+    };
+    let reasons = session_routing_disabled_reasons(
+        has_image_inputs,
+        has_constraint,
+        checkpoint_id,
+        want_logprobs,
+        has_stop_sequences,
+    );
+    if !reasons.is_empty() {
+        tracing::warn!(
+            session_id = sid,
+            ?reasons,
+            "session_id present but session routing disabled by request feature(s); prefilling statelessly"
         );
-        if !reasons.is_empty() {
-            tracing::warn!(
-                session_id = sid,
-                ?reasons,
-                "session_id present but session routing disabled by request feature(s); prefilling statelessly"
-            );
-        }
     }
-    if prompt_tokens >= STATELESS_LARGE_PREFILL_WARN_TOKENS {
+}
+
+/// Tokens a stateless request actually prefilled (prompt minus radix-cache
+/// hit), if that is large enough to warn about.
+const fn large_uncached_prefill(prompt_tokens: usize, cached_tokens: usize) -> Option<usize> {
+    let uncached = prompt_tokens.saturating_sub(cached_tokens);
+    if uncached >= STATELESS_LARGE_PREFILL_WARN_TOKENS {
+        Some(uncached)
+    } else {
+        None
+    }
+}
+
+/// Warn when a stateless request's prefill was large after the radix prefix
+/// cache hit is subtracted. Runs once the cached count is known, so a long
+/// prompt that mostly hit the cache stays quiet.
+fn warn_large_stateless_prefill(engine: &Engine, prompt_tokens: usize, cached_tokens: u32) {
+    let cached = usize::try_from(cached_tokens).unwrap_or(usize::MAX);
+    if let Some(uncached_tokens) = large_uncached_prefill(prompt_tokens, cached) {
         engine.record_stateless_large_prefill();
         tracing::warn!(
             prompt_tokens,
+            cached_tokens,
+            uncached_tokens,
             warn_threshold_tokens = STATELESS_LARGE_PREFILL_WARN_TOKENS,
-            "large stateless prefill: no session controls"
+            "large stateless prefill: uncached suffix exceeds threshold and no session controls"
         );
     }
 }
@@ -3407,44 +3427,22 @@ mod tests {
         assert_eq!(body["error"]["code"], "retained_session_unavailable");
     }
 
-    #[tokio::test]
-    async fn large_stateless_prefill_without_session_id_is_counted() {
-        let engine = Arc::new(Engine::test_stub("zero-prefix-large-stateless-prefill"));
-        engine.test_set_chat_prompt_tokens(vec![7; STATELESS_LARGE_PREFILL_WARN_TOKENS]);
-        let request = chat_request(serde_json::json!({}));
-
-        // The generic test stub has no real generation backend, so the
-        // stateless path errors past the warn/count call site this test
-        // exercises; that's the point reached before the error, not the
-        // error itself.
-        let error = chat_completions_non_streaming(
-            streaming_test_state(),
-            request,
-            Arc::clone(&engine),
-            GenerationDefaults::default(),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(error, ServerError::Engine(higgs_engine::error::EngineError::Generation(_))),
-            "must reach the stateless generation dispatch: {error:?}"
-        );
-
-        assert!(
-            engine
-                .route_test_mutation_sequence()
-                .contains(&"stateless_large_prefill".to_owned()),
-            "large session-less prefill must be counted"
-        );
+    #[test]
+    fn large_stateless_prefill_warning_ignores_radix_cached_prefix() {
+        let t = STATELESS_LARGE_PREFILL_WARN_TOKENS;
+        // Cold prefill at the threshold warns.
+        assert_eq!(large_uncached_prefill(t, 0), Some(t));
+        // A long prompt that mostly hit the radix cache stays quiet.
+        assert_eq!(large_uncached_prefill(3 * t, 3 * t - 100), None);
+        // A large uncached suffix behind a cached prefix still warns.
+        assert_eq!(large_uncached_prefill(3 * t, t), Some(2 * t));
+        // Cache counts above the prompt (defensive) never underflow.
+        assert_eq!(large_uncached_prefill(t, 2 * t), None);
     }
 
     #[tokio::test]
     async fn session_id_disabled_by_stop_sequences_falls_back_to_stateless_prefill() {
         let engine = Arc::new(Engine::test_stub("zero-prefix-session-disabled-by-stop"));
-        // Large enough to also trip the size warning, so the mutation hook
-        // confirms this request actually reached the stateless prefill path
-        // instead of session-routed generation.
-        engine.test_set_chat_prompt_tokens(vec![7; STATELESS_LARGE_PREFILL_WARN_TOKENS]);
         let request = chat_request(serde_json::json!({
             "session_id": 42,
             "stop": ["END"]
@@ -3462,17 +3460,18 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            matches!(error, ServerError::Engine(higgs_engine::error::EngineError::Generation(_))),
+            matches!(
+                error,
+                ServerError::Engine(higgs_engine::error::EngineError::Generation(_))
+            ),
             "must reach the stateless generation dispatch, not session-routed generation: {error:?}"
         );
 
         let mutations = engine.route_test_mutation_sequence();
         assert!(
-            mutations.contains(&"stateless_large_prefill".to_owned()),
-            "stop_sequences must disable session routing and fall back to stateless prefill"
-        );
-        assert!(
-            !mutations.iter().any(|m| m.starts_with("continue:42") || m.starts_with("retain:42")),
+            !mutations
+                .iter()
+                .any(|m| m.starts_with("continue:42") || m.starts_with("retain:42")),
             "session 42 must never be routed to, since stop_sequences disables continuation"
         );
     }
