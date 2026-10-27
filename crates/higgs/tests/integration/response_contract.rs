@@ -274,6 +274,7 @@ fn model_list_serialization() {
             created: 1_700_000_000,
             owned_by: "local".to_owned(),
             vision: true,
+            context_length: Some(65_536),
             capabilities: ModelRuntimeCapabilities {
                 tool_mode: "native",
                 thinking: "optional",

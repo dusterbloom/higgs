@@ -607,6 +607,11 @@ pub struct ModelObject {
     pub owned_by: String,
     /// higgs extension (additive): whether this model accepts image input (VLM).
     pub vision: bool,
+    /// Context window under the de-facto key OpenAI-wire clients read
+    /// (`OpenRouter`/`LiteLLM` `context_length`); mirrors
+    /// `capabilities.contextTokens`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u32>,
     /// higgs extension (additive): facts clients need to select a compatible
     /// tool/reasoning protocol without maintaining a model-name registry.
     pub capabilities: ModelRuntimeCapabilities,
@@ -921,6 +926,7 @@ mod tests {
                 created: 1_234_567_890,
                 owned_by: "local".to_owned(),
                 vision: false,
+                context_length: Some(65_536),
                 capabilities: ModelRuntimeCapabilities {
                     tool_mode: "native",
                     thinking: "disabled",

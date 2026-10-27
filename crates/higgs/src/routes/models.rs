@@ -785,6 +785,7 @@ fn model_object(
         created: chrono::Utc::now().timestamp(),
         owned_by: "local".to_owned(),
         vision,
+        context_length: context_tokens,
         capabilities: ModelRuntimeCapabilities {
             tool_mode,
             thinking,
@@ -1318,6 +1319,9 @@ mod tests {
         assert_eq!(obj.capabilities.tool_mode, "native");
         assert_eq!(obj.capabilities.thinking, "disabled");
         assert_eq!(obj.capabilities.context_tokens, Some(65_536));
+        // OpenAI-wire clients (nodecode) learn the window from this key only.
+        let json = serde_json::to_value(&obj).unwrap();
+        assert_eq!(json["context_length"], 65_536);
     }
 
     #[tokio::test]
