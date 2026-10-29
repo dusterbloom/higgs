@@ -14605,7 +14605,10 @@ fn detect_thinking_support(model_dir: &Path) -> bool {
                 .and_then(|tc| tc.get("model_type"))
                 .and_then(|v| v.as_str())
         });
-    matches!(model_type, Some("qwen3_5" | "qwen3_5_moe"))
+    matches!(
+        model_type.map(higgs_models::registry::runtime_family),
+        Some("qwen3_5" | "qwen3_5_moe")
+    )
 }
 
 /// Whether the model's chat template references the `enable_thinking` toggle,

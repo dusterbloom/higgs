@@ -248,6 +248,18 @@ fn qwen_moe_does_not_resolve_to_dense() {
     assert_eq!(adapter::resolve(&detected).unwrap().id(), "qwen3.5-moe");
 }
 
+/// Clover (block-diffusion Qwen3.6 fine-tune) must reach the same Qwen3.5-MoE
+/// loader through both the engine path (registry) and the adapter registry.
+#[test]
+fn clover_moe_loads_as_its_qwen35_moe_runtime_family() {
+    let dir = write_config(&complete_config("clover_moe"));
+    let model_type = higgs_models::registry::detect_model_type(dir.path()).unwrap();
+    assert_eq!(model_type, "qwen3_5_moe");
+    assert!(higgs_models::registry::is_supported(&model_type));
+    let detected = adapter::detect(dir.path()).unwrap();
+    assert_eq!(adapter::resolve(&detected).unwrap().id(), "qwen3.5-moe");
+}
+
 #[test]
 fn exact_match_beats_version_tolerant_match() {
     let dir = write_config(&complete_config("gemma4_text"));

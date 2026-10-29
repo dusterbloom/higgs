@@ -20,8 +20,20 @@ pub fn detect_model_type<P: AsRef<Path>>(model_dir: P) -> Result<String, ModelEr
     config
         .get("model_type")
         .and_then(|v| v.as_str())
-        .map(ToOwned::to_owned)
+        .map(|model_type| runtime_family(model_type).to_owned())
         .ok_or_else(|| ModelError::UnsupportedModel("missing model_type in config.json".into()))
+}
+
+/// Map a checkpoint `model_type` onto the runtime family that loads it.
+///
+/// `clover_moe` (DiffuSpace Clover, a block-diffusion fine-tune) is a
+/// Qwen3.6-MoE backbone with extra preview-mode tensors; its causal path is
+/// `qwen3_5_moe`. Every other type maps to itself.
+pub fn runtime_family(model_type: &str) -> &str {
+    match model_type {
+        "clover_moe" => "qwen3_5_moe",
+        other => other,
+    }
 }
 
 /// Supported model architectures.

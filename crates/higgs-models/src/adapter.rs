@@ -704,6 +704,7 @@ pub fn detect(dir: &Path) -> Result<DetectedModel, ModelError> {
     let top_model_type = raw
         .get("model_type")
         .and_then(Value::as_str)
+        .map(crate::registry::runtime_family)
         .ok_or_else(|| ModelError::UnsupportedModel("missing model_type in config.json".into()))?;
     let architectures = raw
         .get("architectures")

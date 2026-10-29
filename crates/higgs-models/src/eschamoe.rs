@@ -876,7 +876,7 @@ pub fn classify(key: &str) -> (Storage, &str) {
 ///
 /// A norm is the only 1-D weight whose last name part holds `norm`, so the
 /// name gives the answer with no list of layers to maintain.
-fn is_offset_rmsnorm(key: &str) -> bool {
+pub(crate) fn is_offset_rmsnorm(key: &str) -> bool {
     let Some(module) = key.strip_suffix(".weight") else {
         return false;
     };

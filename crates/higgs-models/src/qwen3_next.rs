@@ -3987,6 +3987,60 @@ thread_local! {
     static PROF_TQ_N: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+#[doc(hidden)]
+pub mod switch_mlp_gather_probe {
+    //! Opaque integration-test seam for the generic switch-MLP gather; not model dispatch.
+    use mlx_rs::{Array, error::Exception};
+
+    pub struct SwitchMlpGather(super::SwitchMlpWeights);
+
+    impl SwitchMlpGather {
+        /// Each projection is `(weight, scales, biases)` from `mlx_rs::ops::quantize`.
+        pub fn new(
+            group_size: i32,
+            bits: i32,
+            projections: [(Array, Array, Array); 3],
+        ) -> Result<Self, Exception> {
+            let mut block = super::SwitchMlpWeights::from_quant(group_size, bits)?;
+            let [gate, up, down] = projections;
+            for (projection, (weight, scales, biases)) in [
+                (&mut block.gate_proj, gate),
+                (&mut block.up_proj, up),
+                (&mut block.down_proj, down),
+            ] {
+                *projection.weight = weight;
+                *projection.scales = scales;
+                *projection.biases = biases;
+            }
+            Ok(Self(block))
+        }
+
+        /// `x` is `[B, L, D]`, `indices` `[B, L, top_k]`; returns `[B, L, top_k, D]`.
+        pub fn forward(&self, x: &Array, indices: &Array) -> Result<Array, Exception> {
+            self.0.forward_gather_global_sort(x, indices)
+        }
+    }
+}
+
+#[doc(hidden)]
+pub mod norm_convention_probe {
+    //! Opaque integration-test seam for the checkpoint norm-convention check.
+    use mlx_rs::Array;
+
+    /// `tensors` are `(stripped_key, weight)` pairs as the loader sees them.
+    pub fn needs_offset(tensors: &[(&str, Array)]) -> Result<bool, crate::error::ModelError> {
+        super::checkpoint_norms_need_offset(tensors.iter().map(|(key, value)| (*key, value)))
+    }
+}
+
+/// `HIGGS_MOE_GATHER_PAD=1`: route the generic switch-MLP gather through the
+/// padded `gather_qmm_rhs` path instead of `gather_qmv` (see
+/// `SwitchMlpWeights::forward_gather_global_sort`).
+fn moe_gather_padded_rhs() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("HIGGS_MOE_GATHER_PAD").is_ok_and(|v| v == "1"))
+}
+
 fn tq_profile_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("HIGGS_PROFILE").is_ok_and(|v| v == "1"))
@@ -6116,19 +6170,27 @@ impl SwitchMlpWeights {
             return out_unsorted.reshape(&[b, l, top_k, d]);
         }
 
-        // MLX 0.30.6 changes gather-QMM dispatch below four rows per expert;
-        // identical routed rows then round differently depending on suffix
-        // length. Pad only the sorted RHS domain with zero rows assigned to the
-        // last expert, and discard them after the projection. Real routing,
-        // scores, and output order remain untouched.
+        // MLX 0.31 `GatherQMM::eval_gpu` takes `gather_qmm_rhs` only when the
+        // sorted hint is set and rows >= 4 * num_experts, else `gather_qmv`.
+        // The two round differently, so a short continuation would diverge
+        // from a long prefill of the same tokens. Without the sorted hint every
+        // size takes `gather_qmv`, which reduces each row independently:
+        // append-stable with no padding (Clover/M4: decode 8 -> 43 tok/s, cold
+        // long prefill ~1.6x slower). HIGGS_MOE_GATHER_PAD=1 restores the
+        // padded `gather_qmm_rhs` path (zero rows on the last expert).
+        let padded_rhs = moe_gather_padded_rhs();
         let num_experts = *self
             .gate_proj
             .weight
             .shape()
             .first()
             .ok_or_else(|| Exception::custom("expert weight has no expert dimension"))?;
-        let required_rows = num_experts * 4;
-        let padding_rows = required_rows.saturating_sub(original_rows);
+        let padding_rows = if padded_rhs {
+            (num_experts * 4).saturating_sub(original_rows)
+        } else {
+            0
+        };
+        let sorted_hint = padded_rhs;
         let (x_sorted, idx_sorted) = if padding_rows > 0 {
             let x_padding = ops::zeros_dtype(&[padding_rows, 1, d], x.dtype())?;
             let last_expert = u32::try_from(num_experts - 1)
@@ -6153,7 +6215,7 @@ impl SwitchMlpWeights {
             true,
             self.gate_proj.group_size,
             self.gate_proj.bits,
-            true, // indices are globally sorted
+            sorted_hint, // indices are globally sorted
         )?;
         let up_out = gather_qmm(
             &x_sorted,
@@ -6164,7 +6226,7 @@ impl SwitchMlpWeights {
             true,
             self.up_proj.group_size,
             self.up_proj.bits,
-            true,
+            sorted_hint,
         )?;
 
         let activated = swiglu(&gate_out, &up_out)?;
@@ -6178,7 +6240,7 @@ impl SwitchMlpWeights {
             true,
             self.down_proj.group_size,
             self.down_proj.bits,
-            true,
+            sorted_hint,
         )?;
 
         // down_out: [N, 1, D] -> squeeze M -> [N, D]
@@ -11577,6 +11639,7 @@ pub fn resolve_runtime_model_args(
     let model_type = runtime_config
         .get("model_type")
         .and_then(serde_json::Value::as_str)
+        .map(crate::registry::runtime_family)
         .unwrap_or_default();
     let mut args = if config.get("text_config").is_some()
         || matches!(model_type, "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe")
@@ -11584,7 +11647,12 @@ pub fn resolve_runtime_model_args(
         if config.get("text_config").is_some() {
             load_qwen3_5_text_config_args_from_value(model_dir, config)?
         } else {
-            let wrapped = serde_json::json!({ "text_config": config.clone() });
+            // A flat config is its own wrapper: the loader reads quantization
+            // overrides, tie_word_embeddings and `modules` from the outer level.
+            let mut wrapped = config.clone();
+            if let Some(map) = wrapped.as_object_mut() {
+                map.insert("text_config".to_owned(), config.clone());
+            }
             load_qwen3_5_text_config_args_from_value(model_dir, &wrapped)?
         }
     } else {
@@ -13187,12 +13255,49 @@ fn dense_mtp_rmsnorm_weight_key(stripped: &str) -> bool {
             || stripped == "mtp.pre_fc_norm_embedding.weight")
 }
 
+/// Whether a checkpoint stores its zero-centered `RMSNorm` weights raw (`w`)
+/// instead of offset (`1 + w`, the mlx-lm form the model applies as-is).
+/// Decided from the data, not the model name: the median mean of the per-layer
+/// `input_layernorm` weights sits near 0 when raw (Clover: -0.04) and near 1
+/// when offset. Pass tensors after any checkpoint conversion (Escha's applies
+/// the offset itself).
+fn checkpoint_norms_need_offset<'a>(
+    tensors: impl IntoIterator<Item = (&'a str, &'a Array)>,
+) -> Result<bool, crate::error::ModelError> {
+    let mut means = tensors
+        .into_iter()
+        .filter(|(key, _)| {
+            key.starts_with("model.layers.") && key.ends_with(".input_layernorm.weight")
+        })
+        .map(|(_, value)| -> Result<f32, Exception> {
+            Ok(value.as_dtype(Dtype::Float32)?.mean(None)?.item::<f32>())
+        })
+        .collect::<Result<Vec<f32>, _>>()?;
+    means.sort_by(f32::total_cmp);
+    let Some(&median) = means.get(means.len() / 2) else {
+        return Ok(false);
+    };
+    let raw = median < 0.5;
+    if raw {
+        tracing::info!(
+            median,
+            layers = means.len(),
+            "Checkpoint stores raw zero-centered RMSNorm weights; loading them as 1 + w"
+        );
+    }
+    Ok(raw)
+}
+
 fn qwen35_loaded_value(
     stripped: &str,
     value: Array,
     dense_mtp_target: bool,
+    offset_norms: bool,
 ) -> Result<Array, crate::error::ModelError> {
-    if dense_mtp_target && dense_mtp_rmsnorm_weight_key(stripped) {
+    let offset_backbone_norm = offset_norms
+        && !stripped.starts_with("mtp.")
+        && crate::eschamoe::is_offset_rmsnorm(stripped);
+    if offset_backbone_norm || (dense_mtp_target && dense_mtp_rmsnorm_weight_key(stripped)) {
         let one = Array::from_f32(1.0)
             .as_dtype(value.dtype())
             .map_err(crate::error::ModelError::Mlx)?;
@@ -13246,7 +13351,7 @@ fn load_qwen3_next_weights<M: mlx_rs::module::ModuleParametersExt>(
             let key = normalize_sidecar_mtp_key(file_path, key);
             if let Some((target_key, dense_mtp_target)) = qwen35_target_param_key(&params, &key) {
                 if let Some(param) = params.get_mut(target_key.as_str()) {
-                    **param = qwen35_loaded_value(&key, value, dense_mtp_target)?;
+                    **param = qwen35_loaded_value(&key, value, dense_mtp_target, false)?;
                     continue;
                 }
             }
@@ -13319,6 +13424,20 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
     quantization: Option<&QuantizationConfig>,
 ) -> Result<(), crate::error::ModelError> {
     let safetensors_files = crate::collect_safetensors_files(model_path)?;
+    // The norm convention needs every layer's `input_layernorm` before any
+    // weight is assigned; loading is lazy, so this pre-pass reads only those.
+    let mut norm_probes = Vec::new();
+    for file_path in &safetensors_files {
+        let loaded = Array::load_safetensors(file_path)
+            .map_err(|e| crate::error::ModelError::Io(std::io::Error::other(e.to_string())))?;
+        norm_probes.extend(loaded.into_iter().filter_map(|(key, value)| {
+            qwen35_checkpoint_param_key(&key)
+                .filter(|stripped| stripped.ends_with(".input_layernorm.weight"))
+                .map(|stripped| (stripped.to_owned(), value))
+        }));
+    }
+    let offset_norms =
+        checkpoint_norms_need_offset(norm_probes.iter().map(|(key, value)| (key.as_str(), value)))?;
     let mut params = model.parameters_mut().flatten();
     let mut matched = 0usize;
     let mut unmatched = Vec::new();
@@ -13341,7 +13460,7 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
             if let Some((target_key, dense_mtp_target)) = qwen35_target_param_key(&params, stripped)
             {
                 if let Some(param) = params.get_mut(target_key.as_str()) {
-                    **param = qwen35_loaded_value(stripped, value, dense_mtp_target)?;
+                    **param = qwen35_loaded_value(stripped, value, dense_mtp_target, offset_norms)?;
                 } else {
                     unmatched.push(key);
                     continue;
@@ -13576,6 +13695,11 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     use std::collections::HashMap;
 
     let (tensors, escha_natives) = checkpoint_tensors(model_path)?;
+    let offset_norms = checkpoint_norms_need_offset(
+        tensors
+            .iter()
+            .filter_map(|(key, value)| qwen35_checkpoint_param_key(key).map(|key| (key, value))),
+    )?;
     let mut params = model.parameters_mut().flatten();
 
     let qkvz_perm = build_qkvz_permutation(gdn_dims)
@@ -13650,7 +13774,7 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
                     qwen35_target_param_key(&params, stripped)
                 {
                     if let Some(param) = params.get_mut(target_key.as_str()) {
-                        **param = qwen35_loaded_value(stripped, value, dense_mtp_target)?;
+                        **param = qwen35_loaded_value(stripped, value, dense_mtp_target, offset_norms)?;
                     }
                 }
             }

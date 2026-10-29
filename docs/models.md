@@ -12,6 +12,7 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 | Qwen3 | `qwen3` | Qwen3 |
 | Qwen3.5 (dense) | `qwen3_5` | Qwen3.5 dense MLX checkpoints |
 | Qwen3.5 / Qwen3.6 MoE | `qwen3_5_moe` | Qwen3.5-35B-A3B, Qwen3.6-35B-A3B |
+| Clover (block-diffusion Qwen3.6 MoE) | `clover_moe` | `kapitsaprime/Clover-35B-A3B-Preview-MLX-4bit` (causal decoding) |
 | Bonsai-2 Hadamard Q2 | `prism_hadamard_qwen35` | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` |
 | MiniCPM-V 4.7 (text) | `minicpmv4_7` | `mlx-community/MiniCPM-V-4.7-1B-4bit` |
 | Qwen3-Next | `qwen3_next` | Qwen3-Coder hybrid checkpoints |
@@ -33,6 +34,7 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 | Qwen3 | `qwen3` | Qwen3 | none |
 | Qwen3.5+ (dense) | `qwen3_5`, `qwen3_5_text` | Qwen3.5 dense checkpoints; Qwen3.8-27B | none |
 | Qwen3.5+ (MoE) | `qwen3_5_moe`, `qwen3_5_text_moe` | Qwen3.5-35B-A3B, Qwen3.6-35B-A3B | none |
+| Clover (block-diffusion Qwen3.6 MoE) | `clover_moe` | `kapitsaprime/Clover-35B-A3B-Preview-MLX-4bit` (causal decoding) | none |
 | Bonsai-2 Hadamard Q2 | `prism_hadamard_qwen35` | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` | none‡ |
 | MiniCPM-V 4.7 (text) | `minicpmv4_7` | `mlx-community/MiniCPM-V-4.7-1B-4bit` | tower-ignored |
 | Qwen3-Next | `qwen3_next` | Qwen3-Coder hybrid checkpoints | none |
@@ -182,6 +184,9 @@ Nanbeige uses repeated shared-weight decoder loops with loop-aware KV cache slot
 - `mlx-community/Qwen3.8-27B-4bit` (27B dense, 4-bit) is verified working through its top-level `qwen3_5` wrapper and nested `qwen3_5_text` config.
 - The cached-model smoke matrix covered `mlx-community/Qwen3.6-35B-A3B-4bit` plus `mlx-community/Llama-3.2-1B-Instruct-4bit`, `mlx-community/Qwen2.5-3B-Instruct-4bit`, `mlx-community/Qwen3-1.7B-4bit`, and `mlx-community/Qwen3-Coder-Next-4bit`.
 - OpenAI-style chat requests use non-thinking mode by default for `Qwen3.6` unless the request explicitly opts into reasoning.
+- Flat configs (no `text_config`) load like their nested form, including per-path quantization overrides. Checkpoints that store zero-centered RMSNorm weights raw (`w` instead of mlx-lm's `1 + w`) are detected from the layer input norms and offset at load.
+- DiffuSpace Clover (`clover_moe`) loads through the Qwen 3.5 MoE adapter and decodes causally; its block-diffusion and self-speculative modes are planned (`docs/superpowers/plans/2026-10-28-clover-dllm-integration.md`).
+- Generic MoE experts (everything except native Escha trellis weights) run through MLX `gather_qmv`, which reduces each routed row independently, so warm continuations match a cold prefill bit-for-bit. `HIGGS_MOE_GATHER_PAD=1` restores the older padded `gather_qmm_rhs` path: faster cold prefill on long prompts (~1.6x), much slower decode (~5x on Qwen3.6-35B-A3B).
 
 ## Bonsai-2 Hadamard Q2 notes
 

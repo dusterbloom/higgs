@@ -783,7 +783,8 @@ impl ModelMetadata {
             .unwrap_or(serde_json::Value::Null);
 
         Self {
-            model_type: config_lookup_str(&config, "model_type").map(str::to_owned),
+            model_type: config_lookup_str(&config, "model_type")
+                .map(|model_type| higgs_models::registry::runtime_family(model_type).to_owned()),
             quantization_bits: config
                 .get("quantization")
                 .and_then(|quantization| quantization.get("bits"))
