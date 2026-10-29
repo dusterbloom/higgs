@@ -13294,6 +13294,13 @@ fn qwen35_loaded_value(
     dense_mtp_target: bool,
     offset_norms: bool,
 ) -> Result<Array, crate::error::ModelError> {
+    // Depthwise GDN conv in PyTorch layout `[C, 1, K]` (raw HF / Clover packs):
+    // store MLX's `[C, K, 1]` so every conv1d call site sees one layout.
+    if stripped.ends_with(".conv1d.weight")
+        && matches!(value.shape(), [_, 1, kernel] if *kernel > 1)
+    {
+        return ops::swap_axes(&value, 1, 2).map_err(crate::error::ModelError::Mlx);
+    }
     let offset_backbone_norm = offset_norms
         && !stripped.starts_with("mtp.")
         && crate::eschamoe::is_offset_rmsnorm(stripped);
