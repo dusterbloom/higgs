@@ -402,6 +402,48 @@ fn check_prefill_yield_tokens(
     true
 }
 
+/// Clover block-diffusion settings: `clover_block_size` must divide the
+/// trained block size (32), `clover_threshold` must be in `[0, 1]`, both need
+/// the simple engine, and `generation_defaults.speculation` must parse.
+fn check_clover_settings(
+    label: &str,
+    model: &crate::config::ModelConfig,
+    result: &mut DoctorResult,
+) -> bool {
+    let mut failures = Vec::new();
+    if let Err(value) =
+        higgs_models::Speculation::parse(model.generation_defaults.speculation.as_deref())
+    {
+        failures.push(format!(
+            "model {label} generation_defaults.speculation '{value}' is not one of \
+             auto|dflash|mtp|none|diffusion"
+        ));
+    }
+    if let Some(block) = model.clover_block_size
+        && (block == 0 || 32 % block != 0)
+    {
+        failures.push(format!(
+            "model {label} clover_block_size={block} must divide 32"
+        ));
+    }
+    if let Some(threshold) = model.clover_threshold
+        && !(0.0..=1.0).contains(&threshold)
+    {
+        failures.push(format!(
+            "model {label} clover_threshold={threshold} must be in [0, 1]"
+        ));
+    }
+    if model.batch && (model.clover_block_size.is_some() || model.clover_threshold.is_some()) {
+        failures.push(format!(
+            "model {label} sets clover_* but block diffusion is simple-engine only (batch=true)"
+        ));
+    }
+    for failure in &failures {
+        fail(failure, result);
+    }
+    failures.is_empty()
+}
+
 /// Warn (not fail) when the *resolved* MLA decision is enabled for an adapter
 /// that does not advertise MLA latent-cache support. The flag is a no-op for
 /// those adapters at runtime, so this is advisory rather than a hard failure.
@@ -485,6 +527,9 @@ fn check_models(config: &HiggsConfig, result: &mut DoctorResult) {
             );
         }
         if !check_prefill_yield_tokens(&label, model.prefill_yield_tokens, result) {
+            continue;
+        }
+        if !check_clover_settings(&label, model, result) {
             continue;
         }
         let kv_cache_config = model.kv_cache_config();
@@ -1570,6 +1615,35 @@ mod tests {
         assert!(check_prefill_yield_tokens("test", Some(0), &mut result));
         assert_eq!(result.failures, 0);
         assert_eq!(result.warnings, 0);
+    }
+
+    #[test]
+    fn clover_settings_validate_block_size_threshold_and_speculation() {
+        let base = || {
+            let mut model = ModelConfig::default();
+            model.clover_block_size = Some(16);
+            model.clover_threshold = Some(0.9);
+            model.generation_defaults.speculation = Some("diffusion".to_owned());
+            model
+        };
+        let mut result = empty_result();
+        assert!(check_clover_settings("test", &base(), &mut result));
+        assert_eq!(result.failures, 0);
+
+        let invalid: [fn(&mut ModelConfig); 5] = [
+            |m| m.clover_block_size = Some(12),
+            |m| m.clover_block_size = Some(0),
+            |m| m.clover_threshold = Some(1.5),
+            |m| m.generation_defaults.speculation = Some("difusion".to_owned()),
+            |m| m.batch = true,
+        ];
+        for mutate in invalid {
+            let mut model = base();
+            mutate(&mut model);
+            let mut result = empty_result();
+            assert!(!check_clover_settings("test", &model, &mut result));
+            assert_eq!(result.failures, 1);
+        }
     }
 
     // -- Duplicate model detection --

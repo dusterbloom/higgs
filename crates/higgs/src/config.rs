@@ -525,6 +525,14 @@ pub struct ModelConfig {
     /// Optional path to a `DFlash` drafter (simple engine); overrides `HIGGS_DFLASH_PATH`.
     #[serde(default)]
     pub draft_model: Option<String>,
+    /// Clover block-diffusion block size (`speculation = "diffusion"`); must
+    /// divide the checkpoint's trained block size (32). Default: trained size.
+    #[serde(default)]
+    pub clover_block_size: Option<usize>,
+    /// Clover `LowConfidence` unmask threshold in `[0, 1]`. Default: the
+    /// checkpoint's `denoising_config.threshold` (0.95).
+    #[serde(default)]
+    pub clover_threshold: Option<f32>,
     /// Optional path to a small dense MLX model (e.g. Qwen3-0.6B) used to score
     /// the prompt for compressive (PFlash) prefill. This is not the served
     /// target model: Bonsai Ternary/Q2 can be the target, but `prefill_drafter`
@@ -1012,6 +1020,8 @@ impl Default for ModelConfig {
             disable_vision: false,
             prefill_yield_tokens: None,
             draft_model: None,
+            clover_block_size: None,
+            clover_threshold: None,
             prefill_drafter: None,
             prefill_compression: PrefillCompressionMode::Off,
             prefill_threshold: default_prefill_threshold(),
@@ -1269,6 +1279,8 @@ pub fn build_simple_config(args: &ServeArgs) -> Result<HiggsConfig, String> {
             kv_adaptive_dense_layers: args.kv_adaptive_dense_layers.unwrap_or(0),
             kv_seed: args.kv_seed.unwrap_or_default(),
             draft_model: None,
+            clover_block_size: None,
+            clover_threshold: None,
             prefill_drafter: None,
             prefill_compression: PrefillCompressionMode::Off,
             prefill_threshold: default_prefill_threshold(),
@@ -1411,6 +1423,8 @@ fn extract_config(
                     kv_adaptive_dense_layers: serve_args.kv_adaptive_dense_layers.unwrap_or(0),
                     kv_seed: serve_args.kv_seed.unwrap_or_default(),
                     draft_model: None,
+                    clover_block_size: None,
+                    clover_threshold: None,
                     prefill_drafter: None,
                     prefill_compression: PrefillCompressionMode::Off,
                     prefill_threshold: default_prefill_threshold(),
@@ -1643,6 +1657,8 @@ fn ensure_auto_router_model(config: &mut HiggsConfig) {
         kv_adaptive_dense_layers: 0,
         kv_seed: 0,
         draft_model: None,
+        clover_block_size: None,
+        clover_threshold: None,
         prefill_drafter: None,
         prefill_compression: PrefillCompressionMode::Off,
         prefill_threshold: default_prefill_threshold(),

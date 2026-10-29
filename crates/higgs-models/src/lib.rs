@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod bonsai_q1;
 pub mod bonsai_q2;
 pub mod cache;
+pub mod clover;
 /// Internal: runtime JIT Metal kernels (Bonsai-Q1 bits=1 matvec/dequant).
 mod crossrow_qmv;
 pub mod deepseek_v2;
@@ -163,13 +164,16 @@ pub enum Speculation {
     Mtp,
     /// Disable speculation entirely; plain autoregressive decode.
     None,
+    /// Clover block diffusion (`LowConfidence` block preview); plain
+    /// autoregressive decode on models without block preview.
+    Diffusion,
 }
 
 impl Speculation {
     /// Parse a request value; absent (`None`) → [`Speculation::Auto`].
     ///
     /// # Errors
-    /// Returns the offending value when it is not one of `auto|dflash|mtp|none`.
+    /// Returns the offending value when it is not one of `auto|dflash|mtp|none|diffusion`.
     pub fn parse(value: Option<&str>) -> Result<Self, String> {
         let Some(raw) = value else {
             return Ok(Self::Auto);
@@ -179,6 +183,7 @@ impl Speculation {
             "dflash" => Ok(Self::DFlash),
             "mtp" => Ok(Self::Mtp),
             "none" | "off" => Ok(Self::None),
+            "diffusion" => Ok(Self::Diffusion),
             other => Err(other.to_owned()),
         }
     }
@@ -1045,6 +1050,36 @@ impl AnyModel {
     pub fn supports_batched_decode(&self) -> bool {
         matches!(self, Self::Transformer(m) if m.supports_batched_decode())
             || matches!(self, Self::LlavaQwen2(_) | Self::QwenVl(_))
+    }
+
+    /// Clover block-diffusion settings when the checkpoint supports block
+    /// preview ([`Self::forward_preview_block`]); `None` otherwise.
+    pub const fn clover_args(&self) -> Option<&qwen3_next::CloverArgs> {
+        if let Self::Qwen3Next(m) = self {
+            m.args.clover.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// Whether [`Self::forward_preview_block`] is available (Clover checkpoints).
+    pub const fn supports_block_preview(&self) -> bool {
+        self.clover_args().is_some()
+    }
+
+    /// Clover block preview: logits `[1, S, V]` for every position of
+    /// `inputs` `[1, S]` against the committed `cache`, which is only read.
+    pub fn forward_preview_block(
+        &mut self,
+        inputs: &Array,
+        cache: &AnyCache,
+    ) -> Result<Array, Exception> {
+        match (self, cache) {
+            (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_preview_block(inputs, c),
+            _ => Err(Exception::custom(
+                "block preview requires a Clover checkpoint (Qwen3Next + Hybrid cache)",
+            )),
+        }
     }
 
     /// Whether this model has a loaded MTP head for speculative decode.

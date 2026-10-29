@@ -436,7 +436,7 @@ async fn create_message_non_streaming(
     let speculation =
         higgs_models::Speculation::parse(req.speculation.as_deref()).map_err(|v| {
             ServerError::BadRequest(format!(
-                "invalid 'speculation' value '{v}' (expected auto|dflash|mtp|none)"
+                "invalid 'speculation' value '{v}' (expected auto|dflash|mtp|none|diffusion)"
             ))
         })?;
     let sampling = SamplingParams {
@@ -602,7 +602,7 @@ async fn create_message_stream(
     let speculation =
         higgs_models::Speculation::parse(req.speculation.as_deref()).map_err(|v| {
             ServerError::BadRequest(format!(
-                "invalid 'speculation' value '{v}' (expected auto|dflash|mtp|none)"
+                "invalid 'speculation' value '{v}' (expected auto|dflash|mtp|none|diffusion)"
             ))
         })?;
     let sampling = SamplingParams {

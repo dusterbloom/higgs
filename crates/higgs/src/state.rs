@@ -1642,7 +1642,7 @@ pub fn build_engine(
         ));
     }
     let kv_cache_config = model_cfg.kv_cache_config();
-    let engine = if model_cfg.batch {
+    let mut engine = if model_cfg.batch {
         Engine::load_batch(resolved, kv_cache_config, local.raise_wired_limit)
             .map_err(|e| e.to_string())?
     } else {
@@ -1672,6 +1672,11 @@ pub fn build_engine(
         )
         .map_err(|e| e.to_string())?
     };
+    if let Engine::Simple(simple) = &mut engine {
+        simple
+            .set_clover_overrides(model_cfg.clover_block_size, model_cfg.clover_threshold)
+            .map_err(|e| e.to_string())?;
+    }
     let name = resolve_exposed_model_name(model_cfg.name.as_deref(), &model_cfg.path, resolved);
     Ok((name, engine))
 }

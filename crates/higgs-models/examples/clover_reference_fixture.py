@@ -6,7 +6,8 @@ Writes two things:
     (tensors byte-copied, config trimmed) that higgs loads like the full model.
   * ``<out>/fixture.safetensors`` + ``fixture.json``: logits from the HF
     reference ``CloverMoeModelLM`` run on the same weights (MLX affine
-    dequantized), for prefill, preview and commit scenarios.
+    dequantized), for prefill, preview and commit scenarios, plus the
+    reference LowConfidence ``generate`` tokens (greedy, with/without penalties).
 
 Needs torch, transformers==5.19.0 and safetensors, plus the reference
 ``modeling_clover_moe.py`` / ``configuration_clover_moe.py`` /
@@ -29,6 +30,7 @@ from pathlib import Path
 
 import torch
 from safetensors.torch import save_file
+from transformers import GenerationConfig
 
 PREFIX = "language_model."
 
@@ -146,6 +148,7 @@ def main() -> None:
     ap.add_argument("reference_code", type=Path)
     ap.add_argument("out", type=Path)
     ap.add_argument("--layers", type=int, default=4)
+    ap.add_argument("--new-tokens", type=int, default=64)
     args = ap.parse_args()
     torch.manual_seed(0)
 
@@ -218,11 +221,41 @@ def main() -> None:
         cache = model(torch.tensor([first]), past_key_values=cache, use_cache=True).past_key_values
         preview(all_mask, "preview_after_commit_logits")
 
+        # Reference LowConfidence `generate` (greedy), with and without the
+        # response penalties; "ramps" moves the length/think-end ramps into a
+        # 64-token window so their bias paths are exercised too. Threshold 0
+        # resolves each block in one pass (per-position argmax, high margin);
+        # 0.95 is the trained setting, whose unmask order on this 4-layer
+        # slice is decided by near-uniform (~1%) confidences.
+        pack = json.loads((args.out / "slice" / "generation_config.json").read_text())
+        penalties = {k: pack[k] for k in (
+            "presence_penalty", "frequency_penalty", "repetition_penalty",
+            "dllm_length_penalty", "dllm_length_penalty_start", "dllm_length_penalty_window",
+            "dllm_think_end_bias", "dllm_think_end_start", "dllm_think_end_window",
+            "dllm_think_end_token_id")}
+        off = {"presence_penalty": 0.0, "frequency_penalty": 0.0, "repetition_penalty": 1.0,
+               "dllm_length_penalty": 0.0, "dllm_think_end_bias": 0.0}
+        ramps = dict(penalties, dllm_length_penalty_start=0, dllm_length_penalty_window=64,
+                     dllm_think_end_start=0, dllm_think_end_window=32)
+        generations = []
+        for threshold in (0.0, 0.95):
+            for name, extra in (("greedy", off), ("pack_penalties", penalties), ("ramps", ramps)):
+                kwargs = dict(extra, max_new_tokens=args.new_tokens, do_sample=False,
+                              eos_token_id=pack["eos_token_id"],
+                              pad_token_id=pack["pad_token_id"],
+                              block_size=config.block_size, threshold=threshold)
+                seq = model.generate(prompt, generation_config=GenerationConfig(), **kwargs)
+                tokens = seq[0, prompt.shape[1]:].tolist()
+                name = f"{name}@{threshold}"
+                generations.append({"name": name, "settings": kwargs, "tokens": tokens})
+                print(f"generate {name}: {len(tokens)} tokens")
+
     args.out.mkdir(parents=True, exist_ok=True)
     save_file({k: v.contiguous() for k, v in out.items()}, str(args.out / "fixture.safetensors"))
     (args.out / "fixture.json").write_text(json.dumps({
         "prompt": prompt[0].tolist(), "mask_token_id": mask, "block_size": config.block_size,
         "first_block": first, "partial_block": partial, "layers": args.layers,
+        "generate": generations,
     }, indent=1))
     print("fixture:", {k: tuple(v.shape) for k, v in out.items()})
 

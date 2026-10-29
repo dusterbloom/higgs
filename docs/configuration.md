@@ -45,7 +45,8 @@ This document collects the full CLI, environment, and config-file reference for 
 - `HIGGS_MTP_DRAFT_N_MAX` controls the maximum MTP draft tokens per speculative cycle. The default is `2` for huge checkpoints and `1` otherwise, clamped to `1..=8`.
 - `HIGGS_MTP_ADAPTIVE_DRAFT=1` lets the decode loop increase or decrease the MTP draft window based on recent verifier acceptance.
 - `HIGGS_MTP_PROMPT_LOOKUP=1` enables a hybrid MTP loop that tries verified prompt-lookup drafts when the prompt/history has a repeated suffix, then keeps the MTP cache synchronized for later MTP-head cycles.
-- Per request, the OpenAI and Anthropic bodies accept `"speculation": "auto" | "dflash" | "mtp" | "none"` to choose the speculative method for that request. `auto` (default) uses the DFlash drafter when one is loaded — including while streaming — and otherwise the MTP head; `mtp` forces the MTP head even when a drafter is loaded; `none` forces plain autoregressive decode. (DFlash requires `draft_model` and the simple engine; it is unavailable under `batch = true`.)
+- Per request, the OpenAI and Anthropic bodies accept `"speculation": "auto" | "dflash" | "mtp" | "none" | "diffusion"` to choose the speculative method for that request. `auto` (default) uses the DFlash drafter when one is loaded — including while streaming — and otherwise the MTP head; `mtp` forces the MTP head even when a drafter is loaded; `none` forces plain autoregressive decode. (DFlash requires `draft_model` and the simple engine; it is unavailable under `batch = true`.) A model's `generation_defaults.speculation` sets the same value as a per-model default.
+- `diffusion` selects block-diffusion (`LowConfidence`) decoding on Clover (`clover_moe`) checkpoints: each 32-token block starts fully masked and is refined by bidirectional preview passes, unmasking every position whose confidence exceeds the threshold (else the single most confident one) until the block resolves; the block is then committed causally. It is opt-in only (`auto` never picks it), simple-engine only, and falls back to autoregressive decode on other models and for requests with tool/JSON constraints, images or logprobs. In this mode the response penalties default to the checkpoint's `generation_config.json` (Clover: presence 0.9, repetition 1.05, length and think-end ramps); request `presence_penalty`, `frequency_penalty` and `repetition_penalty` override them. The prefix cache, PFlash compression and thinking budgets are not applied in diffusion mode, and output streams one block at a time. Optional per-model `clover_block_size` (must divide 32) and `clover_threshold` (`0..=1`, default 0.95) tune the block loop.
 - `HIGGS_CLEAR_CACHE_AFTER_PREFILL` overrides the selected MLX profile behavior for cache clearing.
 - `HIGGS_TURBOQUANT_MIN_TOKENS` overrides the TurboQuant activation threshold. The default is `2048`.
 - `HIGGS_EXPERIMENTAL_PAGED_KV=1` enables the experimental paged-KV path.
@@ -85,6 +86,8 @@ path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 # mlx_profile = "throughput"
 # batch = false
 # draft_model = "/path/to/dflash-drafter"   # enables DFlash speculative decoding (simple engine only)
+# clover_block_size = 32   # Clover block diffusion ("speculation": "diffusion"): must divide 32
+# clover_threshold = 0.95  # Clover LowConfidence unmask threshold, 0..=1
 # prefill_yield_tokens = 512 # 0 or omitted keeps synchronous prefill
 # kv_cache = "turboquant"
 # kv_bits = 3

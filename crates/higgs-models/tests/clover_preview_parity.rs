@@ -8,10 +8,12 @@
 use std::path::PathBuf;
 
 use higgs_models::{
+    AnyModel, SamplingParams,
     cache::KeyValueCache,
+    clover::{AnyModelBlocks, BlockDecodeConfig, BlockModel, CloverPenalties, block_decode},
     qwen3_next::{LayerCache, Qwen3NextCausalLM, load_qwen3_5_moe_model},
 };
-use mlx_rs::{Array, Dtype, ops::indexing::IndexOp};
+use mlx_rs::{Array, Dtype, error::Exception, ops::indexing::IndexOp};
 
 struct Fixture {
     model: Qwen3NextCausalLM,
@@ -195,4 +197,147 @@ fn block_preview_matches_reference_and_leaves_cache_untouched() {
         &got,
         &f.logits["preview_after_commit_logits"],
     );
+}
+
+fn generate_case<'a>(meta: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    meta["generate"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["name"] == name)
+        .unwrap_or_else(|| panic!("fixture lacks generate case {name}"))
+}
+
+/// The block-loop config the reference `generate` ran with for `case`.
+fn case_config(meta: &serde_json::Value, case: &serde_json::Value) -> BlockDecodeConfig {
+    let settings = &case["settings"];
+    let int = |key: &str| usize::try_from(settings[key].as_u64().unwrap()).unwrap();
+    BlockDecodeConfig {
+        block_size: int("block_size"),
+        #[allow(clippy::cast_possible_truncation)]
+        threshold: settings["threshold"].as_f64().unwrap() as f32,
+        mask_token_id: u32::try_from(meta["mask_token_id"].as_u64().unwrap()).unwrap(),
+        max_new_tokens: int("max_new_tokens"),
+        eos_token_ids: ids(settings, "eos_token_id"),
+        pad_token_id: settings["pad_token_id"]
+            .as_u64()
+            .map(|v| u32::try_from(v).unwrap()),
+        penalties: CloverPenalties::from_generation_config(settings),
+        sampling: SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        },
+    }
+}
+
+/// Replays the reference's own preview logits, one array per pass.
+struct Replay {
+    logits: Vec<Array>,
+    commits: Vec<Vec<u32>>,
+}
+
+impl BlockModel for Replay {
+    fn preview(&mut self, _block: &[u32]) -> Result<Array, Exception> {
+        assert!(
+            !self.logits.is_empty(),
+            "more preview passes than the reference"
+        );
+        Ok(self.logits.remove(0))
+    }
+
+    fn commit(&mut self, tokens: &[u32]) -> Result<(), Exception> {
+        self.commits.push(tokens.to_vec());
+        Ok(())
+    }
+}
+
+/// Block loop + penalties + ramps on the reference's exact logits must
+/// reproduce the reference `generate` tokens bit-for-bit. Threshold 0 resolves
+/// a block in one pass, so the fixture's all-mask previews (after the prompt,
+/// and after committing the first block) are exactly what the reference saw.
+#[test]
+#[ignore = "needs HIGGS_CLOVER_FIXTURE_DIR (examples/clover_reference_fixture.py)"]
+fn block_loop_on_reference_logits_matches_reference_generate() {
+    let Some(f) = fixture() else { return };
+    let _gate = higgs_models::mlx_exec::acquire();
+    let first = ids(&f.meta, "first_block");
+    for (name, blocks) in [
+        ("greedy@0.0", 2),
+        ("pack_penalties@0.0", 2),
+        // Its second block follows a different first block; replay one.
+        ("ramps@0.0", 1),
+    ] {
+        let case = generate_case(&f.meta, name);
+        let mut cfg = case_config(&f.meta, case);
+        cfg.max_new_tokens = 32 * blocks;
+        let mut want = ids(case, "tokens");
+        want.truncate(cfg.max_new_tokens);
+        if blocks > 1 {
+            assert_eq!(
+                want[..32],
+                first[..],
+                "{name}: replayed block 2 follows first_block"
+            );
+        }
+        let mut replay = Replay {
+            logits: vec![
+                f.logits["preview_mask32_logits"].clone(),
+                f.logits["preview_after_commit_logits"].clone(),
+            ],
+            commits: Vec::new(),
+        };
+        let vocab = f.logits["preview_mask32_logits"].shape()[1];
+        let out = block_decode(&cfg, vocab, &mut replay, |_| false).unwrap();
+        assert_eq!(out.tokens, want, "{name}");
+        assert_eq!(out.passes_per_block, vec![1; blocks], "{name}");
+        assert_eq!(replay.commits, vec![first.clone(); blocks - 1], "{name}");
+    }
+}
+
+/// Full higgs diffusion (preview forward + causal commits) on the slice vs the
+/// reference `generate`. Exact for `greedy@0.0`. The other cases are printed,
+/// not asserted: on this 4-layer slice they hinge on sub-ulp bf16 ties
+/// (measured 2026-10-29: `pack_penalties@0.0` token 47, penalised 83 beats
+/// 82 by 0.039 logits in the reference; `ramps@0.0` token 22, think-end beats
+/// EOS by 0.020; every `@0.95` case unmasks one position per pass by
+/// near-uniform ~1% confidences, first reordered at pass 5 where the
+/// reference's top pending confidences are 0.01053/0.01047/0.01047).
+#[test]
+#[ignore = "needs HIGGS_CLOVER_FIXTURE_DIR (examples/clover_reference_fixture.py)"]
+fn diffusion_generate_on_slice_matches_reference_tokens() {
+    let Some(f) = fixture() else { return };
+    let _gate = higgs_models::mlx_exec::acquire();
+    let prompt = ids(&f.meta, "prompt");
+    let mut model = AnyModel::Qwen3Next(f.model);
+    for case in f.meta["generate"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let cfg = case_config(&f.meta, case);
+        let want = ids(case, "tokens");
+        let mut cache = model.make_cache().unwrap();
+        let n = i32::try_from(prompt.len()).unwrap();
+        let logits = model
+            .forward(&Array::from_slice(&prompt, &[1, n]), None, &mut cache)
+            .unwrap();
+        let vocab = *logits.shape().last().unwrap();
+        let mut blocks = AnyModelBlocks {
+            model: &mut model,
+            cache: &mut cache,
+        };
+        let out = block_decode(&cfg, vocab, &mut blocks, |_| false).unwrap();
+        let diverged = out
+            .tokens
+            .iter()
+            .zip(&want)
+            .position(|(a, b)| a != b)
+            .or_else(|| (out.tokens.len() != want.len()).then(|| out.tokens.len().min(want.len())));
+        println!(
+            "{name}: {} tokens (reference {}), passes/block {:?}, first divergence {diverged:?}",
+            out.tokens.len(),
+            want.len(),
+            out.passes_per_block
+        );
+        if name == "greedy@0.0" {
+            assert_eq!(out.tokens, want, "{name}");
+        }
+    }
 }

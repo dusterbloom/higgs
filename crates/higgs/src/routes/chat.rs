@@ -2184,7 +2184,7 @@ fn build_sampling_params(
     )
     .map_err(|v| {
         ServerError::BadRequest(format!(
-            "invalid 'speculation' value '{v}' (expected auto|dflash|mtp|none)"
+            "invalid 'speculation' value '{v}' (expected auto|dflash|mtp|none|diffusion)"
         ))
     })?;
     let repetition_penalty = if req.repetition_penalty.is_some() || req.repeat_penalty.is_some() {

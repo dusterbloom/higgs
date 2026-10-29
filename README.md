@@ -177,6 +177,7 @@ never count as traffic in metrics.
 - `[local].raise_wired_limit` defaults to `false`. Enable it only when you explicitly want MLX to raise the process wired-memory limit.
 - `batch=true` is only supported for transformer families with true batched decode support.
 - For batch models, `prefill_yield_tokens` can interleave long prompt prefills with decode; use `0` or omit it for the synchronous default.
+- Clover (`clover_moe`) checkpoints also decode by block diffusion with `"speculation": "diffusion"` (per request or `generation_defaults.speculation`); optional per-model `clover_block_size` (divides 32) and `clover_threshold` (0..=1). See [docs/configuration.md](docs/configuration.md).
 
 
 ## Performance
