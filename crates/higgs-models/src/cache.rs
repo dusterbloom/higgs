@@ -822,6 +822,26 @@ impl SteppingKeyValueCache {
         targets
     }
 
+    /// Read-only view of the resident K/V, for passes that attend to the cache
+    /// without appending to it (Clover block preview). `None` when empty.
+    pub fn peek_view(&self) -> Result<Option<KvCacheView>, Exception> {
+        if self.mla.is_some() {
+            return Err(Exception::custom("peek_view: MLA caches are unsupported"));
+        }
+        if let Some(turbo) = self.turbo.as_ref().filter(|turbo| turbo.capacity > 0) {
+            return turbo
+                .view(self.offset)
+                .map(|view| Some(KvCacheView::TurboQuant(view)));
+        }
+        match (&self.keys, &self.values) {
+            (Some(keys), Some(values)) if self.offset > 0 => Ok(Some(KvCacheView::Dense {
+                keys: slice_axis2(keys, 0, self.offset)?,
+                values: slice_axis2(values, 0, self.offset)?,
+            })),
+            _ => Ok(None),
+        }
+    }
+
     /// Read-only access to internal key array (includes allocated-but-unused slots).
     pub const fn keys(&self) -> Option<&Array> {
         self.keys.as_ref()

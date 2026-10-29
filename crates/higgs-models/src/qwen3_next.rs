@@ -201,6 +201,48 @@ impl Default for QuantSpec {
         }
     }
 }
+/// DiffuSpace Clover (block-diffusion Qwen3.6) preview-mode settings, read
+/// from `config.json` when it declares `mask_token_id` and `block_size`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CloverArgs {
+    /// Trained diffusion block length; preview blocks must divide it.
+    pub block_size: i32,
+    /// Token id of an unresolved block position.
+    pub mask_token_id: u32,
+    /// Block-level expert coreset coverage (`moe_block_coreset_top_p`), when
+    /// `moe_block_coreset_enabled`.
+    pub coreset_top_p: Option<f32>,
+    /// LowConfidence unmask threshold (`denoising_config.threshold`).
+    pub threshold: f32,
+}
+
+impl CloverArgs {
+    #[allow(clippy::cast_possible_truncation)]
+    fn from_config(config: &serde_json::Value) -> Option<Self> {
+        let block_size = i32::try_from(config.get("block_size")?.as_i64()?).ok()?;
+        let mask_token_id = u32::try_from(config.get("mask_token_id")?.as_u64()?).ok()?;
+        let coreset_enabled = config
+            .get("moe_block_coreset_enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let coreset_top_p = coreset_enabled
+            .then(|| config.get("moe_block_coreset_top_p")?.as_f64())
+            .flatten()
+            .map(|p| p as f32);
+        let threshold = config
+            .get("denoising_config")
+            .and_then(|d| d.get("threshold"))
+            .and_then(serde_json::Value::as_f64)
+            .map_or(0.95, |t| t as f32);
+        Some(Self {
+            block_size,
+            mask_token_id,
+            coreset_top_p,
+            threshold,
+        })
+    }
+}
+
 /// Configuration for the Qwen3-Next / Qwen3.5 hybrid architecture.
 ///
 /// Supports hybrid SSM/attention transformers with optional Sparse `MoE`.
@@ -301,6 +343,10 @@ pub struct Qwen3NextModelArgs {
     /// bits/group_size/mode.
     #[serde(default)]
     pub hadamard_overrides: BTreeMap<String, i32>,
+
+    /// Clover block-diffusion settings; `Some` only for Clover checkpoints.
+    #[serde(skip)]
+    pub clover: Option<CloverArgs>,
 
     /// Use separate GDN projections (qwen3.5-style) instead of combined (qwen3_next-style).
     #[serde(default)]
@@ -4033,6 +4079,36 @@ pub mod norm_convention_probe {
     }
 }
 
+/// Clover's block-level expert coreset (`coreset_torch`): pool each block
+/// row's top-k routing probabilities per expert, keep the smallest set of
+/// experts covering `top_p` of that mass, and mask every other expert's router
+/// logit for the whole block. Logits `[B, S, E]` -> masked logits.
+fn coreset_router_logits(logits: &Array, top_k: i32, top_p: f32) -> Result<Array, Exception> {
+    let num_experts = *logits
+        .shape()
+        .last()
+        .ok_or_else(|| Exception::custom("router logits need an expert axis"))?;
+    let probs = ops::softmax_axis(&logits.as_dtype(Dtype::Float32)?, -1, true)?;
+    let top = ops::argpartition_axis(&probs, -top_k, -1)?.index((.., .., num_experts - top_k..));
+    let expert_ids: Vec<u32> = (0..u32::try_from(num_experts).unwrap_or(0)).collect();
+    let experts = Array::from_slice(&expert_ids, &[num_experts]);
+    let chosen = top
+        .expand_dims(-1)?
+        .eq(&experts)?
+        .as_dtype(Dtype::Float32)?
+        .sum_axes(&[-2], false)?; // [B, S, E], 1 where in the row's top-k
+    let totals = probs.multiply(&chosen)?.sum_axes(&[1], false)?; // [B, E]
+    let share = totals.divide(totals.sum_axes(&[-1], true)?)?;
+    let order = ops::argsort_axis(&share.negative()?, -1)?; // descending share
+    let sorted = share.take_along_axis(&order, -1)?;
+    // Exclusive prefix sum: the top expert (0 before it) is always kept.
+    let mass_before = sorted.cumsum(-1, None, false)?;
+    let keep_sorted = mass_before.lt(&Array::from_f32(top_p))?;
+    let allowed = keep_sorted.take_along_axis(&ops::argsort_axis(&order, -1)?, -1)?;
+    let masked = Array::from_f32(f32::NEG_INFINITY).as_dtype(logits.dtype())?;
+    ops::r#where(&allowed.expand_dims(1)?, logits, &masked)
+}
+
 /// `HIGGS_MOE_GATHER_PAD=1`: route the generic switch-MLP gather through the
 /// padded `gather_qmm_rhs` path instead of `gather_qmv` (see
 /// `SwitchMlpWeights::forward_gather_global_sort`).
@@ -5367,6 +5443,77 @@ impl Qwen3NextAttention {
         }
     }
 
+    /// Clover block preview: the block attends to the whole committed prefix
+    /// and to every block position with no causal mask. `cache` is read
+    /// through `peek_view`, never appended to.
+    #[allow(non_snake_case)]
+    fn forward_preview(
+        &mut self,
+        x: &Array,
+        cache: &SteppingKeyValueCache,
+    ) -> Result<Array, Exception> {
+        let shape = x.shape();
+        let (B, L) = (shape[0], shape[1]);
+        let q_out = self
+            .q_proj
+            .forward(x)?
+            .reshape(&[B, L, self.num_attention_heads, -1])?;
+        let halves = q_out.split(2, Some(-1))?;
+        let gate = halves[1].reshape(&[B, L, -1])?;
+        let queries = self
+            .q_norm
+            .forward(&halves[0])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let keys = self
+            .k_norm
+            .forward(
+                &self
+                    .k_proj
+                    .forward(x)?
+                    .reshape(&[B, L, self.num_key_value_heads, -1])?,
+            )?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let values = self
+            .v_proj
+            .forward(x)?
+            .reshape(&[B, L, self.num_key_value_heads, -1])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+
+        // Block positions continue the committed prefix (length-independent rope).
+        let rotate = |rows: Array| {
+            apply_qwen3_next_rope_scheduled(
+                rows,
+                &self.rope,
+                cache.position_offset(),
+                self.yarn.as_ref(),
+                DFlashRowSchedule::NativeBatch,
+            )
+        };
+        let queries = rotate(queries)?;
+        let keys = rotate(keys)?;
+        let (keys, values) = match cache.peek_view()? {
+            Some(prefix) => {
+                let (prefix_keys, prefix_values) = prefix.into_dense()?;
+                (
+                    ops::concatenate_axis(&[&prefix_keys, &keys], 2)?,
+                    ops::concatenate_axis(&[&prefix_values, &values], 2)?,
+                )
+            }
+            None => (keys, values),
+        };
+        let output = fast::scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            self.scale,
+            None,
+            None::<&Array>,
+        )?
+        .transpose_axes(&[0, 2, 1, 3])?
+        .reshape(&[B, L, -1])?;
+        self.o_proj.forward(&sigmoid_mul(&gate, &output)?)
+    }
+
     /// Apply `RoPE` at custom positions using `rope_dynamic`.
     ///
     /// # Arguments
@@ -6645,6 +6792,38 @@ pub struct GdnLayerTape {
     pub offset_init: i32,
 }
 
+/// Clover's preview-only GDN tensors (`bd_gdn_conv1d` right taps and the
+/// `bd_gdn_local_memory` softmax controls). Unused by causal decoding.
+#[derive(Debug, Clone, ModuleParameters)]
+struct CloverPreviewParams {
+    /// Right-convolution taps `[conv_dim, 1, kernel - 1]`.
+    #[param]
+    conv_right_weight: Param<Array>,
+    /// Per-value-head scale on the l2-normalized block logits `[Hv]`.
+    #[param]
+    bd_softmax_logit_scale: Param<Array>,
+    /// Per-value-head history-slot logit bias `[Hv]`.
+    #[param]
+    bd_softmax_history_bias: Param<Array>,
+    /// Per-value-head history-slot block-length coefficient `[Hv]`.
+    #[param]
+    bd_softmax_history_c: Param<Array>,
+}
+
+impl CloverPreviewParams {
+    /// Shape-`[1]` placeholders, so a checkpoint missing them fails the
+    /// all-params-loaded check instead of previewing with zeros.
+    fn placeholders() -> Result<Self, Exception> {
+        let placeholder = || Array::zeros::<f32>(&[1]).map(Param::new);
+        Ok(Self {
+            conv_right_weight: placeholder()?,
+            bd_softmax_logit_scale: placeholder()?,
+            bd_softmax_history_bias: placeholder()?,
+            bd_softmax_history_c: placeholder()?,
+        })
+    }
+}
+
 #[allow(non_snake_case)]
 #[derive(Debug, Clone, ModuleParameters)]
 struct GatedDeltaNet {
@@ -6683,6 +6862,9 @@ struct GatedDeltaNet {
     qk_norm_weight_k: Array,
     /// Pre-transposed conv weight for fast T=1 decode: [`kernel_size`, `conv_dim`].
     conv_weight_t: Option<Array>,
+    /// Clover block-preview tensors; `Some` only for Clover checkpoints.
+    #[param]
+    clover: Option<CloverPreviewParams>,
 }
 
 impl GatedDeltaNet {
@@ -6790,6 +6972,11 @@ impl GatedDeltaNet {
                 Array::from_slice(&values, &[head_k_dim])
             },
             conv_weight_t: None,
+            clover: args
+                .clover
+                .as_ref()
+                .map(|_| CloverPreviewParams::placeholders())
+                .transpose()?,
         })
     }
 
@@ -6908,8 +7095,21 @@ impl GatedDeltaNet {
         batch: i32,
         dtype: Dtype,
     ) -> Result<Array, Exception> {
+        let ordered = self.chronological_conv_state_ref(cache, batch, dtype)?;
+        cache.conv_state = None;
+        Ok(ordered)
+    }
+
+    /// The last `kernel - 1` committed conv inputs, oldest first and
+    /// zero-padded for short prefixes, without touching the cache.
+    fn chronological_conv_state_ref(
+        &self,
+        cache: &ArraysCache,
+        batch: i32,
+        dtype: Dtype,
+    ) -> Result<Array, Exception> {
         let n_keep = self.conv_kernel_size - 1;
-        let Some(state) = cache.conv_state.take() else {
+        let Some(state) = cache.conv_state.clone() else {
             return ops::zeros_dtype(&[batch, n_keep, self.conv_dim], dtype);
         };
 
@@ -7317,52 +7517,7 @@ impl GatedDeltaNet {
             .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
 
         // Project inputs — same as stateful forward
-        let (q, k, v, z, b, a) = if self.use_separate_projections {
-            let qkv_proj = self
-                .in_proj_qkv
-                .as_ref()
-                .ok_or_else(|| Exception::custom("in_proj_qkv missing"))?;
-            let z_proj = self
-                .in_proj_z
-                .as_ref()
-                .ok_or_else(|| Exception::custom("in_proj_z missing"))?;
-            let b_proj = self
-                .in_proj_b
-                .as_ref()
-                .ok_or_else(|| Exception::custom("in_proj_b missing"))?;
-            let a_proj = self
-                .in_proj_a
-                .as_ref()
-                .ok_or_else(|| Exception::custom("in_proj_a missing"))?;
-
-            let qkv = qkv_proj.forward(inputs)?;
-            let z = z_proj
-                .forward(inputs)?
-                .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
-            let b = b_proj.forward(inputs)?;
-            let a = a_proj.forward(inputs)?;
-
-            let split_indices = &[self.key_dim, self.key_dim * 2];
-            let qkv_parts = qkv.split_axis(split_indices, Some(-1))?;
-            let q = qkv_parts
-                .first()
-                .ok_or_else(|| Exception::custom("qkv split failed"))?
-                .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
-            let k = qkv_parts
-                .get(1)
-                .ok_or_else(|| Exception::custom("qkv split failed"))?
-                .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
-            let v = qkv_parts
-                .get(2)
-                .ok_or_else(|| Exception::custom("qkv split failed"))?
-                .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
-
-            (q, k, v, z, b, a)
-        } else {
-            let mixed_qkvz = self.in_proj_qkvz.forward(inputs)?;
-            let mixed_ba = self.in_proj_ba.forward(inputs)?;
-            self.fix_query_key_value_ordering(&mixed_qkvz, &mixed_ba, B, S)?
-        };
+        let (q, k, v, z, b, a) = self.project_qkvzba(inputs, B, S)?;
 
         // Conv1d — read conv_state without consuming it
         let q_flat = q.reshape(&[B, S, -1])?;
@@ -7490,6 +7645,199 @@ impl GatedDeltaNet {
 
         let out_flat = gated_out.reshape(&[B, S, -1])?;
         self.out_proj.forward(&out_flat)
+    }
+
+    /// Input projections `(q, k, v, z, b, a)` in per-head layout, from either
+    /// the fused (`qkvz`/`ba`) or the separate projection weights.
+    #[allow(non_snake_case, clippy::type_complexity)]
+    fn project_qkvzba(
+        &self,
+        inputs: &Array,
+        B: i32,
+        S: i32,
+    ) -> Result<(Array, Array, Array, Array, Array, Array), Exception> {
+        Ok(if self.use_separate_projections {
+            let qkv_proj = self
+                .in_proj_qkv
+                .as_ref()
+                .ok_or_else(|| Exception::custom("in_proj_qkv missing"))?;
+            let z_proj = self
+                .in_proj_z
+                .as_ref()
+                .ok_or_else(|| Exception::custom("in_proj_z missing"))?;
+            let b_proj = self
+                .in_proj_b
+                .as_ref()
+                .ok_or_else(|| Exception::custom("in_proj_b missing"))?;
+            let a_proj = self
+                .in_proj_a
+                .as_ref()
+                .ok_or_else(|| Exception::custom("in_proj_a missing"))?;
+
+            let qkv = qkv_proj.forward(inputs)?;
+            let z = z_proj
+                .forward(inputs)?
+                .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
+            let b = b_proj.forward(inputs)?;
+            let a = a_proj.forward(inputs)?;
+
+            let split_indices = &[self.key_dim, self.key_dim * 2];
+            let qkv_parts = qkv.split_axis(split_indices, Some(-1))?;
+            let q = qkv_parts
+                .first()
+                .ok_or_else(|| Exception::custom("qkv split failed"))?
+                .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
+            let k = qkv_parts
+                .get(1)
+                .ok_or_else(|| Exception::custom("qkv split failed"))?
+                .reshape(&[B, S, self.num_k_heads, self.head_k_dim])?;
+            let v = qkv_parts
+                .get(2)
+                .ok_or_else(|| Exception::custom("qkv split failed"))?
+                .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
+
+            (q, k, v, z, b, a)
+        } else {
+            let mixed_qkvz = self.in_proj_qkvz.forward(inputs)?;
+            let mixed_ba = self.in_proj_ba.forward(inputs)?;
+            self.fix_query_key_value_ordering(&mixed_qkvz, &mixed_ba, B, S)?
+        })
+    }
+
+    /// Clover block preview (`bd_gdn_conv1d` + `bd_gdn_local_memory`) over a
+    /// whole-valid block `inputs` `[B, S, D]` against the committed state in
+    /// `cache`, which is read and never written. The conv adds Clover's right
+    /// taps over later block positions to the causal taps over the committed
+    /// history; the mixer is a bidirectional softmax over the block plus one
+    /// history slot holding the gate-decayed readout of the clean SSM state.
+    #[allow(non_snake_case, clippy::too_many_lines)]
+    fn forward_preview(&mut self, inputs: &Array, cache: &ArraysCache) -> Result<Array, Exception> {
+        let shape = inputs.shape();
+        let (B, S) = (shape[0], shape[1]);
+        let (hv, dk, dv) = (self.num_v_heads, self.head_k_dim, self.head_v_dim);
+        let ks = self.conv_kernel_size;
+        let clover = self
+            .clover
+            .clone()
+            .ok_or_else(|| Exception::custom("block preview needs Clover preview tensors"))?;
+        let right = clover.conv_right_weight.as_ref();
+        if right.shape() != [self.conv_dim, 1, ks - 1]
+            || clover.bd_softmax_logit_scale.shape() != [hv]
+        {
+            return Err(Exception::custom(format!(
+                "Clover preview tensors not loaded (conv_right_weight {:?})",
+                right.shape()
+            )));
+        }
+
+        let (q, k, v, z, _b, a) = self.project_qkvzba(inputs, B, S)?;
+        let dtype = inputs.dtype();
+        let mixed = ops::concatenate_axis(
+            &[
+                &q.reshape(&[B, S, -1])?,
+                &k.reshape(&[B, S, -1])?,
+                &v.reshape(&[B, S, -1])?,
+            ],
+            -1,
+        )?;
+
+        // Causal taps over [history | block] plus right taps inside the block,
+        // accumulated in fp32 as the reference does.
+        let history = self.chronological_conv_state_ref(cache, B, dtype)?;
+        let conv_in = ops::concatenate_axis(&[&history, &mixed], 1)?.as_dtype(Dtype::Float32)?;
+        let causal_w = self.transposed_conv_weight(Dtype::Float32)?; // [K, C], tap K-1 = current
+        let right_w = right
+            .squeeze_axes(&[1])?
+            .transpose()?
+            .as_dtype(Dtype::Float32)?; // [K-1, C]
+        let mixed_f = mixed.as_dtype(Dtype::Float32)?;
+        let mut conv = conv_in.index((.., 0..S, ..)).multiply(causal_w.index(0))?;
+        for tap in 1..ks {
+            let window = conv_in.index((.., tap..tap + S, ..));
+            conv = conv.add(window.multiply(causal_w.index(tap))?)?;
+        }
+        for distance in 1..ks.min(S) {
+            let later = ops::concatenate_axis(
+                &[
+                    &mixed_f.index((.., distance.., ..)),
+                    &ops::zeros::<f32>(&[B, distance, self.conv_dim])?,
+                ],
+                1,
+            )?;
+            conv = conv.add(later.multiply(right_w.index(distance - 1))?)?;
+        }
+        let conv = nn::silu(&conv)?.as_dtype(dtype)?;
+
+        let parts = conv.split_axis(&[self.key_dim, self.key_dim * 2], Some(-1))?;
+        let conv_q = parts[0].reshape(&[B, S, self.num_k_heads, dk])?;
+        let conv_k = parts[1].reshape(&[B, S, self.num_k_heads, dk])?;
+        let conv_v = parts[2].reshape(&[B, S, hv, dv])?;
+
+        // `qk_norm_weight_q` folds l2-normalisation and the 1/sqrt(dk) scale;
+        // `qk_norm_weight_k` is plain l2-normalisation (the softmax logits use
+        // unscaled unit q and k). Value heads share key heads by repetition.
+        let w_q = self.qk_norm_weight_q.as_dtype(dtype)?;
+        let w_k = self.qk_norm_weight_k.as_dtype(dtype)?;
+        let repeat = |x: Array| -> Result<Array, Exception> {
+            let factor = hv / self.num_k_heads;
+            let x = if factor > 1 {
+                ops::repeat_axis::<f32>(x, factor, -2)?
+            } else {
+                x
+            };
+            // [B, S, Hv, D] -> [B, Hv, S, D] in fp32
+            x.as_dtype(Dtype::Float32)?.transpose_axes(&[0, 2, 1, 3])
+        };
+        let q_scaled = repeat(fast::rms_norm(&conv_q, &w_q, 1e-6)?)?;
+        let q_unit = repeat(fast::rms_norm(&conv_q, &w_k, 1e-6)?)?;
+        let k_unit = repeat(fast::rms_norm(&conv_k, &w_k, 1e-6)?)?;
+        let values = conv_v
+            .as_dtype(Dtype::Float32)?
+            .transpose_axes(&[0, 2, 1, 3])?;
+
+        // History slot: decayed readout of the clean recurrent state [B, Hv, Dv, Dk].
+        let state = match &cache.ssm_state {
+            Some(state) => state.as_dtype(Dtype::Float32)?,
+            None => ops::zeros::<f32>(&[B, hv, dv, dk])?,
+        };
+        let decay = compute_g_direct(
+            &self.A_log.as_dtype(Dtype::Float32)?,
+            &a.as_dtype(Dtype::Float32)?,
+            &self.dt_bias.as_dtype(Dtype::Float32)?,
+        )?
+        .transpose_axes(&[0, 2, 1])?
+        .expand_dims(-1)?; // [B, Hv, S, 1]
+        let history_value =
+            ops::matmul(&q_scaled, &state.transpose_axes(&[0, 1, 3, 2])?)?.multiply(&decay)?; // [B, Hv, S, Dv]
+
+        let per_head = |p: &Param<Array>| -> Result<Array, Exception> {
+            p.as_ref().as_dtype(Dtype::Float32)?.reshape(&[1, hv, 1, 1])
+        };
+        let logits = ops::matmul(&q_unit, &k_unit.transpose_axes(&[0, 1, 3, 2])?)?
+            .multiply(per_head(&clover.bd_softmax_logit_scale)?)?; // [B, Hv, S, S]
+        // The reference normalises the block length by the trained 32, not by
+        // the configured block size.
+        #[allow(clippy::cast_precision_loss)]
+        let length_term = (S as f32 / 32.0).ln();
+        let history_logit = per_head(&clover.bd_softmax_history_bias)?
+            .add(per_head(&clover.bd_softmax_history_c)?.multiply(Array::from_f32(length_term))?)?;
+        let history_logit = ops::broadcast_to(&history_logit, &[B, hv, S, 1])?;
+        let weights = ops::softmax_axis(
+            &ops::concatenate_axis(&[&logits, &history_logit], -1)?,
+            -1,
+            true,
+        )?;
+        let local = ops::matmul(&weights.index((.., .., .., 0..S)), &values)?;
+        let y = weights
+            .index((.., .., .., S..S + 1))
+            .multiply(&history_value)?
+            .add(local)?
+            .transpose_axes(&[0, 2, 1, 3])?
+            .as_dtype(dtype)?; // [B, S, Hv, Dv]
+
+        let normed = self.norm.forward(&y)?;
+        let gated = swiglu(&z, &normed)?;
+        self.out_proj.forward(&gated.reshape(&[B, S, -1])?)
     }
 
     /// Tape-recording forward: identical output, also returns a `GdnLayerTape`
@@ -8226,6 +8574,16 @@ impl FfnBlock {
     }
 
     fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        self.forward_routed(x, None)
+    }
+
+    /// `coreset_top_p`: restrict `MoE` routing to Clover's block-level expert
+    /// coreset (block preview only); `None` is the ordinary forward.
+    fn forward_routed(
+        &mut self,
+        x: &Array,
+        coreset_top_p: Option<f32>,
+    ) -> Result<Array, Exception> {
         if self.is_moe {
             // Delegate to SparseMoeBlock logic
             let gate_ref = self
@@ -8237,7 +8595,12 @@ impl FfnBlock {
                 .as_ref()
                 .ok_or_else(|| Exception::custom("MoE shared_expert_gate missing"))?;
 
-            let gates = ops::softmax_axis(&gate_ref.forward(x)?, -1, true)?;
+            let router_logits = gate_ref.forward(x)?;
+            let router_logits = match coreset_top_p {
+                Some(top_p) => coreset_router_logits(&router_logits, self.top_k, top_p)?,
+                None => router_logits,
+            };
+            let gates = ops::softmax_axis(&router_logits, -1, true)?;
 
             let neg_k = -self.top_k;
             let all_inds = ops::argpartition_axis(&gates, neg_k, -1)?;
@@ -11581,6 +11944,60 @@ impl Qwen3NextCausalLM {
         crate::metal_kernel::bonsai_q2_m5_argmax_reduce_ids(&maxv, &maxid).map(Some)
     }
 
+    /// Clover block preview (`preview=True` in the reference): logits for
+    /// every position of `inputs` `[B, S]` (a whole-valid block) against the
+    /// committed `kv_cache`, which is read and never written. Linear-attention
+    /// layers use `bd_gdn_*`, full attention drops the causal mask, and `MoE`
+    /// routing is restricted to the block's expert coreset when configured.
+    pub fn forward_preview_block(
+        &mut self,
+        inputs: &Array,
+        kv_cache: &[Option<LayerCache>],
+    ) -> Result<Array, Exception> {
+        let clover = self
+            .args
+            .clover
+            .clone()
+            .ok_or_else(|| Exception::custom("block preview needs a Clover checkpoint"))?;
+        let block = *inputs.shape().last().unwrap_or(&0);
+        if block <= 0 || clover.block_size % block != 0 {
+            return Err(Exception::custom(format!(
+                "preview block {block} must divide the trained block size {}",
+                clover.block_size
+            )));
+        }
+        if kv_cache.len() != self.model.layers.len() {
+            return Err(Exception::custom("block preview needs a cache per layer"));
+        }
+
+        let mut h = self.model.embed_tokens.forward(inputs)?;
+        for (layer, layer_cache) in self.model.layers.iter_mut().zip(kv_cache) {
+            let normed = layer.input_layernorm.forward(&h)?;
+            let mixed = match (layer_cache, layer.is_linear) {
+                (Some(LayerCache::Arrays(state)), true) => layer
+                    .linear_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("linear_attn missing"))?
+                    .forward_preview(&normed, state)?,
+                (Some(LayerCache::KV(kv)), false) => layer
+                    .self_attn
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("self_attn missing"))?
+                    .forward_preview(&normed, kv)?,
+                _ => return Err(Exception::custom("layer cache does not match layer type")),
+            };
+            let h2 = h.add(mixed)?;
+            let normed_post = layer.post_attention_layernorm.forward(&h2)?;
+            h = h2.add(
+                layer
+                    .mlp
+                    .forward_routed(&normed_post, clover.coreset_top_p)?,
+            )?;
+        }
+        let normed = self.model.norm.forward(&h)?;
+        self.project_logits(&normed)
+    }
+
     fn project_logits(&self, hidden: &Array) -> Result<Array, Exception> {
         self.lm_head.as_ref().map_or_else(
             || self.model.embed_tokens.as_linear(hidden),
@@ -12551,6 +12968,7 @@ pub(crate) fn load_qwen3_5_text_config_args_from_value(
     if !eschamoe {
         detect_dense_gdn_projections(model_dir.as_ref(), &mut args.quant_overrides);
     }
+    args.clover = CloverArgs::from_config(text_config).or_else(|| CloverArgs::from_config(config));
 
     Ok(args)
 }
@@ -13225,12 +13643,31 @@ fn normalize_sidecar_mtp_key(file_path: &Path, key: String) -> String {
     }
 }
 
+/// Clover checkpoints store the preview tensors flat on `linear_attn`; the
+/// model nests them under `linear_attn.clover`.
+fn clover_preview_param_key(stripped: &str) -> Option<String> {
+    const NAMES: [&str; 4] = [
+        "conv_right_weight",
+        "bd_softmax_logit_scale",
+        "bd_softmax_history_bias",
+        "bd_softmax_history_c",
+    ];
+    NAMES.iter().find_map(|name| {
+        let layer = stripped.strip_suffix(name)?.strip_suffix(".linear_attn.")?;
+        Some(format!("{layer}.linear_attn.clover.{name}"))
+    })
+}
+
 fn qwen35_target_param_key(
     params: &HashMap<std::rc::Rc<str>, &mut Array>,
     stripped: &str,
 ) -> Option<(String, bool)> {
     if params.contains_key(stripped) {
         Some((stripped.to_owned(), false))
+    } else if let Some(key) =
+        clover_preview_param_key(stripped).filter(|key| params.contains_key(key.as_str()))
+    {
+        Some((key, false))
     } else if let Some(moe_key) =
         moe_mtp_param_key(stripped).filter(|key| params.contains_key(key.as_str()))
     {
