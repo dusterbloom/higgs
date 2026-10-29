@@ -3,6 +3,26 @@
 Status: design, not started. Authored 2026-10-28 (design by Fable, spot-checked against code).
 Line numbers refer to `main` as of 2026-10-28.
 
+## Status (2026-10-29)
+
+| Phase | State | Commit | Notes |
+|---|---|---|---|
+| P0 load + AR | done | `1c4b4e9f9` | Unmodified Kapitsa pack loads; AR 42-45 tok/s on M4 (was 5.3). Generic MoE gather now `gather_qmv` (append-stable, no padding); `HIGGS_MOE_GATHER_PAD=1` restores padded rhs. Norm rule uses median layer `input_layernorm` mean (final/q/k norms are not usable signals: raw Clover final norm 1.73, q/k 0.54). |
+| P1 DFlash | gate FAILED | `77286742a` (conv layout fix) | Drafter acceptance 1.5-5.9/round; DFlash 7-20 tok/s vs AR 44. Root cause: multi-row MoE gather has no efficient deterministic path (`gather_qmv` re-reads weights per row; padded rhs pays 1024 rows). Ceiling with an ideal kernel ~1.2-1.4x AR on this M4. |
+| P2 preview forward | done | `0b85ee65c` | `Qwen3NextCausalLM::forward_preview_block`; parity vs HF reference on 4-layer slice: top-1 100%, worst cosine 0.9955, cache bit-identical. |
+| P3 LowConfidence diffusion | next | | Build on `forward_preview_block` (model-level, not yet on `AnyModel`). Commit path = `forward` (causal). Penalties/ramps from pack `generation_config.json` (open question 3). |
+| Kernel (option D) | deferred by user | | Deterministic affine-4bit gather GEMM; prerequisite for fast P1/P3/P4. |
+
+Fixture: `examples/clover_reference_fixture.py PACK REF_CODE_DIR OUT` (needs torch + transformers==5.19.0;
+a throwaway venv works). Test: `HIGGS_CLOVER_FIXTURE_DIR=OUT cargo test -p higgs-models --test
+clover_preview_parity -- --ignored` (dev profile: release-profile test binaries fail to link on main,
+`___isPlatformVersionAtLeast`).
+
+Pre-existing issues found (not caused by this work): `higgs-models` unit tests do not compile
+(mlx-rs API drift, 83 errors) so new tests are integration tests via `#[doc(hidden)]` probe seams;
+`logprobs: true` requests panic (`as_slice` on unevaluated array); `clippy -p higgs-models` has 156
+errors; `clippy -p higgs` fails on `build.rs` shadowing; 4 `higgs` lib tests fail on main.
+
 ## Context and evidence (2026-10-28 session)
 
 - Model: `Diffuspace/Clover-35B-A3B-Preview`, Qwen3.6-35B-A3B backbone fine-tuned for block
