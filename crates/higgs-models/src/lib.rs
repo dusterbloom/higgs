@@ -169,13 +169,16 @@ pub enum Speculation {
     /// Clover block diffusion (`LowConfidence` block preview); plain
     /// autoregressive decode on models without block preview.
     Diffusion,
+    /// Clover self-speculation: a block preview drafts, a causal pass verifies
+    /// (greedy, exact acceptance); plain autoregressive decode otherwise.
+    SelfSpec,
 }
 
 impl Speculation {
     /// Parse a request value; absent (`None`) → [`Speculation::Auto`].
     ///
     /// # Errors
-    /// Returns the offending value when it is not one of `auto|dflash|mtp|none|diffusion`.
+    /// Returns the offending value when it is not one of `auto|dflash|mtp|none|diffusion|self_spec`.
     pub fn parse(value: Option<&str>) -> Result<Self, String> {
         let Some(raw) = value else {
             return Ok(Self::Auto);
@@ -186,6 +189,7 @@ impl Speculation {
             "mtp" => Ok(Self::Mtp),
             "none" | "off" => Ok(Self::None),
             "diffusion" => Ok(Self::Diffusion),
+            "self_spec" | "selfspec" => Ok(Self::SelfSpec),
             other => Err(other.to_owned()),
         }
     }
@@ -3114,6 +3118,10 @@ mod tests {
         assert_eq!(Speculation::parse(Some("mtp")), Ok(Speculation::Mtp));
         assert_eq!(Speculation::parse(Some("none")), Ok(Speculation::None));
         assert_eq!(Speculation::parse(Some("off")), Ok(Speculation::None));
+        assert_eq!(
+            Speculation::parse(Some("self_spec")),
+            Ok(Speculation::SelfSpec)
+        );
         assert_eq!(Speculation::parse(Some("bogus")), Err("bogus".to_owned()));
         // Default carrier value rides on SamplingParams.
         assert_eq!(SamplingParams::default().speculation, Speculation::Auto);

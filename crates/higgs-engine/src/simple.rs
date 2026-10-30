@@ -1209,7 +1209,14 @@ enum SpeculationRoute {
     MtpFamily,
     /// Clover `LowConfidence` block diffusion (opt-in only, never `Auto`).
     Diffusion,
+    /// Clover self-speculation (opt-in only, never `Auto`).
+    SelfSpec,
     Autoregressive,
+}
+
+/// Self-speculation is exact greedy only; anything else decodes autoregressively.
+fn self_spec_greedy(params: &SamplingParams) -> bool {
+    params.temperature <= f32::EPSILON && !params.has_penalties()
 }
 
 fn paired_dflash_exact_domain(params: &SamplingParams, thinking_enabled: bool) -> bool {
@@ -1232,6 +1239,13 @@ fn resolve_speculation_route(
         Speculation::Diffusion => {
             if diffusion_eligible {
                 SpeculationRoute::Diffusion
+            } else {
+                SpeculationRoute::Autoregressive
+            }
+        }
+        Speculation::SelfSpec => {
+            if diffusion_eligible {
+                SpeculationRoute::SelfSpec
             } else {
                 SpeculationRoute::Autoregressive
             }
@@ -10221,12 +10235,15 @@ impl SimpleEngine {
             stateless_mtp_family_eligible(params, constraint.is_some(), logprobs),
             self.diffusion_eligible(constraint.is_some(), image_batch.is_some(), logprobs),
         );
-        if speculation_route == SpeculationRoute::Diffusion {
+        if speculation_route == SpeculationRoute::Diffusion
+            || (speculation_route == SpeculationRoute::SelfSpec && self_spec_greedy(params))
+        {
             return self.diffusion_decode(
                 prompt_tokens,
                 max_tokens,
                 params,
                 stop_sequences,
+                speculation_route == SpeculationRoute::SelfSpec,
                 DflashBufferedSink::default(),
             );
         }
@@ -13774,7 +13791,9 @@ impl SimpleEngine {
             stateless_mtp_family_eligible(params, constraint.is_some(), logprobs),
             self.diffusion_eligible(constraint.is_some(), image_batch.is_some(), logprobs),
         );
-        if speculation_route == SpeculationRoute::Diffusion {
+        if speculation_route == SpeculationRoute::Diffusion
+            || (speculation_route == SpeculationRoute::SelfSpec && self_spec_greedy(params))
+        {
             let detok = IncrementalDetok::new(
                 String::new(),
                 0,
@@ -13785,6 +13804,7 @@ impl SimpleEngine {
                 max_tokens,
                 params,
                 stop_sequences,
+                speculation_route == SpeculationRoute::SelfSpec,
                 DflashStreamSink { sender, detok },
             );
         }
@@ -14934,6 +14954,7 @@ impl SimpleEngine {
         max_tokens: u32,
         params: &SamplingParams,
         stop_sequences: &[String],
+        self_spec: bool,
         mut sink: S,
     ) -> Result<S::Output, EngineError> {
         let request_t0 = std::time::Instant::now();
@@ -14987,11 +15008,7 @@ impl SimpleEngine {
 
         let mut tokens: Vec<u32> = Vec::new();
         let mut sink_error = None;
-        let mut blocks = higgs_models::clover::AnyModelBlocks {
-            model: &mut model,
-            cache: &mut cache,
-        };
-        let out = higgs_models::clover::block_decode(&cfg, vocab, &mut blocks, |emitted| {
+        let mut emit = |emitted: &[u32]| {
             tokens.extend_from_slice(emitted);
             let forced = if emitted
                 .last()
@@ -15018,8 +15035,65 @@ impl SimpleEngine {
                     true
                 }
             }
-        })
-        .map_err(EngineError::Mlx)?;
+        };
+        if self_spec {
+            let first =
+                mlx_rs::ops::indexing::argmax_axis(&logits.reshape(&[-1, vocab])?, -1, None)
+                    .and_then(|a| a.as_dtype(mlx_rs::Dtype::Uint32))
+                    .map_err(EngineError::Mlx)?;
+            eval([&first]).map_err(EngineError::Mlx)?;
+            let first = *first
+                .as_slice::<u32>()
+                .last()
+                .ok_or_else(|| EngineError::Generation("empty prefill logits".to_owned()))?;
+            let spec_cfg = higgs_models::clover::SelfSpecConfig {
+                mask_token_id: clover.mask_token_id,
+                max_new_tokens: cfg.max_new_tokens,
+                eos_token_ids: self.eos_token_ids.clone(),
+                // ponytail: A/B knob; adaptive 4 <-> 8 otherwise.
+                draft_rows: std::env::var("HIGGS_CLOVER_SPEC_ROWS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&r: &usize| r >= 2 && clover.trained_block_size % r == 0),
+            };
+            let mut spec = higgs_models::clover::AnyModelSpec::new(&mut model, &mut cache);
+            let out =
+                higgs_models::clover::self_spec_decode(&spec_cfg, first, &mut spec, &mut emit)
+                    .map_err(EngineError::Mlx)?;
+            if let Some(error) = sink_error {
+                return Err(error);
+            }
+            let decode_s = request_t0
+                .elapsed()
+                .saturating_sub(prefill_elapsed)
+                .as_secs_f64();
+            tracing::info!(
+                completion_tokens = out.tokens.len(),
+                cycles = out.cycles,
+                wide_cycles = out.wide_cycles,
+                tokens_per_cycle = format!(
+                    "{:.2}",
+                    out.tokens.len().saturating_sub(1) as f64 / out.cycles.max(1) as f64
+                ),
+                tok_per_sec = format!("{:.1}", out.tokens.len() as f64 / decode_s.max(1e-9)),
+                prefill_ms = format!("{:.1}", prefill_elapsed.as_secs_f64() * 1e3),
+                decode_ms = format!("{:.1}", decode_s * 1e3),
+                "Self-spec generation complete"
+            );
+            let finish_reason = if out.hit_eos || out.stopped_by_caller {
+                "stop"
+            } else {
+                "length"
+            };
+            let completion = Self::completion_len(&out.tokens)?;
+            return sink.finish(self, &out.tokens, finish_reason, prompt_len, completion);
+        }
+        let mut blocks = higgs_models::clover::AnyModelBlocks {
+            model: &mut model,
+            cache: &mut cache,
+        };
+        let out = higgs_models::clover::block_decode(&cfg, vocab, &mut blocks, &mut emit)
+            .map_err(EngineError::Mlx)?;
         if let Some(error) = sink_error {
             return Err(error);
         }
@@ -18083,7 +18157,7 @@ mod tests {
 
     #[test]
     fn speculation_route_truth_table_is_exhaustive() {
-        use SpeculationRoute::{Autoregressive, DFlash, Diffusion, MtpFamily};
+        use SpeculationRoute::{Autoregressive, DFlash, Diffusion, MtpFamily, SelfSpec};
 
         let cases = [
             (Speculation::None, false, false, Autoregressive),
@@ -18139,6 +18213,17 @@ mod tests {
                     ),
                     Autoregressive
                 );
+                for (clover, expected) in [(true, SelfSpec), (false, Autoregressive)] {
+                    assert_eq!(
+                        resolve_speculation_route(
+                            Speculation::SelfSpec,
+                            dflash_eligible,
+                            mtp_family_eligible,
+                            clover
+                        ),
+                        expected
+                    );
+                }
             }
         }
     }
@@ -19647,7 +19732,10 @@ mod tests {
                 Speculation::DFlash => engine
                     .last_dflash_timing()
                     .expect("DFlash request must publish phase timing"),
-                Speculation::Auto | Speculation::Mtp | Speculation::Diffusion => unreachable!(),
+                Speculation::Auto
+                | Speculation::Mtp
+                | Speculation::Diffusion
+                | Speculation::SelfSpec => unreachable!(),
             };
             assert_eq!(
                 phase_timing.decode_tokens,
@@ -19746,7 +19834,10 @@ mod tests {
                     df_wall_secs.push(elapsed);
                     df_phase_timings.push(phase_timing);
                 }
-                Speculation::Auto | Speculation::Mtp | Speculation::Diffusion => unreachable!(),
+                Speculation::Auto
+                | Speculation::Mtp
+                | Speculation::Diffusion
+                | Speculation::SelfSpec => unreachable!(),
             }
         }
         dflash_assert_benchmark_power_state("postflight");

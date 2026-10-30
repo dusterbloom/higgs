@@ -416,7 +416,7 @@ fn check_clover_settings(
     {
         failures.push(format!(
             "model {label} generation_defaults.speculation '{value}' is not one of \
-             auto|dflash|mtp|none|diffusion"
+             auto|dflash|mtp|none|diffusion|self_spec"
         ));
     }
     if let Some(block) = model.clover_block_size

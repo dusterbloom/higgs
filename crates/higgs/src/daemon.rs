@@ -202,8 +202,8 @@ port = 8000
 # kv_cache_bytes = 0            # prefix KV cache byte budget (0 = disabled; evicts LRU over budget)
 # # Speculative decoding (decode) + compressive prefill (PFlash) drafters:
 # # draft_model      = "/path/to/dspark-drafter"      # decode speculation (DFlash/dSpark)
-# # Clover (clover_moe) block diffusion, selected per request or via
-# # generation_defaults with speculation = "diffusion":
+# # Clover (clover_moe) block diffusion / self-speculation, selected per request or
+# # via generation_defaults with speculation = "diffusion" | "self_spec":
 # # clover_block_size = 32                            # must divide 32
 # # clover_threshold  = 0.95                          # LowConfidence unmask threshold, 0..=1
 # # Validated low-bit Bonsai targets default to the block (BatchedTape) verifier.
