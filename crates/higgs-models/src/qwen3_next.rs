@@ -4065,6 +4065,34 @@ pub mod switch_mlp_gather_probe {
         pub fn forward(&self, x: &Array, indices: &Array) -> Result<Array, Exception> {
             self.0.forward_gather_global_sort(x, indices)
         }
+
+        /// [`Self::forward`] through the fused gate+up gather.
+        pub fn forward_fused(&mut self, x: &Array, indices: &Array) -> Result<Array, Exception> {
+            self.0.forward_gather_fused(x, indices)
+        }
+    }
+
+    /// Raw affine `x @ w[rhs_indices].T` gather (MLX picks the kernel from the
+    /// shapes and `sorted_indices`).
+    pub fn gather_qmm(
+        x: &Array,
+        (w, scales, biases): (&Array, &Array, &Array),
+        rhs_indices: &Array,
+        group_size: i32,
+        bits: i32,
+        sorted_indices: bool,
+    ) -> Result<Array, Exception> {
+        super::gather_qmm(
+            x,
+            w,
+            scales,
+            biases,
+            rhs_indices,
+            true,
+            group_size,
+            bits,
+            sorted_indices,
+        )
     }
 }
 
@@ -4109,12 +4137,112 @@ fn coreset_router_logits(logits: &Array, top_k: i32, top_p: f32) -> Result<Array
     ops::r#where(&allowed.expand_dims(1)?, logits, &masked)
 }
 
-/// `HIGGS_MOE_GATHER_PAD=1`: route the generic switch-MLP gather through the
-/// padded `gather_qmm_rhs` path instead of `gather_qmv` (see
-/// `SwitchMlpWeights::forward_gather_global_sort`).
-fn moe_gather_padded_rhs() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("HIGGS_MOE_GATHER_PAD").is_ok_and(|v| v == "1"))
+/// Kernel family of the generic switch-MLP gather. Every choice is
+/// append-stable: a routed row's output does not depend on the batch size.
+///
+/// MLX 0.31 `GatherQMM` picks `gather_qmm_rhs` (sorted, rows >= 4 * experts),
+/// steel `gather_qmm` (rows per matrix >= the qmv batch limit, at most 32) or
+/// `gather_qmv`. `gather_qmm_rhs` and steel `gather_qmm` share `BlockMMA`
+/// (BK = 32) and the quantized block loader: a row's bits are identical in
+/// both and independent of the other rows in its tile. `gather_qmv` rounds
+/// differently. Verified on M4 in `tests/moe_gather_append_stable.rs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MoeGatherKernel {
+    /// Default: `gather_qmv` at every size. Fastest decode and short batches;
+    /// long prefill ~1.6x slower than the MMA kernels.
+    Qmv,
+    /// `HIGGS_MOE_GATHER_KERNEL=mma`: MMA family. `gather_qmm_rhs` (padded to
+    /// `4 * experts` rows) from `experts / 4` rows up, below that one steel
+    /// tile per row. Fastest long prefill; decode and short batches pay
+    /// whole 32-row tiles (Clover/M4: prefill 1.6x faster, decode 2x slower).
+    Mma,
+    /// `HIGGS_MOE_GATHER_PAD=1`: `gather_qmm_rhs` at every size, padding short
+    /// domains to `4 * experts` rows.
+    PaddedRhs,
+}
+
+fn moe_gather_kernel() -> MoeGatherKernel {
+    static KERNEL: std::sync::OnceLock<MoeGatherKernel> = std::sync::OnceLock::new();
+    *KERNEL.get_or_init(|| {
+        if std::env::var("HIGGS_MOE_GATHER_PAD").is_ok_and(|v| v == "1") {
+            MoeGatherKernel::PaddedRhs
+        } else if std::env::var("HIGGS_MOE_GATHER_KERNEL")
+            .is_ok_and(|v| v.trim().eq_ignore_ascii_case("mma"))
+        {
+            MoeGatherKernel::Mma
+        } else {
+            MoeGatherKernel::Qmv
+        }
+    })
+}
+
+/// Steel `gather_qmm` tile height: MLX's `BM`, and >= every
+/// `get_qmv_batch_limit` (max 32), so a tile never falls back to `gather_qmv`.
+const MOE_GATHER_TILE: i32 = 32;
+
+/// Input of the three switch-MLP gathers `gather_qmm(x, w, experts, sorted)`
+/// over the globally expert-sorted routed rows.
+struct MoeGatherLayout {
+    x: Array,
+    experts: Array,
+    sorted: bool,
+}
+
+impl MoeGatherLayout {
+    /// `x_sorted` `[rows, 1, D]` and `idx_sorted` `[rows]` are the routed rows
+    /// in expert order.
+    fn new(x_sorted: &Array, idx_sorted: &Array, num_experts: i32) -> Result<Self, Exception> {
+        let rows = idx_sorted.dim(0);
+        let d = x_sorted.dim(-1);
+        let kernel = moe_gather_kernel();
+        if kernel == MoeGatherKernel::Qmv {
+            return Ok(Self {
+                x: x_sorted.clone(),
+                experts: idx_sorted.clone(),
+                sorted: false,
+            });
+        }
+        if kernel == MoeGatherKernel::Mma && rows * 4 < num_experts {
+            // One zero-padded steel tile per row (M4: cheaper than padding to
+            // 4 * experts rows below experts / 4 rows).
+            let padding = ops::zeros_dtype(&[rows, MOE_GATHER_TILE - 1, d], x_sorted.dtype())?;
+            return Ok(Self {
+                x: ops::concatenate_axis(&[x_sorted, &padding], 1)?,
+                experts: idx_sorted.clone(),
+                sorted: false,
+            });
+        }
+        let padding = (num_experts * 4).max(16) - rows;
+        if padding <= 0 {
+            return Ok(Self {
+                x: x_sorted.clone(),
+                experts: idx_sorted.clone(),
+                sorted: true,
+            });
+        }
+        let last_expert = u32::try_from(num_experts - 1)
+            .map_err(|_| Exception::custom("expert count must fit in u32"))?;
+        let fill = Array::from_slice(&[last_expert], &[]);
+        Ok(Self {
+            x: ops::concatenate_axis(
+                &[
+                    x_sorted,
+                    &ops::zeros_dtype(&[padding, 1, d], x_sorted.dtype())?,
+                ],
+                0,
+            )?,
+            experts: ops::concatenate_axis(
+                &[idx_sorted, &Array::full::<u32>(&[padding], &fill)?],
+                0,
+            )?,
+            sorted: true,
+        })
+    }
+
+    /// Output of the last gather -> routed rows in original order `[rows, N]`.
+    fn restore(out: &Array, inv_order: &Array) -> Result<Array, Exception> {
+        out.index((.., 0, ..)).take_axis(inv_order, 0)
+    }
 }
 
 fn tq_profile_enabled() -> bool {
@@ -6317,87 +6445,32 @@ impl SwitchMlpWeights {
             return out_unsorted.reshape(&[b, l, top_k, d]);
         }
 
-        // MLX 0.31 `GatherQMM::eval_gpu` takes `gather_qmm_rhs` only when the
-        // sorted hint is set and rows >= 4 * num_experts, else `gather_qmv`.
-        // The two round differently, so a short continuation would diverge
-        // from a long prefill of the same tokens. Without the sorted hint every
-        // size takes `gather_qmv`, which reduces each row independently:
-        // append-stable with no padding (Clover/M4: decode 8 -> 43 tok/s, cold
-        // long prefill ~1.6x slower). HIGGS_MOE_GATHER_PAD=1 restores the
-        // padded `gather_qmm_rhs` path (zero rows on the last expert).
-        let padded_rhs = moe_gather_padded_rhs();
+        // Append-stable kernel policy: see `MoeGatherKernel`.
         let num_experts = *self
             .gate_proj
             .weight
             .shape()
             .first()
             .ok_or_else(|| Exception::custom("expert weight has no expert dimension"))?;
-        let padding_rows = if padded_rhs {
-            (num_experts * 4).saturating_sub(original_rows)
-        } else {
-            0
-        };
-        let sorted_hint = padded_rhs;
-        let (x_sorted, idx_sorted) = if padding_rows > 0 {
-            let x_padding = ops::zeros_dtype(&[padding_rows, 1, d], x.dtype())?;
-            let last_expert = u32::try_from(num_experts - 1)
-                .map_err(|_| Exception::custom("expert count must fit in u32"))?;
-            let fill = Array::from_slice(&[last_expert], &[]);
-            let index_padding = Array::full::<u32>(&[padding_rows], &fill)?;
-            (
-                ops::concatenate_axis(&[&x_sorted, &x_padding], 0)?,
-                ops::concatenate_axis(&[&idx_sorted, &index_padding], 0)?,
+        let layout = MoeGatherLayout::new(&x_sorted, &idx_sorted, num_experts)?;
+        let gather = |input: &Array, proj: &QLinear| {
+            gather_qmm(
+                input,
+                &proj.weight,
+                &proj.scales,
+                &proj.biases,
+                &layout.experts,
+                true,
+                proj.group_size,
+                proj.bits,
+                layout.sorted,
             )
-        } else {
-            (x_sorted, idx_sorted)
         };
-
-        // --- gather_qmm with coalesced access ---
-        let gate_out = gather_qmm(
-            &x_sorted,
-            &self.gate_proj.weight,
-            &self.gate_proj.scales,
-            &self.gate_proj.biases,
-            &idx_sorted,
-            true,
-            self.gate_proj.group_size,
-            self.gate_proj.bits,
-            sorted_hint, // indices are globally sorted
-        )?;
-        let up_out = gather_qmm(
-            &x_sorted,
-            &self.up_proj.weight,
-            &self.up_proj.scales,
-            &self.up_proj.biases,
-            &idx_sorted,
-            true,
-            self.up_proj.group_size,
-            self.up_proj.bits,
-            sorted_hint,
-        )?;
-
+        let gate_out = gather(&layout.x, &self.gate_proj)?;
+        let up_out = gather(&layout.x, &self.up_proj)?;
         let activated = swiglu(&gate_out, &up_out)?;
-
-        let down_out = gather_qmm(
-            &activated,
-            &self.down_proj.weight,
-            &self.down_proj.scales,
-            &self.down_proj.biases,
-            &idx_sorted,
-            true,
-            self.down_proj.group_size,
-            self.down_proj.bits,
-            sorted_hint,
-        )?;
-
-        // down_out: [N, 1, D] -> squeeze M -> [N, D]
-        let out_flat = down_out.squeeze_axes(&[-2])?;
-
-        // --- Unsort: restore original token order ---
-        let out_unsorted = out_flat.take_axis(&inv_order, 0)?;
-
-        // Reshape back to [B, L, top_k, D]
-        out_unsorted.reshape(&[b, l, top_k, d])
+        let down_out = gather(&activated, &self.down_proj)?;
+        MoeGatherLayout::restore(&down_out, &inv_order)?.reshape(&[b, l, top_k, d])
     }
 
     /// Like `forward_gather_global_sort` but fuses gate+up into a single
@@ -6455,17 +6528,26 @@ impl SwitchMlpWeights {
         let x_sorted = x_flat.take_axis(&token_idx, 0)?;
         let idx_sorted = idx_flat.take_axis(&order, 0)?;
 
+        // Same append-stable kernel policy as `forward_gather_global_sort`.
+        let num_experts = *self
+            .down_proj
+            .weight
+            .shape()
+            .first()
+            .ok_or_else(|| Exception::custom("expert weight has no expert dimension"))?;
+        let layout = MoeGatherLayout::new(&x_sorted, &idx_sorted, num_experts)?;
+
         // --- Fused gate+up: ONE gather_qmm instead of TWO ---
         let fused_out = gather_qmm(
-            &x_sorted,
+            &layout.x,
             fw,
             fs,
             fb,
-            &idx_sorted,
+            &layout.experts,
             true,
             self.gate_proj.group_size,
             self.gate_proj.bits,
-            true,
+            layout.sorted,
         )?;
         // Split at intermediate boundary → gate_out, up_out
         let parts = fused_out.split_axis(&[*intermediate], Some(-1))?;
@@ -6483,21 +6565,13 @@ impl SwitchMlpWeights {
             &self.down_proj.weight,
             &self.down_proj.scales,
             &self.down_proj.biases,
-            &idx_sorted,
+            &layout.experts,
             true,
             self.down_proj.group_size,
             self.down_proj.bits,
-            true,
+            layout.sorted,
         )?;
-
-        // down_out: [N, 1, D] -> squeeze M -> [N, D]
-        let out_flat = down_out.squeeze_axes(&[-2])?;
-
-        // --- Unsort: restore original token order ---
-        let out_unsorted = out_flat.take_axis(&inv_order, 0)?;
-
-        // Reshape back to [B, L, top_k, D]
-        out_unsorted.reshape(&[b, l, top_k, d])
+        MoeGatherLayout::restore(&down_out, &inv_order)?.reshape(&[b, l, top_k, d])
     }
 
     /// Fuse gate+up for [`Self::forward_gather_fused`] /
