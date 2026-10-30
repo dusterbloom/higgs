@@ -153,8 +153,12 @@ impl BlockModel for AnyModelBlocks<'_> {
         self.model.forward_preview_block(&row(block)?, self.cache)
     }
 
+    /// The cache is request-local (diffusion mode never retains it), so the
+    /// commit takes the fast multi-row kernels.
     fn commit(&mut self, tokens: &[u32]) -> Result<(), Exception> {
-        let hidden = self.model.forward_hidden(&row(tokens)?, None, self.cache)?;
+        let hidden = crate::qwen3_next::with_fast_rows(|| {
+            self.model.forward_hidden(&row(tokens)?, None, self.cache)
+        })?;
         let mut targets = vec![&hidden];
         targets.extend(self.cache.eval_targets());
         eval(targets)

@@ -1259,6 +1259,16 @@ impl QLinear {
             return x.matmul(&dense.transpose()?);
         }
 
+        // Fast rows (see `with_fast_rows`): 1..=8 rows through the weight-once
+        // MMA kernel. Not bit-identical to qmv.
+        if fast_rows()
+            && self.mode == crate::quant_mode::QuantMode::Affine
+            && matches!(self.weight_layout, QLinearWeightLayout::Canonical)
+            && crate::qmm8::supported(x, &self.weight, self.bits, self.group_size)
+        {
+            return crate::qmm8::qmm8_affine4(x, &self.weight, &self.scales, &self.biases);
+        }
+
         // Fast path: batched quantized GEMM for verify (T>1, T<=16).
         // Fuses T matmuls into one Metal kernel dispatch — eliminates
         // pipeline bubbles. Gated by env var until validated.
@@ -2029,6 +2039,9 @@ type CompiledGdnOutputGateFn =
     dyn for<'a> FnMut((&'a Array, &'a Array, &'a Array)) -> Result<Array, Exception>;
 
 thread_local! {
+    /// Set inside [`with_fast_rows`]: rows whose numerics never reach a
+    /// retained cache (Clover previews, diffusion commits).
+    static FAST_ROWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static COMPILED_SILU_MUL_FN: RefCell<Option<Box<CompiledSiluMulFn>>> = RefCell::new(None);
     static COMPILED_SIGMOID_MUL_FN: RefCell<Option<Box<CompiledSigmoidMulFn>>> = RefCell::new(None);
     static COMPILED_GDN_OUTPUT_GATE_FN: RefCell<Option<Box<CompiledGdnOutputGateFn>>> =
@@ -9152,6 +9165,31 @@ fn last_token_hidden_for_projection(hidden: &Array) -> Result<Array, Exception> 
 }
 
 #[allow(clippy::shadow_reuse, clippy::indexing_slicing)]
+/// Run `f` with "fast rows" on.
+///
+/// Multi-row forwards whose outputs never reach a retained cache (Clover block
+/// previews; diffusion commits into a request-local cache) skip the
+/// append-stability machinery (`RoPE` padding to 1,024 rows, per-row qmv) for
+/// kernels that are not bit-identical to the one-row path.
+/// `HIGGS_FAST_ROWS=0` disables it.
+pub fn with_fast_rows<R, F: FnOnce() -> R>(f: F) -> R {
+    // Restores the previous value on every exit, unwinding included.
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FAST_ROWS.with(|flag| flag.set(self.0));
+        }
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let on = *ENABLED.get_or_init(|| std::env::var("HIGGS_FAST_ROWS").map_or(true, |v| v != "0"));
+    let _restore = Restore(FAST_ROWS.with(|flag| flag.replace(on)));
+    f()
+}
+
+fn fast_rows() -> bool {
+    FAST_ROWS.with(std::cell::Cell::get)
+}
+
 fn apply_qwen3_next_rope_scheduled(
     x: Array,
     rope: &nn::Rope,
@@ -9190,7 +9228,7 @@ fn apply_qwen3_next_rope_scheduled(
         }
         return ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 2);
     }
-    if seq_len > 1 {
+    if seq_len > 1 && !fast_rows() {
         return apply_rope_prefill_append_stable(&x, rope, offset, yarn_freqs);
     }
 
@@ -12033,6 +12071,14 @@ impl Qwen3NextCausalLM {
     /// layers use `bd_gdn_*`, full attention drops the causal mask, and `MoE`
     /// routing is restricted to the block's expert coreset when configured.
     pub fn forward_preview_block(
+        &mut self,
+        inputs: &Array,
+        kv_cache: &[Option<LayerCache>],
+    ) -> Result<Array, Exception> {
+        with_fast_rows(|| self.forward_preview_block_rows(inputs, kv_cache))
+    }
+
+    fn forward_preview_block_rows(
         &mut self,
         inputs: &Array,
         kv_cache: &[Option<LayerCache>],

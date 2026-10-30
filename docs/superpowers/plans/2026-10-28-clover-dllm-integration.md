@@ -43,8 +43,43 @@ Diffusion (opt-in `speculation: "diffusion"`, faithful to the reference, parity-
 3. Content-adaptive AR<->diffusion switching (only real win: enumerative spans 46-68 vs 46 AR).
 4. Pass-cost cuts: fuse GDN preview taps / compile elementwise chains (-25-35 ms), freeze
    resolved rows, stream resolved left prefix per pass (latency).
-5. Cheapest decisive experiment before any self-spec/kernel work: run Kapitsa on this M4 with
-   `NI_CLOVER_DECODE=spec` on code + prose; if code self-spec ≤ ~46 tok/s, close that path.
+5. ~~Cheapest decisive experiment~~ DONE 2026-10-30, gate PASSED (self-spec path stays open).
+   Kapitsa 0.2.24 on this M4 (Low Power off, no other Metal clients), same pack, greedy, thinking
+   off, 256 tok, warm rep (`research/kapitsa_spec.sh`, results in `research/kapitsa_spec/`):
+
+   | prompt | `spec` tok/s (tok/cycle) | Kapitsa `diffusion` bs32/0.95 tok/s (tok/pass) | higgs AR | higgs diffusion |
+   |---|---|---|---|---|
+   | code (2) | 71.8 / 72.1 (5.31) | 22.9 (2.29) / 16.3 (1.57) | 41-45 | 7.9-20 |
+   | prose (2) | 41.6 / 45.4 (3.04 / 3.43) | 9.6 (0.93) / 7.9 (0.77) | 41-45 | 4.7-11.5 |
+   | count 1..200 | 102.2 (7.97) | 88.5 (10.67) | 41-45 | 46-68 |
+
+   Per-cost: a self-spec cycle (8-row denoise draft + 8-row causal verify) is **74-78 ms**; a
+   32-row denoising pass is **~96-100 ms** (higgs: ~255 ms). So the "no idle bandwidth" bound
+   above is wrong for Kapitsa's kernels: it runs a 32-row pass ~2.6x faster on the same M4, and
+   an 8+8 cycle at ~3.5x a higgs AR step.
+
+   A/B (`research/kapitsa_ab.sh`, code1 prompt, greedy, 256 tok; ms/pass includes commit passes):
+
+   | engine / mode | rows | coreset | passes | ms/pass (or /cycle) |
+   |---|---|---|---|---|
+   | Kapitsa spec | 8+8 | on / off | 48 / 44 cycles | 73.7 / 79.2 |
+   | Kapitsa diffusion | 32 | on / off | 112 / 122 | 99.5 / 114.0 |
+   | Kapitsa diffusion t0.95 | 8 | on / off | 117 / 112 | 48.6 / 52.6 |
+   | higgs diffusion t0.95 | 8 | on | 113 | **106** (2 runs: 12.0 / 12.3 s) |
+   | higgs AR | 1 | - | 255 steps | **21.4** (46.6 tok/s) |
+
+   - The coreset is worth only 7-13% in Kapitsa. It is not the gap. higgs is ~2.1x slower per
+     8-row pass. With `gather_qmv` each routed slot re-reads its expert's weights, so the coreset
+     cannot save bytes in higgs. Kapitsa reads each distinct expert once per pass. That is option D.
+   - higgs bs8 output (227 tok, 113 passes) matches Kapitsa with **coreset off** (227, 112), not
+     coreset on (256, 117). The coreset call site looks wired (`forward_preview_block` ->
+     `forward_routed(.., coreset_top_p)`, pack has `moe_block_coreset_enabled: true, top_p 0.9`),
+     so this is either a reference-semantics difference or coincidence. Unresolved.
+   - `HIGGS_PROFILE=1` halves AR decode (20-24 vs 46.6 tok/s). Never benchmark with it on.
+   - **Ceiling for P4 self-spec in higgs.** Today: 106 ms draft + an 8-row verify of similar cost
+     ≈ 200 ms/cycle. At 5.31 tok/cycle on code that is ~26 tok/s, *below* AR's 46.6. At Kapitsa's
+     cycle cost (74 ms) it is ~72 tok/s (1.55x AR on code, ~0.9-1x on prose). So P4 is only worth
+     building after a multi-row gather kernel (option D) brings an 8-row pass to ≲ 50 ms.
 6. Deterministic small-tile MMA gather kernel (option D) only if prefill/commit gains justify it.
 
 Pre-existing issues on `main` (not from this work): higgs-models unit tests don't compile (mlx-rs
@@ -62,6 +97,7 @@ Uncommitted local edits to AGENTS.md / CLAUDE.md and the bilinear-probe files ar
 | P3 LowConfidence diffusion | done | (this commit) | `clover::block_decode` + `speculation = "diffusion"` (request or `generation_defaults`; opt-in, never `auto`), pack penalties as diffusion-only defaults, `clover_block_size`/`clover_threshold`. Real Clover M4: 3.5-8.8 tok/s (1.6-2.5 positions/pass, ~255 ms per 32-row pass; same MoE multi-row cost as P1) vs AR ~35 tok/s; coherent on 3 prompts. Parity: block loop on reference logits exact (greedy, pack penalties, ramps); slice end-to-end exact for greedy@0, other cases flip on sub-ulp bf16 ties (see `clover_preview_parity.rs`). |
 | MoE gather MMA family | opt-in (`HIGGS_MOE_GATHER_KERNEL=mma`) | (this commit) | Verified on MLX 0.31/M4: `gather_qmm_rhs` == steel `gather_qmm` tiles bit-for-bit (tile height 18/24/32/64, row position, row alone), so an MMA-only policy is append-stable. Not the default: Clover prefill 230 -> 350-390 tok/s but AR decode 44 -> 24 tok/s and diffusion 5-11 -> 3-11 tok/s (decode pays a 32-row tile per routed row: 0.61 vs 0.18 ms/layer). `forward_gather_fused` no longer passes `sorted=true` unconditionally (size switching under `HIGGS_MOE_FFN_GATE_UP`). A fast stable decode still needs option D. |
 | Kernel (option D) | deferred by user | | Deterministic affine-4bit gather GEMM; prerequisite for fast P1/P3/P4. |
+| Fast rows (8-row passes) | done | (this commit) | 8-row preview profile (M4): MoE 26.5 / GDN 22.6 / attention 15.7 / rest 15.3 ms. Dense projections ran at ~3x the one-row time (MLX qmv and `crossrow_qmv` re-read weights), and preview/commit RoPE padded every call to 1,024 rows. New `qmm8` (weight-once 8-row affine-4bit MMA kernel, Kapitsa's `verify8` technique) + plain RoPE inside `with_fast_rows` (previews and diffusion commits only; request-local cache). Preview 79.9 -> 56.5 ms, causal commit 80.0 -> 59.9 ms; bs8/t0.95 code 18.9 -> 25.6-26.4 tok/s at the same 112-113 passes. Parity divergences unchanged. Option D at 8 rows is worth only ~7 ms (MoE 26.6 vs ~19 floor); compiling the GDN mixer gained nothing. |
 
 Fixture: `examples/clover_reference_fixture.py PACK REF_CODE_DIR OUT` (needs torch + transformers==5.19.0;
 a throwaway venv works). Test: `HIGGS_CLOVER_FIXTURE_DIR=OUT cargo test -p higgs-models --test

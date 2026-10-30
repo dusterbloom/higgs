@@ -115,6 +115,8 @@ pub mod progress;
 pub mod quant_config;
 pub mod quant_mode;
 pub mod qwen3_moe;
+#[doc(hidden)]
+pub mod qmm8;
 pub mod qwen3_next;
 pub mod qwen_vl;
 pub mod registry;
