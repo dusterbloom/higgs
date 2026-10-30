@@ -3,6 +3,55 @@
 Status: design, not started. Authored 2026-10-28 (design by Fable, spot-checked against code).
 Line numbers refer to `main` as of 2026-10-28.
 
+## Handoff (2026-10-30) — start here
+
+Branch `feat/clover-dllm` (pushed to `fork`), 7 commits on `main` + this doc update:
+`1c4b4e9f9` P0 load/gather · `77286742a` conv layout · `0b85ee65c` P2 preview · `68578a964` docs ·
+`5645a7b2a` P3 LowConfidence diffusion · `c93035808` opt-in append-stable MMA gather ·
+`66d0efa14` opt-in native gather.
+
+### Measured on M4 10-core / 32 GB (Low Power Mode OFF, no other Metal clients — both matter:
+Low Power Mode cut decode ~3x; a LiquidAgent llama-server on :8180/:8181 skewed earlier runs)
+
+| path | prefill tok/s @530/2026/8021 | AR decode tok/s | append-stable |
+|---|---|---|---|
+| default `gather_qmv` | 219 / 232 / 220 | 38-45 | yes |
+| `HIGGS_MOE_GATHER_KERNEL=mma` | 311 / 373-392 / 347-356 | 22-24 | yes |
+| `HIGGS_MOE_GATHER_KERNEL=native` (mlx-lm style) | 346 / 399 / 367 | 41-45 | NO (warm may differ from cold by rounding) |
+
+Diffusion (opt-in `speculation: "diffusion"`, faithful to the reference, parity-tested): prose
+4.7-11.5 tok/s, code 7.9-20, JSON 11.6-25, math 12-27, enumerative (count/repeat) 46-68 tok/s.
+
+### Why diffusion does not beat AR here (two independent reviews, Fable + Codex, plus experiments)
+- Tokens/pass is a model property: ~1 on prose, ~1.5-2 on code, 2.3-3 structured, 8-20 enumerative.
+  AR greedy top-1 >0.95 on only 29-39% of prose tokens. Coreset tightening (top_p 0.5-0.7) does
+  not cut pass time and corrupts output.
+- Masked rows route independently: a 32-row pass touches ~160/256 experts (~12 GB), already ~84%
+  of achievable bandwidth. AR runs at ~80 GB/s ≈ 92% of achievable (78 GB/s measured GEMV), so
+  there is no idle bandwidth. MoE cost ≈ max(10 us/routed slot/layer, distinct experts × 1.77 MB
+  / 78 GB/s) + ~43 ms/pass non-MoE (≈35 ms launch overhead vs AR).
+- Parity needs tokens/pass ≥ 7.3 at bs8 today (≥ 4.3 with ideal kernels); measured bs8: prose
+  1.05, code 2.05, math 3.0, count 7.6.
+- Artifacts: `~/AI-Models/clover-fixture/research/` (diffreview/, space/ results, bench scripts,
+  reference Python, test configs); fixture + 4-layer slice in `~/AI-Models/clover-fixture/`;
+  failed qmv-tiled kernel attempt in `~/AI-Models/clover-fixture/kernel-attempt-qmv-tiled/`.
+
+### Open decisions / next steps (ranked)
+1. Decide the default gather mode (`qmv` stable vs `native` fast). Consider `native` as default
+   with stable mode for retained sessions only.
+2. Diffusion defaults: `clover_block_size = 8`, threshold 0.8-0.9 (2-2.7x over bs32/0.95).
+3. Content-adaptive AR<->diffusion switching (only real win: enumerative spans 46-68 vs 46 AR).
+4. Pass-cost cuts: fuse GDN preview taps / compile elementwise chains (-25-35 ms), freeze
+   resolved rows, stream resolved left prefix per pass (latency).
+5. Cheapest decisive experiment before any self-spec/kernel work: run Kapitsa on this M4 with
+   `NI_CLOVER_DECODE=spec` on code + prose; if code self-spec ≤ ~46 tok/s, close that path.
+6. Deterministic small-tile MMA gather kernel (option D) only if prefill/commit gains justify it.
+
+Pre-existing issues on `main` (not from this work): higgs-models unit tests don't compile (mlx-rs
+drift); release-profile higgs-models test binaries fail to link; `logprobs: true` panics; clippy
+errors in higgs-models/higgs; 4 failing higgs lib tests; 2 failing higgs-engine batch tests.
+Uncommitted local edits to AGENTS.md / CLAUDE.md and the bilinear-probe files are the user's.
+
 ## Status (2026-10-29)
 
 | Phase | State | Commit | Notes |
