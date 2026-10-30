@@ -4159,6 +4159,11 @@ enum MoeGatherKernel {
     /// `HIGGS_MOE_GATHER_PAD=1`: `gather_qmm_rhs` at every size, padding short
     /// domains to `4 * experts` rows.
     PaddedRhs,
+    /// `HIGGS_MOE_GATHER_KERNEL=native`: MLX's own size dispatch (sorted hint,
+    /// no padding): `gather_qmm_rhs` from `4 * experts` rows, `gather_qmv`
+    /// below, as mlx-lm does. Fast prefill and decode, but NOT append-stable:
+    /// a warm continuation can differ from a cold prefill by rounding.
+    Native,
 }
 
 fn moe_gather_kernel() -> MoeGatherKernel {
@@ -4170,6 +4175,10 @@ fn moe_gather_kernel() -> MoeGatherKernel {
             .is_ok_and(|v| v.trim().eq_ignore_ascii_case("mma"))
         {
             MoeGatherKernel::Mma
+        } else if std::env::var("HIGGS_MOE_GATHER_KERNEL")
+            .is_ok_and(|v| v.trim().eq_ignore_ascii_case("native"))
+        {
+            MoeGatherKernel::Native
         } else {
             MoeGatherKernel::Qmv
         }
@@ -4195,11 +4204,11 @@ impl MoeGatherLayout {
         let rows = idx_sorted.dim(0);
         let d = x_sorted.dim(-1);
         let kernel = moe_gather_kernel();
-        if kernel == MoeGatherKernel::Qmv {
+        if matches!(kernel, MoeGatherKernel::Qmv | MoeGatherKernel::Native) {
             return Ok(Self {
                 x: x_sorted.clone(),
                 experts: idx_sorted.clone(),
-                sorted: false,
+                sorted: kernel == MoeGatherKernel::Native,
             });
         }
         if kernel == MoeGatherKernel::Mma && rows * 4 < num_experts {
