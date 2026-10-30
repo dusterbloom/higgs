@@ -110,6 +110,8 @@ pub mod verify_rope_probe {
 }
 pub mod lfm2_moe;
 pub mod mlx_exec;
+#[doc(hidden)]
+pub mod moe8;
 pub mod phi3;
 pub mod progress;
 pub mod quant_config;

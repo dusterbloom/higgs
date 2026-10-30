@@ -6596,6 +6596,42 @@ impl SwitchMlpWeights {
         MoeGatherLayout::restore(&down_out, &inv_order)?.reshape(&[b, l, top_k, d])
     }
 
+    /// Fast rows (see [`with_fast_rows`]): 1..=8 routed rows through the
+    /// weight-once `MoE` kernels of [`crate::moe8`], each distinct expert read
+    /// once. `None` outside their domain (other quantizations, trellis
+    /// experts, fused-away gate/up, wide rows). Not bit-identical to qmv.
+    ///
+    /// `x`: `[B, L, D]`, `indices`: `[B, L, top_k]`; returns `[B, L, top_k, D]`.
+    pub(crate) fn forward_fast_rows(
+        &self,
+        x: &Array,
+        indices: &Array,
+    ) -> Result<Option<Array>, Exception> {
+        fn parts(p: &QLinear) -> crate::moe8::Expert<'_> {
+            (&p.weight, &p.scales, &p.biases)
+        }
+        let affine4_g64 = |p: &QLinear| {
+            p.mode == crate::quant_mode::QuantMode::Affine
+                && matches!(p.weight_layout, QLinearWeightLayout::Canonical)
+                && p.bits == 4
+                && p.group_size == 64
+        };
+        let ([b, l, d], [_, _, top_k]) = (x.shape(), indices.shape()) else {
+            return Ok(None);
+        };
+        let (gate, up, down) = (&self.gate_proj, &self.up_proj, &self.down_proj);
+        if self.escha.is_some() || ![gate, up, down].into_iter().all(affine4_g64) {
+            return Ok(None);
+        }
+        let x2 = x.reshape(&[b * l, *d])?;
+        let idx = indices.reshape(&[b * l, *top_k])?;
+        if !crate::moe8::supported(&x2, &idx, &gate.weight, &up.weight, &down.weight) {
+            return Ok(None);
+        }
+        let y = crate::moe8::moe8_affine4(&x2, &idx, parts(gate), parts(up), parts(down))?;
+        y.reshape(&[*b, *l, *top_k, *d]).map(Some)
+    }
+
     /// Fuse gate+up for [`Self::forward_gather_fused`] /
     /// [`Self::forward_gather_fused_decode`] and release the separate copies, so
     /// fusing costs no resident memory (the lazy init keeps both).
@@ -8717,10 +8753,15 @@ impl FfnBlock {
                 .switch_mlp
                 .as_mut()
                 .ok_or_else(|| Exception::custom("MoE switch_mlp missing"))?;
-            let y = if moe_ffn_fuse_gate_up() {
-                switch_ref.forward_gather_fused(x, &inds)?
+            let fast = if fast_rows() {
+                switch_ref.forward_fast_rows(x, &inds)?
             } else {
-                switch_ref.forward_gather_global_sort(x, &inds)?
+                None
+            };
+            let y = match fast {
+                Some(y) => y,
+                None if moe_ffn_fuse_gate_up() => switch_ref.forward_gather_fused(x, &inds)?,
+                None => switch_ref.forward_gather_global_sort(x, &inds)?,
             };
 
             let expert_sum = y
