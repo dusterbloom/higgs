@@ -5402,7 +5402,15 @@ impl Qwen3NextAttention {
             .get(1)
             .ok_or_else(|| Exception::custom("Input must have >= 2 dims"))?;
         // Q is projected to 2 * num_heads * head_dim (doubled for gating)
-        let q_proj_output = self.q_proj.forward_decode_fast(x)?;
+        let (q_proj_output, keys_raw, values_raw) =
+            match fast_rows_multi(&[&self.q_proj, &self.k_proj, &self.v_proj], x)? {
+                Some(mut qkv) => (qkv.remove(0), qkv.remove(0), qkv.remove(0)),
+                None => (
+                    self.q_proj.forward_decode_fast(x)?,
+                    self.k_proj.forward_decode_fast(x)?,
+                    self.v_proj.forward_decode_fast(x)?,
+                ),
+            };
         let q_reshaped = q_proj_output.reshape(&[B, L, self.num_attention_heads, -1])?;
         let q_halves = q_reshaped.split(2, Some(-1))?;
         let queries_pre = q_halves
@@ -5412,9 +5420,6 @@ impl Qwen3NextAttention {
             .get(1)
             .ok_or_else(|| Exception::custom("split produced empty result"))?
             .reshape(&[B, L, -1])?;
-
-        let keys_raw = self.k_proj.forward_decode_fast(x)?;
-        let values_raw = self.v_proj.forward_decode_fast(x)?;
 
         // Per-head RmsNorm then transpose to [B, H, L, D]
         let mut queries = self
@@ -5996,7 +6001,13 @@ impl Qwen3NextMLP {
                 .up_proj
                 .as_ref()
                 .ok_or_else(|| Exception::custom("MLP has neither fused nor split up"))?;
-            swiglu(&gate_out.forward(x)?, &up_out.forward(x)?)?
+            match fast_rows_multi(&[gate_out, up_out], x)? {
+                Some(mut gu) => {
+                    let gate = gu.remove(0);
+                    swiglu(&gate, &gu.remove(0))?
+                }
+                None => swiglu(&gate_out.forward(x)?, &up_out.forward(x)?)?,
+            }
         };
         self.down_proj.forward(&activated)
     }
@@ -7834,8 +7845,14 @@ impl GatedDeltaNet {
 
             (q, k, v, z, b, a)
         } else {
-            let mixed_qkvz = self.in_proj_qkvz.forward(inputs)?;
-            let mixed_ba = self.in_proj_ba.forward(inputs)?;
+            let (mixed_qkvz, mixed_ba) =
+                match fast_rows_multi(&[&self.in_proj_qkvz, &self.in_proj_ba], inputs)? {
+                    Some(mut ys) => (ys.remove(0), ys.remove(0)),
+                    None => (
+                        self.in_proj_qkvz.forward(inputs)?,
+                        self.in_proj_ba.forward(inputs)?,
+                    ),
+                };
             self.fix_query_key_value_ordering(&mixed_qkvz, &mixed_ba, B, S)?
         })
     }
@@ -7985,8 +8002,14 @@ impl GatedDeltaNet {
                 .reshape(&[B, S, self.num_v_heads, self.head_v_dim])?;
             (q, k, v, z, b, a)
         } else {
-            let mixed_qkvz = self.in_proj_qkvz.forward(inputs)?;
-            let mixed_ba = self.in_proj_ba.forward(inputs)?;
+            let (mixed_qkvz, mixed_ba) =
+                match fast_rows_multi(&[&self.in_proj_qkvz, &self.in_proj_ba], inputs)? {
+                    Some(mut ys) => (ys.remove(0), ys.remove(0)),
+                    None => (
+                        self.in_proj_qkvz.forward(inputs)?,
+                        self.in_proj_ba.forward(inputs)?,
+                    ),
+                };
             self.fix_query_key_value_ordering(&mixed_qkvz, &mixed_ba, B, S)?
         };
 
@@ -9376,6 +9399,32 @@ pub fn with_fast_rows<R, F: FnOnce() -> R>(f: F) -> R {
 
 pub(crate) fn fast_rows() -> bool {
     FAST_ROWS.with(std::cell::Cell::get)
+}
+
+/// Fast rows (see [`with_fast_rows`]): `x @ W_i^T` for 1..=3 affine-4bit g64
+/// projections sharing `x` (q|k|v, gate|up, qkvz|ba) in one weight-once
+/// dispatch of [`crate::qmm8`]; `None` outside its domain (then call each
+/// projection's `forward`). Not bit-identical to qmv.
+fn fast_rows_multi(projs: &[&QLinear], x: &Array) -> Result<Option<Vec<Array>>, Exception> {
+    let affine4_g64 = |p: &&QLinear| {
+        p.mode == crate::quant_mode::QuantMode::Affine
+            && matches!(p.weight_layout, QLinearWeightLayout::Canonical)
+            && p.bits == 4
+            && p.group_size == 64
+            && p.hadamard_block == 0
+    };
+    if !fast_rows() || !projs.iter().all(affine4_g64) {
+        return Ok(None);
+    }
+    let ws: Vec<&Array> = projs.iter().map(|p| &*p.weight).collect();
+    if !crate::qmm8::supported_multi(x, &ws) {
+        return Ok(None);
+    }
+    let segs: Vec<crate::qmm8::Segment<'_>> = projs
+        .iter()
+        .map(|p| (&*p.weight, &*p.scales, &*p.biases))
+        .collect();
+    crate::qmm8::qmm8_affine4_multi(x, &segs).map(Some)
 }
 
 fn apply_qwen3_next_rope_scheduled(
