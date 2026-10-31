@@ -5774,6 +5774,72 @@ impl SimpleEngine {
         })
     }
 
+    /// Publish the stock post-prefill state to the radix prefix cache: the
+    /// hybrid two-phase snapshot (`stored_clone`) when there is one, else the
+    /// live cache keyed at the conversation body. Must run before any decode
+    /// row enters `prepared.cache` (self-speculation verifies with fast-rows
+    /// kernels whose rows are not append-stable and must never be stored).
+    fn store_prefix_cache_after_prefill(
+        &self,
+        prompt_tokens: &[u32],
+        generation_suffix: &[u32],
+        prepared: &PreparedGeneration<'_>,
+        checkpoint_id: Option<&str>,
+    ) -> Result<(), EngineError> {
+        let mut pc = self
+            .prefix_cache
+            .lock()
+            .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
+        let radix_bytes_before = pc.radix_byte_stats().resident_bytes;
+        // Strip the generation-prompt suffix from the key so multi-turn
+        // conversations share their common history prefix (the suffix tokens
+        // `<|im_start|>assistant\n…` change between turns).
+        //
+        // Dense KV caches block-page: the suffix is dropped at block
+        // boundaries and reconstruction stays exact.
+        //
+        // Hybrid (GDN/SSM) caches can't be trimmed after the fact
+        // (mlx-lm #980), so `run_prefill` two-phase splits a hybrid
+        // prefill: it snapshots `stored_clone` at the conversation
+        // boundary (BEFORE the suffix, floored to a block multiple above)
+        // and keys that snapshot at ITS OWN resident length -- not a
+        // second, independently recomputed `exact_generation_body` split
+        // -- so the key stays exactly consistent with the flooring by
+        // construction. `PagedPrefixCache::store` block-pages the
+        // snapshot when that boundary is block-aligned and falls back to
+        // a whole clone otherwise (see `slice_into_blocks`); either way
+        // reuse is exact (no RoPE/SSM shift) AND cross-turn matching
+        // fires (the conversation boundary recurs verbatim in the next
+        // turn). This replaces the old "key hybrid at full length" path,
+        // which was correct but never matched cross-turn (the suffix
+        // diverges), forcing a full re-prefill every turn.
+        let cache_to_store = prepared.stored_clone.as_ref().unwrap_or(&prepared.cache);
+        let is_hybrid = matches!(cache_to_store, AnyCache::Hybrid(_));
+        let stripped = if prepared.stored_clone.is_some() {
+            let resident = usize::try_from(cache_to_store.resident_len()).unwrap_or(0);
+            prompt_tokens.get(..resident).unwrap_or(prompt_tokens)
+        } else {
+            exact_generation_body(prompt_tokens, generation_suffix).unwrap_or(prompt_tokens)
+        };
+        // Correct by construction: hybrid (GDN+KV) caches are whole-clone
+        // snapshots whose KV offset cannot be trimmed after prefill. Only
+        // store when the two-phase snapshot (stored_clone) exists — its
+        // offset matches the stripped key exactly. Without it, the fallback
+        // (prepared.cache) includes generation-suffix tokens and the
+        // boundary guard in prepare_store would correctly reject the
+        // mismatch (with a WARN). Skipping silently here is better: the
+        // store is intentionally omitted, not attempted and rejected.
+        if !is_hybrid || prepared.stored_clone.is_some() {
+            pc.store(stripped, cache_to_store, checkpoint_id);
+            let radix_bytes_after = pc.radix_byte_stats().resident_bytes;
+            record_request_radix_growth_bytes(
+                u64::try_from(radix_bytes_after.saturating_sub(radix_bytes_before))
+                    .unwrap_or(u64::MAX),
+            );
+        }
+        Ok(())
+    }
+
     /// Evaluate the prefill forward pass without sampling. Stores the
     /// post-prefill KV state back into the prefix cache (skipped for multimodal).
     #[allow(clippy::too_many_arguments)]
@@ -6030,57 +6096,12 @@ impl SimpleEngine {
 
         // Skip prefix cache for multimodal (image-specific KV states)
         if store_prefix_cache && prepared.image_batch.is_none() {
-            let mut pc = self
-                .prefix_cache
-                .lock()
-                .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
-            let radix_bytes_before = pc.radix_byte_stats().resident_bytes;
-            // Strip the generation-prompt suffix from the key so multi-turn
-            // conversations share their common history prefix (the suffix tokens
-            // `<|im_start|>assistant\n…` change between turns).
-            //
-            // Dense KV caches block-page: the suffix is dropped at block
-            // boundaries and reconstruction stays exact.
-            //
-            // Hybrid (GDN/SSM) caches can't be trimmed after the fact
-            // (mlx-lm #980), so `run_prefill` two-phase splits a hybrid
-            // prefill: it snapshots `stored_clone` at the conversation
-            // boundary (BEFORE the suffix, floored to a block multiple above)
-            // and keys that snapshot at ITS OWN resident length -- not a
-            // second, independently recomputed `exact_generation_body` split
-            // -- so the key stays exactly consistent with the flooring by
-            // construction. `PagedPrefixCache::store` block-pages the
-            // snapshot when that boundary is block-aligned and falls back to
-            // a whole clone otherwise (see `slice_into_blocks`); either way
-            // reuse is exact (no RoPE/SSM shift) AND cross-turn matching
-            // fires (the conversation boundary recurs verbatim in the next
-            // turn). This replaces the old "key hybrid at full length" path,
-            // which was correct but never matched cross-turn (the suffix
-            // diverges), forcing a full re-prefill every turn.
-            let cache_to_store = prepared.stored_clone.as_ref().unwrap_or(&prepared.cache);
-            let is_hybrid = matches!(cache_to_store, AnyCache::Hybrid(_));
-            let stripped = if prepared.stored_clone.is_some() {
-                let resident = usize::try_from(cache_to_store.resident_len()).unwrap_or(0);
-                prompt_tokens.get(..resident).unwrap_or(prompt_tokens)
-            } else {
-                exact_generation_body(prompt_tokens, generation_suffix).unwrap_or(prompt_tokens)
-            };
-            // Correct by construction: hybrid (GDN+KV) caches are whole-clone
-            // snapshots whose KV offset cannot be trimmed after prefill. Only
-            // store when the two-phase snapshot (stored_clone) exists — its
-            // offset matches the stripped key exactly. Without it, the fallback
-            // (prepared.cache) includes generation-suffix tokens and the
-            // boundary guard in prepare_store would correctly reject the
-            // mismatch (with a WARN). Skipping silently here is better: the
-            // store is intentionally omitted, not attempted and rejected.
-            if !is_hybrid || prepared.stored_clone.is_some() {
-                pc.store(stripped, cache_to_store, checkpoint_id);
-                let radix_bytes_after = pc.radix_byte_stats().resident_bytes;
-                record_request_radix_growth_bytes(
-                    u64::try_from(radix_bytes_after.saturating_sub(radix_bytes_before))
-                        .unwrap_or(u64::MAX),
-                );
-            }
+            self.store_prefix_cache_after_prefill(
+                prompt_tokens,
+                generation_suffix,
+                prepared,
+                checkpoint_id,
+            )?;
         }
         trace_mlx_memory("prefix_store", prompt_tokens.len());
         maybe_clear_mlx_cache(
@@ -7747,9 +7768,27 @@ impl SimpleEngine {
             params.speculation,
             self.dflash.is_some() && paired_dflash_exact_domain(params, enable_thinking),
             has_mtp,
-            // Retained-session integration of block diffusion is deferred.
+            // Retained-session integration of block diffusion is deferred;
+            // self-speculation has its own session path below.
             false,
         );
+        if run_mode == SessionRunMode::Generation
+            && params.speculation == Speculation::SelfSpec
+            && self.diffusion_eligible(false, false, false)
+            && self_spec_greedy(params)
+        {
+            return self.generate_continued_self_spec_locked(
+                session_id,
+                prompt_tokens,
+                max_tokens,
+                enable_thinking,
+                sender,
+                continuation_policy,
+                acceptance,
+                timing,
+                total_start,
+            );
+        }
         if run_mode == SessionRunMode::Generation && speculation_route == SpeculationRoute::DFlash {
             let prefill_sink = sender.map(install_retained_prefill_cancellation_sink);
             let output = self
@@ -10235,15 +10274,23 @@ impl SimpleEngine {
             stateless_mtp_family_eligible(params, constraint.is_some(), logprobs),
             self.diffusion_eligible(constraint.is_some(), image_batch.is_some(), logprobs),
         );
-        if speculation_route == SpeculationRoute::Diffusion
-            || (speculation_route == SpeculationRoute::SelfSpec && self_spec_greedy(params))
-        {
+        if speculation_route == SpeculationRoute::SelfSpec && self_spec_greedy(params) {
+            return self.self_spec_generate(
+                prompt_tokens,
+                max_tokens,
+                stop_sequences,
+                enable_thinking,
+                checkpoint_id,
+                allow_prefix_cache,
+                DflashBufferedSink::default(),
+            );
+        }
+        if speculation_route == SpeculationRoute::Diffusion {
             return self.diffusion_decode(
                 prompt_tokens,
                 max_tokens,
                 params,
                 stop_sequences,
-                speculation_route == SpeculationRoute::SelfSpec,
                 DflashBufferedSink::default(),
             );
         }
@@ -13791,9 +13838,23 @@ impl SimpleEngine {
             stateless_mtp_family_eligible(params, constraint.is_some(), logprobs),
             self.diffusion_eligible(constraint.is_some(), image_batch.is_some(), logprobs),
         );
-        if speculation_route == SpeculationRoute::Diffusion
-            || (speculation_route == SpeculationRoute::SelfSpec && self_spec_greedy(params))
-        {
+        if speculation_route == SpeculationRoute::SelfSpec && self_spec_greedy(params) {
+            let detok = IncrementalDetok::new(
+                String::new(),
+                0,
+                std::sync::Arc::clone(&self.decode_skip_ids),
+            );
+            return self.self_spec_generate(
+                prompt_tokens,
+                max_tokens,
+                stop_sequences,
+                enable_thinking,
+                checkpoint_id,
+                allow_prefix_cache,
+                DflashStreamSink { sender, detok },
+            );
+        }
+        if speculation_route == SpeculationRoute::Diffusion {
             let detok = IncrementalDetok::new(
                 String::new(),
                 0,
@@ -13804,7 +13865,6 @@ impl SimpleEngine {
                 max_tokens,
                 params,
                 stop_sequences,
-                speculation_route == SpeculationRoute::SelfSpec,
                 DflashStreamSink { sender, detok },
             );
         }
@@ -15005,7 +15065,6 @@ impl SimpleEngine {
         max_tokens: u32,
         params: &SamplingParams,
         stop_sequences: &[String],
-        self_spec: bool,
         mut sink: S,
     ) -> Result<S::Output, EngineError> {
         let request_t0 = std::time::Instant::now();
@@ -15040,49 +15099,22 @@ impl SimpleEngine {
         let mut cache = model
             .make_cache_with_config(self.kv_cache_config)
             .map_err(EngineError::Mlx)?;
-        // Self-speculation drafts with the loaded DFlash drafter when there is
-        // one (`HIGGS_CLOVER_SPEC_DRAFTER=preview` keeps the block preview);
-        // its prefill then also primes the drafter's context.
-        let dflash = self.dflash.as_ref().filter(|d| {
-            self_spec
-                && !d.is_dspark
-                && std::env::var("HIGGS_CLOVER_SPEC_DRAFTER")
-                    .ok()
-                    .is_none_or(|v| v != "preview")
-        });
-        let mut drafter = dflash.map(|d| lock_or_recover(&d.drafter));
-        let mut draft_cache = drafter.as_ref().map(|d| d.make_cache());
-        let (logits, taps) = match (dflash, drafter.as_deref_mut(), draft_cache.as_mut()) {
-            (Some(dflash), Some(drafter), Some(draft_cache)) => self.dflash_prefill_with_taps(
-                &mut model,
+        let n = i32::try_from(prompt_tokens.len())
+            .map_err(|_| EngineError::Generation("prompt length overflows i32".to_owned()))?;
+        let prompt = Array::from_slice(prompt_tokens, &[1, n]);
+        let logits = model
+            .forward_chunked(
+                &prompt,
                 &mut cache,
-                drafter,
-                draft_cache,
-                prompt_tokens,
-                &dflash.tap_layers,
-            )?,
-            _ => {
-                let n = i32::try_from(prompt_tokens.len()).map_err(|_| {
-                    EngineError::Generation("prompt length overflows i32".to_owned())
-                })?;
-                let prompt = Array::from_slice(prompt_tokens, &[1, n]);
-                let logits = model
-                    .forward_chunked(
-                        &prompt,
-                        &mut cache,
-                        self.tuning.chunked_prefill_chunk_size(),
-                    )
-                    .map_err(EngineError::Mlx)?;
-                let mut targets = vec![&logits];
-                targets.extend(cache.eval_targets());
-                eval(targets).map_err(EngineError::Mlx)?;
-                (logits, Vec::new())
-            }
-        };
+                self.tuning.chunked_prefill_chunk_size(),
+            )
+            .map_err(EngineError::Mlx)?;
+        let mut targets = vec![&logits];
+        targets.extend(cache.eval_targets());
+        eval(targets).map_err(EngineError::Mlx)?;
         let vocab = logits.shape().last().copied().unwrap_or(0);
         let prefill_elapsed = request_t0.elapsed();
         mlx_gate.begin_decode();
-
         let mut tokens: Vec<u32> = Vec::new();
         let mut sink_error = None;
         let mut emit = |emitted: &[u32]| {
@@ -15113,117 +15145,6 @@ impl SimpleEngine {
                 }
             }
         };
-        if self_spec {
-            let first =
-                mlx_rs::ops::indexing::argmax_axis(&logits.reshape(&[-1, vocab])?, -1, None)
-                    .and_then(|a| a.as_dtype(mlx_rs::Dtype::Uint32))
-                    .map_err(EngineError::Mlx)?;
-            eval([&first]).map_err(EngineError::Mlx)?;
-            let first = *first
-                .as_slice::<u32>()
-                .last()
-                .ok_or_else(|| EngineError::Generation("empty prefill logits".to_owned()))?;
-            let spec_cfg = higgs_models::clover::SelfSpecConfig {
-                max_new_tokens: cfg.max_new_tokens,
-                eos_token_ids: self.eos_token_ids.clone(),
-                // ponytail: A/B knob fixes the block; adaptive otherwise. A
-                // preview block must divide the trained block; a drafter block
-                // need not.
-                rows: std::env::var("HIGGS_CLOVER_SPEC_ROWS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .filter(|&r: &usize| {
-                        r >= 2 && (dflash.is_some() || clover.trained_block_size % r == 0)
-                    })
-                    .map_or_else(
-                        || {
-                            if dflash.is_some() {
-                                higgs_models::clover::DFLASH_ROWS.to_vec()
-                            } else {
-                                higgs_models::clover::PREVIEW_ROWS.to_vec()
-                            }
-                        },
-                        |r| vec![r],
-                    ),
-                cycle_base_rows: if dflash.is_some() {
-                    higgs_models::clover::DFLASH_CYCLE_BASE_ROWS
-                } else {
-                    higgs_models::clover::PREVIEW_CYCLE_BASE_ROWS
-                },
-            };
-            let trace = std::env::var("HIGGS_CLOVER_SPEC_TRACE").is_ok_and(|v| v == "1");
-            let (out, phases) = match (dflash, drafter.as_deref_mut(), draft_cache) {
-                (Some(dflash), Some(drafter), Some(draft_cache)) => {
-                    let mask = u32::try_from(dflash.mask_token_id).map_err(|_| {
-                        EngineError::Generation("drafter mask token id overflow".to_owned())
-                    })?;
-                    let spec = higgs_models::clover::DFlashSpec::new(
-                        &mut model,
-                        &mut cache,
-                        drafter,
-                        draft_cache,
-                        taps,
-                        mask,
-                    )
-                    .map_err(EngineError::Mlx)?;
-                    let mut timed = TimedSpec::new(spec, trace);
-                    let out = higgs_models::clover::self_spec_decode(
-                        &spec_cfg, first, &mut timed, &mut emit,
-                    )
-                    .map_err(EngineError::Mlx)?;
-                    (out, timed.phases_ms())
-                }
-                _ => {
-                    let spec = higgs_models::clover::AnyModelSpec::new(
-                        &mut model,
-                        &mut cache,
-                        clover.mask_token_id,
-                    );
-                    let mut timed = TimedSpec::new(spec, trace);
-                    let out = higgs_models::clover::self_spec_decode(
-                        &spec_cfg, first, &mut timed, &mut emit,
-                    )
-                    .map_err(EngineError::Mlx)?;
-                    (out, timed.phases_ms())
-                }
-            };
-            if let Some(error) = sink_error {
-                return Err(error);
-            }
-            let decode_s = request_t0
-                .elapsed()
-                .saturating_sub(prefill_elapsed)
-                .as_secs_f64();
-            let per_cycle = |ms: f64| format!("{:.2}", ms / out.cycles.max(1) as f64);
-            tracing::info!(
-                drafter = if dflash.is_some() {
-                    "dflash"
-                } else {
-                    "preview"
-                },
-                completion_tokens = out.tokens.len(),
-                cycles = out.cycles,
-                wide_cycles = out.wide_cycles,
-                tokens_per_cycle = format!(
-                    "{:.2}",
-                    out.tokens.len().saturating_sub(1) as f64 / out.cycles.max(1) as f64
-                ),
-                tok_per_sec = format!("{:.1}", out.tokens.len() as f64 / decode_s.max(1e-9)),
-                prefill_ms = format!("{:.1}", prefill_elapsed.as_secs_f64() * 1e3),
-                decode_ms = format!("{:.1}", decode_s * 1e3),
-                draft_ms_per_cycle = per_cycle(phases[0]),
-                verify_ms_per_cycle = per_cycle(phases[1]),
-                keep_ms_per_cycle = per_cycle(phases[2]),
-                "Self-spec generation complete"
-            );
-            let finish_reason = if out.hit_eos || out.stopped_by_caller {
-                "stop"
-            } else {
-                "length"
-            };
-            let completion = Self::completion_len(&out.tokens)?;
-            return sink.finish(self, &out.tokens, finish_reason, prompt_len, completion);
-        }
         let mut blocks = higgs_models::clover::AnyModelBlocks {
             model: &mut model,
             cache: &mut cache,
@@ -15256,6 +15177,646 @@ impl SimpleEngine {
         };
         let completion = Self::completion_len(&out.tokens)?;
         sink.finish(self, &out.tokens, finish_reason, prompt_len, completion)
+    }
+}
+
+/// A loaded `DFlash` drafter with the request-local context it is primed into
+/// and the target layers it taps.
+type SelfSpecDrafter<'a> = (&'a mut DFlashDrafter, &'a mut DFlashCache, &'a [usize]);
+
+impl SimpleEngine {
+    /// Self-speculation drafts with the loaded `DFlash` drafter when there is
+    /// one (`HIGGS_CLOVER_SPEC_DRAFTER=preview` keeps the block preview).
+    fn self_spec_dflash(&self) -> Option<&DFlashState> {
+        self.dflash.as_ref().filter(|d| {
+            !d.is_dspark
+                && std::env::var("HIGGS_CLOVER_SPEC_DRAFTER")
+                    .ok()
+                    .is_none_or(|v| v != "preview")
+        })
+    }
+
+    /// One stock forward of `tokens`: with a drafter, the chunked tap prefill
+    /// that primes its context and returns the last chunk's taps; otherwise
+    /// the plain chunked prefill. Returns the logits of the last position.
+    fn self_spec_forward(
+        &self,
+        model: &mut AnyModel,
+        cache: &mut AnyCache,
+        tokens: &[u32],
+        drafter: &mut Option<SelfSpecDrafter<'_>>,
+    ) -> Result<(Array, Vec<Array>), EngineError> {
+        match drafter.as_mut() {
+            Some((drafter, draft_cache, tap_layers)) => self.dflash_prefill_with_taps(
+                model,
+                cache,
+                drafter,
+                draft_cache,
+                tokens,
+                tap_layers,
+            ),
+            None => {
+                let n = i32::try_from(tokens.len()).map_err(|_| {
+                    EngineError::Generation("prompt length overflows i32".to_owned())
+                })?;
+                let logits = model
+                    .forward_chunked(
+                        &Array::from_slice(tokens, &[1, n]),
+                        cache,
+                        self.tuning.chunked_prefill_chunk_size(),
+                    )
+                    .map_err(EngineError::Mlx)?;
+                let mut targets = vec![&logits];
+                targets.extend(cache.eval_targets());
+                eval(targets).map_err(EngineError::Mlx)?;
+                Ok((logits, Vec::new()))
+            }
+        }
+    }
+
+    /// Stock (non-fast-rows) prefill of `prepared.actual_prompt_tokens` onto
+    /// `prepared.cache`: the request-local copy of a reused prefix, or a
+    /// fresh cache. With `store`, a hybrid cache is snapshotted into
+    /// `prepared.stored_clone` at the same block-aligned conversation
+    /// boundary as `run_prefill_evaluation`, so the radix entry holds stock
+    /// rows only. The drafter, when present, is primed with every tap row
+    /// except the last chunk's, which are returned pending for its first
+    /// draft.
+    fn self_spec_stock_prefill(
+        &self,
+        prepared: &mut PreparedGeneration<'_>,
+        generation_suffix: &[u32],
+        store: bool,
+        mut drafter: Option<SelfSpecDrafter<'_>>,
+    ) -> Result<(Array, Vec<Array>), EngineError> {
+        let is_hybrid = matches!(prepared.cache, AnyCache::Hybrid(_));
+        let split_at = if store && is_hybrid {
+            exact_generation_body(&prepared.actual_prompt_tokens, generation_suffix)
+                .map_or(0, |body| hybrid_checkpoint_boundary(body.len()))
+        } else {
+            0
+        };
+        let (body, tail) = prepared.actual_prompt_tokens.split_at(split_at);
+        if !body.is_empty() {
+            let (_, taps) = self.self_spec_forward(
+                &mut prepared.model,
+                &mut prepared.cache,
+                body,
+                &mut drafter,
+            )?;
+            if let Some((drafter, draft_cache, _)) = drafter.as_mut()
+                && !taps.is_empty()
+            {
+                drafter
+                    .prime_taps(&taps, draft_cache)
+                    .map_err(EngineError::Mlx)?;
+            }
+            // Snapshot before the generation suffix: the stored entry must end
+            // at the recurring conversation boundary (see `run_prefill_evaluation`).
+            prepared.stored_clone = Some(prepared.cache.deep_clone());
+        }
+        self.self_spec_forward(&mut prepared.model, &mut prepared.cache, tail, &mut drafter)
+    }
+
+    /// Self-speculative decode on a prefilled request-local state. `logits`
+    /// are the prefill's last-position logits and `taps` the drafter's
+    /// pending tap rows (empty without a drafter). Verified tokens go to
+    /// `sink` as they are kept; the caller finishes the sink.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::as_conversions,
+        clippy::too_many_arguments,
+        clippy::too_many_lines
+    )]
+    fn self_spec_run<S: DflashSink>(
+        &self,
+        model: &mut AnyModel,
+        cache: &mut AnyCache,
+        drafter: Option<(&mut DFlashDrafter, DFlashCache)>,
+        taps: Vec<Array>,
+        logits: &Array,
+        max_tokens: u32,
+        stop_sequences: &[String],
+        prompt_len: u32,
+        cached_prompt_tokens: u32,
+        prefill_elapsed: std::time::Duration,
+        sink: &mut S,
+    ) -> Result<(higgs_models::clover::SelfSpecOutput, &'static str), EngineError> {
+        let decode_t0 = std::time::Instant::now();
+        let clover = self
+            .clover
+            .as_ref()
+            .ok_or_else(|| EngineError::Generation("Clover diffusion state missing".to_owned()))?;
+        let with_drafter = drafter.is_some();
+        let vocab = logits.shape().last().copied().unwrap_or(0);
+        let first = mlx_rs::ops::indexing::argmax_axis(&logits.reshape(&[-1, vocab])?, -1, None)
+            .and_then(|a| a.as_dtype(mlx_rs::Dtype::Uint32))
+            .map_err(EngineError::Mlx)?;
+        eval([&first]).map_err(EngineError::Mlx)?;
+        let first = *first
+            .as_slice::<u32>()
+            .last()
+            .ok_or_else(|| EngineError::Generation("empty prefill logits".to_owned()))?;
+        let max_new_tokens = usize::try_from(max_tokens).unwrap_or(usize::MAX);
+        let spec_cfg = higgs_models::clover::SelfSpecConfig {
+            max_new_tokens,
+            eos_token_ids: self.eos_token_ids.clone(),
+            // ponytail: A/B knob fixes the block; adaptive otherwise. A
+            // preview block must divide the trained block; a drafter block
+            // need not.
+            rows: std::env::var("HIGGS_CLOVER_SPEC_ROWS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&r: &usize| r >= 2 && (with_drafter || clover.trained_block_size % r == 0))
+                .map_or_else(
+                    || {
+                        if with_drafter {
+                            higgs_models::clover::DFLASH_ROWS.to_vec()
+                        } else {
+                            higgs_models::clover::PREVIEW_ROWS.to_vec()
+                        }
+                    },
+                    |r| vec![r],
+                ),
+            cycle_base_rows: if with_drafter {
+                higgs_models::clover::DFLASH_CYCLE_BASE_ROWS
+            } else {
+                higgs_models::clover::PREVIEW_CYCLE_BASE_ROWS
+            },
+        };
+        let trace = std::env::var("HIGGS_CLOVER_SPEC_TRACE").is_ok_and(|v| v == "1");
+
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut sink_error = None;
+        let mut emit = |emitted: &[u32]| {
+            tokens.extend_from_slice(emitted);
+            let forced = if emitted
+                .last()
+                .is_some_and(|t| self.eos_token_ids.contains(t))
+            {
+                Some("stop")
+            } else if tokens.len() >= max_new_tokens {
+                Some("length")
+            } else {
+                None
+            };
+            let completion = Self::completion_len(&tokens).unwrap_or(u32::MAX);
+            match sink.emit(
+                self,
+                &tokens,
+                stop_sequences,
+                prompt_len,
+                completion,
+                forced,
+            ) {
+                Ok(stop) => stop,
+                Err(error) => {
+                    sink_error = Some(error);
+                    true
+                }
+            }
+        };
+        let (out, phases) = match drafter {
+            Some((drafter, draft_cache)) => {
+                let mask = self
+                    .dflash
+                    .as_ref()
+                    .and_then(|d| u32::try_from(d.mask_token_id).ok())
+                    .ok_or_else(|| {
+                        EngineError::Generation("drafter mask token id overflow".to_owned())
+                    })?;
+                let spec = higgs_models::clover::DFlashSpec::new(
+                    model,
+                    cache,
+                    drafter,
+                    draft_cache,
+                    taps,
+                    mask,
+                )
+                .map_err(EngineError::Mlx)?;
+                let mut timed = TimedSpec::new(spec, trace);
+                let out =
+                    higgs_models::clover::self_spec_decode(&spec_cfg, first, &mut timed, &mut emit)
+                        .map_err(EngineError::Mlx)?;
+                (out, timed.phases_ms())
+            }
+            None => {
+                let spec =
+                    higgs_models::clover::AnyModelSpec::new(model, cache, clover.mask_token_id);
+                let mut timed = TimedSpec::new(spec, trace);
+                let out =
+                    higgs_models::clover::self_spec_decode(&spec_cfg, first, &mut timed, &mut emit)
+                        .map_err(EngineError::Mlx)?;
+                (out, timed.phases_ms())
+            }
+        };
+        if let Some(error) = sink_error {
+            return Err(error);
+        }
+        let decode_s = decode_t0.elapsed().as_secs_f64();
+        let per_cycle = |ms: f64| format!("{:.2}", ms / out.cycles.max(1) as f64);
+        tracing::info!(
+            drafter = if with_drafter { "dflash" } else { "preview" },
+            completion_tokens = out.tokens.len(),
+            cycles = out.cycles,
+            wide_cycles = out.wide_cycles,
+            tokens_per_cycle = format!(
+                "{:.2}",
+                out.tokens.len().saturating_sub(1) as f64 / out.cycles.max(1) as f64
+            ),
+            tok_per_sec = format!("{:.1}", out.tokens.len() as f64 / decode_s.max(1e-9)),
+            prompt_tokens = prompt_len,
+            cached_prompt_tokens,
+            prefill_ms = format!("{:.1}", prefill_elapsed.as_secs_f64() * 1e3),
+            decode_ms = format!("{:.1}", decode_s * 1e3),
+            draft_ms_per_cycle = per_cycle(phases[0]),
+            verify_ms_per_cycle = per_cycle(phases[1]),
+            keep_ms_per_cycle = per_cycle(phases[2]),
+            "Self-spec generation complete"
+        );
+        let finish_reason = if out.hit_eos || out.stopped_by_caller {
+            "stop"
+        } else {
+            "length"
+        };
+        Ok((out, finish_reason))
+    }
+
+    /// Clover self-speculation (`speculation = "self_spec"`, greedy).
+    ///
+    /// The AR path's radix prefix lookup materializes a request-local copy of
+    /// the longest stock prefix; the remaining suffix is stock-prefilled (with
+    /// drafter taps when the `DFlash` drafter drafts) and the entry is stored
+    /// exactly as the AR path stores it, before the first verify. Decode then
+    /// runs [`higgs_models::clover::self_spec_decode`] on the local copy: its
+    /// fast-rows verify rows are not append-stable and never reach the shared
+    /// cache. `PFlash` and thinking budgets are not applied in this mode.
+    #[allow(clippy::too_many_arguments)]
+    fn self_spec_generate<S: DflashSink>(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        stop_sequences: &[String],
+        enable_thinking: bool,
+        checkpoint_id: Option<&str>,
+        allow_prefix_cache: bool,
+        mut sink: S,
+    ) -> Result<S::Output, EngineError> {
+        let request_t0 = std::time::Instant::now();
+        let prompt_len = Self::prompt_len(prompt_tokens)?;
+        let generation_suffix = self.gen_prompt_suffixes.for_request(enable_thinking);
+        let store = cache_policy_allows_prefix_cache(allow_prefix_cache);
+        let mut prepared =
+            self.prepare_generation(prompt_tokens, None, checkpoint_id, allow_prefix_cache)?;
+        let dflash = self.self_spec_dflash();
+        let mut drafter = dflash.map(|d| lock_or_recover(&d.drafter));
+        let mut draft_cache = drafter.as_ref().map(|d| d.make_cache());
+        let prefill_drafter = match (dflash, drafter.as_deref_mut(), draft_cache.as_mut()) {
+            (Some(dflash), Some(drafter), Some(draft_cache)) => {
+                Some((drafter, draft_cache, dflash.tap_layers.as_slice()))
+            }
+            _ => None,
+        };
+        let (logits, taps) =
+            self.self_spec_stock_prefill(&mut prepared, generation_suffix, store, prefill_drafter)?;
+        if store {
+            self.store_prefix_cache_after_prefill(
+                prompt_tokens,
+                generation_suffix,
+                &prepared,
+                checkpoint_id,
+            )?;
+        }
+        maybe_clear_mlx_cache(
+            self.tuning.clear_cache_after_prefill(),
+            "simple_post_prefill",
+        );
+        let prefill_elapsed = request_t0.elapsed();
+        prepared._mlx_gate.begin_decode();
+        let decode_drafter = match (drafter.as_deref_mut(), draft_cache) {
+            (Some(drafter), Some(draft_cache)) => Some((drafter, draft_cache)),
+            _ => None,
+        };
+        let (out, finish_reason) = self.self_spec_run(
+            &mut prepared.model,
+            &mut prepared.cache,
+            decode_drafter,
+            taps,
+            &logits,
+            max_tokens,
+            stop_sequences,
+            prompt_len,
+            prepared.reused_prefix_tokens,
+            prefill_elapsed,
+            &mut sink,
+        )?;
+        let completion = Self::completion_len(&out.tokens)?;
+        sink.finish(self, &out.tokens, finish_reason, prompt_len, completion)
+    }
+
+    /// Retain the stock prompt boundary of a self-spec session turn: a deep
+    /// clone of the prefilled cache taken before the live cache receives
+    /// fast-rows verify rows, compressed per the retention policy and keyed by
+    /// the full prompt. The completion is not retained; the next turn
+    /// stock-prefills it as part of its suffix.
+    fn retain_self_spec_prompt_state(
+        &self,
+        session_id: u64,
+        prepared: &PreparedGeneration<'_>,
+        prompt_tokens: &[u32],
+    ) {
+        let Ok(boundary) = i32::try_from(prompt_tokens.len()) else {
+            tracing::warn!(
+                session_id,
+                "Retained session boundary exceeds i32; dropping session retention"
+            );
+            return;
+        };
+        let mut cache = match prepared.cache.try_deep_clone() {
+            Ok(cache) => cache,
+            Err(error) => {
+                tracing::warn!(session_id, error = %error, "Failed to clone self-spec prompt state");
+                return;
+            }
+        };
+        if let Err(error) = cache.validate_absolute_boundary(boundary) {
+            tracing::warn!(
+                session_id,
+                error = %error,
+                expected = boundary,
+                "Self-spec prompt cache is misaligned; dropping session retention"
+            );
+            return;
+        }
+        let retained_storage = retained_kv_storage(self.kv_cache_config, prompt_tokens.len());
+        let mut cap_exempt = false;
+        if retained_storage != RetainedKvStorage::Dense {
+            match cache.quantize_for_retention(self.kv_cache_config) {
+                Ok(layers) if layers > 0 => {
+                    cap_exempt = retained_storage == RetainedKvStorage::TurboQuantOverCap;
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    session_id,
+                    error = %error,
+                    "Failed to TurboQuant-compress retained KV; retaining dense"
+                ),
+            }
+        }
+        match RetainedState::target_only(cache, prompt_tokens.to_vec(), &prepared._mlx_gate) {
+            Ok(state) => self.stash_retained(session_id, state, cap_exempt),
+            Err(error) => tracing::warn!(
+                session_id,
+                error = %error,
+                "Failed to evaluate and key retained self-spec prompt state"
+            ),
+        }
+    }
+
+    /// Retained-session turn decoded self-speculatively.
+    ///
+    /// Forks the session's stock state (falling back to the radix lookup like
+    /// the AR path), stock-prefills the suffix, publishes the prompt boundary
+    /// (stock rows only) as the session's new state, then self-spec decodes on
+    /// the request-local copy. Session prompts are retained whole, so the
+    /// previous reply is re-prefilled by the next turn.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn generate_continued_self_spec_locked(
+        &self,
+        session_id: u64,
+        prompt_tokens: &[u32],
+        max_tokens: u32,
+        enable_thinking: bool,
+        sender: Option<&tokio::sync::mpsc::Sender<StreamingOutput>>,
+        continuation_policy: SessionContinuationPolicy,
+        mut acceptance: Option<SessionStreamAcceptance>,
+        timing: bool,
+        total_start: std::time::Instant,
+    ) -> Result<SessionGeneration, EngineError> {
+        let total = u32::try_from(prompt_tokens.len())
+            .map_err(|_| EngineError::Generation("prompt too long".to_owned()))?;
+        let (mut prepared, prefilled, continued) = {
+            let model = self
+                .model
+                .lock()
+                .map_err(|e| EngineError::Generation(format!("Model lock poisoned: {e}")))?;
+            let mlx_gate = RequestMlxExecution::acquire();
+            let forked = match self.fork_target_continuable(
+                session_id,
+                prompt_tokens,
+                SessionRunMode::Generation,
+                &mlx_gate,
+            ) {
+                Ok(forked) => forked,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id,
+                        error = %error,
+                        "retained target session could not be forked; cold-prefilling"
+                    );
+                    None
+                }
+            };
+            if continuation_policy == SessionContinuationPolicy::RequireContinuation
+                && forked.is_none()
+            {
+                if let Some(acceptance) = acceptance.take() {
+                    let _ = acceptance.send(Err(session_id));
+                }
+                self.cache_metrics
+                    .required_continuation_misses
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(EngineError::RetainedSessionUnavailable(session_id));
+            }
+            if let Some((cache, prior)) = forked {
+                let suffix: Vec<u32> = prompt_tokens.get(prior..).unwrap_or_default().to_vec();
+                let prefilled = u32::try_from(suffix.len()).unwrap_or(u32::MAX);
+                let prompt_array = Array::from(suffix.as_slice()).index(NewAxis);
+                let prepared = PreparedGeneration {
+                    model,
+                    cache,
+                    actual_prompt_tokens: suffix,
+                    prompt_array,
+                    prompt_len: total,
+                    image_batch: None,
+                    reused_prefix_tokens: u32::try_from(prior).unwrap_or(u32::MAX),
+                    stored_clone: None,
+                    _mlx_gate: mlx_gate,
+                };
+                (prepared, prefilled, true)
+            } else {
+                drop(model);
+                drop(mlx_gate);
+                let prepared = self.prepare_generation(prompt_tokens, None, None, true)?;
+                let prefilled =
+                    u32::try_from(prepared.actual_prompt_tokens.len()).unwrap_or(u32::MAX);
+                (prepared, prefilled, false)
+            }
+        };
+        record_request_execution(
+            if continued {
+                RequestExecutionPath::RetainedSuffix
+            } else if prepared.actual_prompt_tokens.len() < prompt_tokens.len() {
+                RequestExecutionPath::RadixHit
+            } else {
+                RequestExecutionPath::Cold
+            },
+            u64::from(total),
+            u64::from(prefilled),
+        );
+        if let Some(acceptance) = acceptance.take() {
+            let _ = acceptance.send(Ok(()));
+        }
+        if continued {
+            self.cache_metrics
+                .continuations
+                .fetch_add(1, Ordering::Relaxed);
+            self.cache_metrics.prefill_saved_tokens.fetch_add(
+                u64::from(total.saturating_sub(prefilled)),
+                Ordering::Relaxed,
+            );
+        }
+        if let Some(sender) = sender {
+            let cached = if continued {
+                total.saturating_sub(prefilled)
+            } else {
+                0
+            };
+            send_session_stream_output(
+                sender,
+                StreamingOutput {
+                    new_text: String::new(),
+                    finished: false,
+                    finish_reason: None,
+                    prompt_tokens: total,
+                    completion_tokens: 0,
+                    token_logprob: None,
+                    prefill_progress: Some(crate::engine::PrefillProgress {
+                        processed: cached,
+                        cached,
+                        total,
+                    }),
+                },
+            )?;
+        }
+
+        let prefill_start = std::time::Instant::now();
+        let dflash = self.self_spec_dflash();
+        let mut drafter = dflash.map(|d| lock_or_recover(&d.drafter));
+        let mut draft_cache = drafter.as_ref().map(|d| d.make_cache());
+        let prefill_drafter = match (dflash, drafter.as_deref_mut(), draft_cache.as_mut()) {
+            (Some(dflash), Some(drafter), Some(draft_cache)) => {
+                Some((drafter, draft_cache, dflash.tap_layers.as_slice()))
+            }
+            _ => None,
+        };
+        // Same cooperative prefill boundary as the AR session path: a stop or
+        // a disconnected client aborts between chunks, leaving the previously
+        // published session intact.
+        let prefill_sink = sender.map(install_retained_prefill_cancellation_sink);
+        let (logits, taps) = self
+            .self_spec_stock_prefill(
+                &mut prepared,
+                self.gen_prompt_suffixes.for_request(enable_thinking),
+                false,
+                prefill_drafter,
+            )
+            .map_err(|error| {
+                let stop = crate::stop::generation_stop();
+                map_streaming_prefill_error(error, stop.as_ref())
+            })?;
+        drop(prefill_sink);
+        maybe_clear_mlx_cache(
+            self.tuning.clear_cache_after_prefill(),
+            "simple_post_prefill",
+        );
+        let prefill_elapsed = prefill_start.elapsed();
+        // Publish before decode: the live cache is about to receive fast-rows
+        // verify rows, and a cancelled turn still leaves this stock boundary.
+        let retain_start = std::time::Instant::now();
+        self.retain_self_spec_prompt_state(session_id, &prepared, prompt_tokens);
+        let retain_elapsed = retain_start.elapsed();
+
+        prepared._mlx_gate.begin_decode();
+        let decode_drafter = match (drafter.as_deref_mut(), draft_cache) {
+            (Some(drafter), Some(draft_cache)) => Some((drafter, draft_cache)),
+            _ => None,
+        };
+        let decode_start = std::time::Instant::now();
+        let (out, finish_reason) = match sender {
+            Some(sender) => {
+                let mut sink = DflashStreamSink {
+                    sender,
+                    detok: IncrementalDetok::new(
+                        String::new(),
+                        0,
+                        std::sync::Arc::clone(&self.decode_skip_ids),
+                    ),
+                };
+                let run = self.self_spec_run(
+                    &mut prepared.model,
+                    &mut prepared.cache,
+                    decode_drafter,
+                    taps,
+                    &logits,
+                    max_tokens,
+                    &[],
+                    total,
+                    prepared.reused_prefix_tokens,
+                    prefill_elapsed,
+                    &mut sink,
+                )?;
+                let completion = Self::completion_len(&run.0.tokens)?;
+                sink.finish(self, &run.0.tokens, run.1, total, completion)?;
+                run
+            }
+            None => self.self_spec_run(
+                &mut prepared.model,
+                &mut prepared.cache,
+                decode_drafter,
+                taps,
+                &logits,
+                max_tokens,
+                &[],
+                total,
+                prepared.reused_prefix_tokens,
+                prefill_elapsed,
+                &mut DflashBufferedSink::default(),
+            )?,
+        };
+        let decode_elapsed = decode_start.elapsed();
+        drop(drafter);
+        drop(prepared);
+
+        #[allow(clippy::print_stderr)] // env-gated diagnostic
+        if timing {
+            eprintln!(
+                "DIAG session-timing: route=self_spec continued={continued} prompt={total} prefilled={prefilled} generated={} prefill={prefill_elapsed:.2?} decode={decode_elapsed:.2?} retain_eval={retain_elapsed:.2?} total={:.2?}",
+                out.tokens.len(),
+                total_start.elapsed()
+            );
+        }
+        tracing::info!(
+            session_id,
+            continued,
+            prompt_tokens = total,
+            prefilled_tokens = prefilled,
+            prefill_saved = total.saturating_sub(prefilled),
+            "cache-resident turn"
+        );
+        Ok(SessionGeneration {
+            text: self.decode_tokens(&out.tokens)?,
+            completion_tokens: u32::try_from(out.tokens.len()).unwrap_or(u32::MAX),
+            finish_reason: finish_reason.to_owned(),
+            prompt_tokens: total,
+            prefilled_tokens: prefilled,
+            outcome: if continued {
+                SessionOutcome::Continued
+            } else {
+                SessionOutcome::ExactBootstrap
+            },
+            continued,
+        })
     }
 }
 
@@ -21252,6 +21813,329 @@ mod tests {
             find_stop_in_tail("hiSTOP", 6, &stops),
             Some(2),
             "stop at pos 2 so 'hi' can be emitted as prefix"
+        );
+    }
+}
+
+/// Clover self-speculation against the shared caches. The radix entry and the
+/// retained session may hold stock prefill rows only (the fast-rows verify
+/// rows are not append-stable), and reuse must not change the output. These
+/// run on the 4-layer Clover slice (`HIGGS_CLOVER_FIXTURE_DIR`, built by
+/// `examples/clover_reference_fixture.py`), so they are ignored by default.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod self_spec_cache_tests {
+    use std::path::Path;
+
+    use higgs_models::{
+        AnyCache, SamplingParams, Speculation, cache::KvCacheView, qwen3_next::LayerCache,
+        turboquant::KvCacheConfig,
+    };
+    use mlx_rs::{
+        Array,
+        ops::indexing::{IndexOp, NewAxis},
+    };
+
+    use super::{SessionOutcome, SimpleEngine, hybrid_checkpoint_boundary};
+    use crate::chat_template::ChatMessage;
+    use crate::mlx_tuning::{MlxRuntimeTuning, RequestedMlxProfile};
+
+    const MAX_NEW: u32 = 24;
+
+    fn slice_engine() -> Option<SimpleEngine> {
+        let dir = std::env::var("HIGGS_CLOVER_FIXTURE_DIR").ok()?;
+        let model_dir = Path::new(&dir).join("slice");
+        let tuning = MlxRuntimeTuning::from_model_dir(&model_dir, RequestedMlxProfile::Baseline);
+        let kv_cache_config = KvCacheConfig {
+            max_retained_sessions: 2,
+            retained_idle_secs: 0,
+            kv_cache_bytes: 1 << 30,
+            ..KvCacheConfig::default()
+        };
+        Some(
+            SimpleEngine::load(&model_dir, kv_cache_config, tuning, false, None, 0, false)
+                .expect("load the Clover slice"),
+        )
+    }
+
+    fn user(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "user".to_owned(),
+            content: content.to_owned(),
+            reasoning_content: None,
+            tool_calls: None,
+        }
+    }
+
+    fn self_spec_params() -> SamplingParams {
+        SamplingParams {
+            temperature: 0.0,
+            speculation: Speculation::SelfSpec,
+            ..SamplingParams::default()
+        }
+    }
+
+    /// A prompt whose conversation body spans several prefix-cache blocks.
+    fn long_prompt(engine: &SimpleEngine) -> (Vec<u32>, Vec<u32>) {
+        let text =
+            "The ocean regulates the climate by storing heat and carbon dioxide. ".repeat(12);
+        let prompt = engine
+            .prepare_chat_prompt_with_thinking(&[user(&text)], None, false)
+            .unwrap();
+        let suffix = engine.gen_prompt_suffixes.for_request(false).to_vec();
+        assert!(!suffix.is_empty() && prompt.ends_with(&suffix));
+        assert!(prompt.len() - suffix.len() >= 64, "body spans two blocks");
+        (prompt, suffix)
+    }
+
+    /// Stock chunked prefill on a fresh cache, one forward per segment of
+    /// `segments` (a single segment is a cold one-shot prefill; a split
+    /// reproduces a stock warm continuation). The reference every shared
+    /// entry must match bit for bit.
+    fn stock_prefill(engine: &SimpleEngine, segments: &[&[u32]]) -> AnyCache {
+        let mut model = engine.model.lock().unwrap();
+        let _exec = higgs_models::mlx_exec::acquire();
+        let mut cache = model
+            .make_cache_with_config(engine.kv_cache_config)
+            .unwrap();
+        for tokens in segments {
+            let logits = model
+                .forward_chunked(
+                    &Array::from(*tokens).index(NewAxis),
+                    &mut cache,
+                    engine.tuning.chunked_prefill_chunk_size(),
+                )
+                .unwrap();
+            let mut targets = vec![&logits];
+            targets.extend(cache.eval_targets());
+            higgs_models::mlx_exec::eval(targets).unwrap();
+        }
+        cache
+    }
+
+    /// The resident state arrays of a hybrid cache, layer by layer: the K/V
+    /// rows actually written (not the stepped buffer) and the GDN states.
+    fn resident_arrays(cache: &AnyCache) -> Vec<(String, Array)> {
+        let AnyCache::Hybrid(layers) = cache else {
+            panic!("the Clover slice uses a hybrid cache");
+        };
+        let mut out = Vec::new();
+        for (layer, entry) in layers.iter().enumerate() {
+            match entry {
+                Some(LayerCache::KV(kv)) => {
+                    let view = kv.peek_view().unwrap().expect("prefilled KV layer");
+                    let KvCacheView::Dense { keys, values } = view else {
+                        panic!("dense KV expected");
+                    };
+                    out.push((format!("layer {layer} keys"), keys));
+                    out.push((format!("layer {layer} values"), values));
+                }
+                Some(LayerCache::Arrays(gdn)) => {
+                    out.push((
+                        format!("layer {layer} conv_state"),
+                        gdn.conv_state.clone().expect("conv state"),
+                    ));
+                    out.push((
+                        format!("layer {layer} ssm_state"),
+                        gdn.ssm_state.clone().expect("ssm state"),
+                    ));
+                }
+                None => {}
+            }
+        }
+        out
+    }
+
+    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+        a.as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap()
+            .subtract(b.as_dtype(mlx_rs::Dtype::Float32).unwrap())
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item()
+    }
+
+    fn assert_bit_identical(actual: &AnyCache, expected: &AnyCache, what: &str) {
+        let _exec = higgs_models::mlx_exec::acquire();
+        assert_eq!(
+            actual.resident_len(),
+            expected.resident_len(),
+            "{what}: resident length"
+        );
+        let actual = resident_arrays(actual);
+        let expected = resident_arrays(expected);
+        assert_eq!(actual.len(), expected.len(), "{what}: state array count");
+        for ((name, a), (_, e)) in actual.iter().zip(&expected) {
+            assert_eq!(a.shape(), e.shape(), "{what}: {name} shape");
+            assert_eq!(a.dtype(), e.dtype(), "{what}: {name} dtype");
+            let equal: bool = a.eq(e).unwrap().all(None).unwrap().item();
+            assert!(
+                equal,
+                "{what}: {name} differs from the stock prefill (max abs diff {})",
+                max_abs_diff(a, e)
+            );
+        }
+    }
+
+    fn radix_entry(engine: &SimpleEngine, prompt: &[u32]) -> (usize, AnyCache) {
+        let _exec = higgs_models::mlx_exec::acquire();
+        let hit = engine
+            .prefix_cache
+            .lock()
+            .unwrap()
+            .find_memory_prefix(prompt)
+            .expect("radix entry for the prompt");
+        (hit.prefix_len, hit.cache)
+    }
+
+    fn retained_session(engine: &SimpleEngine, session_id: u64) -> (Vec<u32>, AnyCache) {
+        let exec = higgs_models::mlx_exec::acquire();
+        let retained = engine.retained.lock().unwrap();
+        let state = &retained.get(&session_id).expect("retained session").state;
+        let cache = state.fork_target_cache_for_session(&exec).unwrap();
+        (state.tokens().to_vec(), cache)
+    }
+
+    #[test]
+    #[ignore = "needs HIGGS_CLOVER_FIXTURE_DIR (loads the 4-layer Clover slice)"]
+    fn self_spec_radix_entry_is_stock_prefill_and_reuse_keeps_output() {
+        let Some(engine) = slice_engine() else {
+            return;
+        };
+        let (prompt, suffix) = long_prompt(&engine);
+        let run = || {
+            engine
+                .generate_with_thinking(
+                    &prompt,
+                    MAX_NEW,
+                    &self_spec_params(),
+                    &[],
+                    false,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+                .text
+        };
+        engine.clear_prefix_cache();
+        let cold = run();
+        assert_eq!(
+            engine.prefix_cache_len(),
+            1,
+            "self_spec stores the stock prefix"
+        );
+
+        let expected_len = hybrid_checkpoint_boundary(prompt.len() - suffix.len());
+        let (stored_len, stored) = radix_entry(&engine, &prompt);
+        assert_eq!(
+            stored_len, expected_len,
+            "entry ends at the block-aligned body"
+        );
+        let reference = stock_prefill(&engine, &[&prompt[..expected_len]]);
+        assert_bit_identical(
+            &stored,
+            &reference,
+            "radix entry after a cold self_spec request",
+        );
+
+        let warm = run();
+        assert_eq!(
+            warm, cold,
+            "self_spec with a cached prefix must reproduce the cold output"
+        );
+        let (_, stored) = radix_entry(&engine, &prompt);
+        assert_bit_identical(
+            &stored,
+            &reference,
+            "radix entry after a warm self_spec request",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs HIGGS_CLOVER_FIXTURE_DIR (loads the 4-layer Clover slice)"]
+    fn self_spec_session_retains_stock_prompt_state_and_continues_exactly() {
+        let Some(engine) = slice_engine() else {
+            return;
+        };
+        let (prompt1, suffix) = long_prompt(&engine);
+        let params = self_spec_params();
+        engine.clear_prefix_cache();
+        let turn1 = engine
+            .generate_continued_with_thinking(7, &prompt1, MAX_NEW, &params, false)
+            .unwrap();
+        assert_eq!(turn1.outcome, SessionOutcome::ExactBootstrap);
+        let (retained_tokens, retained) = retained_session(&engine, 7);
+        assert_eq!(
+            retained_tokens, prompt1,
+            "the session retains the prompt boundary only"
+        );
+        assert_bit_identical(
+            &retained,
+            &stock_prefill(&engine, &[&prompt1]),
+            "retained session after turn 1",
+        );
+
+        // Turn 2 extends turn 1's prompt exactly, as a rendered history does.
+        // The suffix spans more than 17 rows: the stock prefill of a shorter
+        // tail takes a different kernel path and is not bit-identical to the
+        // same rows inside a one-shot prefill (measured on this slice: tails
+        // of 1-17 rows differ, 18-40 match), on the AR session path as well.
+        let mut prompt2 = prompt1.clone();
+        prompt2.extend(
+            engine
+                .tokenizer()
+                .encode(
+                    "Tell me more about how the ocean stores heat, and why the deep water matters.",
+                    false,
+                )
+                .unwrap()
+                .get_ids(),
+        );
+        prompt2.extend(&suffix);
+        assert!(
+            prompt2.len() - prompt1.len() >= 18,
+            "suffix spans at least 18 rows"
+        );
+        let turn2 = engine
+            .generate_continued_with_thinking(7, &prompt2, MAX_NEW, &params, false)
+            .unwrap();
+        assert_eq!(turn2.outcome, SessionOutcome::Continued);
+        assert_eq!(
+            usize::try_from(turn2.prefilled_tokens).unwrap(),
+            prompt2.len() - prompt1.len(),
+            "a continued turn prefills only the new suffix"
+        );
+        let (retained_tokens, retained) = retained_session(&engine, 7);
+        assert_eq!(retained_tokens, prompt2);
+        // The continuation stock-prefills the suffix onto the retained prompt
+        // state, so the reference is the same stock split (a one-shot prefill
+        // of the whole prompt differs by kernel tiling, as on the AR path).
+        assert_bit_identical(
+            &retained,
+            &stock_prefill(&engine, &[&prompt1, &prompt2[prompt1.len()..]]),
+            "retained session after turn 2",
+        );
+
+        // Cold restart of turn 2: a new session with the radix cleared.
+        engine.clear_prefix_cache();
+        let cold = engine
+            .generate_continued_with_thinking(8, &prompt2, MAX_NEW, &params, false)
+            .unwrap();
+        assert_eq!(cold.outcome, SessionOutcome::ExactBootstrap);
+        assert_eq!(
+            turn2.text, cold.text,
+            "a continued self_spec turn must match a cold restart"
         );
     }
 }
