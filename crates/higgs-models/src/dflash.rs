@@ -774,6 +774,9 @@ impl DFlashCandidateSelector {
 
     /// Greedy path walk over the per-position top-k candidate shortlist.
     fn select(&self, hidden: &Array, logits: &Array, anchor: i32) -> Result<Array, Exception> {
+        if let Some(tokens) = self.select_fast(hidden, logits, anchor)? {
+            return Ok(tokens);
+        }
         let b = hidden.shape()[0];
         let t = hidden.shape()[1];
         let neg = logits.negative()?;
@@ -1219,6 +1222,13 @@ pub struct DFlashDrafter {
     #[param]
     candidate_selector: Option<DFlashCandidateSelector>,
     pub config: DFlashConfig,
+    /// Fast rows: every layer's `k_proj|v_proj` stacked along N, so one
+    /// projection of the context rows feeds every layer's commit (see
+    /// [`Self::stage_forward_fast`]).
+    fused_kv: std::sync::OnceLock<(Array, Array, Array)>,
+    /// The target head's leading rows as the draft head (see
+    /// [`Self::reduced_head`]).
+    draft_head: std::sync::OnceLock<(Array, Array, Array)>,
 }
 
 /// Transactional per-layer context owned by a DFlash/dSpark drafter.
@@ -1406,6 +1416,13 @@ impl DFlashForwardTransaction {
             .ok_or_else(|| Exception::custom("drafter staged context position overflow"))
     }
 
+    /// The staged per-layer `(K, V)` context (test seam).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn layers(&self) -> &[Option<(Array, Array)>] {
+        &self.layers
+    }
+
     pub fn commit(self, cache: &mut DFlashCache) -> Result<(), Exception> {
         if cache.branch != self.base_branch {
             return Err(Exception::custom(format!(
@@ -1575,7 +1592,31 @@ impl DFlashDrafter {
                 .then(|| DFlashCandidateSelector::new(&config, spec))
                 .transpose()?,
             config,
+            fused_kv: std::sync::OnceLock::new(),
+            draft_head: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The first `rows` ids of the target head `(weight, scales, biases)` as
+    /// the draft head: the `DFlash2` shortlist is drawn from those ids only
+    /// (Kapitsa's reduced draft head; the ids are BPE merge order, so the
+    /// leading rows hold nearly every generated token). Built once; the
+    /// copies are contiguous so the fast-rows kernels never re-copy them.
+    pub fn reduced_head(
+        &self,
+        head: (&Array, &Array, &Array),
+        rows: i32,
+    ) -> Result<&(Array, Array, Array), Exception> {
+        if let Some(built) = self.draft_head.get() {
+            return Ok(built);
+        }
+        let slice =
+            |a: &Array| crate::metal_kernel::materialized_device_copy_lazy(&a.index((..rows, ..)));
+        let built = (slice(head.0)?, slice(head.1)?, slice(head.2)?);
+        drop(self.draft_head.set(built));
+        self.draft_head
+            .get()
+            .ok_or_else(|| Exception::custom("drafter reduced head missing"))
     }
 
     /// Create an empty per-layer KV cache for the drafter.
@@ -1872,6 +1913,9 @@ impl DFlashDrafter {
 
         let rows = self.validate_context_taps(taps, "forward")?;
         self.validate_noise(noise, taps)?;
+        if let Some(transaction) = self.stage_forward_fast(noise, taps, cache)? {
+            return Ok(transaction);
+        }
         let projected_position = cache.projected_position()?;
         let mut staged = cache.staged_layers(self.layers.len())?;
 
@@ -2003,6 +2047,582 @@ impl DFlashDrafter {
             .as_ref()
             .map(|selector| selector.select(hidden, logits, anchor))
             .transpose()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fast rows: the fused DFlash2 draft (`crate::dflash_rows`)
+// ---------------------------------------------------------------------------
+
+/// A drafter inside the fused kernels' domain.
+#[derive(Clone, Copy)]
+struct FusedGeometry {
+    heads: crate::dflash_rows::Heads,
+    hidden: i32,
+    block: i32,
+    layers: i32,
+}
+
+fn qmm8(p: &crate::qwen3_next::QLinear, x: &Array) -> Result<Array, Exception> {
+    crate::qmm8::qmm8_affine4(x, &p.weight, &p.scales, &p.biases)
+}
+
+fn segment(p: &crate::qwen3_next::QLinear) -> crate::qmm8::Segment<'_> {
+    (&p.weight, &p.scales, &p.biases)
+}
+
+fn qmm8_multi(ps: &[&crate::qwen3_next::QLinear], x: &Array) -> Result<Vec<Array>, Exception> {
+    let segs: Vec<crate::qmm8::Segment<'_>> = ps.iter().map(|p| segment(p)).collect();
+    crate::qmm8::qmm8_affine4_multi(x, &segs)
+}
+
+impl DFlashDrafter {
+    /// The fused kernels' domain: a `DFlash2` trunk (two-tap group-16 convs,
+    /// 128-wide heads, a hidden size the row kernels tile), every layer
+    /// sliding with one window, every projection affine 4-bit group-64.
+    fn fused_geometry(&self) -> Option<FusedGeometry> {
+        let c = &self.config;
+        let window = self.layers.first()?.self_attn.sliding_window;
+        let hidden = c.hidden_size;
+        let layer_ok = |l: &DFlashDecoderLayer| {
+            let a = &l.self_attn;
+            let projections = [
+                &a.q_proj,
+                &a.k_proj,
+                &a.v_proj,
+                &a.o_proj,
+                &l.mlp.gate_proj,
+                &l.mlp.up_proj,
+                &l.mlp.down_proj,
+            ];
+            let conv_ok = |conv: &DFlashDynamicConv| {
+                conv.kernel_projection.fast_rows_affine4()
+                    && conv.base_kernel.shape() == [2, 2, hidden]
+            };
+            a.is_sliding
+                && a.sliding_window == window
+                && projections.iter().all(|p| p.fast_rows_affine4())
+                && l.attention_conv.as_ref().is_some_and(conv_ok)
+                && l.mlp_conv.as_ref().is_some_and(conv_ok)
+        };
+        let ok = c.is_dflash2()
+            && self.dspark.is_none()
+            && c.conv_kernel_size() == 2
+            && c.conv_group_size() == crate::dflash_rows::CONV_GROUP
+            && c.head_dim == crate::dflash_rows::D
+            && crate::dflash_rows::hidden_supported(hidden)
+            && c.num_attention_heads % c.num_key_value_heads == 0
+            && window > 1
+            && self.fc.fast_rows_affine4()
+            && self.layers.iter().all(layer_ok);
+        let layers = i32::try_from(self.layers.len()).ok()?;
+        ok.then_some(FusedGeometry {
+            heads: crate::dflash_rows::Heads {
+                hq: c.num_attention_heads,
+                hkv: c.num_key_value_heads,
+                window,
+                eps: c.rms_norm_eps,
+                rope_base: c.rope_theta,
+            },
+            hidden,
+            block: c.block_size,
+            layers,
+        })
+    }
+
+    /// Every layer's `k_proj|v_proj` stacked along N (built once, lazily).
+    fn stacked_kv(&self) -> Result<&(Array, Array, Array), Exception> {
+        if let Some(stacked) = self.fused_kv.get() {
+            return Ok(stacked);
+        }
+        let projections: Vec<&crate::qwen3_next::QLinear> = self
+            .layers
+            .iter()
+            .flat_map(|layer| [&layer.self_attn.k_proj, &layer.self_attn.v_proj])
+            .collect();
+        let stack = |part: fn(&crate::qwen3_next::QLinear) -> &Array| {
+            let arrays: Vec<&Array> = projections.iter().map(|p| part(p)).collect();
+            ops::concatenate_axis(&arrays, 0)
+        };
+        let stacked = (
+            stack(|p| &p.weight)?,
+            stack(|p| &p.scales)?,
+            stack(|p| &p.biases)?,
+        );
+        // A lost race stores an identical value.
+        drop(self.fused_kv.set(stacked));
+        self.fused_kv
+            .get()
+            .ok_or_else(|| Exception::custom("drafter stacked k|v projection missing"))
+    }
+
+    /// Fast rows: the context rows' fc, hidden norm, every layer's k|v in one
+    /// projection, one commit per layer; the staged per-layer caches.
+    fn fused_context(
+        &self,
+        geo: FusedGeometry,
+        taps: &[Array],
+        context: &[(&Array, &Array)],
+        position: i32,
+        rows: i32,
+    ) -> Result<Vec<Option<(Array, Array)>>, Exception> {
+        let tap_refs: Vec<&Array> = taps.iter().collect();
+        let x = ops::concatenate_axis(&tap_refs, -1)?.reshape(&[rows, -1])?;
+        let target_hidden = crate::dflash_rows::norm_rows(
+            &qmm8(&self.fc, &x)?,
+            &self.hidden_norm.weight,
+            geo.heads.eps,
+        )?;
+        let (kw, ks, kb) = self.stacked_kv()?;
+        let kv = crate::qmm8::qmm8_affine4(&target_hidden, kw, ks, kb)?;
+        let context_position = Array::from_slice(&[position], &[1]);
+        self.layers
+            .iter()
+            .zip(context)
+            .enumerate()
+            .map(|(index, (layer, (ck, cv)))| {
+                let commit = crate::dflash_rows::CommitLayer {
+                    index: i32::try_from(index)
+                        .map_err(|_| Exception::custom("drafter layer index"))?,
+                    count: geo.layers,
+                };
+                crate::dflash_rows::ctx_commit(
+                    &kv,
+                    &layer.self_attn.k_norm.weight,
+                    &context_position,
+                    ck,
+                    cv,
+                    commit,
+                    geo.heads,
+                )
+                .map(Some)
+            })
+            .collect()
+    }
+
+    /// One layer of the fused trunk: the residual and the next sublayer's
+    /// normed input (`next_norm` weights) after the attention and MLP
+    /// sublayers, each wrapped in its two-tap dynamic convolution.
+    fn fused_layer(
+        layer: &DFlashDecoderLayer,
+        (ck, cv): (&Array, &Array),
+        (h, n): (&Array, &Array),
+        block_position: &Array,
+        next_norm: &Array,
+        heads: crate::dflash_rows::Heads,
+    ) -> Result<(Array, Array), Exception> {
+        let (Some(attention_conv), Some(mlp_conv)) =
+            (layer.attention_conv.as_ref(), layer.mlp_conv.as_ref())
+        else {
+            return Err(Exception::custom("DFlash2 layer missing its convolutions"));
+        };
+        let eps = heads.eps;
+        let attn = &layer.self_attn;
+        let d = qmm8(&attention_conv.kernel_projection, n)?;
+        let a = crate::dflash_rows::conv_prep(n, &d, &attention_conv.base_kernel)?;
+        let qkv = qmm8_multi(&[&attn.q_proj, &attn.k_proj, &attn.v_proj], &a)?;
+        let [q, kn, vn] = <[Array; 3]>::try_from(qkv)
+            .map_err(|_| Exception::custom("drafter q|k|v projection count"))?;
+        let o = crate::dflash_rows::attention(&crate::dflash_rows::AttnInputs {
+            q: &q,
+            kn: &kn,
+            vn: &vn,
+            qw: &attn.q_norm.weight,
+            kw: &attn.k_norm.weight,
+            ck,
+            cv,
+            pos: block_position,
+            heads,
+        })?;
+        let u = qmm8(&attn.o_proj, &o)?;
+        let (h2, n2) = crate::dflash_rows::conv_fin_res_norm(
+            h,
+            &u,
+            &d,
+            &attention_conv.base_kernel,
+            &layer.post_attention_layernorm.weight,
+            eps,
+        )?;
+        let d2 = qmm8(&mlp_conv.kernel_projection, &n2)?;
+        let a2 = crate::dflash_rows::conv_prep(&n2, &d2, &mlp_conv.base_kernel)?;
+        let act = crate::qmm8::qmm8_affine4_swiglu(
+            &a2,
+            segment(&layer.mlp.gate_proj),
+            segment(&layer.mlp.up_proj),
+        )?;
+        let m = qmm8(&layer.mlp.down_proj, &act)?;
+        crate::dflash_rows::conv_fin_res_norm(&h2, &m, &d2, &mlp_conv.base_kernel, next_norm, eps)
+    }
+
+    /// The fused fast-rows draft (see [`crate::dflash_rows`]), or `None`
+    /// outside its domain: fast rows off, geometry unsupported, a context
+    /// tile remainder pending, an empty layer cache, more context rows than
+    /// one commit takes (the MLX chain handles those).
+    fn stage_forward_fast(
+        &self,
+        noise: &Array,
+        taps: &[Array],
+        cache: &DFlashCache,
+    ) -> Result<Option<DFlashForwardTransaction>, Exception> {
+        if !(crate::qwen3_next::fast_rows() && crate::dflash_rows::enabled()) {
+            return Ok(None);
+        }
+        let Some(geo) = self.fused_geometry() else {
+            return Ok(None);
+        };
+        let Some(first) = taps.first() else {
+            return Ok(None);
+        };
+        let rows = first.dim(1);
+        if first.dim(0) != 1
+            || !(1..=8).contains(&rows)
+            || rows >= geo.heads.window
+            || cache.pending_taps.is_some()
+            || cache.layers.len() != self.layers.len()
+        {
+            return Ok(None);
+        }
+        let Some(context): Option<Vec<(&Array, &Array)>> = cache
+            .layers
+            .iter()
+            .map(|layer| layer.as_ref().map(|(k, v)| (k, v)))
+            .collect()
+        else {
+            return Ok(None);
+        };
+        let Some(first_layer) = self.layers.first() else {
+            return Ok(None);
+        };
+        let noise_position = cache
+            .position
+            .checked_add(rows)
+            .ok_or_else(|| Exception::custom("drafter noise position overflow"))?;
+        let eps = geo.heads.eps;
+        let staged = self.fused_context(geo, taps, &context, cache.position, rows)?;
+
+        // Trunk over the block rows; the residual stays fp32 after layer 0.
+        let block_position = Array::from_slice(&[noise_position], &[1]);
+        let mut h = noise.reshape(&[geo.block, geo.hidden])?;
+        let mut n = crate::dflash_rows::norm_rows(&h, &first_layer.input_layernorm.weight, eps)?;
+        for (index, layer) in self.layers.iter().enumerate() {
+            let Some((ck, cv)) = staged.get(index).and_then(Option::as_ref) else {
+                return Err(Exception::custom("drafter staged context missing"));
+            };
+            let next_norm = self
+                .layers
+                .get(index + 1)
+                .map_or(&self.norm.weight, |next| &next.input_layernorm.weight);
+            (h, n) = Self::fused_layer(
+                layer,
+                (ck, cv),
+                (&h, &n),
+                &block_position,
+                next_norm,
+                geo.heads,
+            )?;
+        }
+        Ok(Some(DFlashForwardTransaction {
+            hidden: n.reshape(&[1, geo.block, geo.hidden])?,
+            layers: staged,
+            base_branch: cache.branch,
+            base_revision: cache.revision,
+            base_position: cache.position,
+            appended_rows: rows,
+        }))
+    }
+}
+
+impl DFlashCandidateSelector {
+    /// The fused selector (top-16 + merge, lattice walk; see
+    /// [`crate::dflash_rows`]) for fast rows, or `None` outside its domain.
+    fn select_fast(
+        &self,
+        hidden: &Array,
+        logits: &Array,
+        anchor: i32,
+    ) -> Result<Option<Array>, Exception> {
+        if !(crate::qwen3_next::fast_rows() && crate::dflash_rows::enabled())
+            || self.top_k != crate::dflash_rows::TOP_K
+            || self.rank % 64 != 0
+            || !self.hidden_projection.fast_rows_affine4()
+        {
+            return Ok(None);
+        }
+        let (Some(pred), Some(succ)) = (
+            self.predecessor_codebook.affine_q8_g64(),
+            self.successor_codebook.affine_q8_g64(),
+        ) else {
+            return Ok(None);
+        };
+        let &[1, t, vocab] = logits.shape() else {
+            return Ok(None);
+        };
+        let &[1, rows, width] = hidden.shape() else {
+            return Ok(None);
+        };
+        if rows != t {
+            return Ok(None);
+        }
+        let flat = hidden.reshape(&[t, width])?;
+        if !crate::qmm8::supported(&flat, &self.hidden_projection.weight, 4, 64) {
+            return Ok(None);
+        }
+        let Some((values, ids)) = crate::dflash_rows::top16(&logits.reshape(&[t, vocab])?)? else {
+            return Ok(None);
+        };
+        let sel = qmm8(&self.hidden_projection, &flat)?;
+        let anchor_id = Array::from_slice(&[anchor], &[1]);
+        let tokens = crate::dflash_rows::lattice_walk(&ids, &values, &sel, pred, succ, &anchor_id)?;
+        Ok(Some(tokens.reshape(&[1, t])?))
+    }
+}
+
+#[doc(hidden)]
+pub mod probe {
+    //! Test seam (higgs-models unit tests do not compile): a tiny random
+    //! `DFlash2` drafter inside the fused kernels' domain.
+    use mlx_rs::{Array, Dtype, error::Exception, module::ModuleParameters, ops, random};
+
+    use super::{DFlashConfig, DFlashDrafter};
+
+    pub const HIDDEN: i32 = 512;
+    pub const HEADS: i32 = 4;
+    pub const KV_HEADS: i32 = 2;
+    pub const INTERMEDIATE: i32 = 1024;
+    pub const LAYERS: i32 = 2;
+    pub const TAPS: i32 = 2;
+    pub const VOCAB: i32 = 4096;
+    pub const WINDOW: i32 = 16;
+    pub const BLOCK: i32 = 8;
+    pub const RANK: i32 = 256;
+    pub const MASK: i32 = 4000;
+
+    const CONFIG: &str = r#"{
+        "hidden_size": 512, "num_hidden_layers": 2, "num_attention_heads": 4,
+        "num_key_value_heads": 2, "head_dim": 128, "intermediate_size": 1024,
+        "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "block_size": 8, "vocab_size": 4096,
+        "layer_types": ["sliding_attention", "sliding_attention"], "sliding_window": 16,
+        "quantization": {"group_size": 64, "bits": 4}, "is_causal": false,
+        "dflash_config": {"block_size": 8, "mask_token_id": 4000, "target_layer_ids": [1, 3],
+                          "conv_group_size": 16, "conv_kernel_size": 2,
+                          "selector_rank": 256, "selector_top_k": 16}
+    }"#;
+
+    type Params<'a> = mlx_rs::module::FlattenedModuleParamMut<'a>;
+
+    fn normal(shape: &[i32], scale: f32, seed: u64) -> Result<Array, Exception> {
+        let key = random::key(seed)?;
+        random::normal::<f32>(shape, None, Some(scale), Some(&key))?.as_dtype(Dtype::Bfloat16)
+    }
+
+    fn gain(dim: i32, seed: u64) -> Result<Array, Exception> {
+        let key = random::key(seed)?;
+        random::uniform::<f32, f32>(0.5, 1.5, &[dim], Some(&key))?.as_dtype(Dtype::Bfloat16)
+    }
+
+    fn set(params: &mut Params<'_>, name: &str, value: Array) -> Result<(), Exception> {
+        let param = params
+            .get_mut(name)
+            .ok_or_else(|| Exception::custom(format!("no drafter parameter {name}")))?;
+        **param = value;
+        Ok(())
+    }
+
+    /// `name.{weight,scales,biases}` = a random `[n, k]` matrix quantized at
+    /// `bits` (group 64).
+    fn quant(
+        params: &mut Params<'_>,
+        name: &str,
+        n: i32,
+        k: i32,
+        bits: i32,
+        scale: f32,
+        seed: u64,
+    ) -> Result<(), Exception> {
+        let (wq, scales, biases) = ops::quantize(&normal(&[n, k], scale, seed)?, 64, bits)?;
+        set(params, &format!("{name}.weight"), wq)?;
+        set(params, &format!("{name}.scales"), scales)?;
+        set(params, &format!("{name}.biases"), biases)
+    }
+
+    /// A random drafter with the geometry above (two sliding layers, window
+    /// 16; codebooks large enough for the lattice edges to steer the walk).
+    #[allow(clippy::too_many_lines)]
+    pub fn tiny_dflash2(seed: u64) -> Result<DFlashDrafter, Exception> {
+        let config: DFlashConfig =
+            serde_json::from_str(CONFIG).map_err(|e| Exception::custom(e.to_string()))?;
+        let mut drafter = DFlashDrafter::new(config)?;
+        let mut params = drafter.parameters_mut().flatten();
+        let mut next_seed = seed.wrapping_mul(1_000_003);
+        let mut seeded = || {
+            next_seed = next_seed.wrapping_add(7919);
+            next_seed
+        };
+        let p = &mut params;
+        quant(p, "fc", HIDDEN, TAPS * HIDDEN, 4, 0.04, seeded())?;
+        quant(
+            p,
+            "candidate_selector.hidden_projection",
+            RANK,
+            HIDDEN,
+            4,
+            0.04,
+            seeded(),
+        )?;
+        quant(
+            p,
+            "candidate_selector.predecessor_codebook",
+            VOCAB,
+            RANK,
+            8,
+            0.5,
+            seeded(),
+        )?;
+        quant(
+            p,
+            "candidate_selector.successor_codebook",
+            VOCAB,
+            RANK,
+            8,
+            0.5,
+            seeded(),
+        )?;
+        set(p, "hidden_norm.weight", gain(HIDDEN, seeded())?)?;
+        set(p, "norm.weight", gain(HIDDEN, seeded())?)?;
+        for l in 0..LAYERS {
+            let pre = format!("layers.{l}");
+            let qk = HEADS * 128;
+            let kv = KV_HEADS * 128;
+            quant(
+                p,
+                &format!("{pre}.self_attn.q_proj"),
+                qk,
+                HIDDEN,
+                4,
+                0.04,
+                seeded(),
+            )?;
+            quant(
+                p,
+                &format!("{pre}.self_attn.k_proj"),
+                kv,
+                HIDDEN,
+                4,
+                0.04,
+                seeded(),
+            )?;
+            quant(
+                p,
+                &format!("{pre}.self_attn.v_proj"),
+                kv,
+                HIDDEN,
+                4,
+                0.04,
+                seeded(),
+            )?;
+            quant(
+                p,
+                &format!("{pre}.self_attn.o_proj"),
+                HIDDEN,
+                qk,
+                4,
+                0.04,
+                seeded(),
+            )?;
+            quant(
+                p,
+                &format!("{pre}.mlp.gate_proj"),
+                INTERMEDIATE,
+                HIDDEN,
+                4,
+                0.04,
+                seeded(),
+            )?;
+            quant(
+                p,
+                &format!("{pre}.mlp.up_proj"),
+                INTERMEDIATE,
+                HIDDEN,
+                4,
+                0.04,
+                seeded(),
+            )?;
+            quant(
+                p,
+                &format!("{pre}.mlp.down_proj"),
+                HIDDEN,
+                INTERMEDIATE,
+                4,
+                0.04,
+                seeded(),
+            )?;
+            set(
+                p,
+                &format!("{pre}.self_attn.q_norm.weight"),
+                gain(128, seeded())?,
+            )?;
+            set(
+                p,
+                &format!("{pre}.self_attn.k_norm.weight"),
+                gain(128, seeded())?,
+            )?;
+            set(
+                p,
+                &format!("{pre}.input_layernorm.weight"),
+                gain(HIDDEN, seeded())?,
+            )?;
+            set(
+                p,
+                &format!("{pre}.post_attention_layernorm.weight"),
+                gain(HIDDEN, seeded())?,
+            )?;
+            for conv in ["attention_conv", "mlp_conv"] {
+                let projection = format!("{pre}.{conv}.kernel_projection");
+                quant(p, &projection, 4 * HIDDEN / 16, HIDDEN, 4, 0.04, seeded())?;
+                // Near-identity current tap, small previous tap.
+                let current = normal(&[2, 1, HIDDEN], 0.1, seeded())?.add(Array::from_f32(1.0))?;
+                let previous = normal(&[2, 1, HIDDEN], 0.1, seeded())?;
+                let base =
+                    ops::concatenate_axis(&[&current, &previous], 1)?.as_dtype(Dtype::Bfloat16)?;
+                set(p, &format!("{pre}.{conv}.base_kernel"), base)?;
+            }
+        }
+        drop(params);
+        Ok(drafter)
+    }
+
+    /// The fused draft, `None` when the fast path declines (fast rows forced
+    /// on).
+    pub fn fused_stage_forward(
+        drafter: &DFlashDrafter,
+        noise: &Array,
+        taps: &[Array],
+        cache: &super::DFlashCache,
+    ) -> Result<Option<super::DFlashForwardTransaction>, Exception> {
+        crate::qwen3_next::with_fast_rows(|| drafter.stage_forward_fast(noise, taps, cache))
+    }
+
+    /// The fused selector, `None` when it declines (fast rows forced on).
+    pub fn fused_select(
+        drafter: &DFlashDrafter,
+        hidden: &Array,
+        logits: &Array,
+        anchor: i32,
+    ) -> Result<Option<Array>, Exception> {
+        let Some(selector) = drafter.candidate_selector.as_ref() else {
+            return Ok(None);
+        };
+        crate::qwen3_next::with_fast_rows(|| selector.select_fast(hidden, logits, anchor))
+    }
+
+    /// The selector's `(predecessor, successor)` codebooks as
+    /// `(weight, scales, biases)` for a reference computation.
+    pub fn codebooks(drafter: &DFlashDrafter) -> Option<[(&Array, &Array, &Array); 2]> {
+        let selector = drafter.candidate_selector.as_ref()?;
+        Some([
+            selector.predecessor_codebook.affine_q8_g64()?,
+            selector.successor_codebook.affine_q8_g64()?,
+        ])
     }
 }
 

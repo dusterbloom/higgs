@@ -7,6 +7,7 @@ pub mod clover;
 mod crossrow_qmv;
 pub mod deepseek_v2;
 pub mod dflash;
+pub mod dflash_rows;
 pub mod error;
 pub mod eschamoe;
 pub mod gemma2;
@@ -1796,6 +1797,28 @@ impl AnyModel {
             | Self::Lfm2Moe(_) => Err(Exception::custom(
                 "embed_token_ids only implemented for Qwen3Next",
             )),
+        }
+    }
+
+    /// The `lm_head` as `(weight, scales, biases)` when it is affine 4-bit
+    /// group-64 (the fast-rows kernels' format; the `DFlash2` reduced draft
+    /// head slices its leading rows), else `None`.
+    #[must_use]
+    pub fn lm_head_fast_rows_parts(&self) -> Option<(&Array, &Array, &Array)> {
+        match self {
+            Self::Qwen3Next(m) => m.lm_head_fast_rows_parts(),
+            Self::Transformer(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Gemma4(_)
+            | Self::Phi3(_)
+            | Self::Starcoder2(_)
+            | Self::LlavaQwen2(_)
+            | Self::QwenVl(_)
+            | Self::DeepSeekV2(_)
+            | Self::BonsaiQ1(_)
+            | Self::Lfm2Moe(_) => None,
         }
     }
 

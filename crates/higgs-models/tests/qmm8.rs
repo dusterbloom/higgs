@@ -97,3 +97,49 @@ fn qmm8_multi_matches_separate_matmuls() {
         );
     }
 }
+
+/// Gate|up with the `SwiGLU` in the epilogue (one dispatch) matches
+/// `silu(x Wg^T) * (x Wu^T)` from the two separate matmuls; 136 columns =
+/// 17 blocks of 8 leave the last threadgroup partly live.
+#[test]
+fn qmm8_swiglu_matches_separate_matmuls() {
+    random::seed(13).unwrap();
+    let (n, k) = (136, 512);
+    let quant = || {
+        let w = random::normal::<f32>(&[n, k], None, None, None)
+            .unwrap()
+            .multiply(Array::from_f32(0.05))
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        ops::quantize(&w, 64, 4).unwrap()
+    };
+    let (gate, up) = (quant(), quant());
+    let x = random::normal::<f32>(&[1, 6, k], None, None, None)
+        .unwrap()
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+    let dense = |(w, s, b): &(Array, Array, Array)| {
+        ops::quantized_matmul(&x, w, s, b, true, 64, 4)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+    };
+    let g = dense(&gate);
+    let want = g
+        .multiply(mlx_rs::nn::sigmoid(&g).unwrap())
+        .unwrap()
+        .multiply(dense(&up))
+        .unwrap();
+    let got = probe::qmm8_swiglu(&x, (&gate.0, &gate.1, &gate.2), (&up.0, &up.1, &up.2)).unwrap();
+    assert_eq!(got.shape(), &[1, 6, n]);
+    assert_eq!(got.dtype(), Dtype::Bfloat16);
+    let got = got.as_dtype(Dtype::Float32).unwrap();
+    let err: f32 = ops::abs(&got.subtract(&want).unwrap())
+        .unwrap()
+        .max(None)
+        .unwrap()
+        .item();
+    let mag: f32 = ops::abs(&want).unwrap().max(None).unwrap().item();
+    assert!(err <= 0.03 * mag, "max err {err} vs magnitude {mag}");
+}

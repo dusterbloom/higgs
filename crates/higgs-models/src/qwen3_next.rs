@@ -985,6 +985,16 @@ pub(crate) struct QLinear {
 }
 
 impl QLinear {
+    /// Canonical affine 4-bit group-64 without rotation: the weight format of
+    /// the fast-rows kernels ([`crate::qmm8`]).
+    pub(crate) fn fast_rows_affine4(&self) -> bool {
+        self.mode == crate::quant_mode::QuantMode::Affine
+            && matches!(self.weight_layout, QLinearWeightLayout::Canonical)
+            && self.bits == 4
+            && self.group_size == 64
+            && self.hadamard_block == 0
+    }
+
     #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn new(group_size: i32, bits: i32) -> Result<Self, Exception> {
         // `bits == 0` marks a BF16-dense tensor (only `.weight` on disk) —
@@ -1704,6 +1714,17 @@ pub(crate) struct QEmbedding {
 }
 
 impl QEmbedding {
+    /// `(weight, scales, biases)` of an affine 8-bit group-64 table without
+    /// rotation (the fast-rows `DFlash2` selector reads it in-kernel), else
+    /// `None`.
+    pub(crate) fn affine_q8_g64(&self) -> Option<(&Array, &Array, &Array)> {
+        (self.mode == crate::quant_mode::QuantMode::Affine
+            && self.bits == 8
+            && self.group_size == 64
+            && self.hadamard_block == 0)
+            .then(|| (&*self.weight, &*self.scales, &*self.biases))
+    }
+
     #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn new(group_size: i32, bits: i32) -> Result<Self, Exception> {
         // `bits == 0` marks a BF16-dense embedding (only `.weight` on disk).
@@ -9406,14 +9427,7 @@ pub(crate) fn fast_rows() -> bool {
 /// dispatch of [`crate::qmm8`]; `None` outside its domain (then call each
 /// projection's `forward`). Not bit-identical to qmv.
 fn fast_rows_multi(projs: &[&QLinear], x: &Array) -> Result<Option<Vec<Array>>, Exception> {
-    let affine4_g64 = |p: &&QLinear| {
-        p.mode == crate::quant_mode::QuantMode::Affine
-            && matches!(p.weight_layout, QLinearWeightLayout::Canonical)
-            && p.bits == 4
-            && p.group_size == 64
-            && p.hadamard_block == 0
-    };
-    if !fast_rows() || !projs.iter().all(affine4_g64) {
+    if !fast_rows() || !projs.iter().all(|p| p.fast_rows_affine4()) {
         return Ok(None);
     }
     let ws: Vec<&Array> = projs.iter().map(|p| &*p.weight).collect();
@@ -12311,6 +12325,15 @@ impl Qwen3NextCausalLM {
     /// Input: `[B, T, hidden_size]`. Returns: `[B, T, vocab_size]`.
     pub fn forward_all_logits_from_hidden(&self, hidden: &Array) -> Result<Array, Exception> {
         self.project_logits(hidden)
+    }
+
+    /// The `lm_head` as `(weight, scales, biases)` when it is in the
+    /// fast-rows kernels' format ([`QLinear::fast_rows_affine4`]).
+    pub(crate) fn lm_head_fast_rows_parts(&self) -> Option<(&Array, &Array, &Array)> {
+        self.lm_head
+            .as_ref()
+            .filter(|head| head.fast_rows_affine4())
+            .map(|head| (&*head.weight, &*head.scales, &*head.biases))
     }
 
     fn project_q2_m5_argmax_ids(&self, hidden: &Array) -> Result<Option<Array>, Exception> {

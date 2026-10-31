@@ -485,17 +485,22 @@ pub const PREVIEW_ROWS: [usize; 2] = [4, 8];
 pub const PREVIEW_CYCLE_BASE_ROWS: f32 = 13.0;
 /// `DFlash` drafting (block 8): M4 optima are 3 rows on prose, 6-8 on code.
 pub const DFLASH_ROWS: [usize; 3] = [3, 6, 8];
-/// M4: drafter + verify ~33.5 ms + 4.1 ms/row.
-pub const DFLASH_CYCLE_BASE_ROWS: f32 = 8.2;
+/// M4 with the fused drafter: a cycle costs ~28.4 ms + 3.3 ms/row (38.3 /
+/// 49.1 / 54.7 ms at 3 / 6 / 8 rows).
+pub const DFLASH_CYCLE_BASE_ROWS: f32 = 8.6;
 
 /// Expected tokens of a cycle at `rows`: the pending/bonus token plus the
 /// accepted prefix, `p[i]` being the acceptance of draft `i + 1` given the
-/// drafts before it were accepted.
+/// drafts before it were accepted. Acceptance does not rise with depth, so a
+/// depth counts at most as the depth before it: a deep depth the loop has not
+/// tested yet (still at its prior) cannot sell a wider block on its own.
 fn expected_tokens(p: &[f32], rows: usize) -> f32 {
     let mut prefix = 1.0_f32;
     let mut total = 1.0_f32;
+    let mut cap = 1.0_f32;
     for &pi in p.iter().take(rows.saturating_sub(1)) {
-        prefix *= pi;
+        cap = cap.min(pi);
+        prefix *= cap;
         total += prefix;
     }
     total
@@ -510,6 +515,12 @@ fn best_rows(ladder: &[usize], p: &[f32], base: f32) -> usize {
         .copied()
         .max_by(|&a, &b| rate(a).total_cmp(&rate(b)))
         .unwrap_or(8)
+}
+
+/// Whether a cycle's draft is evaluated asynchronously ahead of the verify.
+fn async_draft() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("HIGGS_SPEC_ASYNC_DRAFT").map_or(true, |v| v != "0"))
 }
 
 /// Result of [`self_spec_decode`].
@@ -569,6 +580,11 @@ where
     while !(out.hit_eos || out.stopped_by_caller) && out.tokens.len() < cfg.max_new_tokens {
         let rows = best_rows(&ladder, &p, cfg.cycle_base_rows);
         let drafts = model.draft(pending, rows - 1)?;
+        // The draft's GPU work runs while the host builds the verify graph
+        // (`HIGGS_SPEC_ASYNC_DRAFT=0` keeps both in the verify's eval).
+        if async_draft() {
+            crate::mlx_exec::async_eval([&drafts])?;
+        }
         let k = usize::try_from(drafts.dim(0)).map_err(|_| Exception::custom("draft count"))?;
         if k >= rows {
             return Err(Exception::custom(format!(
@@ -594,14 +610,19 @@ where
         out.cycles += 1;
         out.accepted += n;
         out.wide_cycles += usize::from(rows == widest);
+        // Only the depths this cycle tested (the accepted drafts and the
+        // first rejected one) forget and update: an untested depth keeps its
+        // estimate at full weight, else its evidence would thin out while the
+        // loop runs narrower blocks and one later observation would swing it.
         for (depth, (s, t)) in successes.iter_mut().zip(trials.iter_mut()).enumerate() {
-            *s *= 0.95;
-            *t *= 0.95;
             if depth < n {
-                *s += 1.0;
-                *t += 1.0;
+                *s = s.mul_add(0.95, 1.0);
+                *t = t.mul_add(0.95, 1.0);
             } else if depth == n && n < k {
-                *t += 1.0;
+                *s *= 0.95;
+                *t = t.mul_add(0.95, 1.0);
+            } else {
+                continue;
             }
             p[depth] = *s / *t;
         }
@@ -826,6 +847,22 @@ pub struct DFlashSpec<'a> {
     committed: i32,
     tapes: Vec<Option<crate::qwen3_next::GdnLayerTape>>,
     rows: usize,
+    /// The reduced draft head (see [`crate::dflash::DFlashDrafter::reduced_head`]);
+    /// `None` runs the target's full head.
+    draft_head: Option<(Array, Array, Array)>,
+}
+
+/// Rows of the target head the drafter's shortlist is drawn from:
+/// `HIGGS_DFLASH_HEAD_ROWS` (0 = the full head), default 98304 (Kapitsa's;
+/// every token of the M4 prose/code/count runs has an id below 95201).
+fn draft_head_rows() -> Option<i32> {
+    static ROWS: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        std::env::var("HIGGS_DFLASH_HEAD_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .map_or(Some(98_304), |rows| (rows > 0).then_some(rows))
+    })
 }
 
 impl<'a> DFlashSpec<'a> {
@@ -849,6 +886,14 @@ impl<'a> DFlashSpec<'a> {
             .position()
             .checked_add(pending.pending_rows()?)
             .ok_or_else(|| Exception::custom("drafter position overflow"))?;
+        // A reduced head needs the fast-rows head format and fewer rows than
+        // the vocabulary (in multiples of the kernel's 8-row block).
+        let draft_head = match (draft_head_rows(), model.lm_head_fast_rows_parts()) {
+            (Some(rows), Some(head)) if rows % 8 == 0 && rows < head.0.dim(0) => {
+                Some(drafter.reduced_head(head, rows)?.clone())
+            }
+            _ => None,
+        };
         Ok(Self {
             model,
             cache,
@@ -860,6 +905,7 @@ impl<'a> DFlashSpec<'a> {
             committed,
             tapes: Vec::new(),
             rows: 0,
+            draft_head,
         })
     }
 }
@@ -891,7 +937,14 @@ impl SpecModel for DFlashSpec<'_> {
                 )));
             }
             let hidden = tx.hidden().index((.., 1..=k, ..));
-            let logits = self.model.forward_all_logits_from_hidden(&hidden)?;
+            let logits = match &self.draft_head {
+                Some((w, s, b)) => {
+                    let hidden_width = hidden.dim(2);
+                    crate::qmm8::qmm8_affine4(&hidden.reshape(&[k, hidden_width])?, w, s, b)?
+                        .reshape(&[1, k, -1])?
+                }
+                None => self.model.forward_all_logits_from_hidden(&hidden)?,
+            };
             let tokens = match self
                 .drafter
                 .propose_dflash2_tokens(&hidden, &logits, anchor)?

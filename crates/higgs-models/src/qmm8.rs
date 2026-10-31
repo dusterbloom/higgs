@@ -264,6 +264,77 @@ fn kernel() -> &'static FastKernel {
     })
 }
 
+/// Gate|up + `SwiGLU` in one dispatch: fragment 0 of every simdgroup is 8
+/// rows of the gate weight, fragment 1 the same 8 rows of the up weight, and
+/// the epilogue writes `silu(gate) * up` for those 8 outputs (no intermediate
+/// arrays; the `DFlash2` drafter's MLP). [`SOURCE`] with four substitutions,
+/// so the plain kernel's text is untouched.
+fn gu_source() -> String {
+    const EDITS: [(&str, &str); 4] = [
+        (
+            "constexpr int TGB = 8 * NF * CS;  // output rows per threadgroup",
+            "constexpr int TGB = 8 * CS;  // output columns per threadgroup (gate|up pairs)",
+        ),
+        (
+            "const int n0 = (tg * CS + sg) * 8 * NF;",
+            "const int n0 = (tg * CS + sg) * 8;",
+        ),
+        (
+            "    const int n = min(n0 + 8 * f + fm, N - 1);
+    wline[f] = reinterpret_cast<const device uint4*>(w + size_t(n) * (K / 8)) + 2 * c;
+    srow[f] = scales + size_t(n) * G;
+    brow[f] = biases + size_t(n) * G;",
+            "    const int n = min(n0 + fm, N - 1);
+    const device uint32_t* wf = f == 0 ? w0 : w1;
+    const device ST* sf = f == 0 ? s0 : s1;
+    const device ST* bf = f == 0 ? b0 : b1;
+    wline[f] = reinterpret_cast<const device uint4*>(wf + size_t(n) * (K / 8)) + 2 * c;
+    srow[f] = sf + size_t(n) * G;
+    brow[f] = bf + size_t(n) * G;",
+        ),
+        (
+            "  for (int f = 0; f < NF; ++f) {
+    const int n = n0 + 8 * f + fm;
+    if (n >= N) continue;
+    if (fn < M) y[(size_t(slice) * M + fn) * N + n] = OutT(acc[f].x);
+    if (fn + 1 < M) y[(size_t(slice) * M + fn + 1) * N + n] = OutT(acc[f].y);
+  }",
+            "  const int n = n0 + fm;
+  if (n < N) {
+    const float2 g = acc[0];
+    const float2 a = g / (1.0f + metal::precise::exp(-g)) * acc[1];
+    if (fn < M) y[(size_t(slice) * M + fn) * N + n] = OutT(a.x);
+    if (fn + 1 < M) y[(size_t(slice) * M + fn + 1) * N + n] = OutT(a.y);
+  }",
+        ),
+    ];
+    let mut source = SOURCE.to_owned();
+    for (from, to) in EDITS {
+        debug_assert_eq!(
+            source.matches(from).count(),
+            1,
+            "qmm8 gate|up source anchor: {from}"
+        );
+        source = source.replace(from, to);
+    }
+    source
+}
+
+fn gu_kernel() -> &'static FastKernel {
+    static KERNEL: OnceLock<FastKernel> = OnceLock::new();
+    KERNEL.get_or_init(|| {
+        FastKernel::new(
+            c"higgs_qmm8_affine4_g64_swiglu",
+            &[
+                c"x", c"w0", c"s0", c"b0", c"w1", c"s1", c"b1", c"w2", c"s2", c"b2",
+            ],
+            &[c"y0", c"y1", c"y2"],
+            &std::ffi::CString::new(gu_source()).unwrap_or_default(),
+            &std::ffi::CString::new(HEADER).unwrap_or_default(),
+        )
+    })
+}
+
 fn reduce_kernel() -> &'static FastKernel {
     static KERNEL: OnceLock<FastKernel> = OnceLock::new();
     KERNEL.get_or_init(|| {
@@ -413,6 +484,63 @@ pub(crate) fn qmm8_affine4_multi(x: &Array, segs: &[Segment<'_>]) -> Result<Vec<
         .collect()
 }
 
+/// `silu(x @ dequant(gate)^T) * (x @ dequant(up)^T)` for 1..=8 rows in one
+/// dispatch (see [`gu_source`]); `gate` and `up` share `x` and their shape,
+/// output `[.., N]` in `gate`'s scales dtype. Call only when
+/// [`supported_multi`] holds for both weights.
+pub(crate) fn qmm8_affine4_swiglu(
+    x: &Array,
+    gate: Segment<'_>,
+    up: Segment<'_>,
+) -> Result<Array, Exception> {
+    let k = *x.shape().last().unwrap_or(&0);
+    let rows: i32 = x.shape().iter().rev().skip(1).product();
+    let n = gate.0.dim(0);
+    if up.0.shape() != gate.0.shape() {
+        return Err(Exception::custom(format!(
+            "qmm8 gate|up: shapes {:?} vs {:?}",
+            gate.0.shape(),
+            up.0.shape()
+        )));
+    }
+    let x2 = x.reshape(&[rows, k])?;
+    let out_dtype = gate.1.dtype();
+    let cs = ((n + 7) / 8).min(CS);
+    let tgb = 8 * cs;
+    let tg_x = (n + tgb - 1) / tgb;
+    let mut out = gu_kernel().apply(
+        &[
+            &x2, gate.0, gate.1, gate.2, up.0, up.1, up.2, gate.0, gate.1, gate.2,
+        ],
+        &[
+            TemplateArg::Dtype(c"T", x.dtype()),
+            TemplateArg::Dtype(c"ST", out_dtype),
+            TemplateArg::Dtype(c"OutT", out_dtype),
+            TemplateArg::Int(c"K", k),
+            TemplateArg::Int(c"N0", n),
+            TemplateArg::Int(c"N1", 0),
+            TemplateArg::Int(c"N2", 0),
+            TemplateArg::Int(c"M", rows),
+            TemplateArg::Int(c"NF", NF),
+            TemplateArg::Int(c"CS", cs),
+            TemplateArg::Int(c"S", 1),
+            TemplateArg::Int(c"GS", GS),
+        ],
+        [tg_x * 32 * cs, 1, 1],
+        [32 * cs, 1, 1],
+        &[
+            (&[rows, n], out_dtype),
+            (&[1], out_dtype),
+            (&[1], out_dtype),
+        ],
+    )?;
+    let mut shape = x.shape().to_vec();
+    if let Some(last) = shape.last_mut() {
+        *last = n;
+    }
+    out.swap_remove(0).reshape(&shape)
+}
+
 #[doc(hidden)]
 pub mod probe {
     //! Test seam (higgs-models unit tests do not compile).
@@ -420,6 +548,15 @@ pub mod probe {
 
     pub fn supported(x: &Array, w: &Array) -> bool {
         super::supported(x, w, 4, 64)
+    }
+
+    /// Gate|up + `SwiGLU` in one dispatch.
+    pub fn qmm8_swiglu(
+        x: &Array,
+        gate: (&Array, &Array, &Array),
+        up: (&Array, &Array, &Array),
+    ) -> Result<Array, Exception> {
+        super::qmm8_affine4_swiglu(x, gate, up)
     }
 
     pub fn qmm8(x: &Array, w: &Array, s: &Array, b: &Array) -> Result<Array, Exception> {
