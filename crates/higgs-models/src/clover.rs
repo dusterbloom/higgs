@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use mlx_rs::{Array, error::Exception, ops};
+use mlx_rs::{Array, error::Exception, ops, ops::indexing::IndexOp};
 
 use crate::mlx_exec::eval;
 
@@ -449,11 +449,16 @@ where
 // Self-speculative decoding (DiffuSpace's SGLang `spec` mode, exact acceptance).
 // ---------------------------------------------------------------------------
 
-/// The extra operations self-speculation needs on top of [`BlockModel::preview`].
-pub trait SpecModel: BlockModel {
-    /// Causal forward of `tokens` into the state, tentatively; the greedy next
-    /// token after each row (`out[i]` follows `tokens[..=i]`).
-    fn verify(&mut self, tokens: &[u32]) -> Result<Vec<u32>, Exception>;
+/// The three operations one greedy speculative cycle needs.
+pub trait SpecModel {
+    /// Draft up to `max` tokens to follow `pending`: a `[k]` u32 array with
+    /// `k <= max`. It may stay lazy; the loop evaluates it with the verify
+    /// pass so the drafter's GPU work overlaps the verify graph construction.
+    fn draft(&mut self, pending: u32, max: usize) -> Result<Array, Exception>;
+    /// Causal forward of the `[rows]` u32 `tokens` into the state,
+    /// tentatively; the greedy next token after each row (`out[i]` follows
+    /// `tokens[..=i]`).
+    fn verify(&mut self, tokens: &Array) -> Result<Vec<u32>, Exception>;
     /// Keep the first `n` rows of the last [`Self::verify`], drop the rest.
     fn keep(&mut self, n: usize) -> Result<(), Exception>;
 }
@@ -461,12 +466,50 @@ pub trait SpecModel: BlockModel {
 /// One self-speculative request.
 #[derive(Debug, Clone)]
 pub struct SelfSpecConfig {
-    pub mask_token_id: u32,
     pub max_new_tokens: usize,
     pub eos_token_ids: Vec<u32>,
-    /// Force one draft block size (rows incl. the pending token); `None`
-    /// adapts between 4 and 8.
-    pub draft_rows: Option<usize>,
+    /// Verify block sizes (rows incl. the pending token, each `>= 2`) the
+    /// loop chooses from; one entry fixes the size.
+    pub rows: Vec<usize>,
+    /// Cycle cost model in row units: a cycle at `r` rows costs `base + r`.
+    /// Each cycle runs the block with the highest expected tokens per cost
+    /// under the running per-position acceptance estimate; near a boundary
+    /// the candidates' rates are nearly equal, so the choice is robust to
+    /// the estimate's noise.
+    pub cycle_base_rows: f32,
+}
+
+/// Block preview drafting: a preview block must divide the trained block.
+pub const PREVIEW_ROWS: [usize; 2] = [4, 8];
+/// M4: preview ~35-41 ms + verify ~33.5 ms + 4.1 ms/row.
+pub const PREVIEW_CYCLE_BASE_ROWS: f32 = 13.0;
+/// `DFlash` drafting (block 8): M4 optima are 3 rows on prose, 6-8 on code.
+pub const DFLASH_ROWS: [usize; 3] = [3, 6, 8];
+/// M4: drafter + verify ~33.5 ms + 4.1 ms/row.
+pub const DFLASH_CYCLE_BASE_ROWS: f32 = 8.2;
+
+/// Expected tokens of a cycle at `rows`: the pending/bonus token plus the
+/// accepted prefix, `p[i]` being the acceptance of draft `i + 1` given the
+/// drafts before it were accepted.
+fn expected_tokens(p: &[f32], rows: usize) -> f32 {
+    let mut prefix = 1.0_f32;
+    let mut total = 1.0_f32;
+    for &pi in p.iter().take(rows.saturating_sub(1)) {
+        prefix *= pi;
+        total += prefix;
+    }
+    total
+}
+
+/// The block size with the highest expected tokens per cycle cost.
+fn best_rows(ladder: &[usize], p: &[f32], base: f32) -> usize {
+    #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
+    let rate = |r: usize| expected_tokens(p, r) / (base + r as f32);
+    ladder
+        .iter()
+        .copied()
+        .max_by(|&a, &b| rate(a).total_cmp(&rate(b)))
+        .unwrap_or(8)
 }
 
 /// Result of [`self_spec_decode`].
@@ -477,26 +520,25 @@ pub struct SelfSpecOutput {
     pub cycles: usize,
     /// Drafts accepted over all cycles.
     pub accepted: usize,
-    /// Cycles run at 8 rows (the rest at 4).
+    /// Cycles run at the widest block size.
     pub wide_cycles: usize,
     pub hit_eos: bool,
     pub stopped_by_caller: bool,
 }
 
-/// Greedy self-speculative decoding with exact acceptance.
+/// Greedy speculative decoding with exact acceptance.
 ///
-/// Each cycle drafts the tokens after `pending` with one block preview
-/// `[pending, mask...]`,
-/// verifies `[pending, drafts...]` causally, keeps the drafts that match the
-/// causal argmax plus the causal token after them. The output is the verify
-/// pass's greedy sequence whatever the drafts are; the multi-row verify rounds
-/// differently from a one-row decode step, so near-tied tokens can differ from
-/// plain AR decoding.
+/// Each cycle drafts the tokens after `pending`, verifies
+/// `[pending, drafts...]` causally, keeps the drafts that match the causal
+/// argmax plus the causal token after them. The output is the verify pass's
+/// greedy sequence whatever the drafts are; the multi-row verify rounds
+/// differently from a one-row decode step, so near-tied tokens can differ
+/// from plain AR decoding.
 ///
 /// `first` is the greedy token after the prompt (not yet in the state).
 /// `on_tokens` receives each cycle's new tokens and returns `true` to stop.
-// Indices are bounded by construction: `rows >= 2` and `verify` returns one
-// prediction per row.
+// Indices are bounded by construction: `rows >= 2`, `k <= rows - 1` and
+// `verify` returns one prediction per row.
 #[allow(clippy::indexing_slicing)]
 pub fn self_spec_decode<M, F>(
     cfg: &SelfSpecConfig,
@@ -516,49 +558,55 @@ where
     out.hit_eos = cfg.eos_token_ids.contains(&first);
     out.stopped_by_caller = on_tokens(&[first]);
     let mut pending = first;
-    // Share of the block accepted, smoothed. Hysteresis from Kapitsa's
-    // measurements (M4): code keeps ~0.66 at 8 rows, prose ~0.73 at 4.
-    let mut fill = 1.0_f32;
-    let mut rows = cfg.draft_rows.unwrap_or(8);
+    let ladder: Vec<usize> = cfg.rows.iter().map(|&r| r.max(2)).collect();
+    let widest = ladder.iter().copied().max().unwrap_or(8);
+    // Acceptance of each draft depth given the drafts before it held,
+    // exponentially forgotten, prior 0.8 over two trials. Drafters lose
+    // accuracy with depth, so one pooled rate would overrate wide blocks.
+    let mut successes = vec![1.6_f32; widest - 1];
+    let mut trials = vec![2.0_f32; widest - 1];
+    let mut p = vec![0.8_f32; widest - 1];
     while !(out.hit_eos || out.stopped_by_caller) && out.tokens.len() < cfg.max_new_tokens {
-        let mut block = vec![cfg.mask_token_id; rows];
-        block[0] = pending;
-        let w = i32::try_from(rows).map_err(|_| Exception::custom("draft rows overflow"))?;
-        let logits = model.preview(&block)?.reshape(&[w, -1])?;
-        let mask = i32::try_from(cfg.mask_token_id).map_err(|_| Exception::custom("mask id"))?;
-        let vocab = logits.shape()[1];
-        let mask_column = ops::arange::<_, i32>(0, vocab, 1)?.eq(Array::from_int(mask))?;
-        let drafts = ops::indexing::argmax_axis(
-            &ops::r#where(&mask_column, Array::from_f32(f32::NEG_INFINITY), &logits)?,
-            -1,
-            None,
-        )?
-        .as_dtype(mlx_rs::Dtype::Uint32)?;
-        eval([&drafts])?;
-        block[1..].copy_from_slice(&drafts.as_slice::<u32>()[1..]);
-
+        let rows = best_rows(&ladder, &p, cfg.cycle_base_rows);
+        let drafts = model.draft(pending, rows - 1)?;
+        let k = usize::try_from(drafts.dim(0)).map_err(|_| Exception::custom("draft count"))?;
+        if k >= rows {
+            return Err(Exception::custom(format!(
+                "drafter returned {k} tokens for {} slots",
+                rows - 1
+            )));
+        }
+        let block = ops::concatenate_axis(&[&Array::from_slice(&[pending], &[1]), &drafts], 0)?;
         let next = model.verify(&block)?;
+        if next.len() != k + 1 {
+            return Err(Exception::custom(format!(
+                "verify returned {} predictions for {} rows",
+                next.len(),
+                k + 1
+            )));
+        }
+        let tokens = block.as_slice::<u32>();
         let mut n = 0;
-        while n + 1 < rows && block[n + 1] == next[n] {
+        while n < k && tokens[n + 1] == next[n] {
             n += 1;
         }
         model.keep(n + 1)?;
         out.cycles += 1;
         out.accepted += n;
-        out.wide_cycles += usize::from(rows == 8);
-        #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
-        {
-            fill = 0.7_f32.mul_add(fill, 0.3 * (n + 1) as f32 / rows as f32);
-        }
-        if cfg.draft_rows.is_none() {
-            rows = match rows {
-                8 if fill < 0.5 => 4,
-                4 if fill > 0.8 => 8,
-                r => r,
-            };
+        out.wide_cycles += usize::from(rows == widest);
+        for (depth, (s, t)) in successes.iter_mut().zip(trials.iter_mut()).enumerate() {
+            *s *= 0.95;
+            *t *= 0.95;
+            if depth < n {
+                *s += 1.0;
+                *t += 1.0;
+            } else if depth == n && n < k {
+                *t += 1.0;
+            }
+            p[depth] = *s / *t;
         }
 
-        let mut new = block[1..=n].to_vec();
+        let mut new = tokens[1..=n].to_vec();
         new.push(next[n]);
         pending = next[n];
         new.truncate(cfg.max_new_tokens - out.tokens.len());
@@ -572,69 +620,307 @@ where
     Ok(out)
 }
 
-/// [`SpecModel`] over a loaded model and a request-local cache: verify runs
-/// in [`crate::qwen3_next::with_fast_rows`] and records the GDN tape so a
+/// What one verify leaves behind: greedy next token per row, the post-layer
+/// hiddens at the requested tap layers and the GDN tape for a partial keep.
+type VerifyRows = (
+    Vec<u32>,
+    Vec<Array>,
+    Vec<Option<crate::qwen3_next::GdnLayerTape>>,
+);
+
+/// Fast-rows tape verify of one `[rows]` block on a request-local cache; the
+/// taps are materialized by the same eval as the logits.
+fn verify_rows(
+    model: &mut AnyModel,
+    cache: &mut AnyCache,
+    tokens: &Array,
+    tap_layers: &[usize],
+) -> Result<VerifyRows, Exception> {
+    let input = tokens.reshape(&[1, -1])?;
+    let (logits, taps, tapes) = crate::qwen3_next::with_fast_rows(|| {
+        model.forward_with_taps_tape_scheduled(
+            &input,
+            None,
+            cache,
+            tap_layers,
+            None,
+            crate::qwen3_next::DFlashRowSchedule::NativeBatch,
+        )
+    })?;
+    let next = ops::indexing::argmax_axis(&logits, -1, None)?.as_dtype(mlx_rs::Dtype::Uint32)?;
+    eval([&next])?;
+    Ok((next.as_slice::<u32>().to_vec(), taps, tapes))
+}
+
+/// Keep the first `n` of the `rows` rows of the last verify (GDN replay from
+/// the tape + KV trim); a no-op when every row is kept.
+fn keep_rows(
+    model: &AnyModel,
+    cache: &mut AnyCache,
+    tapes: &[Option<crate::qwen3_next::GdnLayerTape>],
+    rows: usize,
+    n: usize,
+) -> Result<(), Exception> {
+    if n < rows {
+        let kept = i32::try_from(n).map_err(|_| Exception::custom("rows overflow"))?;
+        let dropped = i32::try_from(rows - n).map_err(|_| Exception::custom("rows overflow"))?;
+        model.replay_tape_rollback(tapes, cache, kept, dropped)?;
+    }
+    Ok(())
+}
+
+/// [`SpecModel`] over a loaded model and a request-local cache, drafting
+/// with a block preview.
+///
+/// The preview of `[pending, mask...]` drafts; verify runs in
+/// [`crate::qwen3_next::with_fast_rows`] and records the GDN tape so a
 /// partial accept replays only the kept rows.
 pub struct AnyModelSpec<'a> {
     pub model: &'a mut AnyModel,
     pub cache: &'a mut AnyCache,
+    mask_token_id: u32,
     tapes: Vec<Option<crate::qwen3_next::GdnLayerTape>>,
     rows: usize,
 }
 
 impl<'a> AnyModelSpec<'a> {
-    pub const fn new(model: &'a mut AnyModel, cache: &'a mut AnyCache) -> Self {
+    pub const fn new(model: &'a mut AnyModel, cache: &'a mut AnyCache, mask_token_id: u32) -> Self {
         Self {
             model,
             cache,
+            mask_token_id,
             tapes: Vec::new(),
             rows: 0,
         }
     }
 }
 
-impl BlockModel for AnyModelSpec<'_> {
-    fn preview(&mut self, block: &[u32]) -> Result<Array, Exception> {
-        self.model.forward_preview_block(&row(block)?, self.cache)
-    }
-
-    fn commit(&mut self, tokens: &[u32]) -> Result<(), Exception> {
-        AnyModelBlocks {
-            model: self.model,
-            cache: self.cache,
-        }
-        .commit(tokens)
-    }
-}
-
 impl SpecModel for AnyModelSpec<'_> {
-    fn verify(&mut self, tokens: &[u32]) -> Result<Vec<u32>, Exception> {
-        let (logits, _, tapes) = crate::qwen3_next::with_fast_rows(|| {
-            self.model.forward_with_taps_tape_scheduled(
-                &row(tokens)?,
-                None,
-                self.cache,
-                &[],
-                None,
-                crate::qwen3_next::DFlashRowSchedule::NativeBatch,
-            )
-        })?;
-        let next =
-            ops::indexing::argmax_axis(&logits, -1, None)?.as_dtype(mlx_rs::Dtype::Uint32)?;
-        eval([&next])?;
+    /// One preview of `[pending, mask * max]`; the argmax of the masked
+    /// positions (the mask id itself excluded) drafts them.
+    fn draft(&mut self, pending: u32, max: usize) -> Result<Array, Exception> {
+        let mut block = vec![self.mask_token_id; max + 1];
+        if let Some(slot) = block.first_mut() {
+            *slot = pending;
+        }
+        let w = i32::try_from(block.len()).map_err(|_| Exception::custom("draft rows overflow"))?;
+        let logits = self
+            .model
+            .forward_preview_block(&row(&block)?, self.cache)?
+            .reshape(&[w, -1])?
+            .index((1.., ..));
+        let mask = i32::try_from(self.mask_token_id).map_err(|_| Exception::custom("mask id"))?;
+        let vocab = logits.dim(1);
+        let mask_column = ops::arange::<_, i32>(0, vocab, 1)?.eq(Array::from_int(mask))?;
+        ops::indexing::argmax_axis(
+            &ops::r#where(&mask_column, Array::from_f32(f32::NEG_INFINITY), &logits)?,
+            -1,
+            None,
+        )?
+        .as_dtype(mlx_rs::Dtype::Uint32)
+    }
+
+    fn verify(&mut self, tokens: &Array) -> Result<Vec<u32>, Exception> {
+        let (next, _, tapes) = verify_rows(self.model, self.cache, tokens, &[])?;
         self.tapes = tapes;
-        self.rows = tokens.len();
-        Ok(next.as_slice::<u32>().to_vec())
+        self.rows = next.len();
+        Ok(next)
     }
 
     fn keep(&mut self, n: usize) -> Result<(), Exception> {
-        if n < self.rows {
-            let kept = i32::try_from(n).map_err(|_| Exception::custom("rows overflow"))?;
-            let dropped =
-                i32::try_from(self.rows - n).map_err(|_| Exception::custom("rows overflow"))?;
-            self.model
-                .replay_tape_rollback(&self.tapes, self.cache, kept, dropped)?;
+        keep_rows(self.model, self.cache, &self.tapes, self.rows, n)?;
+        self.tapes.clear();
+        self.rows = 0;
+        Ok(())
+    }
+}
+
+/// Target tap rows (`[1, T, H]` per tap layer) the drafter has not consumed
+/// yet, kept consistent with the rows the verify keeps.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct DraftTaps {
+    /// Committed rows not yet in the drafter's context.
+    pending: Vec<Array>,
+    /// Every row of the last verify, rejected ones included.
+    verified: Vec<Array>,
+}
+
+impl DraftTaps {
+    #[must_use]
+    pub const fn new(pending: Vec<Array>) -> Self {
+        Self {
+            pending,
+            verified: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn pending(&self) -> &[Array] {
+        &self.pending
+    }
+
+    /// Rows in `pending`.
+    pub fn pending_rows(&self) -> Result<i32, Exception> {
+        self.pending.first().map_or(Ok(0), |tap| {
+            tap.shape()
+                .get(1)
+                .copied()
+                .ok_or_else(|| Exception::custom("tap has no row axis"))
+        })
+    }
+
+    /// The drafter consumed `pending`.
+    pub fn consume(&mut self) {
+        self.pending.clear();
+    }
+
+    /// The verify processed these rows.
+    pub fn record(&mut self, verified: Vec<Array>) {
+        self.verified = verified;
+    }
+
+    /// The first `n` verified rows are committed: they become `pending`.
+    pub fn keep(&mut self, n: usize) -> Result<(), Exception> {
+        let rows = self
+            .verified
+            .first()
+            .and_then(|tap| tap.shape().get(1).copied())
+            .ok_or_else(|| Exception::custom("keep without a recorded verify"))?;
+        let kept = i32::try_from(n).map_err(|_| Exception::custom("kept rows overflow"))?;
+        if kept < 1 || kept > rows {
+            return Err(Exception::custom(format!(
+                "keep {kept} of {rows} verified rows"
+            )));
+        }
+        if !self.pending.is_empty() {
+            return Err(Exception::custom(
+                "drafter has not consumed the pending taps",
+            ));
+        }
+        self.pending = self
+            .verified
+            .drain(..)
+            .map(|tap| tap.index((.., ..kept, ..)))
+            .collect();
+        Ok(())
+    }
+}
+
+/// [`SpecModel`] whose drafts come from a `DFlash` drafter.
+///
+/// The `DFlash2` selector (or the target head's argmax for plain `DFlash`)
+/// proposes; the verify also returns the target hiddens at the drafter's tap
+/// layers, and the kept rows become the drafter's context for the next
+/// draft, so the drafter's position tracks the request-local cache exactly.
+pub struct DFlashSpec<'a> {
+    pub model: &'a mut AnyModel,
+    pub cache: &'a mut AnyCache,
+    drafter: &'a mut crate::dflash::DFlashDrafter,
+    draft_cache: crate::dflash::DFlashCache,
+    tap_layers: Vec<usize>,
+    taps: DraftTaps,
+    mask_token_id: u32,
+    /// Target rows committed so far (the drafter's position after it consumes
+    /// the pending taps).
+    committed: i32,
+    tapes: Vec<Option<crate::qwen3_next::GdnLayerTape>>,
+    rows: usize,
+}
+
+impl<'a> DFlashSpec<'a> {
+    /// `draft_cache` holds the prompt except `taps`, the target hiddens of
+    /// its last chunk (what the drafter's prefill returns).
+    pub fn new(
+        model: &'a mut AnyModel,
+        cache: &'a mut AnyCache,
+        drafter: &'a mut crate::dflash::DFlashDrafter,
+        draft_cache: crate::dflash::DFlashCache,
+        taps: Vec<Array>,
+        mask_token_id: u32,
+    ) -> Result<Self, Exception> {
+        if drafter.config.is_dspark() {
+            return Err(Exception::custom(
+                "dSpark drafters cannot draft self-speculation",
+            ));
+        }
+        let pending = DraftTaps::new(taps);
+        let committed = draft_cache
+            .position()
+            .checked_add(pending.pending_rows()?)
+            .ok_or_else(|| Exception::custom("drafter position overflow"))?;
+        Ok(Self {
+            model,
+            cache,
+            tap_layers: drafter.config.target_layer_ids().to_vec(),
+            drafter,
+            draft_cache,
+            taps: pending,
+            mask_token_id,
+            committed,
+            tapes: Vec::new(),
+            rows: 0,
+        })
+    }
+}
+
+impl SpecModel for DFlashSpec<'_> {
+    fn draft(&mut self, pending: u32, max: usize) -> Result<Array, Exception> {
+        let bs = self.drafter.config.block_size;
+        let width = usize::try_from(bs).map_err(|_| Exception::custom("block size"))?;
+        let mut block = vec![self.mask_token_id; width.max(1)];
+        if let Some(slot) = block.first_mut() {
+            *slot = pending;
+        }
+        let noise = self.model.embed_token_ids(&row(&block)?)?;
+        let anchor = i32::try_from(pending).map_err(|_| Exception::custom("token id overflow"))?;
+        // Positions 1.. are the masked slots; the selector walks them in order
+        // and a slot depends only on the slots before it, so only the first
+        // `k` go through the target head and the top-k partition.
+        let k = i32::try_from(max.min(width.saturating_sub(1)))
+            .map_err(|_| Exception::custom("draft cap overflow"))?;
+        let tokens = crate::qwen3_next::with_fast_rows(|| {
+            let tx = self
+                .drafter
+                .stage_forward(&noise, self.taps.pending(), &self.draft_cache)?;
+            if tx.position()? != self.committed {
+                return Err(Exception::custom(format!(
+                    "drafter context diverged: drafter {} target {}",
+                    tx.position()?,
+                    self.committed
+                )));
+            }
+            let hidden = tx.hidden().index((.., 1..=k, ..));
+            let logits = self.model.forward_all_logits_from_hidden(&hidden)?;
+            let tokens = match self
+                .drafter
+                .propose_dflash2_tokens(&hidden, &logits, anchor)?
+            {
+                Some(tokens) => tokens,
+                None => ops::indexing::argmax_axis(&logits, -1, None)?,
+            };
+            tx.commit(&mut self.draft_cache)?;
+            Ok(tokens)
+        })?;
+        self.taps.consume();
+        tokens.index(0).as_dtype(mlx_rs::Dtype::Uint32)
+    }
+
+    fn verify(&mut self, tokens: &Array) -> Result<Vec<u32>, Exception> {
+        let (next, taps, tapes) = verify_rows(self.model, self.cache, tokens, &self.tap_layers)?;
+        self.taps.record(taps);
+        self.tapes = tapes;
+        self.rows = next.len();
+        Ok(next)
+    }
+
+    fn keep(&mut self, n: usize) -> Result<(), Exception> {
+        keep_rows(self.model, self.cache, &self.tapes, self.rows, n)?;
+        self.taps.keep(n)?;
+        self.committed = self
+            .committed
+            .checked_add(i32::try_from(n).map_err(|_| Exception::custom("rows overflow"))?)
+            .ok_or_else(|| Exception::custom("drafter position overflow"))?;
         self.tapes.clear();
         self.rows = 0;
         Ok(())

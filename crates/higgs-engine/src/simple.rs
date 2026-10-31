@@ -14899,6 +14899,57 @@ fn read_pad_token_id(model_dir: &Path) -> Option<u32> {
     u32::try_from(value.get("pad_token_id")?.as_u64()?).ok()
 }
 
+/// Host-side timing of the three self-speculation phases. `sync_draft`
+/// (`HIGGS_CLOVER_SPEC_TRACE=1`) evaluates each draft before the verify so the
+/// drafter's own cost is visible; it costs the draft/verify overlap, so it is
+/// a diagnostic, not the production schedule.
+struct TimedSpec<M> {
+    inner: M,
+    sync_draft: bool,
+    /// Draft, verify, keep.
+    phases: [std::time::Duration; 3],
+}
+
+impl<M> TimedSpec<M> {
+    const fn new(inner: M, sync_draft: bool) -> Self {
+        Self {
+            inner,
+            sync_draft,
+            phases: [std::time::Duration::ZERO; 3],
+        }
+    }
+
+    fn phases_ms(&self) -> [f64; 3] {
+        self.phases.map(|d| d.as_secs_f64() * 1e3)
+    }
+}
+
+impl<M: higgs_models::clover::SpecModel> higgs_models::clover::SpecModel for TimedSpec<M> {
+    fn draft(&mut self, pending: u32, max: usize) -> Result<Array, mlx_rs::error::Exception> {
+        let t = std::time::Instant::now();
+        let drafts = self.inner.draft(pending, max)?;
+        if self.sync_draft {
+            eval([&drafts])?;
+        }
+        self.phases[0] += t.elapsed();
+        Ok(drafts)
+    }
+
+    fn verify(&mut self, tokens: &Array) -> Result<Vec<u32>, mlx_rs::error::Exception> {
+        let t = std::time::Instant::now();
+        let next = self.inner.verify(tokens)?;
+        self.phases[1] += t.elapsed();
+        Ok(next)
+    }
+
+    fn keep(&mut self, n: usize) -> Result<(), mlx_rs::error::Exception> {
+        let t = std::time::Instant::now();
+        self.inner.keep(n)?;
+        self.phases[2] += t.elapsed();
+        Ok(())
+    }
+}
+
 impl SimpleEngine {
     /// Override the Clover diffusion block size / threshold (per-model config
     /// `clover_block_size` / `clover_threshold`). No-op for other models.
@@ -14989,19 +15040,45 @@ impl SimpleEngine {
         let mut cache = model
             .make_cache_with_config(self.kv_cache_config)
             .map_err(EngineError::Mlx)?;
-        let n = i32::try_from(prompt_tokens.len())
-            .map_err(|_| EngineError::Generation("prompt length overflows i32".to_owned()))?;
-        let prompt = Array::from_slice(prompt_tokens, &[1, n]);
-        let logits = model
-            .forward_chunked(
-                &prompt,
+        // Self-speculation drafts with the loaded DFlash drafter when there is
+        // one (`HIGGS_CLOVER_SPEC_DRAFTER=preview` keeps the block preview);
+        // its prefill then also primes the drafter's context.
+        let dflash = self.dflash.as_ref().filter(|d| {
+            self_spec
+                && !d.is_dspark
+                && std::env::var("HIGGS_CLOVER_SPEC_DRAFTER")
+                    .ok()
+                    .is_none_or(|v| v != "preview")
+        });
+        let mut drafter = dflash.map(|d| lock_or_recover(&d.drafter));
+        let mut draft_cache = drafter.as_ref().map(|d| d.make_cache());
+        let (logits, taps) = match (dflash, drafter.as_deref_mut(), draft_cache.as_mut()) {
+            (Some(dflash), Some(drafter), Some(draft_cache)) => self.dflash_prefill_with_taps(
+                &mut model,
                 &mut cache,
-                self.tuning.chunked_prefill_chunk_size(),
-            )
-            .map_err(EngineError::Mlx)?;
-        let mut targets = vec![&logits];
-        targets.extend(cache.eval_targets());
-        eval(targets).map_err(EngineError::Mlx)?;
+                drafter,
+                draft_cache,
+                prompt_tokens,
+                &dflash.tap_layers,
+            )?,
+            _ => {
+                let n = i32::try_from(prompt_tokens.len()).map_err(|_| {
+                    EngineError::Generation("prompt length overflows i32".to_owned())
+                })?;
+                let prompt = Array::from_slice(prompt_tokens, &[1, n]);
+                let logits = model
+                    .forward_chunked(
+                        &prompt,
+                        &mut cache,
+                        self.tuning.chunked_prefill_chunk_size(),
+                    )
+                    .map_err(EngineError::Mlx)?;
+                let mut targets = vec![&logits];
+                targets.extend(cache.eval_targets());
+                eval(targets).map_err(EngineError::Mlx)?;
+                (logits, Vec::new())
+            }
+        };
         let vocab = logits.shape().last().copied().unwrap_or(0);
         let prefill_elapsed = request_t0.elapsed();
         mlx_gate.begin_decode();
@@ -15047,19 +15124,69 @@ impl SimpleEngine {
                 .last()
                 .ok_or_else(|| EngineError::Generation("empty prefill logits".to_owned()))?;
             let spec_cfg = higgs_models::clover::SelfSpecConfig {
-                mask_token_id: clover.mask_token_id,
                 max_new_tokens: cfg.max_new_tokens,
                 eos_token_ids: self.eos_token_ids.clone(),
-                // ponytail: A/B knob; adaptive 4 <-> 8 otherwise.
-                draft_rows: std::env::var("HIGGS_CLOVER_SPEC_ROWS")
+                // ponytail: A/B knob fixes the block; adaptive otherwise. A
+                // preview block must divide the trained block; a drafter block
+                // need not.
+                rows: std::env::var("HIGGS_CLOVER_SPEC_ROWS")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .filter(|&r: &usize| r >= 2 && clover.trained_block_size % r == 0),
+                    .filter(|&r: &usize| {
+                        r >= 2 && (dflash.is_some() || clover.trained_block_size % r == 0)
+                    })
+                    .map_or_else(
+                        || {
+                            if dflash.is_some() {
+                                higgs_models::clover::DFLASH_ROWS.to_vec()
+                            } else {
+                                higgs_models::clover::PREVIEW_ROWS.to_vec()
+                            }
+                        },
+                        |r| vec![r],
+                    ),
+                cycle_base_rows: if dflash.is_some() {
+                    higgs_models::clover::DFLASH_CYCLE_BASE_ROWS
+                } else {
+                    higgs_models::clover::PREVIEW_CYCLE_BASE_ROWS
+                },
             };
-            let mut spec = higgs_models::clover::AnyModelSpec::new(&mut model, &mut cache);
-            let out =
-                higgs_models::clover::self_spec_decode(&spec_cfg, first, &mut spec, &mut emit)
+            let trace = std::env::var("HIGGS_CLOVER_SPEC_TRACE").is_ok_and(|v| v == "1");
+            let (out, phases) = match (dflash, drafter.as_deref_mut(), draft_cache) {
+                (Some(dflash), Some(drafter), Some(draft_cache)) => {
+                    let mask = u32::try_from(dflash.mask_token_id).map_err(|_| {
+                        EngineError::Generation("drafter mask token id overflow".to_owned())
+                    })?;
+                    let spec = higgs_models::clover::DFlashSpec::new(
+                        &mut model,
+                        &mut cache,
+                        drafter,
+                        draft_cache,
+                        taps,
+                        mask,
+                    )
                     .map_err(EngineError::Mlx)?;
+                    let mut timed = TimedSpec::new(spec, trace);
+                    let out = higgs_models::clover::self_spec_decode(
+                        &spec_cfg, first, &mut timed, &mut emit,
+                    )
+                    .map_err(EngineError::Mlx)?;
+                    (out, timed.phases_ms())
+                }
+                _ => {
+                    let spec = higgs_models::clover::AnyModelSpec::new(
+                        &mut model,
+                        &mut cache,
+                        clover.mask_token_id,
+                    );
+                    let mut timed = TimedSpec::new(spec, trace);
+                    let out = higgs_models::clover::self_spec_decode(
+                        &spec_cfg, first, &mut timed, &mut emit,
+                    )
+                    .map_err(EngineError::Mlx)?;
+                    (out, timed.phases_ms())
+                }
+            };
             if let Some(error) = sink_error {
                 return Err(error);
             }
@@ -15067,7 +15194,13 @@ impl SimpleEngine {
                 .elapsed()
                 .saturating_sub(prefill_elapsed)
                 .as_secs_f64();
+            let per_cycle = |ms: f64| format!("{:.2}", ms / out.cycles.max(1) as f64);
             tracing::info!(
+                drafter = if dflash.is_some() {
+                    "dflash"
+                } else {
+                    "preview"
+                },
                 completion_tokens = out.tokens.len(),
                 cycles = out.cycles,
                 wide_cycles = out.wide_cycles,
@@ -15078,6 +15211,9 @@ impl SimpleEngine {
                 tok_per_sec = format!("{:.1}", out.tokens.len() as f64 / decode_s.max(1e-9)),
                 prefill_ms = format!("{:.1}", prefill_elapsed.as_secs_f64() * 1e3),
                 decode_ms = format!("{:.1}", decode_s * 1e3),
+                draft_ms_per_cycle = per_cycle(phases[0]),
+                verify_ms_per_cycle = per_cycle(phases[1]),
+                keep_ms_per_cycle = per_cycle(phases[2]),
                 "Self-spec generation complete"
             );
             let finish_reason = if out.hit_eos || out.stopped_by_caller {

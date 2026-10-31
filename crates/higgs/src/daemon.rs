@@ -203,7 +203,8 @@ port = 8000
 # # Speculative decoding (decode) + compressive prefill (PFlash) drafters:
 # # draft_model      = "/path/to/dspark-drafter"      # decode speculation (DFlash/dSpark)
 # # Clover (clover_moe) block diffusion / self-speculation, selected per request or
-# # via generation_defaults with speculation = "diffusion" | "self_spec":
+# # via generation_defaults with speculation = "diffusion" | "self_spec"
+# # (self_spec drafts with draft_model when one is set, else with a block preview):
 # # clover_block_size = 32                            # must divide 32
 # # clover_threshold  = 0.95                          # LowConfidence unmask threshold, 0..=1
 # # Validated low-bit Bonsai targets default to the block (BatchedTape) verifier.
