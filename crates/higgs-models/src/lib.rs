@@ -12,6 +12,7 @@ pub mod eschamoe;
 pub mod gemma2;
 pub mod gemma3;
 pub mod gemma4;
+pub mod gdn_rows;
 pub mod gemma_vision;
 pub mod llava_qwen2;
 mod metal_kernel;

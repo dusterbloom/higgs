@@ -2473,7 +2473,7 @@ fn canonical_conv_preactivation_ffi(
 ///
 /// Keep decay and innovation update as two statements. Combining them permits
 /// an FMA/reassociation that changes rollback state bits after partial accept.
-const GDN_RECURRENCE_METAL_PREAMBLE: &str = r"
+pub(crate) const GDN_RECURRENCE_METAL_PREAMBLE: &str = r"
 #define HIGGS_GDN_GATE(gate, a_value, dt_bias_value, a_log_value) \
   float x = static_cast<float>(a_value) + dt_bias_value; \
   float sp = fmax(x, 0.0f) + log1p(exp(-fabs(x))); \
@@ -6922,6 +6922,10 @@ pub struct GdnLayerTape {
     pub conv_pos_init: i32,
     /// Pre-forward cache offset for rollback
     pub offset_init: i32,
+    /// Recorded by the fast-rows kernels ([`crate::gdn_rows`]): `norm_k` is
+    /// fp32, `conv_state_init` is already chronological, and a partial
+    /// accept folds the tape with [`crate::gdn_rows::fold`].
+    pub fused: bool,
 }
 
 /// Clover's preview-only GDN tensors (`bd_gdn_conv1d` right taps and the
@@ -7872,100 +7876,39 @@ impl GatedDeltaNet {
             ],
             -1,
         )?;
-
-        // Causal taps over [history | block] plus right taps inside the block,
-        // accumulated in fp32 as the reference does.
         let history = self.chronological_conv_state_ref(cache, B, dtype)?;
-        let conv_in = ops::concatenate_axis(&[&history, &mixed], 1)?.as_dtype(Dtype::Float32)?;
-        let causal_w = self.transposed_conv_weight(Dtype::Float32)?; // [K, C], tap K-1 = current
-        let right_w = right
-            .squeeze_axes(&[1])?
-            .transpose()?
-            .as_dtype(Dtype::Float32)?; // [K-1, C]
-        let mixed_f = mixed.as_dtype(Dtype::Float32)?;
-        let mut conv = conv_in.index((.., 0..S, ..)).multiply(causal_w.index(0))?;
-        for tap in 1..ks {
-            let window = conv_in.index((.., tap..tap + S, ..));
-            conv = conv.add(window.multiply(causal_w.index(tap))?)?;
-        }
-        for distance in 1..ks.min(S) {
-            let later = ops::concatenate_axis(
-                &[
-                    &mixed_f.index((.., distance.., ..)),
-                    &ops::zeros::<f32>(&[B, distance, self.conv_dim])?,
-                ],
-                1,
-            )?;
-            conv = conv.add(later.multiply(right_w.index(distance - 1))?)?;
-        }
-        let conv = nn::silu(&conv)?.as_dtype(dtype)?;
-
-        let parts = conv.split_axis(&[self.key_dim, self.key_dim * 2], Some(-1))?;
-        let conv_q = parts[0].reshape(&[B, S, self.num_k_heads, dk])?;
-        let conv_k = parts[1].reshape(&[B, S, self.num_k_heads, dk])?;
-        let conv_v = parts[2].reshape(&[B, S, hv, dv])?;
-
-        // `qk_norm_weight_q` folds l2-normalisation and the 1/sqrt(dk) scale;
-        // `qk_norm_weight_k` is plain l2-normalisation (the softmax logits use
-        // unscaled unit q and k). Value heads share key heads by repetition.
-        let w_q = self.qk_norm_weight_q.as_dtype(dtype)?;
-        let w_k = self.qk_norm_weight_k.as_dtype(dtype)?;
-        let repeat = |x: Array| -> Result<Array, Exception> {
-            let factor = hv / self.num_k_heads;
-            let x = if factor > 1 {
-                ops::repeat_axis::<f32>(x, factor, -2)?
-            } else {
-                x
-            };
-            // [B, S, Hv, D] -> [B, Hv, S, D] in fp32
-            x.as_dtype(Dtype::Float32)?.transpose_axes(&[0, 2, 1, 3])
-        };
-        let q_scaled = repeat(fast::rms_norm(&conv_q, &w_q, 1e-6)?)?;
-        let q_unit = repeat(fast::rms_norm(&conv_q, &w_k, 1e-6)?)?;
-        let k_unit = repeat(fast::rms_norm(&conv_k, &w_k, 1e-6)?)?;
-        let values = conv_v
-            .as_dtype(Dtype::Float32)?
-            .transpose_axes(&[0, 2, 1, 3])?;
-
-        // History slot: decayed readout of the clean recurrent state [B, Hv, Dv, Dk].
+        // The clean recurrent state [B, Hv, Dv, Dk], read only.
         let state = match &cache.ssm_state {
             Some(state) => state.as_dtype(Dtype::Float32)?,
             None => ops::zeros::<f32>(&[B, hv, dv, dk])?,
         };
-        let decay = compute_g_direct(
-            &self.A_log.as_dtype(Dtype::Float32)?,
-            &a.as_dtype(Dtype::Float32)?,
-            &self.dt_bias.as_dtype(Dtype::Float32)?,
-        )?
-        .transpose_axes(&[0, 2, 1])?
-        .expand_dims(-1)?; // [B, Hv, S, 1]
-        let history_value =
-            ops::matmul(&q_scaled, &state.transpose_axes(&[0, 1, 3, 2])?)?.multiply(&decay)?; // [B, Hv, S, Dv]
-
-        let per_head = |p: &Param<Array>| -> Result<Array, Exception> {
-            p.as_ref().as_dtype(Dtype::Float32)?.reshape(&[1, hv, 1, 1])
+        if self.qk_norm_weight_q.dtype() != dtype {
+            self.qk_norm_weight_q = self.qk_norm_weight_q.as_dtype(dtype)?;
+            self.qk_norm_weight_k = self.qk_norm_weight_k.as_dtype(dtype)?;
+        }
+        let conv_w = self.transposed_conv_weight(dtype)?; // [K, C], tap K-1 = current
+        let mixer = crate::gdn_rows::PreviewInputs {
+            rows: &mixed,
+            a: &a,
+            history: &history,
+            state: &state,
+            conv_w: &conv_w,
+            conv_r: right,
+            norm_q: &self.qk_norm_weight_q,
+            norm_k: &self.qk_norm_weight_k,
+            a_log: self.A_log.as_ref(),
+            dt_bias: self.dt_bias.as_ref(),
+            scale: clover.bd_softmax_logit_scale.as_ref(),
+            hist_bias: clover.bd_softmax_history_bias.as_ref(),
+            hist_c: clover.bd_softmax_history_c.as_ref(),
         };
-        let logits = ops::matmul(&q_unit, &k_unit.transpose_axes(&[0, 1, 3, 2])?)?
-            .multiply(per_head(&clover.bd_softmax_logit_scale)?)?; // [B, Hv, S, S]
-        // The reference normalises the block length by the trained 32, not by
-        // the configured block size.
-        #[allow(clippy::cast_precision_loss)]
-        let length_term = (S as f32 / 32.0).ln();
-        let history_logit = per_head(&clover.bd_softmax_history_bias)?
-            .add(per_head(&clover.bd_softmax_history_c)?.multiply(Array::from_f32(length_term))?)?;
-        let history_logit = ops::broadcast_to(&history_logit, &[B, hv, S, 1])?;
-        let weights = ops::softmax_axis(
-            &ops::concatenate_axis(&[&logits, &history_logit], -1)?,
-            -1,
-            true,
-        )?;
-        let local = ops::matmul(&weights.index((.., .., .., 0..S)), &values)?;
-        let y = weights
-            .index((.., .., .., S..S + 1))
-            .multiply(&history_value)?
-            .add(local)?
-            .transpose_axes(&[0, 2, 1, 3])?
-            .as_dtype(dtype)?; // [B, S, Hv, Dv]
+        let fast = (fast_rows() && crate::gdn_rows::enabled())
+            .then(|| crate::gdn_rows::geometry(&mixed, &history, &state, &conv_w, 32))
+            .flatten();
+        let y = match fast {
+            Some(geometry) => crate::gdn_rows::preview_mixer(&mixer, geometry)?.as_dtype(dtype)?,
+            None => preview_mixer_mlx(&mixer)?,
+        }; // [B, S, Hv, Dv]
 
         let normed = self.norm.forward(&y)?;
         let gated = swiglu(&z, &normed)?;
@@ -8058,6 +8001,17 @@ impl GatedDeltaNet {
 
         // Save qkv for conv_state rebuild on replay
         let qkv_for_replay = mixed_qkv.clone();
+
+        if fast_rows()
+            && crate::gdn_rows::enabled()
+            && row_schedule == DFlashRowSchedule::NativeBatch
+        {
+            if let Some(result) =
+                self.forward_with_tape_fast(&mixed_qkv, (&z, &b, &a), cache, B, S)?
+            {
+                return Ok(result);
+            }
+        }
 
         // Capture initial state for rollback (Python `_GDNStateCapture` equivalent)
         let conv_state_init = cache.conv_state.clone();
@@ -8222,10 +8176,203 @@ impl GatedDeltaNet {
             ssm_state_init,
             conv_pos_init,
             offset_init,
+            fused: false,
         };
 
         Ok((output, tape))
     }
+
+    /// [`Self::forward_with_tape`] on the fast-rows kernels: one prep
+    /// dispatch (convolution, `SiLU`, q/k norms, next window) feeding the
+    /// tape-recording recurrence. `None` when the geometry is unsupported.
+    #[allow(non_snake_case)]
+    fn forward_with_tape_fast(
+        &mut self,
+        mixed_qkv: &Array,
+        (z, b, a): (&Array, &Array, &Array),
+        cache: &mut ArraysCache,
+        B: i32,
+        S: i32,
+    ) -> Result<Option<(Array, GdnLayerTape)>, Exception> {
+        let dtype = mixed_qkv.dtype();
+        let history = self.chronological_conv_state_ref(cache, B, dtype)?;
+        let state = match &cache.ssm_state {
+            Some(state) => state.clone(),
+            None => ops::zeros_dtype(
+                &[B, self.num_v_heads, self.head_v_dim, self.head_k_dim],
+                gdn_state_dtype(),
+            )?,
+        };
+        let wt = self.transposed_conv_weight(dtype)?;
+        let Some(geometry) = crate::gdn_rows::geometry(mixed_qkv, &history, &state, &wt, 8) else {
+            return Ok(None);
+        };
+        if self.qk_norm_weight_q.dtype() != dtype {
+            self.qk_norm_weight_q = self.qk_norm_weight_q.as_dtype(dtype)?;
+            self.qk_norm_weight_k = self.qk_norm_weight_k.as_dtype(dtype)?;
+        }
+        let offset_init = cache.offset;
+        let (q, k, v, window) = crate::gdn_rows::prep_verify(
+            mixed_qkv,
+            &history,
+            &wt,
+            &self.qk_norm_weight_q,
+            &self.qk_norm_weight_k,
+            geometry,
+        )?;
+        let (y, new_state, delta_tape) = gated_delta_kernel_ffi_with_tape(
+            &q,
+            &k,
+            &v,
+            &self.A_log,
+            a,
+            &self.dt_bias,
+            b,
+            &state,
+            B,
+            S,
+            self.num_k_heads,
+            self.head_k_dim,
+            self.num_v_heads,
+            self.head_v_dim,
+        )?;
+        cache.conv_state = Some(window);
+        cache.conv_pos = self.conv_kernel_size - 2;
+        cache.ssm_state = Some(new_state);
+        cache.offset += S;
+
+        let gated_out = gdn_output_gate(
+            &y.as_dtype(dtype)?,
+            self.norm.weight.as_ref(),
+            self.norm.eps,
+            z,
+        )?;
+        let output = self.out_proj.forward(&gated_out.reshape(&[B, S, -1])?)?;
+        let tape = GdnLayerTape {
+            delta_tape,
+            norm_k: k,
+            a_proj: a.clone(),
+            qkv_input: mixed_qkv.clone(),
+            conv_state_init: Some(history),
+            ssm_state_init: Some(state),
+            conv_pos_init: self.conv_kernel_size - 2,
+            offset_init,
+            fused: true,
+        };
+        Ok(Some((output, tape)))
+    }
+}
+
+/// The Clover preview mixer on MLX ops (`bd_gdn_conv1d` + `bd_gdn_local_memory`)
+/// over a whole-valid block against the committed state: causal taps over
+/// `[history | block]` plus the right taps inside the block, accumulated in
+/// fp32 as the reference does; `SiLU`; the q/k norms; and a bidirectional
+/// softmax over the block plus one history slot holding the gate-decayed
+/// readout of the clean state. Returns `[B, S, Hv, Dv]` in the rows' dtype.
+/// Fast rows take the kernels in [`crate::gdn_rows`] instead.
+#[allow(non_snake_case, clippy::too_many_lines, clippy::indexing_slicing)]
+pub(crate) fn preview_mixer_mlx(
+    x: &crate::gdn_rows::PreviewInputs<'_>,
+) -> Result<Array, Exception> {
+    let dtype = x.rows.dtype();
+    let (&[B, S, C], &[_, hv, dv, dk]) = (x.rows.shape(), x.state.shape()) else {
+        return Err(Exception::custom(
+            "preview mixer needs [B, S, C] rows and a [B, Hv, Dv, Dk] state",
+        ));
+    };
+    let ks = x.conv_w.dim(0);
+    let hk = (C - hv * dv) / (2 * dk);
+    let key_dim = hk * dk;
+
+    let conv_in = ops::concatenate_axis(&[x.history, x.rows], 1)?.as_dtype(Dtype::Float32)?;
+    let causal_w = x.conv_w.as_dtype(Dtype::Float32)?; // [K, C], tap K-1 = current
+    let right_w = x
+        .conv_r
+        .squeeze_axes(&[1])?
+        .transpose()?
+        .as_dtype(Dtype::Float32)?; // [K-1, C]
+    let mixed_f = x.rows.as_dtype(Dtype::Float32)?;
+    let mut conv = conv_in.index((.., 0..S, ..)).multiply(causal_w.index(0))?;
+    for tap in 1..ks {
+        let window = conv_in.index((.., tap..tap + S, ..));
+        conv = conv.add(window.multiply(causal_w.index(tap))?)?;
+    }
+    for distance in 1..ks.min(S) {
+        let later = ops::concatenate_axis(
+            &[
+                &mixed_f.index((.., distance.., ..)),
+                &ops::zeros::<f32>(&[B, distance, C])?,
+            ],
+            1,
+        )?;
+        conv = conv.add(later.multiply(right_w.index(distance - 1))?)?;
+    }
+    let activated = nn::silu(&conv)?.as_dtype(dtype)?;
+
+    let parts = activated.split_axis(&[key_dim, key_dim * 2], Some(-1))?;
+    let conv_q = parts[0].reshape(&[B, S, hk, dk])?;
+    let conv_k = parts[1].reshape(&[B, S, hk, dk])?;
+    let conv_v = parts[2].reshape(&[B, S, hv, dv])?;
+
+    // `norm_q` folds l2-normalisation and the 1/sqrt(dk) scale; `norm_k` is
+    // plain l2-normalisation (the softmax logits use unscaled unit q and k).
+    // Value heads share key heads by repetition.
+    let w_q = x.norm_q.as_dtype(dtype)?;
+    let w_k = x.norm_k.as_dtype(dtype)?;
+    let repeat = |heads: Array| -> Result<Array, Exception> {
+        let factor = hv / hk;
+        let repeated = if factor > 1 {
+            ops::repeat_axis::<f32>(heads, factor, -2)?
+        } else {
+            heads
+        };
+        // [B, S, Hv, D] -> [B, Hv, S, D] in fp32
+        repeated
+            .as_dtype(Dtype::Float32)?
+            .transpose_axes(&[0, 2, 1, 3])
+    };
+    let q_scaled = repeat(fast::rms_norm(&conv_q, &w_q, 1e-6)?)?;
+    let q_unit = repeat(fast::rms_norm(&conv_q, &w_k, 1e-6)?)?;
+    let k_unit = repeat(fast::rms_norm(&conv_k, &w_k, 1e-6)?)?;
+    let values = conv_v
+        .as_dtype(Dtype::Float32)?
+        .transpose_axes(&[0, 2, 1, 3])?;
+
+    // History slot: decayed readout of the clean recurrent state [B, Hv, Dv, Dk].
+    let decay = compute_g_direct(
+        &x.a_log.as_dtype(Dtype::Float32)?,
+        &x.a.as_dtype(Dtype::Float32)?,
+        &x.dt_bias.as_dtype(Dtype::Float32)?,
+    )?
+    .transpose_axes(&[0, 2, 1])?
+    .expand_dims(-1)?; // [B, Hv, S, 1]
+    let history_value =
+        ops::matmul(&q_scaled, &x.state.transpose_axes(&[0, 1, 3, 2])?)?.multiply(&decay)?; // [B, Hv, S, Dv]
+
+    let per_head = |p: &Array| -> Result<Array, Exception> {
+        p.as_dtype(Dtype::Float32)?.reshape(&[1, hv, 1, 1])
+    };
+    let logits = ops::matmul(&q_unit, &k_unit.transpose_axes(&[0, 1, 3, 2])?)?
+        .multiply(per_head(x.scale)?)?; // [B, Hv, S, S]
+    // The reference normalises the block length by the trained 32, not by
+    // the configured block size.
+    #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
+    let length_term = (S as f32 / 32.0).ln();
+    let history_logit =
+        per_head(x.hist_bias)?.add(per_head(x.hist_c)?.multiply(Array::from_f32(length_term))?)?;
+    let history_column = ops::broadcast_to(&history_logit, &[B, hv, S, 1])?;
+    let weights = ops::softmax_axis(
+        &ops::concatenate_axis(&[&logits, &history_column], -1)?,
+        -1,
+        true,
+    )?;
+    let local = ops::matmul(weights.index((.., .., .., 0..S)), &values)?;
+    weights
+        .index((.., .., .., S..S + 1))
+        .multiply(&history_value)?
+        .add(local)?
+        .transpose_axes(&[0, 2, 1, 3])?
+        .as_dtype(dtype) // [B, S, Hv, Dv]
 }
 
 /// Reference implementation of gate computation (used by tests).
@@ -9227,7 +9374,7 @@ pub fn with_fast_rows<R, F: FnOnce() -> R>(f: F) -> R {
     f()
 }
 
-fn fast_rows() -> bool {
+pub(crate) fn fast_rows() -> bool {
     FAST_ROWS.with(std::cell::Cell::get)
 }
 
@@ -11948,6 +12095,55 @@ impl Qwen3NextCausalLM {
             return Ok(());
         }
 
+        // Fast-rows tapes (`forward_with_tape_fast`): fold each layer's
+        // accepted rows and window in one dispatch, no concatenation.
+        if gdn_entries.iter().all(|entry| entry.tape.fused) {
+            let mut staged_gdn = Vec::with_capacity(gdn_entries.len());
+            for entry in &gdn_entries {
+                let (layer, tape) = (entry.layer, entry.tape);
+                let geometry = crate::gdn_rows::Geometry {
+                    rows: target_rows,
+                    hk: layer.num_k_heads,
+                    hv: layer.num_v_heads,
+                    c: layer.conv_dim,
+                    k: layer.conv_kernel_size,
+                };
+                let history = match &tape.conv_state_init {
+                    Some(history) => history.clone(),
+                    None => ops::zeros_dtype(
+                        &[1, layer.conv_kernel_size - 1, layer.conv_dim],
+                        tape.qkv_input.dtype(),
+                    )?,
+                };
+                let (state, window) = crate::gdn_rows::fold(
+                    &entry.snap_state,
+                    &tape.norm_k,
+                    &tape.a_proj,
+                    layer.A_log.as_ref(),
+                    layer.dt_bias.as_ref(),
+                    &tape.delta_tape,
+                    &history,
+                    &tape.qkv_input,
+                    n_accepted,
+                    geometry,
+                )?;
+                let offset = tape
+                    .offset_init
+                    .checked_add(n_accepted)
+                    .ok_or_else(|| Exception::custom("GDN committed offset overflow"))?;
+                staged_gdn.push((
+                    entry.cache_idx,
+                    ArraysCache {
+                        conv_state: Some(window),
+                        ssm_state: Some(state),
+                        conv_pos: layer.conv_kernel_size - 2,
+                        offset,
+                    },
+                ));
+            }
+            return commit_tape_rollback(kv_cache, staged_gdn, kv_rollback);
+        }
+
         // Batch all GDN layers: concat tape/k/a/state/A_log/dt_bias along batch dim
         let tape_slices: Vec<Array> = gdn_entries
             .iter()
@@ -12048,25 +12244,7 @@ impl Qwen3NextCausalLM {
             staged_gdn.push((entry.cache_idx, staged));
         }
 
-        for (cache_index, staged) in staged_gdn {
-            let Some(LayerCache::Arrays(cache)) = &mut kv_cache[cache_index] else {
-                return Err(Exception::custom(
-                    "validated GDN cache changed variant before commit",
-                ));
-            };
-            *cache = staged;
-        }
-        if kv_rollback > 0 {
-            let rollback = usize::try_from(kv_rollback)
-                .map_err(|_| Exception::custom("KV rollback does not fit usize"))?;
-            for cache in kv_cache.iter_mut() {
-                if let Some(LayerCache::KV(kv)) = cache {
-                    kv.trim_by(rollback);
-                }
-            }
-        }
-
-        Ok(())
+        commit_tape_rollback(kv_cache, staged_gdn, kv_rollback)
     }
 
     /// Embed raw token IDs through the target model's embedding layer.
@@ -12174,6 +12352,35 @@ impl Qwen3NextCausalLM {
             |head| head.forward(hidden),
         )
     }
+}
+
+/// The tail of [`Qwen3NextCausalLM::replay_tape_rollback`]: install the
+/// staged GDN caches (built off to the side, so nothing is half rolled back)
+/// and trim the attention layers.
+#[allow(clippy::indexing_slicing)]
+fn commit_tape_rollback(
+    kv_cache: &mut [Option<LayerCache>],
+    staged_gdn: Vec<(usize, ArraysCache)>,
+    kv_rollback: i32,
+) -> Result<(), Exception> {
+    for (cache_index, staged) in staged_gdn {
+        let Some(LayerCache::Arrays(cache)) = &mut kv_cache[cache_index] else {
+            return Err(Exception::custom(
+                "validated GDN cache changed variant before commit",
+            ));
+        };
+        *cache = staged;
+    }
+    if kv_rollback > 0 {
+        let rollback = usize::try_from(kv_rollback)
+            .map_err(|_| Exception::custom("KV rollback does not fit usize"))?;
+        for cache in kv_cache.iter_mut() {
+            if let Some(LayerCache::KV(kv)) = cache {
+                kv.trim_by(rollback);
+            }
+        }
+    }
+    Ok(())
 }
 
 const PREFILL_LAYER_EVAL_INTERVAL: usize = 8;
