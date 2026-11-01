@@ -1985,8 +1985,16 @@ impl PagedPrefixCache {
             if common == child.edge.len() {
                 // Whole child edge matched: its blocks are reused as-is. Drop
                 // the incoming blocks for this span (they are byte-identical KV)
-                // and recurse with the remainder.
-                let remainder = drop_leading_blocks(blocks, common, block_size);
+                // and recurse with the remainder. Drop exactly the blocks the
+                // edge carries: after a sub-block ancestor split the edge
+                // starts mid-block, so `common / block_size` can be one short
+                // and would put a block on the path twice (over-reporting the
+                // match by a block, past the end of the query).
+                let carried = match &child.edge_blocks {
+                    EdgeData::Paged(edge) => edge.tokens,
+                    EdgeData::None => common,
+                };
+                let remainder = drop_leading_blocks(blocks, carried, block_size);
                 let Some(child_mut) = node.children.get_mut(&next_token) else {
                     return InsertOutcome::default();
                 };
@@ -3174,6 +3182,23 @@ mod tests {
             })
             .collect();
         AnyCache::Hybrid(layers)
+    }
+
+    /// Two conversations sharing a long prefix, after an unrelated prompt
+    /// that diverges inside the first block: the second one must match the
+    /// first one's stored endpoint, never more tokens than it shares.
+    #[test]
+    fn hybrid_match_after_sub_block_split_reports_matched_tokens() {
+        let mut cache = PagedPrefixCache::new(16, 32);
+        let other: Vec<u32> = [0, 1, 2].into_iter().chain(10_000..12_077).collect();
+        cache.store(&other[..2048], &make_hybrid_cache(4, 2048));
+        let first: Vec<u32> = [0, 1, 2].into_iter().chain(20_000..23_496).collect();
+        cache.store(&first[..1440], &make_hybrid_cache(4, 1440));
+        cache.store(&first[..3488], &make_hybrid_cache(4, 3488));
+        let mut second = first[..3494].to_vec();
+        second.extend([7, 7, 7, 7, 7]);
+        let hit = cache.find_longest_prefix(&second).expect("shared endpoint");
+        assert_eq!(hit.prefix_len, 3488);
     }
 
     #[test]

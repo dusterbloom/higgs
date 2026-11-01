@@ -65,6 +65,9 @@ use crate::{
 const DEFAULT_PREFIX_CACHE_SIZE: usize = 8;
 const DEFAULT_PAGED_KV_BLOCK_SIZE: usize = 64;
 const HYBRID_CHECKPOINT_BLOCKS: usize = 1;
+/// Shortest system preamble worth its own hybrid checkpoint (a GDN snapshot
+/// costs ~65 MB on Clover; 512 tokens are ~1.3 s of prefill).
+const PREAMBLE_CHECKPOINT_MIN_TOKENS: usize = 512;
 pub const DEFAULT_PFLASH_KEEP_RATIO_MAX: f32 = 0.75;
 pub const DEFAULT_PFLASH_MAX_AUTO_PREFILL_RATIO: f32 = 0.60;
 pub const DEFAULT_PFLASH_PLAN_CACHE: bool = true;
@@ -5714,11 +5717,6 @@ impl SimpleEngine {
             }
         }
 
-        let reused_prefix_tokens = prefix_match
-            .as_ref()
-            .and_then(|m| u32::try_from(m.prefix_len).ok())
-            .unwrap_or(0);
-
         let (actual_prompt_tokens, cache) = if let Some(matched) = prefix_match {
             tracing::debug!(
                 prefix_len = matched.prefix_len,
@@ -5750,6 +5748,10 @@ impl SimpleEngine {
             )
         };
 
+        // What the prefill skips: 0 when a full-prompt hit fell back to a
+        // fresh prefill.
+        let reused_prefix_tokens =
+            u32::try_from(prompt_tokens.len() - actual_prompt_tokens.len()).unwrap_or(0);
         let prompt_array = Array::from(actual_prompt_tokens.as_slice()).index(NewAxis);
         let actual_suffix_tokens = u64::try_from(actual_prompt_tokens.len()).unwrap_or(u64::MAX);
         record_request_execution(
@@ -5841,6 +5843,111 @@ impl SimpleEngine {
         Ok(())
     }
 
+    /// End of a leading ChatML system message (`<|im_start|>system ...
+    /// <|im_end|>`): the preamble (instructions, tool definitions) agents
+    /// repeat verbatim across conversations.
+    fn system_preamble_end(&self, prompt: &[u32]) -> Option<usize> {
+        let start = self.tokenizer.token_to_id("<|im_start|>")?;
+        let end = self.tokenizer.token_to_id("<|im_end|>")?;
+        let system = self.tokenizer.encode("system", false).ok()?;
+        let [system] = system.get_ids() else {
+            return None;
+        };
+        if prompt.first() != Some(&start) || prompt.get(1) != Some(system) {
+            return None;
+        }
+        prompt.iter().position(|&t| t == end).map(|i| i + 1)
+    }
+
+    /// Shared-preamble checkpoint for a hybrid cache. A hybrid entry is only
+    /// reusable at its exact endpoint and the body checkpoint ends inside the
+    /// first user turn, so a new conversation with the same system prompt
+    /// would otherwise prefill it cold. When the request has not already
+    /// reused past it, prefill up to the system message's end (floored to the
+    /// checkpoint quantum), store that state, and leave `prepared` as a radix
+    /// hit there; the caller's body / suffix split then runs on the rest.
+    /// `drafter` (self-speculation) is primed with the preamble's tap rows.
+    fn store_preamble_checkpoint(
+        &self,
+        prompt_tokens: &[u32],
+        generation_suffix: &[u32],
+        prepared: &mut PreparedGeneration<'_>,
+        checkpoint_id: Option<&str>,
+        drafter: &mut Option<SelfSpecDrafter<'_>>,
+    ) -> Result<(), EngineError> {
+        if !matches!(prepared.cache, AnyCache::Hybrid(_)) || prepared.image_batch.is_some() {
+            return Ok(());
+        }
+        let Some(reused) = prompt_tokens
+            .len()
+            .checked_sub(prepared.actual_prompt_tokens.len())
+            .filter(|&r| prompt_tokens.get(r..) == Some(&prepared.actual_prompt_tokens[..]))
+        else {
+            return Ok(());
+        };
+        let quantum = DEFAULT_BLOCK_SIZE.saturating_mul(HYBRID_CHECKPOINT_BLOCKS);
+        let Some(end) = self
+            .system_preamble_end(prompt_tokens)
+            .map(|end| end / quantum * quantum)
+        else {
+            return Ok(());
+        };
+        let body_end = exact_generation_body(prompt_tokens, generation_suffix)
+            .map_or(0, |body| hybrid_checkpoint_boundary(body.len()));
+        if end < PREAMBLE_CHECKPOINT_MIN_TOKENS || end <= reused || end >= body_end {
+            return Ok(());
+        }
+        let (preamble, rest) = prepared.actual_prompt_tokens.split_at(end - reused);
+        match drafter.as_mut() {
+            Some((drafter, draft_cache, tap_layers)) => {
+                let (_, taps) = self.dflash_prefill_with_taps(
+                    &mut prepared.model,
+                    &mut prepared.cache,
+                    drafter,
+                    draft_cache,
+                    preamble,
+                    tap_layers,
+                )?;
+                if !taps.is_empty() {
+                    drafter
+                        .prime_taps(&taps, draft_cache)
+                        .map_err(EngineError::Mlx)?;
+                }
+            }
+            None => {
+                let n = i32::try_from(preamble.len())
+                    .map_err(|_| EngineError::Generation("preamble overflows i32".to_owned()))?;
+                prepared
+                    .model
+                    .forward_chunked(
+                        &Array::from_slice(preamble, &[1, n]),
+                        &mut prepared.cache,
+                        self.tuning.chunked_prefill_chunk_size(),
+                    )
+                    .map_err(EngineError::Mlx)?;
+            }
+        }
+        // `deep_clone` evaluates the cache and copies the in-place KV buffers.
+        let snapshot = prepared.cache.deep_clone();
+        let key = prompt_tokens.get(..end).unwrap_or_default();
+        {
+            let mut pc = self
+                .prefix_cache
+                .lock()
+                .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
+            pc.store(key, &snapshot, checkpoint_id);
+        }
+        tracing::info!(
+            preamble_tokens = end,
+            reused_tokens = reused,
+            "Stored shared-preamble checkpoint"
+        );
+        let rest = rest.to_vec();
+        prepared.prompt_array = Array::from(rest.as_slice()).index(NewAxis);
+        prepared.actual_prompt_tokens = rest;
+        Ok(())
+    }
+
     /// Evaluate the prefill forward pass without sampling. Stores the
     /// post-prefill KV state back into the prefix cache (skipped for multimodal).
     #[allow(clippy::too_many_arguments)]
@@ -5917,6 +6024,15 @@ impl SimpleEngine {
         } else {
             // Text-only prefill: use chunked prefill for long sequences to bound
             // peak memory, otherwise single-pass with last-token-only LM head.
+            if store_prefix_cache && !capture_hidden && prefill_tap_layers.is_none() {
+                self.store_preamble_checkpoint(
+                    prompt_tokens,
+                    generation_suffix,
+                    prepared,
+                    checkpoint_id,
+                    &mut None,
+                )?;
+            }
             let seq_len = prepared.prompt_array.shape().get(1).copied().unwrap_or(0);
             let chunked_threshold = self.tuning.chunked_prefill_threshold();
             let chunked_size = self.tuning.chunked_prefill_chunk_size();
@@ -14813,6 +14929,11 @@ trait DflashSink {
         prompt_len: u32,
         completion_len: u32,
     ) -> Result<Self::Output, EngineError>;
+
+    /// Prefill done: `cached` of the `prompt_len` tokens came from the
+    /// prefix cache (reported as `cached_tokens`). Paths that do not track
+    /// reuse never call it and report 0.
+    fn prefilled(&mut self, prompt_len: u32, cached: u32) -> Result<(), EngineError>;
 }
 
 /// Buffered sink: accumulates the full output and returns a [`GenerationOutput`].
@@ -14822,6 +14943,8 @@ struct DflashBufferedSink {
     /// Set when a stop sequence truncated the output, so `finish` returns the
     /// truncated text rather than the full decode.
     truncated: Option<String>,
+    /// Prefix-cache tokens reused by the prefill (see [`DflashSink::prefilled`]).
+    cached: u32,
 }
 
 impl DflashSink for DflashBufferedSink {
@@ -14866,11 +14989,13 @@ impl DflashSink for DflashBufferedSink {
             completion_tokens: completion_len,
             token_logprobs: None,
             reasoning_content: None,
-            // DFlash doesn't track prefix-cache reuse on either the streaming
-            // or buffered path (see `DflashStreamSink::emit`, which always
-            // sends `prefill_progress: None`).
-            cached_prompt_tokens: 0,
+            cached_prompt_tokens: self.cached,
         })
+    }
+
+    fn prefilled(&mut self, _prompt_len: u32, cached: u32) -> Result<(), EngineError> {
+        self.cached = cached;
+        Ok(())
     }
 }
 
@@ -14947,6 +15072,25 @@ impl DflashSink for DflashStreamSink<'_> {
         _completion_len: u32,
     ) -> Result<(), EngineError> {
         // The terminal `finished: true` chunk was already sent by `emit`.
+        Ok(())
+    }
+
+    /// One prefill-progress event, as the AR stream sends at prefill end.
+    fn prefilled(&mut self, prompt_len: u32, cached: u32) -> Result<(), EngineError> {
+        // A dropped receiver is noticed by the next `emit`.
+        let _ = self.sender.blocking_send(StreamingOutput {
+            new_text: String::new(),
+            finished: false,
+            finish_reason: None,
+            prompt_tokens: prompt_len,
+            completion_tokens: 0,
+            token_logprob: None,
+            prefill_progress: Some(crate::engine::PrefillProgress {
+                processed: prompt_len,
+                cached,
+                total: prompt_len,
+            }),
+        });
         Ok(())
     }
 }
@@ -15301,11 +15445,22 @@ impl SimpleEngine {
     /// draft.
     fn self_spec_stock_prefill(
         &self,
+        prompt_tokens: &[u32],
         prepared: &mut PreparedGeneration<'_>,
         generation_suffix: &[u32],
         store: bool,
+        checkpoint_id: Option<&str>,
         mut drafter: Option<SelfSpecDrafter<'_>>,
     ) -> Result<(Array, Vec<Array>), EngineError> {
+        if store {
+            self.store_preamble_checkpoint(
+                prompt_tokens,
+                generation_suffix,
+                prepared,
+                checkpoint_id,
+                &mut drafter,
+            )?;
+        }
         let is_hybrid = matches!(prepared.cache, AnyCache::Hybrid(_));
         let split_at = if store && is_hybrid {
             exact_generation_body(&prepared.actual_prompt_tokens, generation_suffix)
@@ -15540,8 +15695,14 @@ impl SimpleEngine {
             }
             _ => None,
         };
-        let (logits, taps) =
-            self.self_spec_stock_prefill(&mut prepared, generation_suffix, store, prefill_drafter)?;
+        let (logits, taps) = self.self_spec_stock_prefill(
+            prompt_tokens,
+            &mut prepared,
+            generation_suffix,
+            store,
+            checkpoint_id,
+            prefill_drafter,
+        )?;
         if store {
             self.store_prefix_cache_after_prefill(
                 prompt_tokens,
@@ -15560,6 +15721,7 @@ impl SimpleEngine {
             (Some(drafter), Some(draft_cache)) => Some((drafter, draft_cache)),
             _ => None,
         };
+        sink.prefilled(prompt_len, prepared.reused_prefix_tokens)?;
         let (out, finish_reason) = self.self_spec_run(
             &mut prepared.model,
             &mut prepared.cache,
@@ -15781,9 +15943,11 @@ impl SimpleEngine {
         let prefill_sink = sender.map(install_retained_prefill_cancellation_sink);
         let (logits, taps) = self
             .self_spec_stock_prefill(
+                prompt_tokens,
                 &mut prepared,
                 self.gen_prompt_suffixes.for_request(enable_thinking),
                 false,
+                None,
                 prefill_drafter,
             )
             .map_err(|error| {
@@ -22127,6 +22291,91 @@ mod self_spec_cache_tests {
             &reference,
             "radix entry after a warm self_spec request",
         );
+    }
+
+    /// A new conversation that repeats an earlier one's system prompt reuses
+    /// it from the shared-preamble checkpoint, on the AR and self-spec routes
+    /// alike: the checkpoint is the stock prefill of the preamble, and the
+    /// warm output equals the same request with an empty cache.
+    #[test]
+    #[ignore = "needs HIGGS_CLOVER_FIXTURE_DIR (loads the 4-layer Clover slice)"]
+    fn new_conversation_reuses_the_shared_system_preamble() {
+        let Some(engine) = slice_engine() else {
+            return;
+        };
+        let system = ChatMessage {
+            role: "system".to_owned(),
+            content: "You are a careful coding agent. Read files before editing them, \
+                      run the tests after every change, and report what you verified. "
+                .repeat(24),
+            reasoning_content: None,
+            tool_calls: None,
+        };
+        let prompt = |question: &str| {
+            engine
+                .prepare_chat_prompt_with_thinking(&[system.clone(), user(question)], None, false)
+                .unwrap()
+        };
+        let first = prompt("Summarize the ocean's role in the climate.");
+        let second = prompt("List three rivers in Europe and their lengths, as a table.");
+        let preamble_end = engine.system_preamble_end(&first).expect("system preamble");
+        let checkpoint = preamble_end / 32 * 32;
+        assert!(checkpoint >= super::PREAMBLE_CHECKPOINT_MIN_TOKENS);
+        assert_eq!(first[..checkpoint], second[..checkpoint]);
+
+        for params in [
+            self_spec_params(),
+            SamplingParams {
+                temperature: 0.0,
+                speculation: Speculation::None,
+                ..SamplingParams::default()
+            },
+        ] {
+            let run = |prompt: &[u32]| {
+                engine
+                    .generate_with_thinking(
+                        prompt,
+                        MAX_NEW,
+                        &params,
+                        &[],
+                        false,
+                        None,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap()
+            };
+            engine.clear_prefix_cache();
+            let cold_second = run(&second).text;
+
+            engine.clear_prefix_cache();
+            run(&first);
+            let (stored_len, stored) = radix_entry(&engine, &second);
+            assert_eq!(
+                stored_len, checkpoint,
+                "{:?}: preamble entry",
+                params.speculation
+            );
+            assert_bit_identical(
+                &stored,
+                &stock_prefill(&engine, &[&first[..checkpoint]]),
+                "shared-preamble checkpoint",
+            );
+            let warm = run(&second);
+            assert_eq!(
+                warm.cached_prompt_tokens,
+                u32::try_from(checkpoint).unwrap(),
+                "{:?}: the second conversation starts from the preamble",
+                params.speculation
+            );
+            assert_eq!(
+                warm.text, cold_second,
+                "{:?}: reuse must not change the output",
+                params.speculation
+            );
+        }
     }
 
     #[test]
