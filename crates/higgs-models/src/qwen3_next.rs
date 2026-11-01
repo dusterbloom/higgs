@@ -4182,8 +4182,15 @@ fn coreset_router_logits(logits: &Array, top_k: i32, top_p: f32) -> Result<Array
 /// differently. Verified on M4 in `tests/moe_gather_append_stable.rs`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum MoeGatherKernel {
-    /// Default: `gather_qmv` at every size. Fastest decode and short batches;
-    /// long prefill ~1.6x slower than the MMA kernels.
+    /// Default: [`Self::Mma`] from [`MOE_MMA_MIN_TOKENS`] tokens up,
+    /// [`Self::Qmv`] below. MLX's dense `quantized_matmul` switches from qmv
+    /// to qmm by row count the same way, so a continuation tail at or past
+    /// both switches is bit-identical to the same rows of a cold prefill,
+    /// while decode and short verify blocks keep the fast matvec. Clover/M4:
+    /// expert gathers 71.4 -> 25.7 ms per layer per 1024-token chunk.
+    Auto,
+    /// `HIGGS_MOE_GATHER_KERNEL=qmv`: `gather_qmv` at every size. Fastest
+    /// decode and short batches; long prefill ~2.8x slower than MMA.
     Qmv,
     /// `HIGGS_MOE_GATHER_KERNEL=mma`: MMA family. `gather_qmm_rhs` (padded to
     /// `4 * experts` rows) from `experts / 4` rows up, below that one steel
@@ -4213,11 +4220,23 @@ fn moe_gather_kernel() -> MoeGatherKernel {
             .is_ok_and(|v| v.trim().eq_ignore_ascii_case("native"))
         {
             MoeGatherKernel::Native
-        } else {
+        } else if std::env::var("HIGGS_MOE_GATHER_KERNEL")
+            .is_ok_and(|v| v.trim().eq_ignore_ascii_case("qmv"))
+        {
             MoeGatherKernel::Qmv
+        } else {
+            MoeGatherKernel::Auto
         }
     })
 }
+
+/// [`MoeGatherKernel::Auto`] runs the MMA family from this many tokens up.
+/// ponytail: MLX's dense qmv batch limit (`get_qmv_batch_limit`) for
+/// projections up to 2048 x 2048 on M3/M4-class GPUs, where Clover's dense
+/// layers turn exact; Ultra's limit (32) is above it, so nothing regresses
+/// there. On M1/M2 (limit 14) 14-17-token tails lose bit-exactness; read
+/// the device architecture (`mlx_device_info`) if that ever matters.
+const MOE_MMA_MIN_TOKENS: i32 = 18;
 
 /// Steel `gather_qmm` tile height: MLX's `BM`, and >= every
 /// `get_qmv_batch_limit` (max 32), so a tile never falls back to `gather_qmv`.
@@ -4233,11 +4252,23 @@ struct MoeGatherLayout {
 
 impl MoeGatherLayout {
     /// `x_sorted` `[rows, 1, D]` and `idx_sorted` `[rows]` are the routed rows
-    /// in expert order.
-    fn new(x_sorted: &Array, idx_sorted: &Array, num_experts: i32) -> Result<Self, Exception> {
+    /// of `tokens` tokens in expert order.
+    fn new(
+        x_sorted: &Array,
+        idx_sorted: &Array,
+        num_experts: i32,
+        tokens: i32,
+    ) -> Result<Self, Exception> {
         let rows = idx_sorted.dim(0);
         let d = x_sorted.dim(-1);
-        let kernel = moe_gather_kernel();
+        let kernel = match moe_gather_kernel() {
+            MoeGatherKernel::Auto if tokens >= MOE_MMA_MIN_TOKENS => MoeGatherKernel::Mma,
+            MoeGatherKernel::Auto => MoeGatherKernel::Qmv,
+            kernel @ (MoeGatherKernel::Qmv
+            | MoeGatherKernel::Mma
+            | MoeGatherKernel::PaddedRhs
+            | MoeGatherKernel::Native) => kernel,
+        };
         if matches!(kernel, MoeGatherKernel::Qmv | MoeGatherKernel::Native) {
             return Ok(Self {
                 x: x_sorted.clone(),
@@ -6506,7 +6537,7 @@ impl SwitchMlpWeights {
             .shape()
             .first()
             .ok_or_else(|| Exception::custom("expert weight has no expert dimension"))?;
-        let layout = MoeGatherLayout::new(&x_sorted, &idx_sorted, num_experts)?;
+        let layout = MoeGatherLayout::new(&x_sorted, &idx_sorted, num_experts, b * l)?;
         let gather = |input: &Array, proj: &QLinear| {
             gather_qmm(
                 input,
@@ -6589,7 +6620,7 @@ impl SwitchMlpWeights {
             .shape()
             .first()
             .ok_or_else(|| Exception::custom("expert weight has no expert dimension"))?;
-        let layout = MoeGatherLayout::new(&x_sorted, &idx_sorted, num_experts)?;
+        let layout = MoeGatherLayout::new(&x_sorted, &idx_sorted, num_experts, b * l)?;
 
         // --- Fused gate+up: ONE gather_qmm instead of TWO ---
         let fused_out = gather_qmm(

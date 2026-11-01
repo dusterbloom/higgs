@@ -29,6 +29,7 @@ fn quantized(shape: &[i32], seed: u64) -> (Array, Array, Array) {
 #[test]
 fn short_tails_match_same_rows_inside_long_sequence() {
     for (var, value) in [
+        ("HIGGS_MOE_GATHER_KERNEL", "auto"),
         ("HIGGS_MOE_GATHER_KERNEL", "qmv"),
         ("HIGGS_MOE_GATHER_KERNEL", "mma"),
         ("HIGGS_MOE_GATHER_PAD", "1"),
@@ -48,9 +49,12 @@ fn short_tails_match_same_rows_inside_long_sequence() {
 #[ignore = "run once per kernel mode by short_tails_match_same_rows_inside_long_sequence"]
 fn append_stability_contract() {
     // 64 experts. Under `mma` the 1- and 3-token tails (2 and 6 rows) take
-    // one steel tile per row, the 9- and 20-token tails `gather_qmm_rhs`
+    // one steel tile per row, the 9- to 100-token tails `gather_qmm_rhs`
     // padded to 4 * E = 256 rows, and the 160-token domain (320 rows)
-    // unpadded `gather_qmm_rhs`.
+    // unpadded `gather_qmm_rhs`. `auto` (the default) runs MMA from 18 tokens
+    // up and qmv below, so only its tails from 18 tokens must match the MMA
+    // rows of the long domain, like MLX's own dense qmv -> qmm switch.
+    let auto = std::env::var("HIGGS_MOE_GATHER_KERNEL").is_ok_and(|v| v == "auto");
     let (num_experts, hidden, top_k, long_len) = (64_u32, 64, 2, 160);
     let e = num_experts as i32;
     let mut block = SwitchMlpGather::new(
@@ -77,7 +81,10 @@ fn append_stability_contract() {
     let long_out = block.forward(&long, &long_indices).unwrap();
     let long_fused = block.forward_fused(&long, &long_indices).unwrap();
 
-    for tail_len in [1, 3, 9, 20] {
+    for tail_len in [1, 3, 9, 17, 18, 20, 33, 57, 100] {
+        if auto && tail_len < 18 {
+            continue;
+        }
         let start = long_len - tail_len;
         let tail_out = block
             .forward(
