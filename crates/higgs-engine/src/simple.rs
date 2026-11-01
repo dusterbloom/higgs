@@ -1214,9 +1214,10 @@ enum SpeculationRoute {
     Autoregressive,
 }
 
-/// Self-speculation is exact greedy only; anything else decodes autoregressively.
+/// Self-speculation is exact greedy (penalties apply per verify row);
+/// sampling decodes autoregressively.
 fn self_spec_greedy(params: &SamplingParams) -> bool {
-    params.temperature <= f32::EPSILON && !params.has_penalties()
+    params.temperature <= f32::EPSILON
 }
 
 fn paired_dflash_exact_domain(params: &SamplingParams, thinking_enabled: bool) -> bool {
@@ -7639,6 +7640,8 @@ impl SimpleEngine {
         timing: bool,
         total_start: std::time::Instant,
     ) -> Result<SessionGeneration, EngineError> {
+        let params = self.with_pack_penalties(params);
+        let params = &*params;
         // Opportunistic idle eviction: free retained caches abandoned longer than
         // the configured TTL. Cheap (bounded by max_retained_sessions) and runs
         // on each cache-resident request, so memory is reclaimed without a
@@ -7782,6 +7785,7 @@ impl SimpleEngine {
                 prompt_tokens,
                 max_tokens,
                 enable_thinking,
+                self.clover_spec_penalties(params, enable_thinking),
                 sender,
                 continuation_policy,
                 acceptance,
@@ -10220,6 +10224,8 @@ impl SimpleEngine {
         pflash_policy: &PFlashPromptPolicy,
         allow_prefix_cache: bool,
     ) -> Result<GenerationOutput, EngineError> {
+        let params = self.with_pack_penalties(params);
+        let params = &*params;
         let thinking_budget = params
             .thinking_budget
             .unwrap_or_else(|| self.default_thinking_budget());
@@ -10280,6 +10286,7 @@ impl SimpleEngine {
                 max_tokens,
                 stop_sequences,
                 enable_thinking,
+                self.clover_spec_penalties(params, enable_thinking),
                 checkpoint_id,
                 allow_prefix_cache,
                 DflashBufferedSink::default(),
@@ -13779,6 +13786,8 @@ impl SimpleEngine {
         pflash_policy: &PFlashPromptPolicy,
         allow_prefix_cache: bool,
     ) -> Result<(), EngineError> {
+        let params = self.with_pack_penalties(params);
+        let params = &*params;
         let thinking_budget = params
             .thinking_budget
             .unwrap_or_else(|| self.default_thinking_budget());
@@ -13849,6 +13858,7 @@ impl SimpleEngine {
                 max_tokens,
                 stop_sequences,
                 enable_thinking,
+                self.clover_spec_penalties(params, enable_thinking),
                 checkpoint_id,
                 allow_prefix_cache,
                 DflashStreamSink { sender, detok },
@@ -14995,9 +15005,13 @@ impl<M: higgs_models::clover::SpecModel> higgs_models::clover::SpecModel for Tim
         Ok(drafts)
     }
 
-    fn verify(&mut self, tokens: &Array) -> Result<Vec<u32>, mlx_rs::error::Exception> {
+    fn verify(
+        &mut self,
+        tokens: &Array,
+        penalize: &higgs_models::clover::Penalize<'_>,
+    ) -> Result<Vec<u32>, mlx_rs::error::Exception> {
         let t = std::time::Instant::now();
-        let next = self.inner.verify(tokens)?;
+        let next = self.inner.verify(tokens, penalize)?;
         self.phases[1] += t.elapsed();
         Ok(next)
     }
@@ -15185,6 +15199,49 @@ impl SimpleEngine {
 type SelfSpecDrafter<'a> = (&'a mut DFlashDrafter, &'a mut DFlashCache, &'a [usize]);
 
 impl SimpleEngine {
+    /// Clover's pack penalties (`generation_config.json`) as the request
+    /// defaults, so every decode path runs the model card's controls; request
+    /// values override them. Other models pass through.
+    fn with_pack_penalties<'a>(&self, params: &'a SamplingParams) -> Cow<'a, SamplingParams> {
+        let Some(clover) = &self.clover else {
+            return Cow::Borrowed(params);
+        };
+        let pack = &clover.penalties;
+        let mut params = params.clone();
+        params.presence_penalty.get_or_insert(pack.presence);
+        params.frequency_penalty.get_or_insert(pack.frequency);
+        params.repetition_penalty.get_or_insert(pack.repetition);
+        Cow::Owned(params)
+    }
+
+    /// Self-speculation penalties: the pack's ramps with the request's
+    /// presence / frequency / repetition. The think-end ramp needs an open
+    /// `<think>`: without thinking the template already closed it.
+    fn clover_spec_penalties(
+        &self,
+        params: &SamplingParams,
+        enable_thinking: bool,
+    ) -> higgs_models::clover::CloverPenalties {
+        let mut p = self
+            .clover
+            .as_ref()
+            .map(|c| c.penalties.clone())
+            .unwrap_or_default();
+        if let Some(v) = params.presence_penalty {
+            p.presence = v;
+        }
+        if let Some(v) = params.frequency_penalty {
+            p.frequency = v;
+        }
+        if let Some(v) = params.repetition_penalty {
+            p.repetition = v;
+        }
+        if !enable_thinking {
+            p.think_end_bias = 0.0;
+        }
+        p
+    }
+
     /// Self-speculation drafts with the loaded `DFlash` drafter when there is
     /// one (`HIGGS_CLOVER_SPEC_DRAFTER=preview` keeps the block preview).
     fn self_spec_dflash(&self) -> Option<&DFlashState> {
@@ -15295,6 +15352,7 @@ impl SimpleEngine {
         drafter: Option<(&mut DFlashDrafter, DFlashCache)>,
         taps: Vec<Array>,
         logits: &Array,
+        penalties: higgs_models::clover::CloverPenalties,
         max_tokens: u32,
         stop_sequences: &[String],
         prompt_len: u32,
@@ -15343,6 +15401,9 @@ impl SimpleEngine {
             } else {
                 higgs_models::clover::PREVIEW_CYCLE_BASE_ROWS
             },
+            penalties,
+            vocab,
+            pad_token_id: clover.pad_token_id,
         };
         let trace = std::env::var("HIGGS_CLOVER_SPEC_TRACE").is_ok_and(|v| v == "1");
 
@@ -15450,7 +15511,8 @@ impl SimpleEngine {
     /// exactly as the AR path stores it, before the first verify. Decode then
     /// runs [`higgs_models::clover::self_spec_decode`] on the local copy: its
     /// fast-rows verify rows are not append-stable and never reach the shared
-    /// cache. `PFlash` and thinking budgets are not applied in this mode.
+    /// cache. `PFlash` and thinking budgets are not applied in this mode; the pack's
+    /// think-end ramp bounds thinking instead.
     #[allow(clippy::too_many_arguments)]
     fn self_spec_generate<S: DflashSink>(
         &self,
@@ -15458,6 +15520,7 @@ impl SimpleEngine {
         max_tokens: u32,
         stop_sequences: &[String],
         enable_thinking: bool,
+        penalties: higgs_models::clover::CloverPenalties,
         checkpoint_id: Option<&str>,
         allow_prefix_cache: bool,
         mut sink: S,
@@ -15503,6 +15566,7 @@ impl SimpleEngine {
             decode_drafter,
             taps,
             &logits,
+            penalties,
             max_tokens,
             stop_sequences,
             prompt_len,
@@ -15587,6 +15651,7 @@ impl SimpleEngine {
         prompt_tokens: &[u32],
         max_tokens: u32,
         enable_thinking: bool,
+        penalties: higgs_models::clover::CloverPenalties,
         sender: Option<&tokio::sync::mpsc::Sender<StreamingOutput>>,
         continuation_policy: SessionContinuationPolicy,
         mut acceptance: Option<SessionStreamAcceptance>,
@@ -15759,6 +15824,7 @@ impl SimpleEngine {
                     decode_drafter,
                     taps,
                     &logits,
+                    penalties,
                     max_tokens,
                     &[],
                     total,
@@ -15776,6 +15842,7 @@ impl SimpleEngine {
                 decode_drafter,
                 taps,
                 &logits,
+                penalties,
                 max_tokens,
                 &[],
                 total,

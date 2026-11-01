@@ -258,21 +258,84 @@ impl PenaltyState {
         eval([&self.counts, &self.seen])
     }
 
-    /// Apply the reference's operation order to fresh `[S, V]` f32 logits:
-    /// frequency, presence, repetition, length ramp, think-end ramp.
-    #[allow(clippy::float_cmp)]
+    /// Block-diffusion penalties on fresh `[S, V]` f32 logits: every row sees
+    /// the committed response only, and the think-end ramp is off once the
+    /// close token is committed or visible anywhere in the block.
     fn apply(&self, fresh: Array, block: &[u32], mask_id: u32) -> Result<Array, Exception> {
         if !self.active {
             return Ok(fresh);
         }
+        let open = self.p.think_end_token.is_some_and(|close| {
+            !(self.committed_close || block.iter().any(|&t| t != mask_id && t == close))
+        });
+        let gate = open.then(|| Array::from_f32(1.0));
+        self.penalize(fresh, &self.counts, &self.seen, block.len(), gate)
+    }
+
+    /// Causal penalties on fresh `[k + 1, V]` f32 verify logits of
+    /// `[pending, drafts...]`: row `i` predicts the token after the committed
+    /// response plus `drafts[..i]`, so its counts and think-end state include
+    /// those drafts and a per-row argmax equals sequential penalised decoding.
+    /// `drafts` (`[k]` u32) stays lazy, keeping the draft/verify overlap.
+    fn apply_causal(&self, raw: Array, drafts: &Array) -> Result<Array, Exception> {
+        if !self.active {
+            return Ok(raw);
+        }
+        let fresh = raw.as_dtype(mlx_rs::Dtype::Float32)?;
+        let k = drafts.dim(0);
+        let rows = usize::try_from(k + 1).map_err(|_| Exception::custom("draft rows"))?;
+        let ids = drafts.as_dtype(mlx_rs::Dtype::Int32)?.reshape(&[k, 1])?;
+        let one_hot = ops::arange::<_, i32>(0, self.vocab, 1)?
+            .eq(&ids)?
+            .as_dtype(mlx_rs::Dtype::Float32)?;
+        // Row i adds the drafts before it: a zero row, then the inclusive cumsum.
+        let before = ops::concatenate_axis(&[&ops::zeros::<f32>(&[1, self.vocab])?, &one_hot], 0)?
+            .cumsum(0, None, None)?;
+        let counts = before.add(&self.counts)?;
+        let seen = counts.gt(Array::from_f32(0.0))?;
+        let gate = match self.p.think_end_token {
+            Some(close) if !self.committed_close && self.close_column.is_some() => {
+                let closes = drafts.eq(Array::from_slice(&[close], &[1]))?;
+                let closed = ops::concatenate_axis(
+                    &[
+                        &ops::zeros::<f32>(&[1])?,
+                        &closes.as_dtype(mlx_rs::Dtype::Float32)?,
+                    ],
+                    0,
+                )?
+                .cumsum(0, None, None)?;
+                Some(
+                    closed
+                        .eq(Array::from_f32(0.0))?
+                        .as_dtype(mlx_rs::Dtype::Float32)?
+                        .reshape(&[k + 1, 1])?,
+                )
+            }
+            _ => None,
+        };
+        self.penalize(fresh, &counts, &seen, rows, gate)
+    }
+
+    /// The reference's operation order: frequency, presence, repetition,
+    /// length ramp, think-end ramp. `counts` / `seen` broadcast against the
+    /// `rows` rows; `think_gate` (`None` = off) scales the think-end ramp.
+    #[allow(clippy::float_cmp)]
+    fn penalize(
+        &self,
+        fresh: Array,
+        counts: &Array,
+        seen: &Array,
+        rows: usize,
+        think_gate: Option<Array>,
+    ) -> Result<Array, Exception> {
         let p = &self.p;
         let mut logits = fresh;
         if p.frequency != 0.0 {
-            logits = logits.subtract(self.counts.multiply(Array::from_f32(p.frequency))?)?;
+            logits = logits.subtract(counts.multiply(Array::from_f32(p.frequency))?)?;
         }
         if p.presence != 0.0 {
-            let seen = self.seen.as_dtype(mlx_rs::Dtype::Float32)?;
-            logits = logits.subtract(seen.multiply(Array::from_f32(p.presence))?)?;
+            let presence = seen.as_dtype(mlx_rs::Dtype::Float32)?;
+            logits = logits.subtract(presence.multiply(Array::from_f32(p.presence))?)?;
         }
         if p.repetition != 1.0 {
             let r = Array::from_f32(p.repetition);
@@ -281,9 +344,8 @@ impl PenaltyState {
                 &logits.multiply(&r)?,
                 &logits.divide(&r)?,
             )?;
-            logits = ops::r#where(&self.seen.expand_dims(0)?, &penalised, &logits)?;
+            logits = ops::r#where(seen, &penalised, &logits)?;
         }
-        let rows = block.len();
         if let Some(columns) = &self.stop_columns {
             let bias = ramp(
                 self.length,
@@ -294,18 +356,15 @@ impl PenaltyState {
             );
             logits = logits.add(bias.multiply(columns)?)?;
         }
-        if let (Some(column), Some(close)) = (&self.close_column, p.think_end_token) {
-            let visible = block.iter().any(|&t| t != mask_id && t == close);
-            if !(self.committed_close || visible) {
-                let bias = ramp(
-                    self.length,
-                    rows,
-                    p.think_end_start,
-                    p.think_end_window,
-                    p.think_end_bias,
-                );
-                logits = logits.add(bias.multiply(column)?)?;
-            }
+        if let (Some(column), Some(gate)) = (&self.close_column, think_gate) {
+            let bias = ramp(
+                self.length,
+                rows,
+                p.think_end_start,
+                p.think_end_window,
+                p.think_end_bias,
+            );
+            logits = logits.add(bias.multiply(gate)?.multiply(column)?)?;
         }
         Ok(logits)
     }
@@ -457,11 +516,15 @@ pub trait SpecModel {
     fn draft(&mut self, pending: u32, max: usize) -> Result<Array, Exception>;
     /// Causal forward of the `[rows]` u32 `tokens` into the state,
     /// tentatively; the greedy next token after each row (`out[i]` follows
-    /// `tokens[..=i]`).
-    fn verify(&mut self, tokens: &Array) -> Result<Vec<u32>, Exception>;
+    /// `tokens[..=i]`) of `penalize(logits)`, `logits` being the `[rows, V]`
+    /// verify logits. `penalize` stays inside the verify's eval.
+    fn verify(&mut self, tokens: &Array, penalize: &Penalize<'_>) -> Result<Vec<u32>, Exception>;
     /// Keep the first `n` rows of the last [`Self::verify`], drop the rest.
     fn keep(&mut self, n: usize) -> Result<(), Exception>;
 }
+
+/// Logits processor a [`SpecModel::verify`] applies before its argmax.
+pub type Penalize<'a> = dyn Fn(Array) -> Result<Array, Exception> + 'a;
 
 /// One self-speculative request.
 #[derive(Debug, Clone)]
@@ -477,6 +540,12 @@ pub struct SelfSpecConfig {
     /// the candidates' rates are nearly equal, so the choice is robust to
     /// the estimate's noise.
     pub cycle_base_rows: f32,
+    /// Response penalties and ramps, applied causally per verify row.
+    pub penalties: CloverPenalties,
+    /// Vocabulary size of the verify logits.
+    pub vocab: i32,
+    /// Pad id; joins the EOS ids as a target of the length ramp.
+    pub pad_token_id: Option<u32>,
 }
 
 /// Block preview drafting: a preview block must divide the trained block.
@@ -541,12 +610,16 @@ pub struct SelfSpecOutput {
 ///
 /// Each cycle drafts the tokens after `pending`, verifies
 /// `[pending, drafts...]` causally, keeps the drafts that match the causal
-/// argmax plus the causal token after them. The output is the verify pass's
+/// (penalised) argmax plus the causal token after them. Row `i`'s penalties
+/// see the response through `drafts[..i]`, so with penalties the output is
+/// still sequential penalised greedy decoding. The output is the verify pass's
 /// greedy sequence whatever the drafts are; the multi-row verify rounds
 /// differently from a one-row decode step, so near-tied tokens can differ
 /// from plain AR decoding.
 ///
 /// `first` is the greedy token after the prompt (not yet in the state).
+/// ponytail: `first` is taken unpenalised: an empty response has no counts
+/// and the ramps start past position 1 for any pack seen so far.
 /// `on_tokens` receives each cycle's new tokens and returns `true` to stop.
 // Indices are bounded by construction: `rows >= 2`, `k <= rows - 1` and
 // `verify` returns one prediction per row.
@@ -565,7 +638,11 @@ where
     if cfg.max_new_tokens == 0 {
         return Ok(out);
     }
+    let mut stop_ids = cfg.eos_token_ids.clone();
+    stop_ids.extend(cfg.pad_token_id);
+    let mut penalties = PenaltyState::new(cfg.penalties.clone(), cfg.vocab, &stop_ids)?;
     out.tokens.push(first);
+    penalties.commit(&[first])?;
     out.hit_eos = cfg.eos_token_ids.contains(&first);
     out.stopped_by_caller = on_tokens(&[first]);
     let mut pending = first;
@@ -593,7 +670,7 @@ where
             )));
         }
         let block = ops::concatenate_axis(&[&Array::from_slice(&[pending], &[1]), &drafts], 0)?;
-        let next = model.verify(&block)?;
+        let next = model.verify(&block, &|logits| penalties.apply_causal(logits, &drafts))?;
         if next.len() != k + 1 {
             return Err(Exception::custom(format!(
                 "verify returned {} predictions for {} rows",
@@ -636,6 +713,7 @@ where
             out.hit_eos = true;
         }
         out.tokens.extend_from_slice(&new);
+        penalties.commit(&new)?;
         out.stopped_by_caller = on_tokens(&new);
     }
     Ok(out)
@@ -656,6 +734,7 @@ fn verify_rows(
     cache: &mut AnyCache,
     tokens: &Array,
     tap_layers: &[usize],
+    penalize: &Penalize<'_>,
 ) -> Result<VerifyRows, Exception> {
     let input = tokens.reshape(&[1, -1])?;
     let (logits, taps, tapes) = crate::qwen3_next::with_fast_rows(|| {
@@ -668,7 +747,9 @@ fn verify_rows(
             crate::qwen3_next::DFlashRowSchedule::NativeBatch,
         )
     })?;
-    let next = ops::indexing::argmax_axis(&logits, -1, None)?.as_dtype(mlx_rs::Dtype::Uint32)?;
+    let rows = tokens.dim(0);
+    let penalized = penalize(logits.reshape(&[rows, -1])?)?;
+    let next = ops::indexing::argmax_axis(&penalized, -1, None)?.as_dtype(mlx_rs::Dtype::Uint32)?;
     eval([&next])?;
     Ok((next.as_slice::<u32>().to_vec(), taps, tapes))
 }
@@ -741,8 +822,8 @@ impl SpecModel for AnyModelSpec<'_> {
         .as_dtype(mlx_rs::Dtype::Uint32)
     }
 
-    fn verify(&mut self, tokens: &Array) -> Result<Vec<u32>, Exception> {
-        let (next, _, tapes) = verify_rows(self.model, self.cache, tokens, &[])?;
+    fn verify(&mut self, tokens: &Array, penalize: &Penalize<'_>) -> Result<Vec<u32>, Exception> {
+        let (next, _, tapes) = verify_rows(self.model, self.cache, tokens, &[], penalize)?;
         self.tapes = tapes;
         self.rows = next.len();
         Ok(next)
@@ -959,8 +1040,9 @@ impl SpecModel for DFlashSpec<'_> {
         tokens.index(0).as_dtype(mlx_rs::Dtype::Uint32)
     }
 
-    fn verify(&mut self, tokens: &Array) -> Result<Vec<u32>, Exception> {
-        let (next, taps, tapes) = verify_rows(self.model, self.cache, tokens, &self.tap_layers)?;
+    fn verify(&mut self, tokens: &Array, penalize: &Penalize<'_>) -> Result<Vec<u32>, Exception> {
+        let (next, taps, tapes) =
+            verify_rows(self.model, self.cache, tokens, &self.tap_layers, penalize)?;
         self.taps.record(taps);
         self.tapes = tapes;
         self.rows = next.len();
