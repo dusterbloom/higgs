@@ -780,17 +780,16 @@ async fn chat_completions_non_streaming(
     let required_call = tool_choice.requires_call();
     let required_name = tool_choice.required_name.clone();
     let thinking_enabled = (engine.forces_thinking()
-        || crate::reasoning::effective_thinking_enabled(
+        || request_thinking(
             engine.enable_thinking(),
             &[engine.model_name(), req.model.as_str()],
             req.reasoning.as_ref(),
+            req.reasoning_effort.as_deref(),
             req.chat_template_kwargs
                 .as_ref()
                 .and_then(|k| k.enable_thinking)
-                .or(req.enable_thinking)
-                .or(generation_defaults.enable_thinking),
-            // A required-call grammar starts with visible `<tool_call>` text. Leaving
-            // the template inside `<think>` would classify the entire call as reasoning.
+                .or(req.enable_thinking),
+            generation_defaults.enable_thinking,
         ))
         && !tool_choice.requires_call();
 
@@ -1362,16 +1361,16 @@ async fn chat_completions_stream(
 
     let messages = convert_messages(&effective_messages);
     let thinking_enabled_stream = (engine.forces_thinking()
-        || crate::reasoning::effective_thinking_enabled(
+        || request_thinking(
             engine.enable_thinking(),
             &[engine.model_name(), req.model.as_str()],
             req.reasoning.as_ref(),
+            req.reasoning_effort.as_deref(),
             req.chat_template_kwargs
                 .as_ref()
                 .and_then(|k| k.enable_thinking)
-                .or(req.enable_thinking)
-                .or(generation_defaults.enable_thinking),
-            // Keep the forced envelope in visible output for the streaming parser too.
+                .or(req.enable_thinking),
+            generation_defaults.enable_thinking,
         ))
         && !tool_choice.requires_call();
 
@@ -2205,6 +2204,37 @@ fn build_sampling_params(
     })
 }
 
+/// Thinking for a chat request: the request's explicit `enable_thinking`
+/// (`requested`) wins, then its reasoning effort (`reasoning.effort`, else
+/// Chat Completions `reasoning_effort`), then the model's
+/// `generation_defaults.enable_thinking`. A server default never overrides
+/// what the request asked for.
+fn request_thinking(
+    thinking_supported: bool,
+    model_names: &[&str],
+    reasoning: Option<&crate::types::openai::ReasoningConfig>,
+    reasoning_effort: Option<&str>,
+    requested: Option<bool>,
+    model_default: Option<bool>,
+) -> bool {
+    let effort = reasoning.cloned().or_else(|| {
+        reasoning_effort.map(|effort| crate::types::openai::ReasoningConfig {
+            effort: Some(effort.to_owned()),
+        })
+    });
+    let explicit = requested.or(if effort.is_some() {
+        None
+    } else {
+        model_default
+    });
+    crate::reasoning::effective_thinking_enabled(
+        thinking_supported,
+        model_names,
+        effort.as_ref(),
+        explicit,
+    )
+}
+
 fn resolved_max_tokens(
     req: &ChatCompletionRequest,
     defaults: &GenerationDefaults,
@@ -2620,6 +2650,55 @@ mod tests {
             dst.extend(src.clone());
         }
         serde_json::from_value(request).unwrap()
+    }
+
+    /// The request decides thinking before the model default: its explicit
+    /// toggle, then either effort field (`reasoning` first), then the default.
+    #[test]
+    fn request_thinking_precedence() {
+        let thinking = |extra: serde_json::Value, model_default: Option<bool>| {
+            let req = chat_request(extra);
+            request_thinking(
+                true,
+                &["test"],
+                req.reasoning.as_ref(),
+                req.reasoning_effort.as_deref(),
+                req.chat_template_kwargs
+                    .as_ref()
+                    .and_then(|k| k.enable_thinking)
+                    .or(req.enable_thinking),
+                model_default,
+            )
+        };
+        use serde_json::json;
+        assert!(thinking(json!({"reasoning_effort": "high"}), Some(false)));
+        assert!(thinking(
+            json!({"reasoning": {"effort": "low"}}),
+            Some(false)
+        ));
+        assert!(!thinking(
+            json!({"reasoning": {"effort": "none"}, "reasoning_effort": "high"}),
+            None
+        ));
+        assert!(!thinking(
+            json!({"reasoning_effort": "high", "enable_thinking": false}),
+            None
+        ));
+        assert!(!thinking(
+            json!({"reasoning_effort": "high", "chat_template_kwargs": {"enable_thinking": false}}),
+            Some(true)
+        ));
+        assert!(thinking(json!({}), Some(true)));
+        assert!(!thinking(json!({}), Some(false)));
+        assert!(!thinking(json!({}), None));
+        assert!(!request_thinking(
+            false,
+            &["test"],
+            None,
+            Some("high"),
+            Some(true),
+            Some(true)
+        ));
     }
 
     #[test]

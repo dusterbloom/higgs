@@ -39,6 +39,7 @@ This document collects the full CLI, environment, and config-file reference for 
 ### Additional environment toggles
 
 - `HIGGS_ENABLE_THINKING=0|1` forces Qwen thinking on or off.
+- Per request (OpenAI chat), thinking follows the request first: `chat_template_kwargs.enable_thinking` / `enable_thinking` win, then a reasoning effort (`reasoning.effort`, or the Chat Completions `reasoning_effort` field; `"none"` turns it off), and only then the model's `generation_defaults.enable_thinking`. Clover needs thinking for reliable tool calls.
 - `HIGGS_CHUNKED_PREFILL_THRESHOLD` enables chunked prefill above a token threshold.
 - `HIGGS_CHUNKED_PREFILL_CHUNK_SIZE` controls chunk size during chunked prefill.
 - `HIGGS_MTP=0|1` overrides the tuning profile's speculative decode choice when conditions allow.
