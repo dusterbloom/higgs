@@ -55,6 +55,10 @@ kv_disk_space_mb = 4096
 
 Serve a model from Hugging Face (downloaded on first use):
 
+Experimental native LFM3-1.7B support is available for the official
+`LiquidAI/LFM3-1.7B-MLX-4bit` checkpoint. See the [LFM3 notes](docs/models.md#lfm3-notes)
+for the tested scope, launch command, and numerical validation limits.
+
 Legacy `disk_cache_enabled = true` and optional `disk_cache_path` still work with
 no file-byte ceiling. `kv_disk_dir` cannot be combined with `disk_cache_path`.
 Run `higgs doctor` to check settings and directory access.

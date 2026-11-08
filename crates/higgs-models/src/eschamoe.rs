@@ -1562,10 +1562,8 @@ fn convert_checkpoint_impl(
                                     affine_target,
                                 )
                             };
-                            made.extend(triple_entries(
-                                module,
-                                quantize_affine_named(module, &value, target)?,
-                            ));
+                            let triple = quantize_affine_named(module, &value, target)?;
+                            made.extend(triple_entries(module, triple));
                         }
                         // Escha keeps the GDN conv1d weight in the PyTorch
                         // sequence `[out, in/groups, kernel]`. MLX needs the

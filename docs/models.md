@@ -25,6 +25,7 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 | Starcoder2 | `starcoder2` | Starcoder2 3B, 7B, and 15B |
 | DeepSeek-V2 | `deepseek_v2` | DeepSeek-V2-Lite |
 | LFM2-MoE | `lfm2_moe` | LiquidAI LFM2.5-24B-A2B |
+| LFM3 (experimental) | `lfm3` | LiquidAI LFM3-1.7B-MLX-4bit |
 | LLaVA-Qwen2 | `llava-qwen2` | nanoLLaVA-1.5 |
 | Architecture | `model_type` | Examples | Vision |
 |---|---|---|---|
@@ -47,6 +48,7 @@ Higgs detects local model support from `config.json` `model_type`. The tables be
 | Starcoder2 | `starcoder2` | Starcoder2 3B, 7B, and 15B | none |
 | DeepSeek-V2 | `deepseek_v2` | DeepSeek-V2-Lite | none |
 | LFM2-MoE | `lfm2_moe` | LiquidAI LFM2.5-24B-A2B | none |
+| LFM3 (experimental) | `lfm3` | LiquidAI LFM3-1.7B-MLX-4bit | none |
 | LLaVA-Qwen2 | `llava-qwen2` | nanoLLaVA-1.5 | supported |
 
 † `higgs doctor` reports vision at the adapter level. A multimodal `gemma3` /
@@ -59,6 +61,56 @@ pan-and-scan image input; `gemma3_text` / `gemma4_text` checkpoints show
 describes a text-only backbone; the vision tower bundled with the base
 Qwen3.8-27B model is not part of this Q2 pack, so there is nothing for Higgs
 to skip. See [Bonsai-2 Hadamard Q2 notes](#bonsai-2-hadamard-q2-notes) below.
+
+### LFM3 notes
+
+The native `lfm3` path supports ordinary single-request text prefill, incremental
+decode, and streamed chat with the official `LiquidAI/LFM3-1.7B-MLX-4bit`
+checkpoint. It implements width-7 gated convolution, local/global GQA with
+per-head output gates, zero-tail partial RoPE, sandwich norms, and tied
+embeddings. Weight loading checks required tensors and shapes and rejects
+non-affine quantization, untied embeddings, and biased convolution.
+
+For an existing LM Studio download:
+
+```bash
+cargo build --release -p higgs
+./target/release/higgs serve \
+  --model "$HOME/.cache/lm-studio/models/LiquidAI/LFM3-1.7B-MLX-4bit" \
+  --host 127.0.0.1 --port 8000
+```
+
+The Hugging Face model ID can also be supplied to `--model`. For configured
+models, use `batch = false` and `kv_cache = "off"`. MTP, speculative decoding,
+vision, and TurboQuant are not supported by this adapter. Explicit masks and
+packed/padded document input are rejected. Local attention masks its 256-token
+window but currently retains all KV tensors; full 256K context and retained
+session behavior have not been validated.
+
+The independent CPU PyTorch oracle in `scripts/lfm3_parity.py` pins the official
+checkpoint/config/source/template. Across the three initial real-checkpoint
+probes, f32 one-shot and stepped execution matched every top-1 prediction,
+with mean KL at most 7.92e-8. BF16 is experimental: the multilingual stepped
+probe fails the unchanged 1.5x reference-drift gate despite matching all top-1
+predictions. Real-weight microtests identify shape-dependent MLX BF16
+quantized-matmul/matvec rounding as the main source of schedule drift; this
+does not constitute a passed BF16 parity gate.
+
+On an M4 with 32 GB, two warmed release runs using exact-length chat prompts
+and 128 synchronized greedy decode steps measured:
+
+| Prompt tokens | Prefill tok/s | Decode tok/s |
+| ---: | ---: | ---: |
+| 128 | 660–903 | 62–79 |
+| 512 | 971–993 | 52–68 |
+| 2048 | 782–904 | 41–71 |
+
+These are direct-model measurements with substantial run variance, not API
+throughput guarantees. Reproduce with `cargo run --release -p higgs-models
+--example lfm3_bench -- /path/to/model`; the example warms each shape and
+checks every cache-layer offset. HF byte-golden template tests cover plain
+chat, tools, multi-turn history, and agent messages; a parser fixture covers a
+streamed XML tool call. End-to-end agent/tool execution is not certified.
 
 ### LFM2-MoE notes
 

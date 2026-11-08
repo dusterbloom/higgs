@@ -191,6 +191,7 @@ enum LoadKind {
     DeepSeekV2,
     QwenVl,
     Lfm2Moe,
+    Lfm3,
 }
 
 #[cfg(test)]
@@ -229,7 +230,8 @@ impl BuiltinAdapter {
             | LoadKind::Phi3
             | LoadKind::Starcoder2
             | LoadKind::DeepSeekV2
-            | LoadKind::Lfm2Moe => LoaderBoundaryClass::StandardStream,
+            | LoadKind::Lfm2Moe
+            | LoadKind::Lfm3 => LoaderBoundaryClass::StandardStream,
         }
     }
 }
@@ -268,6 +270,9 @@ const fn deepseek() -> ModelFamily {
 }
 fn liquid() -> ModelFamily {
     ModelFamily::Other("lfm2".to_owned())
+}
+fn liquid3() -> ModelFamily {
+    ModelFamily::Other("lfm3".to_owned())
 }
 const fn llava() -> ModelFamily {
     ModelFamily::Llava
@@ -391,6 +396,14 @@ static LFM2_MOE: BuiltinAdapter = BuiltinAdapter {
     notes: "LiquidAI short-conv/attention hybrid with sparse MoE",
     kind: LoadKind::Lfm2Moe,
 };
+static LFM3: BuiltinAdapter = BuiltinAdapter {
+    id: "lfm3",
+    family: liquid3,
+    version_range: "LFM3",
+    capabilities: caps(false, false, false, false, false),
+    notes: "LiquidAI LFM3 short-conv/attention hybrid text model",
+    kind: LoadKind::Lfm3,
+};
 static QWEN_VL: BuiltinAdapter = BuiltinAdapter {
     id: "qwen_vl",
     family: qwen_vl,
@@ -400,7 +413,7 @@ static QWEN_VL: BuiltinAdapter = BuiltinAdapter {
     kind: LoadKind::QwenVl,
 };
 
-static BUILTINS: [&BuiltinAdapter; 15] = [
+static BUILTINS: [&BuiltinAdapter; 16] = [
     &BONSAI_Q1,
     // Qwen-VL must precede the qwen3_5 adapters: a `qwen3_5_vl` wrapper is an
     // exact match for QWEN_VL and for the nested `qwen3_5` backbone, so equal
@@ -417,6 +430,7 @@ static BUILTINS: [&BuiltinAdapter; 15] = [
     &STARCODER2,
     &LLAVA_QWEN2,
     &DEEPSEEK_V2,
+    &LFM3,
     &LFM2_MOE,
     &TRANSFORMER_DENSE,
 ];
@@ -444,6 +458,7 @@ impl BuiltinAdapter {
             LoadKind::LlavaQwen2 => model_type == "llava-qwen2",
             LoadKind::DeepSeekV2 => model_type == "deepseek_v2",
             LoadKind::Lfm2Moe => model_type == "lfm2_moe",
+            LoadKind::Lfm3 => model_type == "lfm3",
             LoadKind::QwenVl => {
                 matches!(
                     text_alias.as_ref(),
@@ -476,7 +491,8 @@ impl BuiltinAdapter {
             | LoadKind::Starcoder2
             | LoadKind::LlavaQwen2
             | LoadKind::DeepSeekV2
-            | LoadKind::Lfm2Moe => false,
+            | LoadKind::Lfm2Moe
+            | LoadKind::Lfm3 => false,
         }
     }
 
@@ -666,6 +682,8 @@ impl ModelAdapter for BuiltinAdapter {
                 .and_then(|args| crate::deepseek_v2::load_deepseek_v2_model_with_args(dir, args))
                 .map(AnyModel::DeepSeekV2),
             LoadKind::Lfm2Moe => crate::lfm2_moe::load_lfm2_moe_model(dir).map(AnyModel::Lfm2Moe),
+            LoadKind::Lfm3 => crate::lfm3::load_lfm3_model_from_value(dir, model.resolved_config())
+                .map(AnyModel::Lfm3),
             LoadKind::QwenVl => {
                 crate::qwen_vl::load_qwen_vl_model_from_value(dir, &model.raw, disable_vision)
             }
@@ -724,6 +742,15 @@ pub fn detect(dir: &Path) -> Result<DetectedModel, ModelError> {
         || (top_model_type.to_owned(), None),
         |nested| (nested.to_owned(), Some(top_model_type.to_owned())),
     );
+    // MLX Qwen-VL checkpoints declare their backbone family as `model_type`
+    // and are multimodal only via `architectures` + `vision_config`. Claim
+    // them for the Qwen-VL adapter here so the backbone adapters (which
+    // would silently drop the vision tower) cannot win the exact match.
+    let (model_type, wrapper_model_type) =
+        match crate::registry::vl_checkpoint_family(&raw) {
+            Some(family) => (family.to_owned(), Some(top_model_type.to_owned())),
+            None => (model_type, wrapper_model_type),
+        };
     let (family, version) = classify(&model_type);
     Ok(DetectedModel {
         model_type,
@@ -938,12 +965,13 @@ mod tests {
             .iter()
             .map(|adapter| (adapter.id, adapter.loader_boundary_class()))
             .collect::<Vec<_>>();
-        assert_eq!(inventory.len(), 15);
+        assert_eq!(inventory.len(), 16);
         assert!(inventory.contains(&("qwen3-next", LoaderBoundaryClass::QwenSpecial)));
         assert!(inventory.contains(&("qwen3.5-moe", LoaderBoundaryClass::QwenSpecial)));
         assert!(inventory.contains(&("qwen_vl", LoaderBoundaryClass::FullArtifact)));
         assert!(inventory.contains(&("llava-qwen2", LoaderBoundaryClass::FullArtifact)));
         assert!(inventory.contains(&("gemma4-text", LoaderBoundaryClass::FullArtifact)));
+        assert!(inventory.contains(&("lfm3", LoaderBoundaryClass::StandardStream)));
         assert!(
             inventory
                 .iter()
@@ -957,6 +985,19 @@ mod tests {
         assert_eq!(qwen_revision("qwen3_vl"), Some((3, false)));
         // qwen2_5 is a different prefix: not recognized by qwen_revision.
         assert_eq!(qwen_revision("qwen2_5_vl"), None);
+    }
+
+    #[test]
+    fn lfm3_adapter_resolves_with_conservative_capabilities() {
+        let dir = write_config(&serde_json::json!({"model_type": "lfm3"}));
+        let detected = detect(dir.path()).unwrap();
+        let resolved = resolve(&detected).unwrap();
+        let info = resolved.describe();
+
+        assert_eq!(resolved.id(), "lfm3");
+        assert_eq!(info.family, ModelFamily::Other("lfm3".to_owned()));
+        assert_eq!(info.capabilities, Capabilities::default());
+        assert!(!is_untested_version(resolved, &detected));
     }
 
     #[test]

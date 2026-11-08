@@ -17,6 +17,10 @@ pub fn detect_model_type<P: AsRef<Path>>(model_dir: P) -> Result<String, ModelEr
     }
     let config: serde_json::Value = serde_json::from_reader(file)?;
 
+    if let Some(family) = vl_checkpoint_family(&config) {
+        return Ok(family.to_owned());
+    }
+
     config
         .get("model_type")
         .and_then(|v| v.as_str())
@@ -34,6 +38,34 @@ pub fn runtime_family(model_type: &str) -> &str {
         "clover_moe" => "qwen3_5_moe",
         other => other,
     }
+}
+
+/// Detect a Qwen-VL checkpoint from its `architectures` entry and
+/// `vision_config`, independent of `model_type`.
+///
+/// MLX Qwen-VL releases declare their *backbone* family as the top-level
+/// `model_type` (`qwen3_5`, `qwen3_5_moe`, …) and mark the multimodal shape
+/// only through the `architectures` class plus a `vision_config` node — there
+/// is no `*_vl` model type to match on. Returns the loader family label so
+/// both the engine loader and the adapter registry claim these checkpoints
+/// for the Qwen-VL pipeline instead of silently dropping the vision tower.
+/// Text-only releases strip `vision_config` and stay on their backbone loader.
+#[must_use]
+pub fn vl_checkpoint_family(raw: &serde_json::Value) -> Option<&'static str> {
+    if raw.get("vision_config").is_none() {
+        return None;
+    }
+    raw.get("architectures")
+        .and_then(|v| v.as_array())
+        .and_then(|archs| archs.iter().find_map(|a| a.as_str()))
+        .and_then(|arch| match arch {
+            "Qwen2_5VLForConditionalGeneration" => Some("qwen2_5_vl"),
+            "Qwen3VLForConditionalGeneration" => Some("qwen3_vl"),
+            "Qwen3_5ForConditionalGeneration"
+            | "Qwen3_5MoeForConditionalGeneration"
+            | "Qwen3_5VLForConditionalGeneration" => Some("qwen3_5_vl"),
+            _ => None,
+        })
 }
 
 /// Supported model architectures.
@@ -65,6 +97,7 @@ pub fn is_supported(model_type: &str) -> bool {
             | "llava-qwen2"
             | "deepseek_v2"
             | "lfm2_moe"
+            | "lfm3"
     )
 }
 
@@ -311,6 +344,17 @@ mod tests {
     #[test]
     fn test_is_supported_deepseek_v2() {
         assert!(is_supported("deepseek_v2"));
+    }
+
+    #[test]
+    fn test_is_supported_lfm3() {
+        assert!(is_supported("lfm3"));
+    }
+
+    #[test]
+    fn test_detect_model_type_lfm3() {
+        let dir = write_model_type_config("lfm3");
+        assert_eq!(detect_model_type(dir.path()).unwrap(), "lfm3");
     }
 
     #[test]

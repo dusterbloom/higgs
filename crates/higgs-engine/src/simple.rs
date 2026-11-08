@@ -560,6 +560,7 @@ fn any_model_variant_name(model: &AnyModel) -> &'static str {
         AnyModel::DeepSeekV2(_) => "DeepSeekV2",
         AnyModel::BonsaiQ1(_) => "BonsaiQ1",
         AnyModel::Lfm2Moe(_) => "Lfm2Moe",
+        AnyModel::Lfm3(_) => "Lfm3",
     }
 }
 

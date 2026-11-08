@@ -13,6 +13,7 @@
 //! All layers use Sparse `MoE` for the feed-forward block.
 
 use std::cell::RefCell;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
@@ -131,6 +132,10 @@ use crate::{
 
 const fn default_full_attention_interval() -> i32 {
     4
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 const fn default_rope_theta() -> f32 {
@@ -312,6 +317,11 @@ pub struct Qwen3NextModelArgs {
     pub mlp_only_layers: Vec<i32>,
     #[serde(default = "default_full_attention_interval")]
     pub full_attention_interval: i32,
+    /// Qwen3.5 full-attention layers double the q projection and gate the
+    /// attention output with the second half. Original Qwen3-VL text
+    /// backbones use standard (ungated) attention.
+    #[serde(default = "default_true")]
+    pub attn_output_gate: bool,
 
     #[serde(default)]
     pub quantization: Option<QuantizationConfig>,
@@ -1161,15 +1171,22 @@ impl QLinear {
                     && self.bits == 1
                     && self.group_size == 128;
                 if !is_q1_affine {
-                    let [n_rows, n_groups] = *self.scales.shape() else {
-                        return Err(Exception::custom(format!(
-                            "{path} canonical scales must have shape [N, K/group]"
-                        )));
-                    };
-                    let k_dim = n_groups
-                        .checked_mul(self.group_size)
-                        .ok_or_else(|| Exception::custom(format!("{path} canonical K overflow")))?;
-                    return Ok(((n_rows, k_dim), false));
+                    if let [n_rows, n_groups] = *self.scales.shape() {
+                        let k_dim = n_groups.checked_mul(self.group_size).ok_or_else(|| {
+                            Exception::custom(format!("{path} canonical K overflow"))
+                        })?;
+                        return Ok(((n_rows, k_dim), false));
+                    }
+                    // Dense-mode tensors (bf16 releases loaded without a
+                    // quantization block) carry no packed scales: the plain
+                    // [out,in] weight is the logical shape, and they are
+                    // never promotion candidates — decline silently.
+                    if let [n_rows, k_dim] = *self.weight.shape() {
+                        return Ok(((n_rows, k_dim), false));
+                    }
+                    return Err(Exception::custom(format!(
+                        "{path} canonical scales must have shape [N, K/group]"
+                    )));
                 }
                 validate_dflash_affine_lowbit_linear(
                     path,
@@ -5167,6 +5184,8 @@ fn build_yarn_rope(args: &Qwen3NextModelArgs, rope_dim: i32, head_dim: i32) -> O
 
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct Qwen3NextAttention {
+    /// Doubled-q gated attention (qwen3_5) vs standard (Qwen3-VL text).
+    gated: bool,
     #[param]
     q_proj: QLinear,
     #[param]
@@ -5338,6 +5357,7 @@ impl Qwen3NextAttention {
             num_attention_heads: args.num_attention_heads,
             num_key_value_heads: args.num_key_value_heads,
             scale,
+            gated: args.attn_output_gate,
         })
     }
 
@@ -5464,23 +5484,30 @@ impl Qwen3NextAttention {
                 ),
             };
         let q_reshaped = q_proj_output.reshape(&[B, L, self.num_attention_heads, -1])?;
-        let q_halves = q_reshaped.split(2, Some(-1))?;
-        let queries_pre = q_halves
-            .first()
-            .ok_or_else(|| Exception::custom("split produced empty result"))?;
-        let gate = q_halves
-            .get(1)
-            .ok_or_else(|| Exception::custom("split produced empty result"))?
-            .reshape(&[B, L, -1])?;
+        let (queries_pre, gate) = if self.gated {
+            let q_halves = q_reshaped.split(2, Some(-1))?;
+            let queries_pre = q_halves
+                .first()
+                .ok_or_else(|| Exception::custom("split produced empty result"))?
+                .clone();
+            let gate = q_halves
+                .get(1)
+                .ok_or_else(|| Exception::custom("split produced empty result"))?
+                .reshape(&[B, L, -1])?;
+            (queries_pre, Some(gate))
+        } else {
+            // Standard attention: the q projection is undoubled; no gate.
+            (q_reshaped, None)
+        };
+
 
         // Per-head RmsNorm then transpose to [B, H, L, D]
         let mut queries = self
             .q_norm
-            .forward(queries_pre)?
+            .forward(&queries_pre)?
             .transpose_axes(&[0, 2, 1, 3])?;
-        let keys_normed =
-            self.k_norm
-                .forward(&keys_raw.reshape(&[B, L, self.num_key_value_heads, -1])?)?;
+        let keys_reshaped = keys_raw.reshape(&[B, L, self.num_key_value_heads, -1])?;
+        let keys_normed = self.k_norm.forward(&keys_reshaped)?;
         // DIAGNOSTIC: capture k_norm output (pre-transpose, pre-rope) to split
         // k_norm from rope. Requires the raw capture flag.
         let diag_keys_normed = if L > 1 && DIAG_NORM_CAPTURE_REQ.with(|c| c.replace(false)) {
@@ -5641,8 +5668,11 @@ impl Qwen3NextAttention {
             mlx_rs::transforms::async_eval(cache.eval_targets())?;
         }
 
-        let gated = sigmoid_mul(&gate, &output)?;
-        let out = self.o_proj.forward_decode_fast(&gated)?;
+        let attn_in = match &gate {
+            Some(g) => sigmoid_mul(g, &output)?,
+            None => output,
+        };
+        let out = self.o_proj.forward_decode_fast(&attn_in)?;
         if L == 1 {
             mlx_rs::stop_gradient(&out)
         } else {
@@ -5659,6 +5689,7 @@ impl Qwen3NextAttention {
         x: &Array,
         cache: &SteppingKeyValueCache,
     ) -> Result<Array, Exception> {
+        debug_assert!(self.gated, "forward_preview assumes gated attention");
         let shape = x.shape();
         let (B, L) = (shape[0], shape[1]);
         let q_out = self
@@ -5770,6 +5801,8 @@ impl Qwen3NextAttention {
 
 #[derive(Debug, Clone, ModuleParameters)]
 struct DenseQwen3NextAttention {
+    /// Doubled-q gated attention (qwen3_5) vs standard (Qwen3-VL text).
+    gated: bool,
     #[param]
     q_proj: DenseLinearNoBias,
     #[param]
@@ -5822,6 +5855,7 @@ impl DenseQwen3NextAttention {
             num_attention_heads: args.num_attention_heads,
             num_key_value_heads: args.num_key_value_heads,
             scale,
+            gated: args.attn_output_gate,
         })
     }
 
@@ -5842,21 +5876,28 @@ impl DenseQwen3NextAttention {
 
         let q_proj_output = self.q_proj.forward(x)?;
         let q_reshaped = q_proj_output.reshape(&[B, L, self.num_attention_heads, -1])?;
-        let q_halves = q_reshaped.split(2, Some(-1))?;
-        let queries_pre = q_halves
-            .first()
-            .ok_or_else(|| Exception::custom("split produced empty result"))?;
-        let gate = q_halves
-            .get(1)
-            .ok_or_else(|| Exception::custom("split produced empty result"))?
-            .reshape(&[B, L, -1])?;
+        let (queries_pre, gate) = if self.gated {
+            let q_halves = q_reshaped.split(2, Some(-1))?;
+            let queries_pre = q_halves
+                .first()
+                .ok_or_else(|| Exception::custom("split produced empty result"))?
+                .clone();
+            let gate = q_halves
+                .get(1)
+                .ok_or_else(|| Exception::custom("split produced empty result"))?
+                .reshape(&[B, L, -1])?;
+            (queries_pre, Some(gate))
+        } else {
+            // Standard attention: the q projection is undoubled; no gate.
+            (q_reshaped, None)
+        };
 
         let keys_raw = self.k_proj.forward(x)?;
         let values_raw = self.v_proj.forward(x)?;
 
         let mut queries = self
             .q_norm
-            .forward(queries_pre)?
+            .forward(&queries_pre)?
             .transpose_axes(&[0, 2, 1, 3])?;
         let mut keys = self
             .k_norm
@@ -5904,8 +5945,11 @@ impl DenseQwen3NextAttention {
             mlx_rs::transforms::async_eval(cache.eval_targets())?;
         }
 
-        let gated = sigmoid_mul(&gate, &output)?;
-        let out = self.o_proj.forward(&gated)?;
+        let attn_in = match &gate {
+            Some(g) => sigmoid_mul(g, &output)?,
+            None => output,
+        };
+        let out = self.o_proj.forward(&attn_in)?;
         if L == 1 {
             mlx_rs::stop_gradient(&out)
         } else {
@@ -10062,10 +10106,16 @@ impl Qwen3NextCausalLM {
             return Err(Exception::custom("full_attention_interval must be > 0"));
         }
         if args.linear_num_key_heads <= 0 || args.linear_num_value_heads <= 0 {
-            return Err(Exception::custom("linear_num_*_heads must be > 0"));
+            // Pure full-attention backbones (interval 1, e.g. Qwen3-VL text)
+            // carry no linear-attention projections at all.
+            if args.full_attention_interval != 1 {
+                return Err(Exception::custom("linear_num_*_heads must be > 0"));
+            }
         }
         if args.linear_conv_kernel_dim <= 0 {
-            return Err(Exception::custom("linear_conv_kernel_dim must be > 0"));
+            if args.full_attention_interval != 1 {
+                return Err(Exception::custom("linear_conv_kernel_dim must be > 0"));
+            }
         }
 
         let model = Qwen3NextInner::new(&args)?;
@@ -13189,6 +13239,20 @@ pub(crate) fn load_qwen3_5_text_config_args_from_value(
     // Flatten rope_parameters into top-level fields
     flatten_rope_parameters(map);
 
+    // `attn_output_gate` defaults by backbone family: qwen3_5 dense/MoE
+    // full-attention layers are gated (older packs may omit the explicit
+    // flag); the original Qwen3-VL text backbone uses standard attention.
+    if map.get("attn_output_gate").is_none() {
+        let gated = text_config
+            .get("model_type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|t| t.starts_with("qwen3_5"));
+        map.insert(
+            "attn_output_gate".to_owned(),
+            serde_json::Value::from(gated),
+        );
+    }
+
     // Merge top-level quantization config
     if let Some(quant) = config.get("quantization") {
         map.entry("quantization").or_insert_with(|| quant.clone());
@@ -13445,6 +13509,17 @@ pub(crate) fn load_qwen3_5_text_config_args_from_value(
     // (from the global mxfp4 default); without a Dense override the weight
     // loader rejects them for missing .scales. Detect from the safetensors
     // index and inject Dense overrides for paths that have .weight but no .scales.
+    // Pure full-attention backbone (e.g. Qwen3-VL text_config declares no
+    // linear-attention heads): no GDN projections exist and every layer is
+    // standard attention — interval 1 makes the builder mark all layers full.
+    if args.linear_num_key_heads == 0 && args.linear_num_value_heads == 0
+        && args.full_attention_interval != 1
+    {
+        tracing::info!(
+            "Text backbone declares no linear-attention heads; treating as pure full-attention"
+        );
+        args.full_attention_interval = 1;
+    }
     if !eschamoe {
         detect_dense_gdn_projections(model_dir.as_ref(), &mut args.quant_overrides);
     }
@@ -13506,10 +13581,14 @@ fn detect_dense_gdn_projections(
     // stripped) so the membership check below compares like with like. mxfp4
     // exports ship quantized GDN projections as `.weight` + `.scales` with no
     // `.biases` (E2M1 has no zero-point) — scales presence alone decides.
-    fn strip_prefix(k: &str) -> &str {
-        k.strip_prefix("language_model.").unwrap_or(k)
+    fn strip_prefix(k: &str) -> String {
+        // Normalize every checkpoint dialect onto the loader's parameter form:
+        // `language_model.X` (mlx-vlm text releases) and `model.language_model.X`
+        // (native HF multimodal releases) both land on the `model.…` names the
+        // override map is keyed by. Vision and sidecar keys pass through as-is.
+        qwen35_checkpoint_param_key(k).map_or_else(|| k.to_owned(), |c| c.into_owned())
     }
-    let quantized_paths: std::collections::HashSet<&str> = keys
+    let quantized_paths: std::collections::HashSet<String> = keys
         .iter()
         .filter_map(|k| k.strip_suffix(".scales"))
         .map(strip_prefix)
@@ -13522,14 +13601,22 @@ fn detect_dense_gdn_projections(
     };
 
     let mut added = 0usize;
+    // Fully dense releases (native HF bf16 checkpoints with no quantization
+    // block — e.g. Qwen3.5-2B) ship no `.scales` anywhere: every
+    // `.weight`-shipping path is dense, not just the whitelisted
+    // GDN/embedding candidates. Mixed-precision packs always carry some
+    // scales and keep the whitelist behavior below.
+    let all_dense = quantized_paths.is_empty();
     for weight_key in keys.iter() {
         // Look for candidate weights: GDN projections, embedding, LM head.
-        let Some(base) = strip_prefix(weight_key).strip_suffix(".weight") else {
+        let path = strip_prefix(weight_key);
+        let Some(base) = path.strip_suffix(".weight") else {
             continue;
         };
-        if !DENSE_CANDIDATE_SUFFIXES
-            .iter()
-            .any(|suffix| base.ends_with(suffix))
+        if !all_dense
+            && !DENSE_CANDIDATE_SUFFIXES
+                .iter()
+                .any(|suffix| base.ends_with(suffix))
         {
             continue;
         }
@@ -13984,6 +14071,12 @@ struct GdnDims {
 impl GdnDims {
     /// Validate GQA ratio: `num_v_heads` must be divisible by `num_k_heads`.
     fn validate(&self) -> Result<(), Exception> {
+        // A pure full-attention backbone (e.g. Qwen3-VL text_config declares
+        // no linear-attention heads) has no GDN projections at all: 0/0 is a
+        // valid "none" state, not an error.
+        if self.num_k_heads == 0 && self.num_v_heads == 0 {
+            return Ok(());
+        }
         if self.num_k_heads == 0 || self.num_v_heads % self.num_k_heads != 0 {
             return Err(Exception::custom(format!(
                 "GQA ratio invalid: num_v_heads={} not divisible by num_k_heads={}",
@@ -13998,6 +14091,10 @@ impl GdnDims {
 /// to per-head-grouped [`q_h0|k_h0|v_h0|z_h0|q_h1`|...] for `in_proj_qkvz`.
 fn build_qkvz_permutation(d: &GdnDims) -> Result<Vec<i32>, Exception> {
     let nk = d.num_k_heads;
+    if nk == 0 && d.num_v_heads == 0 {
+        // No GDN projections (pure full-attention backbone): empty perm.
+        return Ok(Vec::new());
+    }
     if nk == 0 || d.num_v_heads % nk != 0 {
         return Err(Exception::custom(format!(
             "GQA ratio invalid: num_v_heads={} not divisible by num_k_heads={nk}",
@@ -14035,6 +14132,10 @@ fn build_qkvz_permutation(d: &GdnDims) -> Result<Vec<i32>, Exception> {
 /// Build row permutation for flat [`b_all|a_all`] → per-head-grouped [`b_h0|a_h0|b_h1|a_h1`|...].
 fn build_ba_permutation(d: &GdnDims) -> Vec<i32> {
     let nk = d.num_k_heads;
+    if nk == 0 {
+        // No GDN projections (pure full-attention backbone): empty perm.
+        return Vec::new();
+    }
     let v_per_k = d.num_v_heads / nk;
     let nv = d.num_v_heads;
 
@@ -14081,11 +14182,22 @@ fn can_concatenate0(a: &Array, b: &Array) -> bool {
     can_concatenate0_shapes(a_shape, b_shape)
 }
 
-fn qwen35_checkpoint_param_key(key: &str) -> Option<&str> {
+/// Map a raw checkpoint tensor key into the loader's parameter namespace.
+///
+/// Accepted dialects: bare `mtp.*` sidecar keys pass through unchanged;
+/// `language_model.<param>` (mlx-vlm text releases) and
+/// `model.language_model.<param>` (native HF multimodal releases, e.g.
+/// Qwen3.5-VL, whose tower keys live under `model.visual.*`) both land on
+/// the `model.<param>` form the dense/MoE text loaders expect. Anything
+/// else — including vision keys — maps to `None` (reported unmatched).
+fn qwen35_checkpoint_param_key(key: &str) -> Option<Cow<'_, str>> {
     if key.starts_with("mtp.") {
-        Some(key)
+        Some(Cow::Borrowed(key))
+    } else if let Some(rest) = key.strip_prefix("model.language_model.") {
+        // Native HF form needs a splice (`model.` + rest), not a strip.
+        Some(Cow::Owned(format!("model.{rest}")))
     } else {
-        key.strip_prefix("language_model.")
+        key.strip_prefix("language_model.").map(Cow::Borrowed)
     }
 }
 
@@ -14357,7 +14469,7 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
         norm_probes.extend(loaded.into_iter().filter_map(|(key, value)| {
             qwen35_checkpoint_param_key(&key)
                 .filter(|stripped| stripped.ends_with(".input_layernorm.weight"))
-                .map(|stripped| (stripped.to_owned(), value))
+                .map(|stripped| (stripped.into_owned(), value))
         }));
     }
     let offset_norms =
@@ -14381,10 +14493,12 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
                 unmatched.push(key);
                 continue;
             };
-            if let Some((target_key, dense_mtp_target)) = qwen35_target_param_key(&params, stripped)
+            if let Some((target_key, dense_mtp_target)) =
+                qwen35_target_param_key(&params, &stripped)
             {
                 if let Some(param) = params.get_mut(target_key.as_str()) {
-                    **param = qwen35_loaded_value(stripped, value, dense_mtp_target, offset_norms)?;
+                    **param =
+                        qwen35_loaded_value(&stripped, value, dense_mtp_target, offset_norms)?;
                 } else {
                     unmatched.push(key);
                     continue;
@@ -14458,7 +14572,7 @@ fn load_qwen3_5_moe_weights_direct<M: mlx_rs::module::ModuleParametersExt>(
 /// bit rate, for example 2.0. An affine layer cannot use that value. Thus this
 /// function replaces the layout with [`crate::eschamoe::CONVERSION_TARGET`],
 /// which is the layout that the conversion code makes.
-fn force_eschamoe_quant_layout(
+pub(crate) fn force_eschamoe_quant_layout(
     args: &mut Qwen3NextModelArgs,
     model_path: &Path,
 ) -> Result<(), crate::error::ModelError> {
@@ -14534,7 +14648,7 @@ fn force_eschamoe_quant_layout(
 /// than either source part. MTP prefixes do not belong to this model body and
 /// are deliberately ignored.
 fn eschamoe_runtime_quant_path(checkpoint_prefix: &str) -> Option<String> {
-    let path = qwen35_checkpoint_param_key(checkpoint_prefix)?;
+    let path = qwen35_checkpoint_param_key(checkpoint_prefix)?; // Cow<str>
     if !path.starts_with("model.") && path != "lm_head" {
         return None;
     }
@@ -14547,7 +14661,7 @@ fn eschamoe_runtime_quant_path(checkpoint_prefix: &str) -> Option<String> {
     } else if let Some(base) = path.strip_suffix(".linear_attn.in_proj_a") {
         format!("{base}.linear_attn.in_proj_ba")
     } else {
-        path.to_owned()
+        path.into_owned()
     };
     Some(fused)
 }
@@ -14619,10 +14733,17 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
     use std::collections::HashMap;
 
     let (tensors, escha_natives) = checkpoint_tensors(model_path)?;
+    // Keys pass through `qwen35_checkpoint_param_key`, which may splice a new
+    // prefix (the `model.language_model.` form), so collect owned names first
+    // and hand the probe borrowed views of them.
+    let stripped_keys: Vec<(String, &Array)> = tensors
+        .iter()
+        .filter_map(|(key, value)| {
+            qwen35_checkpoint_param_key(key).map(|key| (key.into_owned(), value))
+        })
+        .collect();
     let offset_norms = checkpoint_norms_need_offset(
-        tensors
-            .iter()
-            .filter_map(|(key, value)| qwen35_checkpoint_param_key(key).map(|key| (key, value))),
+        stripped_keys.iter().map(|(key, value)| (key.as_str(), *value)),
     )?;
     let mut params = model.parameters_mut().flatten();
 
@@ -14695,10 +14816,10 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
 
             if !handled {
                 if let Some((target_key, dense_mtp_target)) =
-                    qwen35_target_param_key(&params, stripped)
+                    qwen35_target_param_key(&params, &stripped)
                 {
                     if let Some(param) = params.get_mut(target_key.as_str()) {
-                        **param = qwen35_loaded_value(stripped, value, dense_mtp_target, offset_norms)?;
+                        **param = qwen35_loaded_value(&stripped, value, dense_mtp_target, offset_norms)?;
                     }
                 }
             }
@@ -16708,7 +16829,7 @@ mod tests {
             let normalized = eschamoe::normalize_key(raw);
             let stripped = qwen35_checkpoint_param_key(&normalized)
                 .unwrap_or_else(|| panic!("{raw} did not normalize into the loader's namespace"));
-            let (storage, prefix) = eschamoe::classify(stripped);
+            let (storage, prefix) = eschamoe::classify(&stripped);
             // Dense tensors land on themselves; quantized ones land on the
             // `.weight` of the QLinear the loader rebuilds.
             let target = match storage {
@@ -29215,14 +29336,27 @@ mod tests {
     #[test]
     fn test_qwen35_checkpoint_key_accepts_unprefixed_mtp_sidecar() {
         assert_eq!(
-            qwen35_checkpoint_param_key("mtp.layers.0.self_attn.q_proj.weight"),
+            qwen35_checkpoint_param_key("mtp.layers.0.self_attn.q_proj.weight").as_deref(),
             Some("mtp.layers.0.self_attn.q_proj.weight")
         );
         assert_eq!(
-            qwen35_checkpoint_param_key("language_model.model.layers.0.input_layernorm.weight"),
+            qwen35_checkpoint_param_key("language_model.model.layers.0.input_layernorm.weight")
+                .as_deref(),
             Some("model.layers.0.input_layernorm.weight")
         );
+        // Native HF multimodal form: backbone nested under `model.`.
+        assert_eq!(
+            qwen35_checkpoint_param_key("model.language_model.layers.0.input_layernorm.weight")
+                .as_deref(),
+            Some("model.layers.0.input_layernorm.weight")
+        );
+        assert_eq!(
+            qwen35_checkpoint_param_key("model.language_model.embed_tokens.weight").as_deref(),
+            Some("model.embed_tokens.weight")
+        );
+        // Vision keys stay out of the text namespace.
         assert_eq!(qwen35_checkpoint_param_key("vision_tower.foo"), None);
+        assert_eq!(qwen35_checkpoint_param_key("model.visual.blocks.0.attn.qkv"), None);
     }
 
     #[test]

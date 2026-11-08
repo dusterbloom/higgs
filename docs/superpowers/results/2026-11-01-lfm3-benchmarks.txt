@@ -1,0 +1,35 @@
+LFM3-1.7B-MLX-4bit native Higgs benchmark
+date: 2026-11-01
+hardware: Apple M4, 10 CPU cores, 32 GB unified memory
+os: macOS 27.0 (26A5388g)
+checkpoint: 1be5bf672013cd91aa62148f77c5eea8d2784a95845d5fe826e08c7b84823815
+binary: /Users/peppi/Dev/higgs/target/release/examples/lfm3_bench
+
+Method:
+- release build, host Metal
+- exact 128/512/2048-token tokenizer chat prompts
+- per-shape full warmup followed by measured run
+- 128 single-token greedy decode steps
+- logits and argmax evaluated/synchronized every step
+- every hybrid-cache layer offset asserted after prefill and every decode step
+- parent server and other GPU work stopped; earlier contended runs discarded
+
+Clean run 1:
+prompt  prefill_s  prefill_tok_s  decode_s  decode_tok_s
+128     0.194075   659.540        2.054349  62.307
+512     0.527519   970.581        2.445491  52.341
+2048    2.265442   904.018        1.792304  71.416
+
+Clean run 2:
+prompt  prefill_s  prefill_tok_s  decode_s  decode_tok_s
+128     0.141748   903.011        1.623466  78.844
+512     0.515476   993.257        1.893728  67.592
+2048    2.618731   782.058        3.092112  41.396
+
+Observed ranges:
+128:  prefill 659.5-903.0 tok/s; decode 62.3-78.8 tok/s
+512:  prefill 970.6-993.3 tok/s; decode 52.3-67.6 tok/s
+2048: prefill 782.1-904.0 tok/s; decode 41.4-71.4 tok/s
+
+All generated continuations were coherent. Wide decode variance is retained and
+reported rather than collapsed into false precision.

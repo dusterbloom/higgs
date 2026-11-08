@@ -1,0 +1,20 @@
+^Dcase         engine                  mean KL     top-1  gate
+probe        higgs f32 oneshot     7.921e-08   100.00%  KL<=0.0001, top1>=99% ok
+probe        higgs f32 stepped     0.000e+00   100.00%  KL<=0.0001, top1>=99% ok
+probe        higgs bf16 oneshot    9.475e-04   100.00%  vs torch bf16 KL=8.360e-04, top1=100.00% ok
+probe        higgs bf16 stepped    1.085e-03   100.00%  vs torch bf16 KL=8.359e-04, top1=100.00% ok
+probe        torch bf16 sched      0.000e+00   100.00%  oneshot vs stepped (diagnostic)
+probe        higgs bf16 sched      2.340e-03   100.00%  oneshot vs stepped (diagnostic)
+positions    higgs f32 oneshot     0.000e+00   100.00%  KL<=0.0001, top1>=99% ok
+positions    higgs f32 stepped     0.000e+00   100.00%  KL<=0.0001, top1>=99% ok
+positions    higgs bf16 oneshot    6.732e-04    96.43%  vs torch bf16 KL=1.462e-03, top1=89.29% ok
+positions    higgs bf16 stepped    1.456e-03    92.86%  vs torch bf16 KL=1.462e-03, top1=89.29% ok
+positions    torch bf16 sched      0.000e+00   100.00%  oneshot vs stepped (diagnostic)
+positions    higgs bf16 sched      1.589e-03    96.43%  oneshot vs stepped (diagnostic)
+multilingual higgs f32 oneshot     2.934e-08   100.00%  KL<=0.0001, top1>=99% ok
+multilingual higgs f32 stepped     0.000e+00   100.00%  KL<=0.0001, top1>=99% ok
+multilingual higgs bf16 oneshot    7.486e-04   100.00%  vs torch bf16 KL=6.009e-04, top1=100.00% ok
+multilingual higgs bf16 stepped    1.379e-03   100.00%  vs torch bf16 KL=6.234e-04, top1=100.00% FAIL
+multilingual torch bf16 sched      5.594e-05   100.00%  oneshot vs stepped (diagnostic)
+multilingual higgs bf16 sched      2.254e-03   100.00%  oneshot vs stepped (diagnostic)
+FAIL

@@ -342,3 +342,31 @@ fn adapter_load_uses_the_already_parsed_config() {
         "adapter reopened config.json instead of using DetectedModel::raw"
     );
 }
+
+#[test]
+fn lfm3_adapter_load_uses_the_resolved_config() {
+    let dir = write_config(&serde_json::json!({
+        "model_type": "lfm3",
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 8,
+        "norm_eps": 0.000_01,
+        "vocab_size": 32,
+        "layer_types": ["conv"],
+        "quantization": {"group_size": 8, "bits": 4, "mode": "affine"}
+    }));
+    let detected = adapter::detect(dir.path()).unwrap();
+    let resolved = adapter::resolve(&detected).unwrap();
+    std::fs::remove_file(dir.path().join("config.json")).unwrap();
+
+    let Err(error) = resolved.load(&detected, false) else {
+        panic!("config-only LFM3 checkpoint unexpectedly loaded");
+    };
+    assert!(
+        matches!(error, higgs_models::error::ModelError::MissingWeight(_)),
+        "adapter or loader reopened config.json instead of using DetectedModel::resolved_config: {error}"
+    );
+}

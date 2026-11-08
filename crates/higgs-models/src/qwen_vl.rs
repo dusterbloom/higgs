@@ -437,9 +437,21 @@ fn expand_qwen_vl_markers(
 
 /// Qwen-VL model: `SigLIP`-shaped vision tower + linear projector on a
 /// `Qwen3Next` text backbone.
+/// Which vision checkpoint dialect this instance serves.
+enum VisionBackend {
+    /// HF-style key layout: SigLIP tower + single linear projector
+    /// (`vision_tower.vision_model.*` / `mm_projector.*`).
+    SigLip {
+        tower: SigLipVisionModel,
+        projector: nn::Linear,
+    },
+    /// mlx-vlm export dialect: fused-QKV SigLIP blocks, learned pos table
+    /// and a merger MLP projector (`vision_tower.blocks.*` / `.merger.*`).
+    MlxQwen(crate::qwen_vl_mlx::MlxQwenVisionTower),
+}
+
 pub struct QwenVlModel {
-    vision_tower: SigLipVisionModel,
-    mm_projector: nn::Linear,
+    vision: VisionBackend,
     language_model: Qwen3NextCausalLM,
     config: QwenVlConfig,
     /// Whether the vision tower + projector were loaded. False when the
@@ -570,29 +582,49 @@ impl QwenVlModel {
             };
             let gh = h / patch;
             let gw = w / patch;
-            // The SigLIP-shaped tower only supports its nominal grid today
-            // (fixed learned position table); fail loudly instead of letting
-            // the position lookup raise a cryptic broadcast error.
-            let num_patches = self.vision_tower.num_patches();
-            if gh * gw != num_patches {
-                return Err(Exception::custom(format!(
-                    "Qwen-VL: image grid {gh}×{gw} ({gh}*{gw} patches) does not match the \
-                     tower's nominal {num_patches} patches — dynamic grids need the \
-                     Qwen-VL RoPE tower (not yet implemented)"
-                )));
-            }
-            // Tower features: one row per (patch-sized) grid cell.
-            let feats = self.vision_tower.forward(&pixel)?; // [1, gh*gw, hidden]
-            let hidden = self.config.vision_config.hidden_size;
-            // Reference `merge_image_features`: 2×2 blocks of patch features
-            // merge into one row of `hidden * merge²` — per_image_tokens is
-            // `(gh / merge) * (gw / merge)` per image.
-            let merged = feats
-                .reshape(&[1, gh / merge, merge, gw / merge, merge, hidden])?
-                .transpose_axes(&[0, 1, 3, 2, 4, 5])?
-                .reshape(&[1, (gh / merge) * (gw / merge), hidden * merge * merge])?
-                .index(0); // [tokens, hidden*merge*merge]
-            rows.push(self.mm_projector.forward(&merged)?);
+            // Both dialects use fixed learned position tables today; fail
+            // loudly instead of letting the position lookup raise a cryptic
+            // broadcast error. Each dialect then produces its final projected
+            // rows for this image.
+            let image_rows = match &mut self.vision {
+                VisionBackend::SigLip { tower, projector } => {
+                    let num_patches = tower.num_patches();
+                    if gh * gw != num_patches {
+                        return Err(Exception::custom(format!(
+                            "Qwen-VL: image grid {gh}×{gw} ({gh}*{gw} patches) does not match the \
+                             tower's nominal {num_patches} patches — dynamic grids need the \
+                             Qwen-VL RoPE tower (not yet implemented)"
+                        )));
+                    }
+                    let feats = tower.forward(&pixel)?; // [1, gh*gw, hidden]
+                    let hidden = self.config.vision_config.hidden_size;
+                    // Reference `merge_image_features`: 2×2 blocks of patch
+                    // features merge into one row of `hidden * merge²`.
+                    let merged = feats
+                        .reshape(&[1, gh / merge, merge, gw / merge, merge, hidden])?
+                        .transpose_axes(&[0, 1, 3, 2, 4, 5])?
+                        .reshape(&[1, (gh / merge) * (gw / merge), hidden * merge * merge])?
+                        .index(0); // [tokens, hidden*merge*merge]
+                    projector.forward(&merged)?
+                }
+                VisionBackend::MlxQwen(tower) => {
+                    let num_patches = tower.num_patches();
+                    if gh * gw != num_patches {
+                        return Err(Exception::custom(format!(
+                            "Qwen-VL: image grid {gh}×{gw} ({gh}*{gw} patches) does not match \
+                             the tower's learned {num_patches}-patch table — preprocessing \
+                             must target {}px",
+                            tower.target_side()
+                        )));
+                    }
+                    let feats = tower.forward(&pixel)?; // [1, gh*gw, hidden]
+                    // Merger: norm over patch features, 2x2 merge concat,
+                    // fc1 -> gelu -> fc2 (the checkpoint's merger.norm is
+                    // hidden-wide: it norms BEFORE the merge concat).
+                    tower.project(&feats, gh, gw, merge)?
+                }
+            };
+            rows.push(image_rows);
         }
         let image_features = if rows.is_empty() {
             Array::from_slice(&[0.0f32; 0], &[0, self.hidden_size()])
@@ -621,7 +653,10 @@ impl VisionModel for QwenVlModel {
     fn vision_capabilities(&self) -> VisionCapabilities {
         VisionCapabilities {
             families: vec!["qwen3_5_vl", "qwen3_vl", "qwen2_5_vl"],
-            image_sizes: vec![self.config.patch_size * 32],
+            image_sizes: match &self.vision {
+                VisionBackend::MlxQwen(tower) => vec![tower.target_side()],
+                VisionBackend::SigLip { .. } => vec![self.config.patch_size * 32],
+            },
             supported_media: vec![
                 "image/png",
                 "image/jpeg",
@@ -652,13 +687,23 @@ impl VisionModel for QwenVlModel {
             let decoded = image::load_from_memory(&img.bytes)
                 .map_err(|e| VisionError::Decode(e.to_string()))?;
             let (w, h) = decoded.dimensions();
-            let (rh, rw) = smart_resize_with_factor(
-                h,
-                w,
-                factor,
-                self.config.min_pixels,
-                self.config.max_pixels,
-            )?;
+            let (rh, rw) = match &self.vision {
+                // The mlx-vlm dialect tower has a fixed learned position
+                // table: force its square side so the grid matches exactly.
+                VisionBackend::MlxQwen(tower) => {
+                    let side = u32::try_from(tower.target_side()).map_err(|_| {
+                        VisionError::Preprocess("tower target side overflow".into())
+                    })?;
+                    (side, side)
+                }
+                VisionBackend::SigLip { .. } => smart_resize_with_factor(
+                    h,
+                    w,
+                    factor,
+                    self.config.min_pixels,
+                    self.config.max_pixels,
+                )?,
+            };
             let array = preprocess_qwen_vl_image(&img.bytes, (rw, rh))?;
             arrays.push(array);
             // Token budget from the image's OWN resized dims; the padded batch
@@ -720,16 +765,21 @@ impl VisionModel for QwenVlModel {
                 "Qwen-VL only supports batch_size=1, got {batch_size}"
             )));
         }
+        // The tokenizer route produces uint32 ids; the sentinel masking and
+        // embedding-merge path below is int32-typed throughout — cast once.
+        let input_ids = input_ids
+            .as_dtype(mlx_rs::Dtype::Int32)
+            .map_err(|e| Exception::custom(format!("Qwen-VL: input id dtype cast failed: {e}")))?;
         let image_features = self.encode_all_images(batch)?; // [sum(per_image_tokens), lm_hidden]
         // Replace IMAGE_TOKEN_INDEX sentinels with 0 before embedding lookup;
         // merge_embeddings overwrites these positions with image features.
         let sentinel = Array::from_slice(&[IMAGE_TOKEN_INDEX], &[1]);
         let is_sentinel = input_ids.eq(&sentinel)?;
         let zero = Array::from_slice(&[0_i32], &[1]);
-        let safe_ids = mlx_rs::ops::r#where(&is_sentinel, &zero, input_ids)?;
+        let safe_ids = mlx_rs::ops::r#where(&is_sentinel, &zero, &input_ids)?;
         let text_embeddings = self.language_model.embed_tokens_batch(&safe_ids)?;
         let combined =
-            crate::vision::merge_embeddings(input_ids, &text_embeddings, &image_features, batch)?;
+            crate::vision::merge_embeddings(&input_ids, &text_embeddings, &image_features, batch)?;
         self.language_model
             .forward_from_embeddings(&combined, None, c)
     }
@@ -738,6 +788,22 @@ impl VisionModel for QwenVlModel {
 // ---------------------------------------------------------------------------
 // Weight loading
 // ---------------------------------------------------------------------------
+
+/// Shape-only vision stubs so a text-only load keeps its structure and the
+/// model reports no vision capability (image requests are rejected).
+fn text_only_vision_backend(
+    config: &QwenVlConfig,
+    lm_hidden: i32,
+) -> Result<VisionBackend, ModelError> {
+    Ok(VisionBackend::SigLip {
+        tower: SigLipVisionModel::new(&config.vision_config)?,
+        projector: nn::LinearBuilder::new(
+            config.mm_hidden_size.max(1),
+            lm_hidden.max(1),
+        )
+        .build()?,
+    })
+}
 
 /// Load a Qwen-VL model from a parsed config.json (wrapper `AnyModel`).
 ///
@@ -768,12 +834,17 @@ pub(crate) fn load_qwen_vl_model_from_value(
             .is_some_and(|n| n > 0);
     // Mirror `adapter::qwen35_args`: wrap a top-level text config so the
     // qwen3.5 arg loader sees a `text_config` node.
-    let text_args = if raw.get("text_config").is_some() {
+    let mut text_args = if raw.get("text_config").is_some() {
         crate::qwen3_next::load_qwen3_5_text_config_args_from_value(dir, raw)?
     } else {
         let wrapped = serde_json::json!({ "text_config": raw.clone() });
         crate::qwen3_next::load_qwen3_5_text_config_args_from_value(dir, &wrapped)?
     };
+    // The VL wrapper bypasses `resolve_runtime_model_args`, so the eschamoe
+    // Q8 layout (int8 pairs + dense routers repacked at 8-bit affine) must be
+    // forced here too — otherwise quantized layers build at the 4-bit default
+    // and the first dequantize of the Q8-packed embedding fails.
+    crate::qwen3_next::force_eschamoe_quant_layout(&mut text_args, dir)?;
     let language_model = if is_moe {
         crate::qwen3_next::load_qwen3_5_moe_model_with_args(dir, text_args)?
     } else {
@@ -793,41 +864,83 @@ pub(crate) fn load_qwen_vl_model_from_value(
     // `disable_vision` escape hatch: load the text backbone only. The vision
     // tower and projector weights are skipped entirely, and the model reports
     // no vision capability so image requests are rejected.
-    let vision_enabled = !disable_vision;
-    let mut vision_tower = SigLipVisionModel::new(&config.vision_config)?;
-    let mut mm_projector =
-        nn::LinearBuilder::new(config.mm_hidden_size, language_model.args.hidden_size).build()?;
-
-    if vision_enabled {
-        let weights = load_safetensor_weights(dir)?;
-
-        // Vision tower weights: try both LLaVA-style prefix candidates.
-        let prefixes = [
-            "vision_tower.vision_model.",
-            "vision_tower.vision_tower.vision_model.",
-        ];
-        let mut tower_err: Option<ModelError> = None;
-        for prefix in prefixes {
-            match load_siglip_weights(&mut vision_tower, &weights, prefix) {
-                Ok(()) => {
-                    tower_err = None;
-                    break;
-                }
-                Err(err) => tower_err = Some(err),
+    let mut vision_enabled = !disable_vision;
+    let vision = if vision_enabled {
+        let mut weights = load_safetensor_weights(dir)?;
+        // Native HF multimodal releases (e.g. Qwen3.5-2B) ship the same
+        // fused-QKV SigLIP tower + merger under `model.visual.*`. Alias that
+        // prefix onto the mlx-vlm dialect's `vision_tower.*` names (Array is a
+        // cheap handle clone) so the loader below sees its expected layout.
+        if !weights.contains_key("vision_tower.blocks.0.attn.qkv.weight")
+            && weights.contains_key("model.visual.blocks.0.attn.qkv.weight")
+        {
+            let nested: Vec<(String, Array)> = weights
+                .iter()
+                .filter_map(|(k, v)| {
+                    k.strip_prefix("model.visual.")
+                        .map(|rest| (format!("vision_tower.{rest}"), v.clone()))
+                })
+                .collect();
+            for (alias, value) in nested {
+                weights.insert(alias, value);
             }
         }
-        if let Some(err) = tower_err {
-            return Err(err);
+        if weights.contains_key("vision_tower.blocks.0.attn.qkv.weight") {
+            // mlx-vlm export dialect (Qwen2.5/3/3.5-VL MLX quants): fused-QKV
+            // SigLIP blocks, learned pos table, merger-MLP projector.
+            VisionBackend::MlxQwen(crate::qwen_vl_mlx::MlxQwenVisionTower::from_weights(
+                &config.vision_config,
+                config.merge_size,
+                language_model.args.hidden_size,
+                &weights,
+            )?)
+        } else if weights.keys().any(|k| k.starts_with("vision_tower.")) {
+            // HF-style key layout: SigLIP tower + single linear projector.
+            let mut vision_tower = SigLipVisionModel::new(&config.vision_config)?;
+            let mut mm_projector =
+                nn::LinearBuilder::new(config.mm_hidden_size, language_model.args.hidden_size)
+                    .build()?;
+            // Vision tower weights: try both LLaVA-style prefix candidates.
+            let prefixes = [
+                "vision_tower.vision_model.",
+                "vision_tower.vision_tower.vision_model.",
+            ];
+            let mut tower_err: Option<ModelError> = None;
+            for prefix in prefixes {
+                match load_siglip_weights(&mut vision_tower, &weights, prefix) {
+                    Ok(()) => {
+                        tower_err = None;
+                        break;
+                    }
+                    Err(err) => tower_err = Some(err),
+                }
+            }
+            if let Some(err) = tower_err {
+                return Err(err);
+            }
+            load_mm_projector_weights(&mut mm_projector, &weights)?;
+            VisionBackend::SigLip {
+                tower: vision_tower,
+                projector: mm_projector,
+            }
+        } else {
+            // Tower-stripped checkpoint (e.g. EschaLabs W2 quants keep the
+            // VLM wrapper config but ship text weights only): load the text
+            // backbone standalone instead of failing on the missing tower.
+            tracing::warn!(
+                "no vision tower weights in checkpoint; loading text backbone only"
+            );
+            vision_enabled = false;
+            text_only_vision_backend(&config, language_model.args.hidden_size)?
         }
-        load_mm_projector_weights(&mut mm_projector, &weights)?;
     } else {
         tracing::info!("disable_vision=true: skipping vision tower and projector weights");
-    }
+        text_only_vision_backend(&config, language_model.args.hidden_size)?
+    };
 
     tracing::info!("Qwen-VL model loaded successfully");
     Ok(AnyModel::QwenVl(QwenVlModel {
-        vision_tower,
-        mm_projector,
+        vision,
         language_model,
         config,
         vision_enabled,

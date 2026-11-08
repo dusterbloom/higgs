@@ -111,6 +111,7 @@ pub mod verify_rope_probe {
     }
 }
 pub mod lfm2_moe;
+pub mod lfm3;
 pub mod mlx_exec;
 #[doc(hidden)]
 pub mod moe8;
@@ -123,6 +124,7 @@ pub mod qwen3_moe;
 pub mod qmm8;
 pub mod qwen3_next;
 pub mod qwen_vl;
+pub mod qwen_vl_mlx;
 pub mod registry;
 pub mod siglip;
 pub mod spec_prefill;
@@ -734,6 +736,8 @@ pub enum AnyModel {
     BonsaiQ1(bonsai_q1::BonsaiQ1Gpu),
     /// `LiquidAI` LFM2-MoE: short-conv/attention hybrid with sparse experts.
     Lfm2Moe(lfm2_moe::Lfm2MoeCausalLM),
+    /// `LiquidAI` LFM3: dense short-conv/local/global-attention hybrid.
+    Lfm3(lfm3::Lfm3CausalLM),
 }
 
 fn checked_head_dim(hidden_size: i32, num_attention_heads: i32) -> Result<i32, Exception> {
@@ -822,6 +826,7 @@ impl AnyModel {
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward(inputs, mask, c),
             (Self::Lfm2Moe(m), AnyCache::Hybrid(c)) => m.forward(inputs, mask, c),
+            (Self::Lfm3(m), AnyCache::Hybrid(c)) => m.forward(inputs, mask, c),
             // BonsaiQ1 builds its causal mask internally; any externally-provided
             // mask is ignored (causal-only semantics).
             (Self::BonsaiQ1(m), AnyCache::KV(c)) => {
@@ -856,6 +861,7 @@ impl AnyModel {
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => m.forward_hidden(inputs, mask, c),
             (Self::Lfm2Moe(m), AnyCache::Hybrid(c)) => m.forward_hidden(inputs, mask, c),
+            (Self::Lfm3(m), AnyCache::Hybrid(c)) => m.forward_hidden(inputs, mask, c),
             (Self::BonsaiQ1(m), AnyCache::KV(c)) => bonsai_q1::forward_trunk_free(m, c, inputs),
             _ => Err(Exception::custom("Model/cache type mismatch")),
         }
@@ -909,6 +915,7 @@ impl AnyModel {
             (Self::QwenVl(m), AnyCache::Hybrid(c)) => m.forward_text_all_logits(inputs, mask, c),
             (Self::DeepSeekV2(m), AnyCache::KV(c)) => m.forward_all_logits(inputs, mask, c),
             (Self::Lfm2Moe(m), AnyCache::Hybrid(c)) => m.forward_all_logits(inputs, mask, c),
+            (Self::Lfm3(m), AnyCache::Hybrid(c)) => m.forward_all_logits(inputs, mask, c),
             (Self::Qwen3Next(m), AnyCache::Hybrid(c)) => {
                 let (_, logits) = m.forward_with_hidden(inputs, mask, c)?;
                 Ok(logits)
@@ -1050,7 +1057,8 @@ impl AnyModel {
             | Self::Starcoder2(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_)
-            | Self::Lfm2Moe(_) => Err(Exception::custom(
+            | Self::Lfm2Moe(_)
+            | Self::Lfm3(_) => Err(Exception::custom(
                 "Batched forward only supported for Transformer, LlavaQwen2, and Qwen3Next models",
             )),
         }
@@ -1112,7 +1120,8 @@ impl AnyModel {
             | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_)
-            | Self::Lfm2Moe(_) => None,
+            | Self::Lfm2Moe(_)
+            | Self::Lfm3(_) => None,
         }
     }
 
@@ -1158,7 +1167,8 @@ impl AnyModel {
             | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_)
-            | Self::Lfm2Moe(_) => Err(Exception::custom("MTP not supported for this model")),
+            | Self::Lfm2Moe(_)
+            | Self::Lfm3(_) => Err(Exception::custom("MTP not supported for this model")),
         }
     }
 
@@ -1182,7 +1192,8 @@ impl AnyModel {
             | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_)
-            | Self::Lfm2Moe(_) => Err(Exception::custom("MTP not supported for this model")),
+            | Self::Lfm2Moe(_)
+            | Self::Lfm3(_) => Err(Exception::custom("MTP not supported for this model")),
         }
     }
 
@@ -1206,7 +1217,8 @@ impl AnyModel {
             | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_)
-            | Self::Lfm2Moe(_) => Err(Exception::custom("MTP not supported for this model")),
+            | Self::Lfm2Moe(_)
+            | Self::Lfm3(_) => Err(Exception::custom("MTP not supported for this model")),
         }
     }
 
@@ -1230,7 +1242,8 @@ impl AnyModel {
             | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_)
-            | Self::Lfm2Moe(_) => Err(Exception::custom("MTP not supported for this model")),
+            | Self::Lfm2Moe(_)
+            | Self::Lfm3(_) => Err(Exception::custom("MTP not supported for this model")),
         }
     }
 
@@ -1286,6 +1299,7 @@ impl AnyModel {
             Self::DeepSeekV2(m) => m.args.hidden_size,
             Self::BonsaiQ1(m) => i32::try_from(m.config.hidden).unwrap_or(i32::MAX),
             Self::Lfm2Moe(m) => m.args.hidden_size,
+            Self::Lfm3(m) => m.args.hidden_size,
         }
     }
 
@@ -1328,6 +1342,7 @@ impl AnyModel {
                 m.args.qk_nope_head_dim + m.args.qk_rope_head_dim,
             )),
             Self::Lfm2Moe(m) => Ok((m.args.num_key_value_heads, m.args.head_dim())),
+            Self::Lfm3(m) => Ok((m.args.num_key_value_heads, m.args.head_dim())),
             Self::BonsaiQ1(m) => Ok((
                 i32::try_from(m.config.kv_heads).map_err(|e| Exception::custom(e.to_string()))?,
                 i32::try_from(m.config.head_dim).map_err(|e| Exception::custom(e.to_string()))?,
@@ -1473,6 +1488,14 @@ impl AnyModel {
                 }
                 Ok(AnyCache::Hybrid(m.make_cache()))
             }
+            Self::Lfm3(m) => {
+                if kv_cache_config.is_turboquant() {
+                    return Err(Exception::custom(
+                        "TurboQuant is not supported for lfm3 models",
+                    ));
+                }
+                Ok(AnyCache::Hybrid(m.make_cache()))
+            }
             Self::BonsaiQ1(m) => {
                 if kv_cache_config.is_turboquant() {
                     return Err(Exception::custom(
@@ -1515,7 +1538,8 @@ impl AnyModel {
             | Self::Starcoder2(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_)
-            | Self::Lfm2Moe(_) => None,
+            | Self::Lfm2Moe(_)
+            | Self::Lfm3(_) => None,
         }
     }
 
@@ -1535,7 +1559,8 @@ impl AnyModel {
             | Self::Starcoder2(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_)
-            | Self::Lfm2Moe(_) => None,
+            | Self::Lfm2Moe(_)
+            | Self::Lfm3(_) => None,
         }
     }
 
@@ -1794,7 +1819,8 @@ impl AnyModel {
             | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_)
-            | Self::Lfm2Moe(_) => Err(Exception::custom(
+            | Self::Lfm2Moe(_)
+            | Self::Lfm3(_) => Err(Exception::custom(
                 "embed_token_ids only implemented for Qwen3Next",
             )),
         }
@@ -1818,7 +1844,8 @@ impl AnyModel {
             | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_)
-            | Self::Lfm2Moe(_) => None,
+            | Self::Lfm2Moe(_)
+            | Self::Lfm3(_) => None,
         }
     }
 
@@ -1837,7 +1864,8 @@ impl AnyModel {
             | Self::QwenVl(_)
             | Self::DeepSeekV2(_)
             | Self::BonsaiQ1(_)
-            | Self::Lfm2Moe(_) => Err(Exception::custom(
+            | Self::Lfm2Moe(_)
+            | Self::Lfm3(_) => Err(Exception::custom(
                 "forward_all_logits_from_hidden only implemented for Qwen3Next",
             )),
         }

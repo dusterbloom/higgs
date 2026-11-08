@@ -1,0 +1,5 @@
+^Dmlx qmm q_proj one-vs-step: unequal=33082/38912 max_abs=0.009765625 mean_abs=0.0013118065 cosine=0.9999275804
+mlx qmm conv_in one-vs-step: unequal=99076/116736 max_abs=0.009765625 mean_abs=0.0015433037 cosine=0.9999294281
+mlx qmm ffn_w1 one-vs-step: unequal=124008/145920 max_abs=0.022460938 mean_abs=0.0015491807 cosine=0.9999297857
+mlx sdpa causal-one-vs-cache-step: unequal=11035/38912 max_abs=0.0009765625 mean_abs=1.2115976e-05 cosine=0.9999997020
+saved /tmp/higgs-lfm3-kernel-rounding/lfm3_kernel_rounding.safetensors

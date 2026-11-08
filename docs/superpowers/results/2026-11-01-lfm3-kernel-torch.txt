@@ -1,0 +1,12 @@
+^Dtorch qmm q_proj one-vs-step: unequal=0/38912 max_abs=0 mean_abs=0 cosine=1.0000045300
+torch-vs-mlx q_proj one: unequal=5/38912 max_abs=1.5258789e-05 mean_abs=5.3985688e-10 cosine=1.0000045300
+torch-vs-mlx q_proj step: unequal=33082/38912 max_abs=0.009765625 mean_abs=0.0013118063 cosine=0.9999320507
+torch qmm conv_in one-vs-step: unequal=0/116736 max_abs=0 mean_abs=0 cosine=1.0000016689
+torch-vs-mlx conv_in one: unequal=19/116736 max_abs=0.0009765625 mean_abs=3.7161122e-08 cosine=1.0000016689
+torch-vs-mlx conv_in step: unequal=99076/116736 max_abs=0.009765625 mean_abs=0.0015432999 cosine=0.9999305010
+torch qmm ffn_w1 one-vs-step: unequal=0/145920 max_abs=0 mean_abs=0 cosine=0.9999998808
+torch-vs-mlx ffn_w1 one: unequal=16/145920 max_abs=0.001953125 mean_abs=2.0147587e-08 cosine=1.0000000000
+torch-vs-mlx ffn_w1 step: unequal=124008/145920 max_abs=0.022460938 mean_abs=0.001549194 cosine=0.9999295473
+torch sdpa causal-one-vs-cache-step: unequal=0/38912 max_abs=0 mean_abs=0 cosine=0.9999991655
+torch-vs-mlx sdpa one: unequal=26063/38912 max_abs=0.0012207031 mean_abs=6.4762447e-05 cosine=0.9999958277
+torch-vs-mlx sdpa step: unequal=25918/38912 max_abs=0.0012207031 mean_abs=6.3731779e-05 cosine=0.9999958277

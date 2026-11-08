@@ -67,6 +67,19 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::Qwen3Next(model))
         }
+        // Qwen-VL (Qwen2.5-VL / Qwen3-VL / Qwen3.5-VL): a `text_config`-wrapped
+        // qwen3.5 dense-or-MoE backbone with a SigLIP vision tower and projector.
+        // The model code lives in `higgs_models::qwen_vl`; routed through the
+        // adapter registry because `load_qwen_vl_model_from_value` is crate-private
+        // and the registry owns its structural validation. Vision enabled —
+        // the `disable_vision` escape hatch is loader-internal.
+        "qwen2_5_vl" | "qwen3_vl" | "qwen3_5_vl" => {
+            let detected = higgs_models::adapter::detect(&config.model_dir)
+                .map_err(EngineError::Model)?;
+            let selected = higgs_models::adapter::resolve(&detected)
+                .map_err(EngineError::Model)?;
+            selected.load(&detected, false).map_err(EngineError::Model)
+        }
         // `prism-ml`'s Bonsai-2 Hadamard-rotated Q2 packs: a `text_config`-wrapped
         // qwen3_5-shaped checkpoint (own top-level `model_type`, handled like the
         // `qwen3_5` VLM wrapper) plus a `modules` manifest that `load_qwen3_5_model`
@@ -124,6 +137,11 @@ pub fn load_model<P: AsRef<Path>>(model_dir: P) -> Result<AnyModel, EngineError>
             let model = higgs_models::lfm2_moe::load_lfm2_moe_model(&config.model_dir)
                 .map_err(EngineError::Model)?;
             Ok(AnyModel::Lfm2Moe(model))
+        }
+        "lfm3" => {
+            let model = higgs_models::lfm3::load_lfm3_model(&config.model_dir)
+                .map_err(EngineError::Model)?;
+            Ok(AnyModel::Lfm3(model))
         }
         other => Err(EngineError::Model(
             higgs_models::error::ModelError::UnsupportedModel(other.to_owned()),
@@ -311,6 +329,24 @@ mod tests {
     fn model_config_from_dir_qwen3_5_moe() {
         let (_dir, result) = config_for_model("qwen3_5_moe");
         assert_eq!(result.unwrap().model_type, "qwen3_5_moe");
+    }
+
+    #[test]
+    fn model_config_from_dir_lfm3() {
+        let (_dir, result) = config_for_model("lfm3");
+        assert_eq!(result.unwrap().model_type, "lfm3");
+    }
+
+    #[test]
+    fn load_model_routes_lfm3_to_dedicated_loader() {
+        let (dir, _result) = config_from_raw(r#"{"model_type": "lfm3"}"#);
+        match load_model(dir.path()) {
+            Ok(_) => panic!("expected load failure: config is intentionally incomplete"),
+            Err(EngineError::Model(ModelError::UnsupportedModel(model_type))) => {
+                assert_ne!(model_type, "lfm3", "lfm3 must reach its dedicated loader")
+            }
+            Err(_) => {}
+        }
     }
 
     #[test]
