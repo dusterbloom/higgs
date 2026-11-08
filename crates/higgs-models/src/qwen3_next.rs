@@ -15040,6 +15040,27 @@ fn load_qwen3_5_moe_weights_fused<M: mlx_rs::module::ModuleParametersExt>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Probe: resolve quant args for the real Qwen3-VL-4B group-64 checkpoint
+    /// on disk (skip silently when absent). Documents what spec layer-0 MLP
+    /// QLinears are built with before any weight loading happens.
+    #[test]
+    fn qwen3_vl_4b_group64_args_probe() {
+        let dir = std::path::Path::new("/Users/peppi/AI-Models/qwen3-vl-4b-4bit");
+        if !dir.exists() {
+            eprintln!("skip: 4B not on disk");
+            return;
+        }
+        let raw = std::fs::read_to_string(dir.join("config.json")).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let args = load_qwen3_5_text_config_args_from_value(dir, &config).unwrap();
+        let spec = args.quant_spec_for("language_model.model.layers.0.mlp.gate_proj");
+        eprintln!(
+            "PROBE quantization={:?} layer0_gate_spec={:?} interval={} hidden={} intermediate={} experts={} linear_k_heads={}",
+            args.quantization, spec, args.full_attention_interval, args.hidden_size, args.intermediate_size, args.num_experts, args.linear_num_key_heads
+        );
+        assert_eq!(spec.group_size, 64, "layer-0 gate must resolve group 64");
+    }
     use crate::cache::KeyValueCache;
 
     #[test]

@@ -314,6 +314,35 @@ pub fn pixel_shuffle(image: &Array, patch: u32, merge: u32) -> Result<Array, Exc
 const QWEN_VL_MEAN: [f32; 3] = [0.481_454_7, 0.457_827_5, 0.408_210_72];
 const QWEN_VL_STD: [f32; 3] = [0.268_629_55, 0.261_302_6, 0.275_777_1];
 
+/// Per-channel image normalization from `preprocessor_config.json` when the
+/// repo ships one, else the historical CLIP constants above. Qwen3-VL
+/// repos declare `[0.5, 0.5, 0.5]`; Qwen2/2.5-VL declare the CLIP pair —
+/// hardcoding either breaks the other family.
+pub(crate) fn read_image_norm(dir: &Path) -> ([f32; 3], [f32; 3]) {
+    let fallback = (QWEN_VL_MEAN, QWEN_VL_STD);
+    let Ok(raw) = std::fs::read_to_string(dir.join("preprocessor_config.json")) else {
+        return fallback;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+        return fallback;
+    };
+    let read3 = |key: &str| -> Option<[f32; 3]> {
+        let arr = v.get(key)?.as_array()?;
+        if arr.len() != 3 {
+            return None;
+        }
+        Some([
+            arr[0].as_f64()? as f32,
+            arr[1].as_f64()? as f32,
+            arr[2].as_f64()? as f32,
+        ])
+    };
+    match (read3("image_mean"), read3("image_std")) {
+        (Some(m), Some(s)) => (m, s),
+        _ => fallback,
+    }
+}
+
 /// Decode, resize to an exact target, and apply Qwen-VL normalization.
 /// Returns `[1, H, W, 3]` NHWC (channel-last for MLX).
 #[allow(
@@ -321,7 +350,12 @@ const QWEN_VL_STD: [f32; 3] = [0.268_629_55, 0.261_302_6, 0.275_777_1];
     clippy::cast_possible_wrap,
     clippy::indexing_slicing
 )]
-fn preprocess_qwen_vl_image(image_bytes: &[u8], target: (u32, u32)) -> Result<Array, VisionError> {
+fn preprocess_qwen_vl_image(
+    image_bytes: &[u8],
+    target: (u32, u32),
+    mean: &[f32; 3],
+    std: &[f32; 3],
+) -> Result<Array, VisionError> {
     let img =
         image::load_from_memory(image_bytes).map_err(|e| VisionError::Decode(e.to_string()))?;
     // PIL BICUBIC ≈ image-rs CatmullRom.
@@ -332,7 +366,7 @@ fn preprocess_qwen_vl_image(image_bytes: &[u8], target: (u32, u32)) -> Result<Ar
     let mut floats: Vec<f32> = Vec::with_capacity(pixels.len());
     for (i, &p) in pixels.iter().enumerate() {
         let ch = i % 3;
-        floats.push((f32::from(p) / 255.0 - QWEN_VL_MEAN[ch]) / QWEN_VL_STD[ch]);
+        floats.push((f32::from(p) / 255.0 - mean[ch]) / std[ch]);
     }
     Ok(Array::from_slice(&floats, &[1, h as i32, w as i32, 3]))
 }
@@ -452,6 +486,9 @@ enum VisionBackend {
 
 pub struct QwenVlModel {
     vision: VisionBackend,
+    /// Per-channel pixel normalization (from preprocessor_config.json).
+    image_mean: [f32; 3],
+    image_std: [f32; 3],
     language_model: Qwen3NextCausalLM,
     config: QwenVlConfig,
     /// Whether the vision tower + projector were loaded. False when the
@@ -608,15 +645,9 @@ impl QwenVlModel {
                     projector.forward(&merged)?
                 }
                 VisionBackend::MlxQwen(tower) => {
-                    let num_patches = tower.num_patches();
-                    if gh * gw != num_patches {
-                        return Err(Exception::custom(format!(
-                            "Qwen-VL: image grid {gh}×{gw} ({gh}*{gw} patches) does not match \
-                             the tower's learned {num_patches}-patch table — preprocessing \
-                             must target {}px",
-                            tower.target_side()
-                        )));
-                    }
+                    // The tower bilinearly interpolates its learned position
+                    // table onto any (gh, gw) grid and applies 2D rotary, so
+                    // rectangular grids are fine — no table-size guard.
                     let feats = tower.forward(&pixel)?; // [1, gh*gw, hidden]
                     // Merger: norm over patch features, 2x2 merge concat,
                     // fc1 -> gelu -> fc2 (the checkpoint's merger.norm is
@@ -688,15 +719,13 @@ impl VisionModel for QwenVlModel {
                 .map_err(|e| VisionError::Decode(e.to_string()))?;
             let (w, h) = decoded.dimensions();
             let (rh, rw) = match &self.vision {
-                // The mlx-vlm dialect tower has a fixed learned position
-                // table: force its square side so the grid matches exactly.
-                VisionBackend::MlxQwen(tower) => {
-                    let side = u32::try_from(tower.target_side()).map_err(|_| {
-                        VisionError::Preprocess("tower target side overflow".into())
-                    })?;
-                    (side, side)
-                }
-                VisionBackend::SigLip { .. } => smart_resize_with_factor(
+                // The mlx-vlm dialect tower historically forced its square
+                // side here because its position table could only be read
+                // exactly at that grid. Since the table is now bilinearly
+                // interpolated onto any (gh, gw) — and 2D rotary handles
+                // rectangular grids — both backends take the same
+                // aspect-preserving smart_resize path.
+                VisionBackend::MlxQwen(_) | VisionBackend::SigLip { .. } => smart_resize_with_factor(
                     h,
                     w,
                     factor,
@@ -704,7 +733,7 @@ impl VisionModel for QwenVlModel {
                     self.config.max_pixels,
                 )?,
             };
-            let array = preprocess_qwen_vl_image(&img.bytes, (rw, rh))?;
+            let array = preprocess_qwen_vl_image(&img.bytes, (rw, rh), &self.image_mean, &self.image_std)?;
             arrays.push(array);
             // Token budget from the image's OWN resized dims; the padded batch
             // canvas must never change this (see `encode_all_images`).
@@ -939,11 +968,14 @@ pub(crate) fn load_qwen_vl_model_from_value(
     };
 
     tracing::info!("Qwen-VL model loaded successfully");
+    let (image_mean, image_std) = read_image_norm(dir);
     Ok(AnyModel::QwenVl(QwenVlModel {
         vision,
         language_model,
         config,
         vision_enabled,
+        image_mean,
+        image_std,
     }))
 }
 
@@ -959,6 +991,101 @@ fn load_mm_projector_weights(
     };
     projector.weight = Param::new(get("mm_projector.weight")?);
     projector.bias = Param::new(weights.get("mm_projector.bias").cloned());
+    Ok(())
+}
+
+/// Debug/parity probe: run the mlx-dialect Qwen-VL tower + merger on a
+/// fixed 576x576 input (`/tmp/parity_in.png`, decoded + normalized with the
+/// serving constants, no resize) and write merged features to
+/// `/tmp/higgs_feats.npy` (npy v1, float32). Mirrors the mlx-vlm reference
+/// dump so the two towers can be diffed numerically. Not part of serving.
+#[allow(clippy::missing_errors_doc)]
+pub fn debug_vision_parity(model_dir: &str) -> Result<String, crate::error::ModelError> {
+    use crate::qwen_vl_mlx::MlxQwenVisionTower;
+
+    let dir = std::path::Path::new(model_dir);
+    let raw = std::fs::read_to_string(dir.join("config.json"))
+        .map_err(|e| crate::error::ModelError::Io(e))?;
+    let config: serde_json::Value =
+        serde_json::from_str(&raw)
+            .map_err(|e| crate::error::ModelError::UnsupportedModel(format!("config parse: {e}")))?;
+    let vision = parse_vision_config(
+        config
+            .get("vision_config")
+            .ok_or_else(|| crate::error::ModelError::UnsupportedModel("missing vision_config".into()))?,
+    )?;
+    let merge = config
+        .pointer("/vision_config/spatial_merge_size")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(2) as i32;
+    let lm_hidden = config
+        .pointer("/text_config/hidden_size")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(2560) as i32;
+    let weights = load_safetensor_weights(dir)?;
+    let mut tower = MlxQwenVisionTower::from_weights(&vision, merge, lm_hidden, &weights)?;
+
+    let bytes = std::fs::read("/tmp/parity_in.png")
+        .map_err(|e| crate::error::ModelError::Io(e))?;
+    let img = image::load_from_memory(&bytes)
+        .map_err(|e| crate::error::ModelError::UnsupportedModel(format!("parity png: {e}")))?
+        .to_rgb8();
+    let (w, h) = img.dimensions();
+    let (w_i, h_i) = (w as i32, h as i32);
+    let pixels_raw = img.into_raw();
+    let (image_mean, image_std) = read_image_norm(dir);
+    let mut floats: Vec<f32> = Vec::with_capacity(pixels_raw.len());
+    for (i, &p) in pixels_raw.iter().enumerate() {
+        let ch = i % 3;
+        floats.push((f32::from(p) / 255.0 - image_mean[ch]) / image_std[ch]);
+    }
+    let pixels = Array::from_slice(&floats, &[1, h_i, w_i, 3]);
+
+    let feats = tower.forward(&pixels)?; // [1, gh*gw, hidden]
+    let patch = config
+        .pointer("/vision_config/patch_size")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(16) as i32;
+    let gh = h_i / patch;
+    let gw = w_i / patch;
+    let seq = gh * gw;
+    let merged = tower.project(&feats, gh, gw, merge)?; // [tokens, lm_hidden]
+
+    mlx_rs::transforms::eval([&merged])?;
+    let host: Vec<f32> = merged.as_slice::<f32>().to_vec();
+    let checksum: f32 = host.iter().map(|v| v.abs()).sum();
+    write_npy_f32("/tmp/higgs_feats.npy", merged.shape(), &host)
+        .map_err(|e| crate::error::ModelError::Io(e))?;
+    Ok(format!(
+        "grid {gh}x{gw} merge {merge} feats {:?} checksum {checksum:.3}",
+        merged.shape()
+    ))
+}
+
+/// Minimal npy v1 writer for float32, C order (debug tooling only).
+pub(crate) fn write_npy_f32(path: &str, shape: &[i32], data: &[f32]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dims = shape
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut header = format!(
+        "{{'descr': '<f4', 'fortran_order': False, 'shape': ({dims},), }}"
+    );
+    let mut pad = 64 - (10 + header.len() + 1) % 64;
+    if pad == 0 {
+        pad = 64;
+    }
+    header.push_str(&" ".repeat(pad - 1));
+    header.push('\n');
+    let file = std::fs::File::create(path)?;
+    let mut w = std::io::BufWriter::new(file);
+    w.write_all(b"\x93NUMPY\x01\x00")?;
+    w.write_all(&(header.len() as u16).to_le_bytes())?;
+    w.write_all(header.as_bytes())?;
+    let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    w.write_all(&bytes)?;
     Ok(())
 }
 

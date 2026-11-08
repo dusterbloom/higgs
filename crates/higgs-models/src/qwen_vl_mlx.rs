@@ -199,6 +199,85 @@ impl MlxQwenVisionTower {
         self.num_patches
     }
 
+    /// Bilinear interpolation of the learned position table onto a (gh, gw)
+    /// patch grid, emitted in plain raster order. Ports mlx-vlm
+    /// `fast_pos_embed_interpolate` minus its block-major permutation —
+    /// higgs' sequence is plain row-major here and permutes later in
+    /// `project`. Falls back to an exact identity lookup when the grid
+    /// equals the table's own square raster.
+    fn interpolated_pos_embeds(&mut self, gh: i32, gw: i32) -> Result<Array, Exception> {
+        let n = self.num_patches;
+        let side = (f64::from(n).sqrt().round() as i32).max(1);
+        let seq = gh * gw;
+        if seq == n && gh == side && gw == side {
+            let idx: Vec<i32> = (0..seq).collect();
+            return self
+                .pos_embed
+                .forward(&Array::from_slice(&idx, &[seq]))?
+                .reshape(&[1, seq, self.hidden]);
+        }
+        let side_u = side as usize;
+        let hidden = self.hidden as usize;
+        let f32_dtype = Array::from_slice(&[0.0_f32], &[1]).dtype();
+        let table = self.pos_embed.weight.as_dtype(f32_dtype)?;
+        mlx_rs::transforms::eval([&table])?;
+        let host: Vec<f32> = table.as_slice::<f32>().to_vec();
+        let mut out = vec![0.0_f32; seq as usize * hidden];
+        // numpy linspace(0, side-1, len) sampled at `target`.
+        let sample = |len: i32, target: i32| -> (usize, usize, f32) {
+            let t = if len <= 1 {
+                0.0
+            } else {
+                f64::from(target) * f64::from(side - 1) / f64::from(len - 1)
+            };
+            let floor = t.floor();
+            let lo = (floor as i32).clamp(0, side - 1) as usize;
+            let hi = ((floor as i32) + 1).clamp(lo as i32, side - 1) as usize;
+            (lo, hi, (t - floor) as f32)
+        };
+        for r in 0..gh {
+            let (r0, r1, dr) = sample(gh, r);
+            for c in 0..gw {
+                let (c0, c1, dc) = sample(gw, c);
+                let i00 = (r0 * side_u + c0) * hidden;
+                let i01 = (r0 * side_u + c1) * hidden;
+                let i10 = (r1 * side_u + c0) * hidden;
+                let i11 = (r1 * side_u + c1) * hidden;
+                let dst = ((r * gw + c) as usize) * hidden;
+                for k in 0..hidden {
+                    let a = host[i00 + k] * (1.0 - dc) + host[i01 + k] * dc;
+                    let b = host[i10 + k] * (1.0 - dc) + host[i11 + k] * dc;
+                    out[dst + k] = a * (1.0 - dr) + b * dr;
+                }
+            }
+        }
+        Ok(Array::from_slice(&out, &[1, seq, self.hidden]))
+    }
+
+    /// 2D rotary frequency table [seq, rot_dim] with rot_dim = head_dim/2:
+    /// [row_frequencies | col_frequencies], theta 10000. Ports mlx-vlm
+    /// `rot_pos_emb`; plain raster (row, col) coordinates per patch.
+    fn vision_rotary(&self, gh: i32, gw: i32) -> Result<Array, Exception> {
+        let head_dim = self.blocks.first().map_or(64, |b| b.head_dim);
+        let rot_dim = (head_dim / 2).max(2);
+        let half = (rot_dim / 2) as usize;
+        let inv: Vec<f32> = (0..half)
+            .map(|i| 10_000.0_f32.powf(-(2.0 * i as f32) / rot_dim as f32))
+            .collect();
+        let seq = gh * gw;
+        let mut freqs = vec![0.0_f32; seq as usize * rot_dim as usize];
+        for r in 0..gh {
+            for c in 0..gw {
+                let dst = ((r * gw + c) as usize) * rot_dim as usize;
+                for (i, &f) in inv.iter().enumerate() {
+                    freqs[dst + i] = r as f32 * f;
+                    freqs[dst + half + i] = c as f32 * f;
+                }
+            }
+        }
+        Ok(Array::from_slice(&freqs, &[seq, rot_dim]))
+    }
+
     /// Encode one image canvas `[1, H, W, 3]` -> `[1, gh*gw, hidden]`.
     pub(crate) fn forward(&mut self, pixel_values: &Array) -> Result<Array, Exception> {
         let patch_embeds = self.patch_embed.forward(pixel_values)?; // [1, gh, gw, hidden]
@@ -208,21 +287,67 @@ impl MlxQwenVisionTower {
             ));
         };
         let feats = patch_embeds.reshape(&[1, gh * gw, self.hidden])?;
-        // Position lookup over the flat grid: the conv output's row-major
-        // order matches the learned table's layout.
-        let idx: Vec<i32> = (0..gh * gw).collect();
-        let pos = self
-            .pos_embed
-            .forward(&Array::from_slice(&idx, &[gh * gw]))?
-            .reshape(&[1, gh * gw, self.hidden])?;
+        // Bilinear interpolation of the learned position table onto the
+        // actual patch grid (mlx-vlm `fast_pos_embed_interpolate`): the
+        // checkpoint table is a side*side raster (2304 = 48x48 for Qwen3-VL)
+        // and any other grid must sample it continuously — reading the
+        // first gh*gw rows zigzags across the table's wider raster and
+        // scrambles positions. Higgs keeps the sequence in plain row-major
+        // order (the 2x2 merge happens later in `project`), so the
+        // interpolated table is emitted in plain raster order as well.
+        let pos = self.interpolated_pos_embeds(gh, gw)?;
+        // 2D rotary (row/col) frequencies for vision attention, matching
+        // mlx-vlm `rot_pos_emb` (theta 10000, half the head dim per axis).
+        let rotary = self.vision_rotary(gh, gw)?;
         let mut x = feats.add(&pos)?;
-        for block in &mut self.blocks {
+        // Debug ladder: HIGGS_PARITY_BLOCK=-1 dumps the post-pos hidden,
+        // >= 0 dumps after that block index (parity tooling only).
+        let dump_block: Option<i32> = std::env::var("HIGGS_PARITY_BLOCK")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        if dump_block == Some(-2) {
+            mlx_rs::transforms::eval([&feats])?;
+            let host: Vec<f32> = feats.as_slice::<f32>().to_vec();
+            let _ = crate::qwen_vl::write_npy_f32(
+                "/tmp/higgs_blk_-2.npy",
+                &[1, gh * gw, self.hidden],
+                &host,
+            );
+        }
+        if dump_block == Some(-1) {
+            mlx_rs::transforms::eval([&x])?;
+            let host: Vec<f32> = x.as_slice::<f32>().to_vec();
+            let _ = crate::qwen_vl::write_npy_f32(
+                "/tmp/higgs_blk_-1.npy",
+                &[1, gh * gw, self.hidden],
+                &host,
+            );
+        }
+        for (block_idx, block) in self.blocks.iter_mut().enumerate() {
             let normed = block.norm1.forward(&x)?;
-            let attn_out = block.attention(&normed)?;
+            let attn_out = block.attention(&normed, &rotary)?;
+            if std::env::var("HIGGS_PARITY_ATTN").ok().and_then(|v| v.parse::<i32>().ok()) == Some(block_idx as i32) {
+                mlx_rs::transforms::eval([&attn_out])?;
+                let host: Vec<f32> = attn_out.as_slice::<f32>().to_vec();
+                let _ = crate::qwen_vl::write_npy_f32(
+                    &format!("/tmp/higgs_attn_{block_idx}.npy"),
+                    &[1, gh * gw, self.hidden],
+                    &host,
+                );
+            }
             let after_attn = x.add(&attn_out)?;
             let normed2 = block.norm2.forward(&after_attn)?;
             let mlp_out = block.mlp(&normed2)?;
             x = after_attn.add(&mlp_out)?;
+            if dump_block == Some(block_idx as i32) {
+                mlx_rs::transforms::eval([&x])?;
+                let host: Vec<f32> = x.as_slice::<f32>().to_vec();
+                let _ = crate::qwen_vl::write_npy_f32(
+                    &format!("/tmp/higgs_blk_{block_idx}.npy"),
+                    &[1, gh * gw, self.hidden],
+                    &host,
+                );
+            }
         }
         Ok(x)
     }
@@ -257,7 +382,7 @@ impl MlxQwenVisionTower {
 
 impl MlxVisionBlock {
     /// Fused-QKV attention: split on the activation side (Phi-3 pattern).
-    fn attention(&mut self, hidden_states: &Array) -> Result<Array, Exception> {
+    fn attention(&mut self, hidden_states: &Array, rotary: &Array) -> Result<Array, Exception> {
         let &[b, seq_len, _] = hidden_states.shape() else {
             return Err(Exception::custom("MlxVisionBlock: expected 3D input"));
         };
@@ -277,6 +402,9 @@ impl MlxVisionBlock {
             .index((.., .., 2 * hidden..3 * hidden))
             .reshape(&[b, seq_len, heads, hd])?
             .transpose_axes(&[0, 2, 1, 3])?;
+        // 2D rotary on q/k only (values pass through), as in the reference.
+        let queries = apply_vision_rope(&queries, rotary)?;
+        let keys = apply_vision_rope(&keys, rotary)?;
         let scale = f64::from(hd).powf(-0.5);
         let attn_output = sdpa(&queries, &keys, &values, scale as f32, b, seq_len, heads, hd)?;
         self.attn_proj.forward(&attn_output)
@@ -291,6 +419,49 @@ impl MlxVisionBlock {
 
 /// Scaled dot-product attention on pre-split [b, h, s, d] tensors, mirroring
 /// `SigLipAttention::forward`.
+/// Rotary 2D position encoding for vision attention, ported from mlx-vlm
+/// `apply_rotary_pos_emb_vision`: `rotary` [seq, rot_dim] with
+/// rot_dim = head_dim/2; cos/sin are duplicated across the full head dim and
+/// rotate_half swaps/negates the two halves. `x` is [b, heads, seq, head_dim].
+fn apply_vision_rope(x: &Array, rotary: &Array) -> Result<Array, Exception> {
+    let &[b, heads, seq, hd] = x.shape() else {
+        return Err(Exception::custom("vision rope: expected 4D q/k"));
+    };
+    let rot = *rotary.shape().last().unwrap_or(&0);
+    if rot <= 0 || 2 * rot != hd {
+        return Err(Exception::custom(format!(
+            "vision rope dim mismatch: rot={rot} head_dim={hd}"
+        )));
+    }
+    mlx_rs::transforms::eval([rotary])?;
+    let rf: Vec<f32> = rotary.as_slice::<f32>().to_vec();
+    let hd_u = hd as usize;
+    let mut cos_full = vec![0.0_f32; seq as usize * hd_u];
+    let sin_full = cos_full.clone();
+    // mlx-vlm tiles cos/sin (1,1,2): the rot_dim values repeat twice.
+    let mut sin_full = sin_full;
+    for s in 0..seq as usize {
+        let src = s * rot as usize;
+        for i in 0..rot as usize {
+            let v = rf[src + i];
+            let (c, sn) = (v.cos(), v.sin());
+            let d1 = s * hd_u + i;
+            let d2 = s * hd_u + rot as usize + i;
+            cos_full[d1] = c;
+            cos_full[d2] = c;
+            sin_full[d1] = sn;
+            sin_full[d2] = sn;
+        }
+    }
+    let cos_arr = Array::from_slice(&cos_full, &[1, 1, seq, hd]);
+    let sin_arr = Array::from_slice(&sin_full, &[1, 1, seq, hd]);
+    let x1 = x.index((.., .., .., 0..rot));
+    let x2 = x.index((.., .., .., rot..hd));
+    let neg = Array::from_slice(&[-1.0_f32], &[1, 1, 1, 1]);
+    let rotated = ops::concatenate_axis(&[&x2.multiply(&neg)?, &x1], -1)?;
+    Ok(x.multiply(&cos_arr)?.add(&rotated.multiply(&sin_arr)?)?)
+}
+
 fn sdpa(
     queries: &Array,
     keys: &Array,
