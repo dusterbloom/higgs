@@ -9415,6 +9415,11 @@ impl Qwen3NextInner {
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct Qwen3NextCausalLM {
     pub args: Qwen3NextModelArgs,
+    /// Pending DeepStack (Qwen3-VL) injection for the next prefill from
+    /// embeddings: image-token positions (host indices) and per-LM-layer
+    /// visual embeds `[n, hidden]` (added residually after LM layers 0..n-1).
+    /// Consumed by the next `forward_raw_hidden_with_taps_from_hidden`.
+    pending_deepstack: Option<(Vec<i32>, Vec<Array>)>,
     #[param]
     model: Qwen3NextInner,
     #[param]
@@ -10142,6 +10147,7 @@ impl Qwen3NextCausalLM {
             mtp,
             dense_mtp,
             moe_mtp,
+            pending_deepstack: None,
         })
     }
 
@@ -10441,12 +10447,21 @@ impl Qwen3NextCausalLM {
     /// drafter context priming; the plain VLM embedding path
     /// ([`Qwen3NextCausalLM::forward_raw_from_hidden`]) runs this with `None`.
     #[allow(non_snake_case, clippy::too_many_lines)]
+    /// Queue a DeepStack visual injection for the next prefill from
+    /// embeddings (Qwen3-VL). `positions` is `[1, n]` token indices of the
+    /// image tokens in the upcoming sequence; `embeds[i]` is `[n, hidden]`,
+    /// added after LM layer `i`.
+    pub fn set_deepstack_visual(&mut self, positions: Vec<i32>, embeds: Vec<Array>) {
+        self.pending_deepstack = Some((positions, embeds));
+    }
+
     fn forward_raw_hidden_with_taps_from_hidden(
         &mut self,
         mut h: Array,
         kv_cache: &mut Vec<Option<LayerCache>>,
         tap_layers: Option<&[usize]>,
     ) -> Result<(Array, Vec<Array>), Exception> {
+        let deepstack = self.pending_deepstack.take();
         // DIAGNOSTIC: capture h after each layer when a probe has requested it
         // (higgs_models::diag_request_hidden_capture). The probe then compares
         // two captured forwards (e.g. body vs full) directly — no "previous
@@ -10609,6 +10624,33 @@ impl Qwen3NextCausalLM {
 
             if tap_layers.is_some_and(|layers| layers.binary_search(&layer_idx).is_ok()) {
                 taps.push(h.clone());
+            }
+
+            // DeepStack (Qwen3-VL): residual-add the visual embeds at the
+            // image-token positions after the first N LM layers. Applied
+            // only when this forward covers every position (single-shot
+            // prefill); a windowed/chunked call that does not cover them
+            // skips the injection rather than corrupting positions.
+            if let Some((positions, embeds)) = deepstack.as_ref() {
+                if layer_idx < embeds.len() && !positions.is_empty() {
+                    let seq = *h.shape().get(1).unwrap_or(&0);
+                    let hidden_dim = *h.shape().get(2).unwrap_or(&0);
+                    let max_pos = positions.iter().copied().max().unwrap_or(-1);
+                    if max_pos >= 0 && max_pos < seq {
+                        // One-hot matmul add: delta = onehot[1, T, n] @ e[1, n, H]
+                        let n = positions.len() as i32;
+                        let mut onehot = vec![0.0_f32; (seq * n) as usize];
+                        for (j, &p) in positions.iter().enumerate() {
+                            if p >= 0 && p < seq {
+                                onehot[(p * n + j as i32) as usize] = 1.0;
+                            }
+                        }
+                        let onehot_arr = Array::from_slice(&onehot, &[1, seq, n]);
+                        let e = embeds[layer_idx].reshape(&[1, n, hidden_dim])?;
+                        let delta = mlx_rs::ops::matmul(&onehot_arr, &e)?;
+                        h = h.add(&delta)?;
+                    }
+                }
             }
 
             // Eval every 8 layers during long prefill chunks to bound lazy

@@ -489,6 +489,10 @@ pub struct QwenVlModel {
     /// Per-channel pixel normalization (from preprocessor_config.json).
     image_mean: [f32; 3],
     image_std: [f32; 3],
+    /// DeepStack visual embeds collected by the last `encode_all_images`
+    /// (one `[tokens, lm_hidden]` per deepstack index), consumed by the next
+    /// `forward_multimodal`.
+    pending_deepstack_embeds: Vec<Array>,
     language_model: Qwen3NextCausalLM,
     config: QwenVlConfig,
     /// Whether the vision tower + projector were loaded. False when the
@@ -649,6 +653,13 @@ impl QwenVlModel {
                     // table onto any (gh, gw) grid and applies 2D rotary, so
                     // rectangular grids are fine — no table-size guard.
                     let feats = tower.forward(&pixel)?; // [1, gh*gw, hidden]
+                    // DeepStack: collect per-index visual embeds; the LM
+                    // injection happens in `forward_multimodal` (it needs the
+                    // input token ids for the image positions).
+                    let deepstack_embeds = tower.take_deepstack();
+                    if !deepstack_embeds.is_empty() {
+                        self.pending_deepstack_embeds = deepstack_embeds;
+                    }
                     // Merger: norm over patch features, 2x2 merge concat,
                     // fc1 -> gelu -> fc2 (the checkpoint's merger.norm is
                     // hidden-wide: it norms BEFORE the merge concat).
@@ -800,6 +811,20 @@ impl VisionModel for QwenVlModel {
             .as_dtype(mlx_rs::Dtype::Int32)
             .map_err(|e| Exception::custom(format!("Qwen-VL: input id dtype cast failed: {e}")))?;
         let image_features = self.encode_all_images(batch)?; // [sum(per_image_tokens), lm_hidden]
+        // DeepStack: hand the visual embeds to the LM for residual injection
+        // at the image-token positions after its first N layers.
+        let deepstack_embeds = std::mem::take(&mut self.pending_deepstack_embeds);
+        if !deepstack_embeds.is_empty() {
+            let ids_host: Vec<i32> = input_ids.as_slice::<i32>().iter().copied().collect();
+            let positions: Vec<i32> = ids_host
+                .iter()
+                .enumerate()
+                .filter(|&(_, t)| *t == IMAGE_TOKEN_INDEX as i32)
+                .map(|(i, _)| i as i32)
+                .collect();
+            self.language_model
+                .set_deepstack_visual(positions, deepstack_embeds);
+        }
         // Replace IMAGE_TOKEN_INDEX sentinels with 0 before embedding lookup;
         // merge_embeddings overwrites these positions with image features.
         let sentinel = Array::from_slice(&[IMAGE_TOKEN_INDEX], &[1]);
@@ -917,12 +942,22 @@ pub(crate) fn load_qwen_vl_model_from_value(
         if weights.contains_key("vision_tower.blocks.0.attn.qkv.weight") {
             // mlx-vlm export dialect (Qwen2.5/3/3.5-VL MLX quants): fused-QKV
             // SigLIP blocks, learned pos table, merger-MLP projector.
-            VisionBackend::MlxQwen(crate::qwen_vl_mlx::MlxQwenVisionTower::from_weights(
+            let mut tower = crate::qwen_vl_mlx::MlxQwenVisionTower::from_weights(
                 &config.vision_config,
                 config.merge_size,
                 language_model.args.hidden_size,
                 &weights,
-            )?)
+            )?;
+            let deepstack_indexes: Vec<usize> = raw
+                .pointer("/vision_config/deepstack_visual_indexes")
+                .and_then(|v| v.as_array())
+                .map_or_else(Vec::new, |arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_i64().and_then(|i| usize::try_from(i).ok()))
+                        .collect()
+                });
+            tower.set_deepstack_indexes(deepstack_indexes);
+            VisionBackend::MlxQwen(tower)
         } else if weights.keys().any(|k| k.starts_with("vision_tower.")) {
             // HF-style key layout: SigLIP tower + single linear projector.
             let mut vision_tower = SigLipVisionModel::new(&config.vision_config)?;
@@ -970,6 +1005,7 @@ pub(crate) fn load_qwen_vl_model_from_value(
     tracing::info!("Qwen-VL model loaded successfully");
     let (image_mean, image_std) = read_image_norm(dir);
     Ok(AnyModel::QwenVl(QwenVlModel {
+        pending_deepstack_embeds: Vec::new(),
         vision,
         language_model,
         config,
@@ -1024,6 +1060,15 @@ pub fn debug_vision_parity(model_dir: &str) -> Result<String, crate::error::Mode
         .unwrap_or(2560) as i32;
     let weights = load_safetensor_weights(dir)?;
     let mut tower = MlxQwenVisionTower::from_weights(&vision, merge, lm_hidden, &weights)?;
+    let deepstack_indexes: Vec<usize> = config
+        .pointer("/vision_config/deepstack_visual_indexes")
+        .and_then(|v| v.as_array())
+        .map_or_else(Vec::new, |arr| {
+            arr.iter()
+                .filter_map(|v| v.as_i64().and_then(|i| usize::try_from(i).ok()))
+                .collect()
+        });
+    tower.set_deepstack_indexes(deepstack_indexes);
 
     let bytes = std::fs::read("/tmp/parity_in.png")
         .map_err(|e| crate::error::ModelError::Io(e))?;
@@ -1056,6 +1101,13 @@ pub fn debug_vision_parity(model_dir: &str) -> Result<String, crate::error::Mode
     let checksum: f32 = host.iter().map(|v| v.abs()).sum();
     write_npy_f32("/tmp/higgs_feats.npy", merged.shape(), &host)
         .map_err(|e| crate::error::ModelError::Io(e))?;
+    let deepstack_out = tower.take_deepstack();
+    for (i, ds) in deepstack_out.iter().enumerate() {
+        mlx_rs::transforms::eval([ds])?;
+        let host: Vec<f32> = ds.as_slice::<f32>().to_vec();
+        write_npy_f32(&format!("/tmp/higgs_ds_{i}.npy"), ds.shape(), &host)
+            .map_err(|e| crate::error::ModelError::Io(e))?;
+    }
     Ok(format!(
         "grid {gh}x{gw} merge {merge} feats {:?} checksum {checksum:.3}",
         merged.shape()

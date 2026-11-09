@@ -46,6 +46,21 @@ pub(crate) struct MlxQwenVisionTower {
     hidden: i32,
     num_patches: i32,
     patch_size: i32,
+    merge_size: i32,
+    /// DeepStack mergers (one per deepstack index) + the tower layers they
+    /// tap. Emptied when the checkpoint ships no `deepstack_merger_list`.
+    deepstack_mergers: Vec<DeepStackMerger>,
+    deepstack_indexes: Vec<usize>,
+    /// DeepStack outputs `[tokens, lm_hidden]` collected by the last forward.
+    deepstack_out: Vec<Array>,
+}
+
+/// Post-shuffle DeepStack merger: LayerNorm over the merged (hidden*merge^2)
+/// width, then fc1 -> gelu(tanh) -> fc2 to the LM hidden size.
+struct DeepStackMerger {
+    norm: nn::LayerNorm,
+    fc1: nn::Linear,
+    fc2: nn::Linear,
 }
 
 impl MlxQwenVisionTower {
@@ -175,6 +190,36 @@ impl MlxQwenVisionTower {
             merger_fc2.bias = Param::new(Some(b));
         }
 
+        // DeepStack mergers (optional per checkpoint): norm over the merged
+        // width (post-shuffle), fc1 -> gelu(tanh) -> fc2 to lm_hidden.
+        let mut deepstack_mergers = Vec::new();
+        let mut i = 0;
+        loop {
+            let p = format!("vision_tower.deepstack_merger_list.{i}");
+            if weights.get(&format!("{p}.linear_fc1.weight")).is_none() {
+                break;
+            }
+            let mut norm = nn::LayerNormBuilder::new(merged_in)
+                .eps(config.layer_norm_eps)
+                .build()?;
+            norm.weight = Param::new(Some(get(&format!("{p}.norm.weight"))?));
+            if let Some(b) = opt(&format!("{p}.norm.bias")) {
+                norm.bias = Param::new(Some(b));
+            }
+            let mut fc1 = nn::LinearBuilder::new(merged_in, config.intermediate_size).build()?;
+            fc1.weight = Param::new(get(&format!("{p}.linear_fc1.weight"))?);
+            if let Some(b) = opt(&format!("{p}.linear_fc1.bias")) {
+                fc1.bias = Param::new(Some(b));
+            }
+            let mut fc2 = nn::LinearBuilder::new(config.intermediate_size, lm_hidden).build()?;
+            fc2.weight = Param::new(get(&format!("{p}.linear_fc2.weight"))?);
+            if let Some(b) = opt(&format!("{p}.linear_fc2.bias")) {
+                fc2.bias = Param::new(Some(b));
+            }
+            deepstack_mergers.push(DeepStackMerger { norm, fc1, fc2 });
+            i += 1;
+        }
+
         Ok(Self {
             patch_embed,
             pos_embed,
@@ -185,7 +230,24 @@ impl MlxQwenVisionTower {
             hidden,
             num_patches,
             patch_size: config.patch_size,
+            merge_size,
+            deepstack_mergers,
+            deepstack_indexes: Vec::new(),
+            deepstack_out: Vec::new(),
         })
+    }
+
+    /// Set the tower layers whose hidden states feed the DeepStack mergers
+    /// (`vision_config.deepstack_visual_indexes`). Must be set before
+    /// `forward`; lengths beyond the merger list are ignored.
+    pub(crate) fn set_deepstack_indexes(&mut self, indexes: Vec<usize>) {
+        self.deepstack_indexes = indexes;
+    }
+
+    /// Take the DeepStack feature list `[tokens, lm_hidden]` per index
+    /// collected by the most recent `forward`.
+    pub(crate) fn take_deepstack(&mut self) -> Vec<Array> {
+        std::mem::take(&mut self.deepstack_out)
     }
 
     /// Fixed square processing side (px) implied by the learned pos table.
@@ -347,6 +409,24 @@ impl MlxQwenVisionTower {
                     &[1, gh * gw, self.hidden],
                     &host,
                 );
+            }
+            if let Some(slot) = self.deepstack_indexes.iter().position(|&i| i == block_idx) {
+                if let Some(merger) = self.deepstack_mergers.get_mut(slot) {
+                    // Post-shuffle merge: plain-raster [1, seq, hidden] ->
+                    // 2x2 block groups -> [1, tokens, hidden*m*m], LayerNorm
+                    // over the merged width, fc1 -> gelu(tanh) -> fc2.
+                    let m = self.merge_size.max(1);
+                    let tokens = (gh / m) * (gw / m);
+                    let merged = x
+                        .reshape(&[1, gh / m, m, gw / m, m, self.hidden])?
+                        .transpose_axes(&[0, 1, 3, 2, 4, 5])?
+                        .reshape(&[1, tokens, self.hidden * m * m])?;
+                    let normed = merger.norm.forward(&merged)?;
+                    let h1 = merger.fc1.forward(&normed)?;
+                    let act = nn::gelu_approximate(&h1)?;
+                    let out = merger.fc2.forward(&act)?.index(0); // [tokens, lm_hidden]
+                    self.deepstack_out.push(out);
+                }
             }
         }
         Ok(x)
