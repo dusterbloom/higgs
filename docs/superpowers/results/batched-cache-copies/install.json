@@ -1,0 +1,8 @@
+{
+  "binary": "/Users/peppi/.local/bin/higgs",
+  "sha256": "79dcf3e1fec06fde7f2070e9a3c3fac8c0a8193ce18c379f3022d02340bb292d",
+  "rollback": "/Users/peppi/.local/bin/higgs.before-batched-cache-1794669708",
+  "rollback_sha256": "a046a791c6cc0aed06b31e67c630d1bb623bac8d5e097a9d784c7822d6984299",
+  "source_worktree": "/Users/peppi/.codex/worktrees/e233/higgs",
+  "comparison": "/private/tmp/higgs-batch-copy-comparison.json"
+}

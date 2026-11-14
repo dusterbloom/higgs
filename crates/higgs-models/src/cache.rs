@@ -791,6 +791,28 @@ impl SteppingKeyValueCache {
         })
     }
 
+    /// Build independent copy graphs; the whole-cache caller evaluates them together.
+    pub(crate) fn try_deep_clone_lazy(&self) -> Result<Self, Exception> {
+        let mut copied = self.clone();
+        let mut slots = vec![&mut copied.keys, &mut copied.values];
+        if let Some(turbo) = &mut copied.turbo {
+            slots.extend([
+                &mut turbo.key_codes,
+                &mut turbo.key_norms,
+                &mut turbo.key_gammas,
+                &mut turbo.value_codes,
+                &mut turbo.value_norms,
+            ]);
+        }
+        if let Some(mla) = &mut copied.mla {
+            slots.push(&mut mla.latent);
+        }
+        for array in slots.into_iter().flatten() {
+            *array = crate::metal_kernel::materialized_device_copy_lazy(array)?;
+        }
+        Ok(copied)
+    }
+
     /// Estimated device bytes retained by this cache's allocated arrays.
     #[must_use]
     pub fn estimated_bytes(&self) -> usize {

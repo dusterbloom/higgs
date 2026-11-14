@@ -590,14 +590,15 @@ impl AnyCache {
 
     /// Fallible independent device-side copy for retained/prefix snapshots.
     pub fn try_deep_clone(&self) -> Result<Self, Exception> {
-        match self {
-            Self::KV(layers) => Ok(Self::KV(
+        let _exec = (!crate::mlx_exec::held()).then(crate::mlx_exec::acquire);
+        let copied = match self {
+            Self::KV(layers) => Ok::<Self, Exception>(Self::KV(
                 layers
                     .iter()
                     .map(|layer| {
                         layer
                             .as_ref()
-                            .map(cache::SteppingKeyValueCache::try_deep_clone)
+                            .map(cache::SteppingKeyValueCache::try_deep_clone_lazy)
                             .transpose()
                     })
                     .collect::<Result<Vec<_>, Exception>>()?,
@@ -609,16 +610,19 @@ impl AnyCache {
                         layer
                             .as_ref()
                             .map(|cache| match cache {
-                                LayerCache::KV(kv) => kv.try_deep_clone().map(LayerCache::KV),
+                                LayerCache::KV(kv) => kv.try_deep_clone_lazy().map(LayerCache::KV),
                                 LayerCache::Arrays(arrays) => {
-                                    arrays.try_deep_clone().map(LayerCache::Arrays)
+                                    arrays.try_deep_clone_lazy().map(LayerCache::Arrays)
                                 }
                             })
                             .transpose()
                     })
                     .collect::<Result<Vec<_>, Exception>>()?,
             )),
-        }
+        }?;
+        // Independent copy graphs share one completion wait across all layers.
+        copied.eval()?;
+        Ok(copied)
     }
 
     /// Estimated device bytes retained by all cache arrays.
@@ -655,6 +659,23 @@ impl AnyCache {
 }
 
 impl qwen3_next::ArraysCache {
+    fn try_deep_clone_lazy(&self) -> Result<Self, Exception> {
+        Ok(Self {
+            conv_state: self
+                .conv_state
+                .as_ref()
+                .map(crate::metal_kernel::materialized_device_copy_lazy)
+                .transpose()?,
+            ssm_state: self
+                .ssm_state
+                .as_ref()
+                .map(crate::metal_kernel::materialized_device_copy_lazy)
+                .transpose()?,
+            conv_pos: self.conv_pos,
+            offset: self.offset,
+        })
+    }
+
     /// Independent copy of recurrent Hybrid state for cross-turn cache storage.
     /// Device-side copy — see [`cache::try_eval_deep_clone`].
     #[must_use]

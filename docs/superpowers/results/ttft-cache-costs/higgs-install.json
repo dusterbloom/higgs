@@ -1,0 +1,10 @@
+{
+  "installed": "/Users/peppi/.local/bin/higgs",
+  "installed_sha256": "a046a791c6cc0aed06b31e67c630d1bb623bac8d5e097a9d784c7822d6984299",
+  "version": "higgs 1.8.0",
+  "backup": "/Users/peppi/.local/bin/higgs.before-prefill-memory-1794586661",
+  "backup_sha256": "aa99f17f30a3b71e6808e9eff8c5abfc7a2162ad63679119ed09c98856f801fc",
+  "metallib_unchanged": true,
+  "source_worktree": "/Users/peppi/.codex/worktrees/e233/higgs",
+  "server_started": false
+}

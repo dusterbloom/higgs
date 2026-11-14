@@ -1,0 +1,110 @@
+{
+  "A": {
+    "requests": [
+      {
+        "turn": 0,
+        "mode": "normal",
+        "ttft_s": 30.076483624987304,
+        "total_s": 30.076665624976158
+      },
+      {
+        "turn": 1,
+        "mode": "normal",
+        "ttft_s": 3.9495860000606626,
+        "total_s": 3.9497175000142306
+      },
+      {
+        "turn": 2,
+        "mode": "background",
+        "ttft_s": 24.410746874986216,
+        "total_s": 24.410938957938924
+      },
+      {
+        "turn": 3,
+        "mode": "normal",
+        "ttft_s": 1.7653891250956804,
+        "total_s": 1.7654684579465538
+      }
+    ],
+    "snapshots": [
+      {
+        "tokens": 5530.0,
+        "copy_ms": 177.544209,
+        "evaluate_ms": 0.8635,
+        "publish_ms": 0.011084
+      },
+      {
+        "tokens": 5692.0,
+        "copy_ms": 1303.359,
+        "evaluate_ms": 0.075542,
+        "publish_ms": 0.039292
+      },
+      {
+        "tokens": 5854.0,
+        "copy_ms": 10408.908708,
+        "evaluate_ms": 0.137958,
+        "publish_ms": 0.093083
+      },
+      {
+        "tokens": 6016.0,
+        "copy_ms": 590.249459,
+        "evaluate_ms": 0.065083,
+        "publish_ms": 0.0295
+      }
+    ]
+  },
+  "B": {
+    "requests": [
+      {
+        "turn": 0,
+        "mode": "normal",
+        "ttft_s": 24.59884083410725,
+        "total_s": 24.598962084157392
+      },
+      {
+        "turn": 1,
+        "mode": "normal",
+        "ttft_s": 1.2939392500557005,
+        "total_s": 1.2940356668550521
+      },
+      {
+        "turn": 2,
+        "mode": "background",
+        "ttft_s": 2.897292625159025,
+        "total_s": 2.8973960001021624
+      },
+      {
+        "turn": 3,
+        "mode": "normal",
+        "ttft_s": 1.3200721668545157,
+        "total_s": 1.3201814589556307
+      }
+    ],
+    "snapshots": [
+      {
+        "tokens": 5530.0,
+        "copy_ms": 14.64725,
+        "evaluate_ms": 0.316042,
+        "publish_ms": 0.004459
+      },
+      {
+        "tokens": 5692.0,
+        "copy_ms": 17.496667000000002,
+        "evaluate_ms": 0.064625,
+        "publish_ms": 0.033083999999999995
+      },
+      {
+        "tokens": 5854.0,
+        "copy_ms": 31.099709,
+        "evaluate_ms": 0.12520799999999999,
+        "publish_ms": 0.094583
+      },
+      {
+        "tokens": 6016.0,
+        "copy_ms": 16.068375,
+        "evaluate_ms": 0.06770799999999999,
+        "publish_ms": 0.034165999999999995
+      }
+    ]
+  }
+}

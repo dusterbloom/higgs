@@ -587,6 +587,52 @@ fn pflash_free_memory_mb() -> Result<usize, EngineError> {
     Ok(free_bytes / (1024 * 1024))
 }
 
+// Match the existing PFlash headroom floor, but degrade execution width rather
+// than rejecting an exact prefill. A 256-row chunk is the huge-model balanced
+// profile's next conservative power-of-two below its normal 384-row chunk.
+const PREFILL_PRESSURE_MIN_FREE_MB: usize = 2_048;
+const PREFILL_PRESSURE_CHUNK_SIZE: i32 = 256;
+// Hybrid body checkpoints floor to one radix block before forwarding. Start
+// the long-context bound one block early so a 16K prompt cannot evade it.
+const LONG_PREFILL_MIN_TOKENS: usize = 16_384 - DEFAULT_BLOCK_SIZE;
+const LONG_PREFILL_CHUNK_SIZE: i32 = 512;
+
+const fn prefill_memory_pressure(prompt_tokens: usize, free_memory_mb: usize) -> bool {
+    prompt_tokens > PREFILL_PRESSURE_CHUNK_SIZE as usize
+        && free_memory_mb < PREFILL_PRESSURE_MIN_FREE_MB
+}
+
+fn prefill_chunk_size_under_pressure(
+    configured_chunk_size: i32,
+    prompt_tokens: usize,
+    free_memory_mb: usize,
+) -> i32 {
+    let long_context_chunk = if prompt_tokens >= LONG_PREFILL_MIN_TOKENS {
+        configured_chunk_size.min(LONG_PREFILL_CHUNK_SIZE)
+    } else {
+        configured_chunk_size
+    };
+    if prefill_memory_pressure(prompt_tokens, free_memory_mb) {
+        long_context_chunk.min(PREFILL_PRESSURE_CHUNK_SIZE)
+    } else {
+        long_context_chunk
+    }
+}
+
+const fn chunked_prefill_required(
+    seq_len: i32,
+    chunked_threshold: i32,
+    configured_chunk_size: i32,
+    effective_chunk_size: i32,
+    force_chunked: bool,
+) -> bool {
+    effective_chunk_size > 0
+        && effective_chunk_size < seq_len
+        && (force_chunked
+            || seq_len > chunked_threshold
+            || effective_chunk_size < configured_chunk_size)
+}
+
 fn floor_char_boundary(text: &str, mut index: usize) -> usize {
     index = index.min(text.len());
     while index > 0 && !text.is_char_boundary(index) {
@@ -3444,7 +3490,19 @@ impl RequestMlxExecution {
     fn finish_phase(&mut self) {
         if let Some(sampler) = self.sampler.take() {
             match sampler.finish(&mut self.gate) {
-                Ok(sample) => record_request_memory_high_water(sample),
+                Ok(sample) => {
+                    if std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|value| value == "1") {
+                        tracing::info!(
+                            phase = ?sample.phase,
+                            active_before_bytes = sample.active_before_bytes,
+                            active_after_bytes = sample.active_after_bytes,
+                            peak_bytes = sample.peak_bytes,
+                            active_growth_bytes = sample.active_growth_bytes,
+                            "Request MLX memory high-water"
+                        );
+                    }
+                    record_request_memory_high_water(sample);
+                }
                 Err(error) => {
                     tracing::warn!(%error, ?self.phase, "request allocation sample discarded");
                     invalidate_request_allocation_capture();
@@ -5918,12 +5976,13 @@ impl SimpleEngine {
             None => {
                 let n = i32::try_from(preamble.len())
                     .map_err(|_| EngineError::Generation("preamble overflows i32".to_owned()))?;
+                let (chunk_size, _) = self.memory_bounded_prefill_chunk_size(preamble.len());
                 prepared
                     .model
                     .forward_chunked(
                         &Array::from_slice(preamble, &[1, n]),
                         &mut prepared.cache,
-                        self.tuning.chunked_prefill_chunk_size(),
+                        chunk_size,
                     )
                     .map_err(EngineError::Mlx)?;
             }
@@ -10968,10 +11027,16 @@ impl SimpleEngine {
             prompt.shape().get(1).copied().ok_or_else(|| {
                 EngineError::Generation("DFlash prompt has no token axis".to_owned())
             })?;
-        let chunk_size = self.tuning.chunked_prefill_chunk_size();
-        let chunked = seq_len > self.tuning.chunked_prefill_threshold()
-            && chunk_size > 0
-            && chunk_size < seq_len;
+        let configured_chunk_size = self.tuning.chunked_prefill_chunk_size();
+        let (chunk_size, force_chunked) =
+            self.memory_bounded_prefill_chunk_size(prompt_tokens.len());
+        let chunked = chunked_prefill_required(
+            seq_len,
+            self.tuning.chunked_prefill_threshold(),
+            configured_chunk_size,
+            chunk_size,
+            force_chunked,
+        );
         let mut offset = 0_i32;
 
         while chunked && offset + chunk_size < seq_len {
@@ -15359,6 +15424,34 @@ impl SimpleEngine {
         Cow::Owned(params)
     }
 
+    /// Bound a prefill's transient working set when the MLX allocator has less
+    /// than its normal safety floor available. The prompt is still processed
+    /// exactly; only the number of rows submitted per chunk changes.
+    fn memory_bounded_prefill_chunk_size(&self, prompt_tokens: usize) -> (i32, bool) {
+        let configured = self.tuning.chunked_prefill_chunk_size();
+        let long_context_bound =
+            prefill_chunk_size_under_pressure(configured, prompt_tokens, usize::MAX);
+        if prompt_tokens <= PREFILL_PRESSURE_CHUNK_SIZE as usize {
+            return (long_context_bound, false);
+        }
+        let Ok(free_memory_mb) = pflash_free_memory_mb() else {
+            return (long_context_bound, false);
+        };
+        let bounded = prefill_chunk_size_under_pressure(configured, prompt_tokens, free_memory_mb);
+        let force_chunked = prefill_memory_pressure(prompt_tokens, free_memory_mb);
+        if force_chunked {
+            maybe_clear_mlx_cache(true, "memory-pressure prefill");
+            tracing::warn!(
+                prompt_tokens,
+                free_memory_mb,
+                configured_chunk_size = configured,
+                bounded_chunk_size = bounded,
+                "Low MLX headroom; reclaiming allocator cache and bounding prefill chunks"
+            );
+        }
+        (bounded, force_chunked)
+    }
+
     /// Self-speculation penalties: the pack's ramps with the request's
     /// presence / frequency / repetition. The think-end ramp needs an open
     /// `<think>`: without thinking the template already closed it.
@@ -15421,12 +15514,9 @@ impl SimpleEngine {
                 let n = i32::try_from(tokens.len()).map_err(|_| {
                     EngineError::Generation("prompt length overflows i32".to_owned())
                 })?;
+                let (chunk_size, _) = self.memory_bounded_prefill_chunk_size(tokens.len());
                 let logits = model
-                    .forward_chunked(
-                        &Array::from_slice(tokens, &[1, n]),
-                        cache,
-                        self.tuning.chunked_prefill_chunk_size(),
-                    )
+                    .forward_chunked(&Array::from_slice(tokens, &[1, n]), cache, chunk_size)
                     .map_err(EngineError::Mlx)?;
                 let mut targets = vec![&logits];
                 targets.extend(cache.eval_targets());
@@ -15453,6 +15543,7 @@ impl SimpleEngine {
         checkpoint_id: Option<&str>,
         mut drafter: Option<SelfSpecDrafter<'_>>,
     ) -> Result<(Array, Vec<Array>), EngineError> {
+        let phase_start = std::time::Instant::now();
         if store {
             self.store_preamble_checkpoint(
                 prompt_tokens,
@@ -15462,6 +15553,9 @@ impl SimpleEngine {
                 &mut drafter,
             )?;
         }
+        let preamble_elapsed = phase_start.elapsed();
+        let body_start = std::time::Instant::now();
+        let mut snapshot_elapsed = std::time::Duration::ZERO;
         let is_hybrid = matches!(prepared.cache, AnyCache::Hybrid(_));
         let split_at = if store && is_hybrid {
             exact_generation_body(&prepared.actual_prompt_tokens, generation_suffix)
@@ -15486,9 +15580,30 @@ impl SimpleEngine {
             }
             // Snapshot before the generation suffix: the stored entry must end
             // at the recurring conversation boundary (see `run_prefill_evaluation`).
+            let snapshot_start = std::time::Instant::now();
             prepared.stored_clone = Some(prepared.cache.deep_clone());
+            snapshot_elapsed = snapshot_start.elapsed();
         }
-        self.self_spec_forward(&mut prepared.model, &mut prepared.cache, tail, &mut drafter)
+        let body_elapsed = body_start.elapsed();
+        let body_tokens = body.len();
+        let tail_tokens = tail.len();
+        let tail_start = std::time::Instant::now();
+        let result =
+            self.self_spec_forward(&mut prepared.model, &mut prepared.cache, tail, &mut drafter);
+        if std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|value| value == "1") {
+            tracing::info!(
+                store,
+                reused_tokens = prepared.reused_prefix_tokens,
+                body_tokens,
+                tail_tokens,
+                preamble_ms = preamble_elapsed.as_secs_f64() * 1000.0,
+                body_and_snapshot_ms = body_elapsed.as_secs_f64() * 1000.0,
+                snapshot_ms = snapshot_elapsed.as_secs_f64() * 1000.0,
+                tail_ms = tail_start.elapsed().as_secs_f64() * 1000.0,
+                "Self-spec prefill phase timings"
+            );
+        }
+        result
     }
 
     /// Self-speculative decode on a prefilled request-local state. `logits`
@@ -15752,6 +15867,8 @@ impl SimpleEngine {
         prepared: &PreparedGeneration<'_>,
         prompt_tokens: &[u32],
     ) {
+        let diag = std::env::var("HIGGS_DIAG_SESSION_TIMING").is_ok_and(|v| v == "1");
+        let started = std::time::Instant::now();
         let Ok(boundary) = i32::try_from(prompt_tokens.len()) else {
             tracing::warn!(
                 session_id,
@@ -15766,6 +15883,7 @@ impl SimpleEngine {
                 return;
             }
         };
+        let copy_elapsed = started.elapsed();
         if let Err(error) = cache.validate_absolute_boundary(boundary) {
             tracing::warn!(
                 session_id,
@@ -15790,8 +15908,17 @@ impl SimpleEngine {
                 ),
             }
         }
+        let quantize_elapsed = started.elapsed().saturating_sub(copy_elapsed);
+        let evaluate_started = std::time::Instant::now();
         match RetainedState::target_only(cache, prompt_tokens.to_vec(), &prepared._mlx_gate) {
-            Ok(state) => self.stash_retained(session_id, state, cap_exempt),
+            Ok(state) => {
+                let evaluate_elapsed = evaluate_started.elapsed();
+                let publish_started = std::time::Instant::now();
+                self.stash_retained(session_id, state, cap_exempt);
+                if diag {
+                    tracing::info!(session_id, tokens = prompt_tokens.len(), copy_ms = copy_elapsed.as_secs_f64() * 1000.0, validate_and_quantize_ms = quantize_elapsed.as_secs_f64() * 1000.0, evaluate_ms = evaluate_elapsed.as_secs_f64() * 1000.0, publish_ms = publish_started.elapsed().as_secs_f64() * 1000.0, "Retained snapshot phase timings");
+                }
+            },
             Err(error) => tracing::warn!(
                 session_id,
                 error = %error,
@@ -16192,10 +16319,10 @@ mod tests {
         SessionGeneration, SessionOutcome, SessionPrefillStrategy, SessionPromptTraceOutcome,
         SessionPromptTracePayloadStats, SessionRunMode, SimpleEngine, SpeculationRoute, Tokenizer,
         adaptive_draft_depth_for_cap, begin_optional_model_load, cache_policy_allows_prefix_cache,
-        canonical_prompt_extension, check_stop_sequences, common_prefix_token_len,
-        contains_real_user_query, continuation_prior_len, continuation_reject_reason,
-        continued_dspark_cold_retry_allowed, derive_model_name, detect_thinking_support,
-        dflash_accepts_pflash_plan, dflash_canonical_target_is_terminal,
+        canonical_prompt_extension, check_stop_sequences, chunked_prefill_required,
+        common_prefix_token_len, contains_real_user_query, continuation_prior_len,
+        continuation_reject_reason, continued_dspark_cold_retry_allowed, derive_model_name,
+        detect_thinking_support, dflash_accepts_pflash_plan, dflash_canonical_target_is_terminal,
         dflash_new_stop_prefix_len, dflash_resolve_target_then_draft,
         dflash_sparse_taps_available_for_pflash_plan, dflash_tail_draft_cap,
         drive_canonical_dspark_round, estimate_paged_kv_blocks, extract_eos_tokens,
@@ -16205,7 +16332,8 @@ mod tests {
         paired_dflash_exact_domain, parse_enabled_flag, pflash_actual_keep_ratio,
         pflash_auto_plan_worth_executing, pflash_cache_source_and_request_tail,
         pflash_cache_source_and_request_tail_with_boundary, pflash_full_score_budget_exceeded,
-        prefill_sample_count, reset_prefill_sample_count, resolve_dflash_block_size_override,
+        prefill_chunk_size_under_pressure, prefill_memory_pressure, prefill_sample_count,
+        reset_prefill_sample_count, resolve_dflash_block_size_override,
         resolve_dflash_min_block_override, resolve_dspark_draft_cap_override,
         resolve_optional_dflash_path, resolve_pflash_full_score_max_tokens,
         resolve_pflash_min_free_memory_mb, resolve_speculation_route, retained_kv_storage_at,
@@ -16368,6 +16496,27 @@ mod tests {
         assert_eq!(resolve_dspark_draft_cap_override(Some(" 4 ")), None);
         assert_eq!(resolve_dflash_min_block_override(Some("2")), Some(2));
         assert_eq!(resolve_dflash_min_block_override(Some(" 2 ")), None);
+    }
+
+    #[test]
+    fn low_headroom_bounds_prefill_chunks_without_rejecting_the_prompt() {
+        assert_eq!(prefill_chunk_size_under_pressure(1_024, 28_832, 1_024), 256);
+        assert_eq!(prefill_chunk_size_under_pressure(128, 28_832, 1_024), 128);
+        assert_eq!(prefill_chunk_size_under_pressure(1_024, 28_832, 2_048), 512);
+        assert_eq!(
+            prefill_chunk_size_under_pressure(1_024, 8_192, 2_048),
+            1_024
+        );
+        assert_eq!(prefill_chunk_size_under_pressure(1_024, 256, 1_024), 1_024);
+        assert!(prefill_memory_pressure(28_832, 1_024));
+        assert!(!prefill_memory_pressure(28_832, 2_048));
+        assert!(!prefill_memory_pressure(256, 1_024));
+        assert!(chunked_prefill_required(257, 1_024, 1_024, 256, true));
+        assert!(!chunked_prefill_required(
+            257, 1_024, 1_024, 1_024, false
+        ));
+        assert!(chunked_prefill_required(800, 1_024, 256, 256, true));
+        assert!(chunked_prefill_required(800, 1_024, 128, 128, true));
     }
 
     #[test]

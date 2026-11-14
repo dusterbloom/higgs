@@ -1,0 +1,12 @@
+{"tokens":2048,"iteration":0,"cache_bytes":107806720,"radix_resident_bytes":107806720,"fork_ms":155.865,"radix_store_ms":35.034,"radix_restore_ms":13.758}
+{"tokens":2048,"iteration":1,"cache_bytes":107806720,"radix_resident_bytes":107806720,"fork_ms":16.221,"radix_store_ms":31.907,"radix_restore_ms":13.200}
+{"tokens":2048,"iteration":2,"cache_bytes":107806720,"radix_resident_bytes":107806720,"fork_ms":16.482,"radix_store_ms":22.016,"radix_restore_ms":13.002}
+{"tokens":2048,"iteration":3,"cache_bytes":107806720,"radix_resident_bytes":107806720,"fork_ms":15.645,"radix_store_ms":22.262,"radix_restore_ms":13.917}
+{"tokens":2048,"iteration":4,"cache_bytes":107806720,"radix_resident_bytes":107806720,"fork_ms":16.655,"radix_store_ms":21.427,"radix_restore_ms":13.720}
+{"tokens":2048,"iteration":5,"cache_bytes":107806720,"radix_resident_bytes":107806720,"fork_ms":16.646,"radix_store_ms":21.986,"radix_restore_ms":13.309}
+{"tokens":8192,"iteration":0,"cache_bytes":233635840,"radix_resident_bytes":233635840,"fork_ms":23.274,"radix_store_ms":52.837,"radix_restore_ms":16.860}
+{"tokens":8192,"iteration":1,"cache_bytes":233635840,"radix_resident_bytes":233635840,"fork_ms":20.064,"radix_store_ms":62.239,"radix_restore_ms":17.000}
+{"tokens":8192,"iteration":2,"cache_bytes":233635840,"radix_resident_bytes":233635840,"fork_ms":22.094,"radix_store_ms":44.646,"radix_restore_ms":16.791}
+{"tokens":8192,"iteration":3,"cache_bytes":233635840,"radix_resident_bytes":233635840,"fork_ms":19.898,"radix_store_ms":43.739,"radix_restore_ms":16.529}
+{"tokens":8192,"iteration":4,"cache_bytes":233635840,"radix_resident_bytes":233635840,"fork_ms":19.140,"radix_store_ms":44.332,"radix_restore_ms":15.937}
+{"tokens":8192,"iteration":5,"cache_bytes":233635840,"radix_resident_bytes":233635840,"fork_ms":19.891,"radix_store_ms":44.717,"radix_restore_ms":16.664}

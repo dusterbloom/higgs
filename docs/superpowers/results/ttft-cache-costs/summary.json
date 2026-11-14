@@ -1,0 +1,44 @@
+[
+  {
+    "case": "stock-a",
+    "prefix_words": 2048,
+    "radix_median_ms": 890.6,
+    "retained_median_ms": 660.3,
+    "other_requests": 0
+  },
+  {
+    "case": "stock-a",
+    "prefix_words": 8192,
+    "radix_median_ms": 982.8,
+    "retained_median_ms": 769.6,
+    "other_requests": 0
+  },
+  {
+    "case": "fast-b",
+    "prefix_words": 2048,
+    "radix_median_ms": 864.2,
+    "retained_median_ms": 662.8,
+    "other_requests": 0
+  },
+  {
+    "case": "fast-b",
+    "prefix_words": 8192,
+    "radix_median_ms": 1003.5,
+    "retained_median_ms": 791.2,
+    "other_requests": 0
+  },
+  {
+    "case": "stock-c",
+    "prefix_words": 2048,
+    "radix_median_ms": 872.3,
+    "retained_median_ms": 660.3,
+    "other_requests": 0
+  },
+  {
+    "case": "stock-c",
+    "prefix_words": 8192,
+    "radix_median_ms": 1031.7,
+    "retained_median_ms": 805.8,
+    "other_requests": 0
+  }
+]
