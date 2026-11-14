@@ -17840,7 +17840,7 @@ mod tests {
     #[ignore = "requires real model weights; placeholder test tensors cannot run MTP forward"]
     fn test_mtp_draft_advances_cache_for_confirmed_token() {
         let stream = Stream::new();
-        mlx_rs::with_new_default_stream(&stream, || {
+        mlx_rs::with_new_default_stream(stream.clone(), || {
             let mut args = valid_causal_lm_args();
             args.mtp_num_hidden_layers = 1;
             let mut model = Qwen3NextCausalLM::new(args).unwrap();
@@ -17858,7 +17858,7 @@ mod tests {
     #[ignore = "requires real model weights; placeholder test tensors cannot run MTP forward"]
     fn test_mtp_advance_appends_accepted_token_state() {
         let stream = Stream::new();
-        mlx_rs::with_new_default_stream(&stream, || {
+        mlx_rs::with_new_default_stream(stream.clone(), || {
             let mut args = valid_causal_lm_args();
             args.mtp_num_hidden_layers = 1;
             let mut model = Qwen3NextCausalLM::new(args).unwrap();
@@ -17877,7 +17877,7 @@ mod tests {
     #[ignore = "requires real model weights; placeholder test tensors cannot run MTP forward"]
     fn test_mtp_advance_many_appends_accepted_token_states() {
         let stream = Stream::new();
-        mlx_rs::with_new_default_stream(&stream, || {
+        mlx_rs::with_new_default_stream(stream.clone(), || {
             let mut args = valid_causal_lm_args();
             args.mtp_num_hidden_layers = 1;
             let mut model = Qwen3NextCausalLM::new(args).unwrap();
@@ -18841,7 +18841,7 @@ mod tests {
         let z = mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 1, 48, 128], None).unwrap();
         let weight = Array::ones::<f32>(&[128]).unwrap();
 
-        let normed = fast::rms_norm(&y, Some(&weight), 1e-6).unwrap();
+        let normed = fast::rms_norm(&y, &weight, 1e-6).unwrap();
         let raw = nn::silu(&z).unwrap().multiply(&normed).unwrap();
         let compiled = gdn_output_gate(&y, &weight, 1e-6, &z).unwrap();
 
@@ -21425,7 +21425,7 @@ mod tests {
             ref_ys.push(y_t);
         }
         let ref_y_refs: Vec<&Array> = ref_ys.iter().collect();
-        let ref_y = ops::stack(&ref_y_refs, 1).unwrap();
+        let ref_y = ops::stack_axis(&ref_y_refs, 1).unwrap();
         ref_y.eval().unwrap();
         ref_state.eval().unwrap();
 
@@ -21668,7 +21668,7 @@ mod tests {
         // Test with task-local default stream
         let stream = mlx_rs::Stream::new();
         let gather_with_stream = || {
-            mlx_rs::with_new_default_stream(&stream.clone(), || {
+            mlx_rs::with_new_default_stream(stream.clone(), || {
                 let mut total_b = 0u128;
                 let mut total_e = 0u128;
                 let n7 = 50;
@@ -21908,7 +21908,7 @@ mod tests {
         let forward_n_inline = |x: &Array, n_layers: usize| -> Array {
             let mut h = x.clone();
             for l in layers.iter().take(n_layers) {
-                let normed = fast::rms_norm(&h, Some(&l.norm_w), 1e-6).unwrap();
+                let normed = fast::rms_norm(&h, &l.norm_w, 1e-6).unwrap();
 
                 // Attention projections (matching real model's GDN layer ops)
                 let _q = ops::quantized_matmul(
@@ -21976,7 +21976,7 @@ mod tests {
                 .unwrap();
 
                 let h2 = h.add(o).unwrap();
-                let normed2 = fast::rms_norm(&h2, Some(&l.norm_w), 1e-6).unwrap();
+                let normed2 = fast::rms_norm(&h2, &l.norm_w, 1e-6).unwrap();
 
                 // Router
                 let gate_out = ops::quantized_matmul(
@@ -22479,10 +22479,10 @@ mod tests {
         bench("A) module+zero_attn", &|x: &Array| {
             let mut h = x.clone();
             for moe in moe_blocks.iter().take(n_layers) {
-                let normed = fast::rms_norm(&h, Some(&norm_w), 1e-6).unwrap();
+                let normed = fast::rms_norm(&h, &norm_w, 1e-6).unwrap();
                 let dummy_attn = normed.multiply(Array::from_f32(0.0)).unwrap();
                 let h2 = h.add(dummy_attn).unwrap();
-                let normed2 = fast::rms_norm(&h2, Some(&norm_w), 1e-6).unwrap();
+                let normed2 = fast::rms_norm(&h2, &norm_w, 1e-6).unwrap();
                 let mlp_out = moe.forward(&normed2).unwrap();
                 h = h2.add(mlp_out).unwrap();
             }
@@ -22493,10 +22493,10 @@ mod tests {
         bench("B) inline+zero_attn", &|x: &Array| {
             let mut h = x.clone();
             for l in extracted.iter().take(n_layers) {
-                let normed = fast::rms_norm(&h, Some(&norm_w), 1e-6).unwrap();
+                let normed = fast::rms_norm(&h, &norm_w, 1e-6).unwrap();
                 let dummy_attn = normed.multiply(Array::from_f32(0.0)).unwrap();
                 let h2 = h.add(dummy_attn).unwrap();
-                let normed2 = fast::rms_norm(&h2, Some(&norm_w), 1e-6).unwrap();
+                let normed2 = fast::rms_norm(&h2, &norm_w, 1e-6).unwrap();
 
                 // Inline MoE (same code as bench_simulated_forward)
                 let gate_out = ops::quantized_matmul(
@@ -22628,7 +22628,7 @@ mod tests {
         bench("C) inline+real_attn+per_layer_norm", &|x: &Array| {
             let mut h = x.clone();
             for (i, l) in extracted.iter().take(n_layers).enumerate() {
-                let normed = fast::rms_norm(&h, Some(&per_layer_norms[i]), 1e-6).unwrap();
+                let normed = fast::rms_norm(&h, &per_layer_norms[i], 1e-6).unwrap();
                 let attn_out = ops::quantized_matmul(
                     &normed,
                     &attn_weights[i].0,
@@ -22640,7 +22640,7 @@ mod tests {
                 )
                 .unwrap();
                 let h2 = h.add(attn_out).unwrap();
-                let normed2 = fast::rms_norm(&h2, Some(&per_layer_norms[i]), 1e-6).unwrap();
+                let normed2 = fast::rms_norm(&h2, &per_layer_norms[i], 1e-6).unwrap();
 
                 let gate_out = ops::quantized_matmul(
                     &normed2, &l.gate.0, &l.gate.1, &l.gate.2, true, gs, bits,
@@ -22743,10 +22743,10 @@ mod tests {
         bench("D) inline+zero_attn+per_layer_norm", &|x: &Array| {
             let mut h = x.clone();
             for (i, l) in extracted.iter().take(n_layers).enumerate() {
-                let normed = fast::rms_norm(&h, Some(&per_layer_norms[i]), 1e-6).unwrap();
+                let normed = fast::rms_norm(&h, &per_layer_norms[i], 1e-6).unwrap();
                 let dummy_attn = normed.multiply(Array::from_f32(0.0)).unwrap();
                 let h2 = h.add(dummy_attn).unwrap();
-                let normed2 = fast::rms_norm(&h2, Some(&per_layer_norms[i]), 1e-6).unwrap();
+                let normed2 = fast::rms_norm(&h2, &per_layer_norms[i], 1e-6).unwrap();
 
                 let gate_out = ops::quantized_matmul(
                     &normed2, &l.gate.0, &l.gate.1, &l.gate.2, true, gs, bits,
@@ -22849,10 +22849,10 @@ mod tests {
         bench("E) inline+mul_one_attn", &|x: &Array| {
             let mut h = x.clone();
             for l in extracted.iter().take(n_layers) {
-                let normed = fast::rms_norm(&h, Some(&norm_w), 1e-6).unwrap();
+                let normed = fast::rms_norm(&h, &norm_w, 1e-6).unwrap();
                 let dummy_attn = normed.multiply(Array::from_f32(1.0)).unwrap();
                 let h2 = h.add(dummy_attn).unwrap();
-                let normed2 = fast::rms_norm(&h2, Some(&norm_w), 1e-6).unwrap();
+                let normed2 = fast::rms_norm(&h2, &norm_w, 1e-6).unwrap();
 
                 let gate_out = ops::quantized_matmul(
                     &normed2, &l.gate.0, &l.gate.1, &l.gate.2, true, gs, bits,
@@ -22955,11 +22955,11 @@ mod tests {
         bench("F) inline+zeros_like_attn", &|x: &Array| {
             let mut h = x.clone();
             for l in extracted.iter().take(n_layers) {
-                let normed = fast::rms_norm(&h, Some(&norm_w), 1e-6).unwrap();
+                let normed = fast::rms_norm(&h, &norm_w, 1e-6).unwrap();
                 let _ = &normed; // normed computed but not used for attn
                 let dummy_attn = ops::zeros_like(&normed).unwrap();
                 let h2 = h.add(dummy_attn).unwrap();
-                let normed2 = fast::rms_norm(&h2, Some(&norm_w), 1e-6).unwrap();
+                let normed2 = fast::rms_norm(&h2, &norm_w, 1e-6).unwrap();
 
                 let gate_out = ops::quantized_matmul(
                     &normed2, &l.gate.0, &l.gate.1, &l.gate.2, true, gs, bits,
@@ -23064,7 +23064,7 @@ mod tests {
             for l in extracted.iter().take(n_layers) {
                 // Skip first rms_norm entirely
                 let h2 = h.clone();
-                let normed2 = fast::rms_norm(&h2, Some(&norm_w), 1e-6).unwrap();
+                let normed2 = fast::rms_norm(&h2, &norm_w, 1e-6).unwrap();
 
                 let gate_out = ops::quantized_matmul(
                     &normed2, &l.gate.0, &l.gate.1, &l.gate.2, true, gs, bits,
@@ -23333,11 +23333,11 @@ mod tests {
                 .unwrap();
 
             // RMS norm
-            let norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
+            let norm_q = fast::rms_norm(&conv_q, &qk_norm_w, 1e-6)
                 .unwrap()
                 .multiply(&inv_scale_sq)
                 .unwrap();
-            let norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
+            let norm_k = fast::rms_norm(&conv_k, &qk_norm_w, 1e-6)
                 .unwrap()
                 .multiply(&inv_scale)
                 .unwrap();
@@ -23350,7 +23350,7 @@ mod tests {
             .unwrap();
 
             // Gated RMSNorm + swiglu
-            let normed = fast::rms_norm(&y, Some(&l.norm_w), 1e-6).unwrap();
+            let normed = fast::rms_norm(&y, &l.norm_w, 1e-6).unwrap();
             let z_shaped = z
                 .index((.., .., ..value_dim))
                 .reshape(&[1, 1, hv, dv])
@@ -23657,7 +23657,7 @@ mod tests {
             let mut gdn_idx = 0usize;
 
             for i in 0..n_layers as usize {
-                let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let normed = fast::rms_norm(&h, &moe_layers[i].norm_w, 1e-6).unwrap();
 
                 // Attention
                 let r = if gdn_layers[i].is_some() {
@@ -23720,11 +23720,11 @@ mod tests {
                         .reshape(&[1, 1, hv, dv])
                         .unwrap();
 
-                    let norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
+                    let norm_q = fast::rms_norm(&conv_q, &qk_norm_w, 1e-6)
                         .unwrap()
                         .multiply(&inv_scale_sq)
                         .unwrap();
-                    let norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
+                    let norm_k = fast::rms_norm(&conv_k, &qk_norm_w, 1e-6)
                         .unwrap()
                         .multiply(&inv_scale)
                         .unwrap();
@@ -23749,7 +23749,7 @@ mod tests {
                     ss[gdn_idx] = new_state;
                     gdn_idx += 1;
 
-                    let normed_y = fast::rms_norm(&y, Some(&l.norm_w), 1e-6).unwrap();
+                    let normed_y = fast::rms_norm(&y, &l.norm_w, 1e-6).unwrap();
                     let z_shaped = z
                         .index((.., .., ..value_dim))
                         .reshape(&[1, 1, hv, dv])
@@ -23814,7 +23814,7 @@ mod tests {
                 };
 
                 let h2 = h.add(r).unwrap();
-                let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let normed2 = fast::rms_norm(&h2, &moe_layers[i].norm_w, 1e-6).unwrap();
 
                 // MoE
                 let m = &moe_layers[i];
@@ -23973,7 +23973,7 @@ mod tests {
                 if !is_gdn {
                     continue;
                 }
-                let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let normed = fast::rms_norm(&h, &moe_layers[i].norm_w, 1e-6).unwrap();
                 let l = gdn_layers[i].as_ref().unwrap();
                 let qkvz = ops::quantized_matmul(
                     &normed,
@@ -24030,11 +24030,11 @@ mod tests {
                     .index((.., .., 2 * key_dim..))
                     .reshape(&[1, 1, hv, dv])
                     .unwrap();
-                let norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
+                let norm_q = fast::rms_norm(&conv_q, &qk_norm_w, 1e-6)
                     .unwrap()
                     .multiply(&inv_scale_sq)
                     .unwrap();
-                let norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
+                let norm_k = fast::rms_norm(&conv_k, &qk_norm_w, 1e-6)
                     .unwrap()
                     .multiply(&inv_scale)
                     .unwrap();
@@ -24057,7 +24057,7 @@ mod tests {
                 .unwrap();
                 ss[gdn_idx] = new_state;
                 gdn_idx += 1;
-                let normed_y = fast::rms_norm(&y, Some(&l.norm_w), 1e-6).unwrap();
+                let normed_y = fast::rms_norm(&y, &l.norm_w, 1e-6).unwrap();
                 let z_shaped = z
                     .index((.., .., ..value_dim))
                     .reshape(&[1, 1, hv, dv])
@@ -24082,7 +24082,7 @@ mod tests {
         let forward_moe_only = |h_in: &Array| -> Array {
             let mut h = h_in.clone();
             for i in 0..n_layers as usize {
-                let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let normed = fast::rms_norm(&h, &moe_layers[i].norm_w, 1e-6).unwrap();
                 // Simple attn proxy
                 let attn_out = ops::quantized_matmul(
                     &normed,
@@ -24095,7 +24095,7 @@ mod tests {
                 )
                 .unwrap();
                 let h2 = h.add(attn_out.sum_axes(&[-1], true).unwrap()).unwrap();
-                let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let normed2 = fast::rms_norm(&h2, &moe_layers[i].norm_w, 1e-6).unwrap();
                 let m = &moe_layers[i];
                 let gate_out = ops::quantized_matmul(
                     &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
@@ -24239,7 +24239,7 @@ mod tests {
             let mut h = h_in.clone();
             let mut gdn_idx = 0usize;
             for i in 0..n_layers as usize {
-                let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let normed = fast::rms_norm(&h, &moe_layers[i].norm_w, 1e-6).unwrap();
                 let r = if gdn_layers[i].is_some() {
                     let l = gdn_layers[i].as_ref().unwrap();
                     let qkvz = ops::quantized_matmul(
@@ -24298,11 +24298,11 @@ mod tests {
                         .index((.., .., 2 * key_dim..))
                         .reshape(&[1, 1, hv, dv])
                         .unwrap();
-                    let _norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
+                    let _norm_q = fast::rms_norm(&conv_q, &qk_norm_w, 1e-6)
                         .unwrap()
                         .multiply(&inv_scale_sq)
                         .unwrap();
-                    let _norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
+                    let _norm_k = fast::rms_norm(&conv_k, &qk_norm_w, 1e-6)
                         .unwrap()
                         .multiply(&inv_scale)
                         .unwrap();
@@ -24320,7 +24320,7 @@ mod tests {
                         .unwrap();
                     gdn_idx += 1;
 
-                    let normed_y = fast::rms_norm(&y, Some(&l.norm_w), 1e-6).unwrap();
+                    let normed_y = fast::rms_norm(&y, &l.norm_w, 1e-6).unwrap();
                     let z_shaped = z
                         .index((.., .., ..value_dim))
                         .reshape(&[1, 1, hv, dv])
@@ -24383,7 +24383,7 @@ mod tests {
                     .unwrap()
                 };
                 let h2 = h.add(r).unwrap();
-                let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let normed2 = fast::rms_norm(&h2, &moe_layers[i].norm_w, 1e-6).unwrap();
                 let m = &moe_layers[i];
                 let gate_out = ops::quantized_matmul(
                     &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
@@ -24510,7 +24510,7 @@ mod tests {
             let mut h = h_in.clone();
             let mut gdn_idx = 0usize;
             for i in 0..n_layers as usize {
-                let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let normed = fast::rms_norm(&h, &moe_layers[i].norm_w, 1e-6).unwrap();
                 let r = if gdn_layers[i].is_some() {
                     let l = gdn_layers[i].as_ref().unwrap();
                     let qkvz = ops::quantized_matmul(
@@ -24569,11 +24569,11 @@ mod tests {
                         .index((.., .., 2 * key_dim..))
                         .reshape(&[1, 1, hv, dv])
                         .unwrap();
-                    let norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
+                    let norm_q = fast::rms_norm(&conv_q, &qk_norm_w, 1e-6)
                         .unwrap()
                         .multiply(&inv_scale_sq)
                         .unwrap();
-                    let norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
+                    let norm_k = fast::rms_norm(&conv_k, &qk_norm_w, 1e-6)
                         .unwrap()
                         .multiply(&inv_scale)
                         .unwrap();
@@ -24604,7 +24604,7 @@ mod tests {
                     gdn_idx += 1;
 
                     let y_4d = y.expand_dims(0).unwrap().expand_dims(0).unwrap();
-                    let normed_y = fast::rms_norm(&y_4d, Some(&l.norm_w), 1e-6).unwrap();
+                    let normed_y = fast::rms_norm(&y_4d, &l.norm_w, 1e-6).unwrap();
                     let z_shaped = z
                         .index((.., .., ..value_dim))
                         .reshape(&[1, 1, hv, dv])
@@ -24667,7 +24667,7 @@ mod tests {
                     .unwrap()
                 };
                 let h2 = h.add(r).unwrap();
-                let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let normed2 = fast::rms_norm(&h2, &moe_layers[i].norm_w, 1e-6).unwrap();
                 let m = &moe_layers[i];
                 let gate_out = ops::quantized_matmul(
                     &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
@@ -24794,7 +24794,7 @@ mod tests {
                 let mut h = h_in.clone();
                 let mut gdn_idx = 0usize;
                 for i in 0..n_layers as usize {
-                    let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                    let normed = fast::rms_norm(&h, &moe_layers[i].norm_w, 1e-6).unwrap();
                     let r = if gdn_layers[i].is_some() {
                         let l = gdn_layers[i].as_ref().unwrap();
                         let qkvz = ops::quantized_matmul(
@@ -24853,11 +24853,11 @@ mod tests {
                             .index((.., .., 2 * key_dim..))
                             .reshape(&[1, 1, hv, dv])
                             .unwrap();
-                        let norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
+                        let norm_q = fast::rms_norm(&conv_q, &qk_norm_w, 1e-6)
                             .unwrap()
                             .multiply(&inv_scale_sq)
                             .unwrap();
-                        let norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
+                        let norm_k = fast::rms_norm(&conv_k, &qk_norm_w, 1e-6)
                             .unwrap()
                             .multiply(&inv_scale)
                             .unwrap();
@@ -24880,7 +24880,7 @@ mod tests {
                         .unwrap();
                         ss[gdn_idx] = new_state;
                         gdn_idx += 1;
-                        let normed_y = fast::rms_norm(&y, Some(&l.norm_w), 1e-6).unwrap();
+                        let normed_y = fast::rms_norm(&y, &l.norm_w, 1e-6).unwrap();
                         let z_shaped = z
                             .index((.., .., ..value_dim))
                             .reshape(&[1, 1, hv, dv])
@@ -24943,7 +24943,7 @@ mod tests {
                         .unwrap()
                     };
                     let h2 = h.add(r).unwrap();
-                    let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                    let normed2 = fast::rms_norm(&h2, &moe_layers[i].norm_w, 1e-6).unwrap();
                     let m = &moe_layers[i];
                     let gate_out = ops::quantized_matmul(
                         &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
@@ -25069,7 +25069,7 @@ mod tests {
             let mut h = h_in.clone();
             let mut gdn_idx = 0usize;
             for i in 0..n_layers as usize {
-                let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let normed = fast::rms_norm(&h, &moe_layers[i].norm_w, 1e-6).unwrap();
                 let r = if gdn_layers[i].is_some() {
                     let l = gdn_layers[i].as_ref().unwrap();
                     let qkvz = ops::quantized_matmul(
@@ -25128,11 +25128,11 @@ mod tests {
                         .index((.., .., 2 * key_dim..))
                         .reshape(&[1, 1, hv, dv])
                         .unwrap();
-                    let norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
+                    let norm_q = fast::rms_norm(&conv_q, &qk_norm_w, 1e-6)
                         .unwrap()
                         .multiply(&inv_scale_sq)
                         .unwrap();
-                    let norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
+                    let norm_k = fast::rms_norm(&conv_k, &qk_norm_w, 1e-6)
                         .unwrap()
                         .multiply(&inv_scale)
                         .unwrap();
@@ -25155,7 +25155,7 @@ mod tests {
                     .unwrap();
                     ss[gdn_idx] = new_state;
                     gdn_idx += 1;
-                    let normed_y = fast::rms_norm(&y, Some(&l.norm_w), 1e-6).unwrap();
+                    let normed_y = fast::rms_norm(&y, &l.norm_w, 1e-6).unwrap();
                     let z_shaped = z
                         .index((.., .., ..value_dim))
                         .reshape(&[1, 1, hv, dv])
@@ -25222,7 +25222,7 @@ mod tests {
                 // Async eval hint: start processing GDN computation while building MoE graph
                 mlx_rs::transforms::async_eval([&h2]).unwrap();
 
-                let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                let normed2 = fast::rms_norm(&h2, &moe_layers[i].norm_w, 1e-6).unwrap();
                 let m = &moe_layers[i];
                 let gate_out = ops::quantized_matmul(
                     &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
@@ -25349,7 +25349,7 @@ mod tests {
                 let mut h = h_in.clone();
                 let mut gdn_idx = 0usize;
                 for i in 0..n_layers as usize {
-                    let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                    let normed = fast::rms_norm(&h, &moe_layers[i].norm_w, 1e-6).unwrap();
                     let r = if gdn_layers[i].is_some() {
                         let l = gdn_layers[i].as_ref().unwrap();
                         let qkvz = ops::quantized_matmul(
@@ -25408,11 +25408,11 @@ mod tests {
                             .index((.., .., 2 * key_dim..))
                             .reshape(&[1, 1, hv, dv])
                             .unwrap();
-                        let norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
+                        let norm_q = fast::rms_norm(&conv_q, &qk_norm_w, 1e-6)
                             .unwrap()
                             .multiply(&inv_scale_sq)
                             .unwrap();
-                        let norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
+                        let norm_k = fast::rms_norm(&conv_k, &qk_norm_w, 1e-6)
                             .unwrap()
                             .multiply(&inv_scale)
                             .unwrap();
@@ -25439,7 +25439,7 @@ mod tests {
 
                         ss[gdn_idx] = new_state;
                         gdn_idx += 1;
-                        let normed_y = fast::rms_norm(&y, Some(&l.norm_w), 1e-6).unwrap();
+                        let normed_y = fast::rms_norm(&y, &l.norm_w, 1e-6).unwrap();
                         let z_shaped = z
                             .index((.., .., ..value_dim))
                             .reshape(&[1, 1, hv, dv])
@@ -25502,7 +25502,7 @@ mod tests {
                         .unwrap()
                     };
                     let h2 = h.add(r).unwrap();
-                    let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                    let normed2 = fast::rms_norm(&h2, &moe_layers[i].norm_w, 1e-6).unwrap();
                     let m = &moe_layers[i];
                     let gate_out = ops::quantized_matmul(
                         &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
@@ -25643,7 +25643,7 @@ mod tests {
                 let mut h = h_in.clone();
                 let mut gdn_idx = 0usize;
                 for i in 0..n_layers as usize {
-                    let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                    let normed = fast::rms_norm(&h, &moe_layers[i].norm_w, 1e-6).unwrap();
                     let r = if gdn_layers[i].is_some() {
                         let l = gdn_layers[i].as_ref().unwrap();
                         let qkvz = ops::quantized_matmul(
@@ -25702,11 +25702,11 @@ mod tests {
                             .index((.., .., 2 * key_dim..))
                             .reshape(&[1, 1, hv, dv])
                             .unwrap();
-                        let _norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
+                        let _norm_q = fast::rms_norm(&conv_q, &qk_norm_w, 1e-6)
                             .unwrap()
                             .multiply(&inv_scale_sq)
                             .unwrap();
-                        let _norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
+                        let _norm_k = fast::rms_norm(&conv_k, &qk_norm_w, 1e-6)
                             .unwrap()
                             .multiply(&inv_scale)
                             .unwrap();
@@ -25724,7 +25724,7 @@ mod tests {
                             .unwrap();
 
                         gdn_idx += 1;
-                        let normed_y = fast::rms_norm(&y, Some(&l.norm_w), 1e-6).unwrap();
+                        let normed_y = fast::rms_norm(&y, &l.norm_w, 1e-6).unwrap();
                         let z_shaped = z
                             .index((.., .., ..value_dim))
                             .reshape(&[1, 1, hv, dv])
@@ -25787,7 +25787,7 @@ mod tests {
                         .unwrap()
                     };
                     let h2 = h.add(r).unwrap();
-                    let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                    let normed2 = fast::rms_norm(&h2, &moe_layers[i].norm_w, 1e-6).unwrap();
                     let m = &moe_layers[i];
                     let gate_out = ops::quantized_matmul(
                         &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
@@ -25918,7 +25918,7 @@ mod tests {
                 let mut h = h_in.clone();
                 let mut gdn_idx = 0usize;
                 for i in 0..test_layers_u {
-                    let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                    let normed = fast::rms_norm(&h, &moe_layers[i].norm_w, 1e-6).unwrap();
                     let r = if gdn_layers[i].is_some() {
                         let l = gdn_layers[i].as_ref().unwrap();
                         let qkvz = ops::quantized_matmul(
@@ -25977,11 +25977,11 @@ mod tests {
                             .index((.., .., 2 * key_dim..))
                             .reshape(&[1, 1, hv, dv])
                             .unwrap();
-                        let norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
+                        let norm_q = fast::rms_norm(&conv_q, &qk_norm_w, 1e-6)
                             .unwrap()
                             .multiply(&inv_scale_sq)
                             .unwrap();
-                        let norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
+                        let norm_k = fast::rms_norm(&conv_k, &qk_norm_w, 1e-6)
                             .unwrap()
                             .multiply(&inv_scale)
                             .unwrap();
@@ -26004,7 +26004,7 @@ mod tests {
                         .unwrap();
                         ss[gdn_idx] = new_state;
                         gdn_idx += 1;
-                        let normed_y = fast::rms_norm(&y, Some(&l.norm_w), 1e-6).unwrap();
+                        let normed_y = fast::rms_norm(&y, &l.norm_w, 1e-6).unwrap();
                         let z_shaped = z
                             .index((.., .., ..value_dim))
                             .reshape(&[1, 1, hv, dv])
@@ -26067,7 +26067,7 @@ mod tests {
                         .unwrap()
                     };
                     let h2 = h.add(r).unwrap();
-                    let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                    let normed2 = fast::rms_norm(&h2, &moe_layers[i].norm_w, 1e-6).unwrap();
                     let m = &moe_layers[i];
                     let gate_out = ops::quantized_matmul(
                         &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
@@ -26196,7 +26196,7 @@ mod tests {
                 let mut h = h_in.clone();
                 let mut gdn_idx = 0usize;
                 for i in 0..n_layers as usize {
-                    let normed = fast::rms_norm(&h, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                    let normed = fast::rms_norm(&h, &moe_layers[i].norm_w, 1e-6).unwrap();
                     let r = if gdn_layers[i].is_some() {
                         let l = gdn_layers[i].as_ref().unwrap();
                         let qkvz = ops::quantized_matmul(
@@ -26255,11 +26255,11 @@ mod tests {
                             .index((.., .., 2 * key_dim..))
                             .reshape(&[1, 1, hv, dv])
                             .unwrap();
-                        let _norm_q = fast::rms_norm(&conv_q, Some(&qk_norm_w), 1e-6)
+                        let _norm_q = fast::rms_norm(&conv_q, &qk_norm_w, 1e-6)
                             .unwrap()
                             .multiply(&inv_scale_sq)
                             .unwrap();
-                        let _norm_k = fast::rms_norm(&conv_k, Some(&qk_norm_w), 1e-6)
+                        let _norm_k = fast::rms_norm(&conv_k, &qk_norm_w, 1e-6)
                             .unwrap()
                             .multiply(&inv_scale)
                             .unwrap();
@@ -26278,7 +26278,7 @@ mod tests {
                             .unwrap();
                         gdn_idx += 1;
 
-                        let normed_y = fast::rms_norm(&y_proxy, Some(&l.norm_w), 1e-6).unwrap();
+                        let normed_y = fast::rms_norm(&y_proxy, &l.norm_w, 1e-6).unwrap();
                         let z_shaped = z
                             .index((.., .., ..value_dim))
                             .reshape(&[1, 1, hv, dv])
@@ -26341,7 +26341,7 @@ mod tests {
                         .unwrap()
                     };
                     let h2 = h.add(r).unwrap();
-                    let normed2 = fast::rms_norm(&h2, Some(&moe_layers[i].norm_w), 1e-6).unwrap();
+                    let normed2 = fast::rms_norm(&h2, &moe_layers[i].norm_w, 1e-6).unwrap();
                     let m = &moe_layers[i];
                     let gate_out = ops::quantized_matmul(
                         &normed2, &m.gate.0, &m.gate.1, &m.gate.2, true, gs, bits,
@@ -28578,7 +28578,7 @@ mod tests {
                         let scale = Array::from_slice(&[0.01f32], &[1]);
                         h = h.add(extra.multiply(&scale).unwrap()).unwrap();
                     }
-                    h = fast::rms_norm(&h, Some(&norm_ws[i]), 1e-6).unwrap();
+                    h = fast::rms_norm(&h, &norm_ws[i], 1e-6).unwrap();
                 }
                 h
             };
@@ -28694,7 +28694,7 @@ mod tests {
 
         // With task-local stream set
         let stream = Stream::new();
-        mlx_rs::with_new_default_stream(&stream, || {
+        mlx_rs::with_new_default_stream(stream.clone(), || {
             let t0 = std::time::Instant::now();
             let mut x = a.clone();
             for _ in 0..n {
@@ -30375,14 +30375,14 @@ mod tests {
     fn assert_qgemv_matches_reference(n: i32, k: i32, group_size: i32, label: &str) {
         use mlx_rs::Dtype;
 
-        let x = mlx_rs::with_new_default_stream(&Stream::default(), || {
+        let x = mlx_rs::with_new_default_stream(Stream::default(), || {
             mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[1, 1, k], None)
         })
         .unwrap()
         .as_dtype(Dtype::Bfloat16)
         .unwrap();
 
-        let w_dense = mlx_rs::with_new_default_stream(&Stream::default(), || {
+        let w_dense = mlx_rs::with_new_default_stream(Stream::default(), || {
             mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[n, k], None)
         })
         .unwrap();
@@ -30779,14 +30779,14 @@ mod tests {
     fn bench_gemv_at(n: i32, k: i32, group_size: i32, iters: usize) {
         use mlx_rs::Dtype;
 
-        let x = mlx_rs::with_new_default_stream(&Stream::default(), || {
+        let x = mlx_rs::with_new_default_stream(Stream::default(), || {
             mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[1, 1, k], None)
         })
         .unwrap()
         .as_dtype(Dtype::Bfloat16)
         .unwrap();
 
-        let w_dense = mlx_rs::with_new_default_stream(&Stream::default(), || {
+        let w_dense = mlx_rs::with_new_default_stream(Stream::default(), || {
             mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[n, k], None)
         })
         .unwrap();
@@ -30980,7 +30980,7 @@ mod tests {
         let y_ref = y_ref.expand_dims(1).unwrap();
         let expected = nn::silu(&z)
             .unwrap()
-            .multiply(&fast::rms_norm(&y_ref, Some(&norm_weight), 1e-6).unwrap())
+            .multiply(&fast::rms_norm(&y_ref, &norm_weight, 1e-6).unwrap())
             .unwrap();
 
         let mut cache = ArraysCache {

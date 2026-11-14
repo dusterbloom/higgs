@@ -2620,11 +2620,8 @@ mod tests {
 
     #[test]
     fn test_as_slice_after_transpose_order() {
-        // mlx-rs `as_slice` now refuses non-contiguous (e.g. transposed) views
-        // outright (`AsSliceError::NotContiguous`) instead of silently handing
-        // back storage-order data. Confirm that guard fires, then confirm the
-        // actual fix TurboQuantStorage::append relies on: flatten+reshape to
-        // force contiguous layout before calling as_slice.
+        // This mlx-rs revision exposes storage-order data for strided views.
+        // TurboQuantStorage::append must materialize logical order first.
         let data: Vec<f32> = (0..24)
             .map(|i| f32::from(i8::try_from(i).unwrap()))
             .collect();
@@ -2632,11 +2629,6 @@ mod tests {
         let transposed = arr.transpose_axes(&[0, 2, 1, 3]).unwrap(); // [B=1, H=2, L=3, D=4]
         assert_eq!(transposed.shape(), &[1, 2, 3, 4]);
         transposed.eval().unwrap();
-        assert_eq!(
-            transposed.try_as_slice::<f32>().unwrap_err(),
-            mlx_rs::error::AsSliceError::NotContiguous
-        );
-
         // Verify the fix: flatten+reshape forces contiguous layout
         let fixed = transposed
             .flatten(None, None)
@@ -2645,12 +2637,14 @@ mod tests {
             .unwrap();
         fixed.eval().unwrap();
         let fixed_slice = fixed.as_slice::<f32>();
-        let fixed_4 = *fixed_slice.get(4).unwrap();
-        // After flatten+reshape, slice[4..8] should be [8,9,10,11] (h=0, t=1 in logical order)
-        assert!(
-            (fixed_4 - 8.0).abs() < f32::EPSILON,
-            "flatten+reshape must produce contiguous logical order, got {fixed_4}"
-        );
+        let expected: Vec<f32> = (0..2)
+            .flat_map(|head| {
+                (0..3).flat_map(move |token| {
+                    (0..4).map(move |dim| f32::from(i8::try_from(token * 8 + head * 4 + dim).unwrap()))
+                })
+            })
+            .collect();
+        assert_eq!(fixed_slice, expected.as_slice());
     }
 
     #[test]
